@@ -18,7 +18,7 @@ local _C = {}
 local _D = {}
 
 local Config = {
-	Version       = "V307",
+	Version       = "V308",
 	Enabled       = false,
 	Mode          = "Perfect",
 
@@ -2732,6 +2732,27 @@ _C.grabOffFn = function(st)
 	local cfg = GameData.cfg
 	if not cfg or not cfg.GetStyleNumber then return 0 end
 	return cfg.GetStyleNumber(st, "M2GrabTargetForwardOffset", 0)
+end
+-- V308: grab-style detector (PerfectCopy / Wrestling / kure / judo / dirty
+-- via grab fields, or the SA list). Used by the poll-origin contact floor.
+_C.isGrabStyle = function(st)
+	local s = tostring(st or ""):lower()
+	if s == "wrestling" or s == "kure" or s == "judo" or s == "dirty"
+		or s == "perfectcopy" then
+		return true
+	end
+	local cfg = GameData.cfg
+	if cfg and cfg.GetStyleConfig then
+		local ok, sc = pcall(cfg.GetStyleConfig, s)
+		if ok and type(sc) == "table" then
+			if type(sc.M2GrabTargetForwardOffset) == "number"
+				or type(sc.M2GrabLockDuration) == "number"
+				or sc.M2GrabAllowRagdollCombo then
+				return true
+			end
+		end
+	end
+	return false
 end
 _C.applyGrabSwingSpeed = function(info, track, hitTL)
 	if not info or info.t ~= "M2" or type(hitTL) ~= "number" then return hitTL end
@@ -5610,7 +5631,19 @@ local onAttack = function(attackerHRP, info, model, id, track, origin, hbPart)
 			end
 		end
 	end
-	if remaining0 > Config.MaxWait then return end
+	-- Poll origin: the attacker's animation REPLICA is late (we found the
+	-- track at tp=0.067, not 0). For a grab-style M2 (PerfectCopy/Wrestling
+	-- forked swing + PairCinematic), the server-side grab runs on its own
+	-- hitbox delay from the REAL swing start - subtracting the poll tp
+	-- shortens the contact. V307 log: poll tp=0.067, contact=267ms, real
+	-- server hit landed at +1153ms (Grappling lock). Floor the poll
+	-- contact at the full hitTL for grab M2s.
+	if origin == "poll" and info.t == "M2" and _C.isGrabStyle
+		and _C.isGrabStyle(styleKey(tostring(info.s or ""))) then
+		if hitTLReal and remaining0 < hitTLReal then
+			remaining0 = hitTLReal
+		end
+	end
 
 	local nowClock  = os.clock()
 	if origin ~= "hitbox" then
@@ -7451,6 +7484,28 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 				State.prevStunEsc = stunnedNow
 			end
 			if not faceHold and not wantBlock.stunTooLate and not tooEarly then
+				-- V308: a second press closer than BlockCooldown to the first is
+				-- silently eaten by the server (V307 log: Mishima M2 s2 - five
+				-- presses at IN-WINDOW trueGap, all LATE; press2-press1 =
+				-- 475ms < 500ms CD). When the s2 press would land inside the CD
+				-- window, release the guard and mark the gap reason so the OUT
+				-- line explains the HIT.
+				local pressGap = now - (State.lastPress or 0)
+				local cdGap   = (Config.BlockCooldown or 0.5) - (Config.BlockCooldownSafety or 0.03)
+				if (wantBlock.strike or 1) >= 2 and pressGap < cdGap then
+					if not wantBlock.cdPressLogged then
+						wantBlock.cdPressLogged = true
+						diagPush("CD-PRESS t=%.2f %s s2 press2−press1=%.0fms < CD %.0fms → сервер молча съест нажатие; гард снят",
+							now, tostring(wantBlock.name), pressGap * 1000, cdGap * 1000)
+					end
+					if wantBlock.rec then
+						wantBlock.rec.blockedReason = string.format("BlockCooldown-real: press gap %.0fms", pressGap * 1000)
+					end
+					releaseBlock()
+					wantBlock.pressed = true
+					wantBlock.pressDt  = wantBlock.contactAbs - now
+					wantBlock.cdSwallowed = true
+				else
 				if (wantBlock.strike or 1) >= 2 and State.blocking then
 					releaseBlock()
 				end
@@ -7465,8 +7520,9 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 				end
 				sent, armOnly = fireBlock(serverNow, comboOk)
 				State.pressSpoofExtra = 0
-			end
-			if sent and armOnly then
+				end
+				end
+				if sent and armOnly then
 				wantBlock.stunArmed = true
 			elseif sent then
 				wantBlock.pressed  = true
