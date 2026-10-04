@@ -18,7 +18,7 @@ local _C = {}
 local _D = {}
 
 local Config = {
-	Version       = "V305",
+	Version       = "V306",
 	Enabled       = false,
 	Mode          = "Perfect",
 
@@ -4644,6 +4644,19 @@ State.ap.tryInterrupt = LPH_NO_VIRTUALIZE(function(now, th, threatCount)
 	if not th or th.pressed or th.dodged or th.interruptAttempted
 		or th.coveredByInterrupt or th.interruptGaveUp then return false end
 	if th.kind ~= "M1" then return false end
+	-- V306: never M1 into a live counter stance (wingchun/aikido). V305 log:
+	-- interrupt fired while canBlockNow was refused (ragdoll window), the
+	-- target held an aikido stance → AIKIDO-COUNTERED-BY, 2.3s stun, then a
+	-- full ragdoll-cascade of LATE MISSes. The stance deals no damage itself;
+	-- it only exists to punish exactly this attack.
+	if wingChunCounterActive(th.attackerModel) then
+		if not th.stanceSkipLogged then
+			th.stanceSkipLogged = true
+			diagPush("INTERRUPT-SKIP t=%.2f %s держит counter-стойку → M1 отменён (иначе контра+стан)",
+				now, tostring(th.name))
+		end
+		return false
+	end
 	if isMustDodge(th) then return false end
 	if incomingHeavyM2(now, 1.2) then
 		th.interruptGaveUp = true
@@ -4836,6 +4849,14 @@ function State.ap.onPerfectParry(attackerName, kind, th)
 		if Config.DeepDiag then
 			diagPush("PUNISH-SKIP t=%.2f counter-iframes", os.clock())
 		end
+		return
+	end
+	-- V306: a target in a counter stance (wingchun/aikido) eats our punish
+	-- M1 and counters it — the stance IS the punish window for attackers.
+	if wingChunCounterActive(model) then
+		State.ap.punishTgt = nil
+		State.ap.punishFresh = false
+		diagPush("PUNISH-SKIP t=%.2f counter-stance %s", os.clock(), tostring(attackerName))
 		return
 	end
 	local stun = (kind == "M2") and (Config.AP_M2Stun or 1.0) or (Config.AP_M1Stun or 0.5)
@@ -6299,6 +6320,19 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 					or am:GetAttribute("Ragdoll")
 					or am:GetAttribute("Downed")
 					or am:GetAttribute("GuardBroken")
+				-- V306: NEUTRALIZED ran up to 5s early while the swing was still
+				-- flying (V305 log: SWING → NEUTRALIZED at +150ms, OUT LATE at
+				-- +835ms HIT). The attacker hit someone/something mid-swing; the
+				-- THREAT still lands on us. Only drop the threat after its own
+				-- window is spent.
+				if atkNeutralized and dt > 0.20 and th.kind == "M1" then
+					if not th.neutEarlyLogged then
+						th.neutEarlyLogged = true
+						diagPush("NEUT-KEEP t=%.2f %s %s: атакующий Parried/Stunned, но contactIn=%+.0fms → угрозу держим",
+							now, tostring(th.name), tostring(th.kind), dt * 1000)
+					end
+					atkNeutralized = false
+				end
 			end
 			if atkNeutralized and th.group and (th.strike or 1) >= 2
 				and not th.group.cancelled and Config.MultiHitKeep ~= false then
