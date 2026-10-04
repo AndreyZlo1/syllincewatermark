@@ -18,7 +18,7 @@ local _C = {}
 local _D = {}
 
 local Config = {
-	Version       = "V304",
+	Version       = "V305",
 	Enabled       = false,
 	Mode          = "Perfect",
 
@@ -1092,18 +1092,14 @@ local canBlockNow = LPH_NO_VIRTUALIZE(function()
 		return true, nil
 	end
 	if Config.BlockCooldownPredict ~= false then
-	local nowB = os.clock()
-	local rearm = State.allowRearmUntil
-	local multiR = State.multiRearmUntil
-	if not ((type(rearm) == "number" and nowB < rearm)
-		or (type(multiR) == "number" and nowB < multiR)) then
-		local rel = State.lastBlockRelease or State.lastPress
-		if rel then
-			local cd = Config.BlockCooldown or 0.5
-			local ready = rel + cd + (Config.BlockCooldownSafety or 0.03)
-			if nowB < ready then return false, "BlockCooldown" end
-		end
-	end
+	-- V305: the PREDICTED cooldown (lastBlockRelease + cd) no longer refuses
+	-- the press. Log proof (V304, clean 58ms ping): BLOCK? [CD left 10ms,
+	-- contactIn +0ms] still refused → OUT LATE STATE:BlockCooldown (twice),
+	-- while STUN-PARRY sends straight past this gate one swing later and the
+	-- server accepts (PERFECT). The server does not honor our predicted CD;
+	-- only the live BlockCooldown attribute below is a real refusal.
+	-- The predictor stays for planning (PLAN blockFreeAt / CD-DODGE), which
+	-- read State.lastBlockRelease directly.
 	end
 	do
 	local nowB = os.clock()
@@ -5679,7 +5675,10 @@ local onAttack = function(attackerHRP, info, model, id, track, origin, hbPart)
 		local ks = ksTab and ksTab[ksKey]
 		if ks and (ks.n or 0) >= 3 then
 			local avg = ks.sum / ks.n
-			if avg > 22 then
+			-- V305: threshold 22 never triggered on a +21..+29ms systematic
+			-- residual (V304 log: resAvg 21-30 across 26 PERFECTs, half the
+			-- presses EARLY/BLOCK-NOT-PARRY). Trigger from 15ms.
+			if avg > 15 then
 				local pad = math.min(avg / 1000, 0.040)
 				remaining0 = remaining0 + pad
 				th.contact0 = remaining0
