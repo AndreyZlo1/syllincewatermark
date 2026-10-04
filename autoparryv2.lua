@@ -18,7 +18,7 @@ local _C = {}
 local _D = {}
 
 local Config = {
-	Version       = "V306",
+	Version       = "V307",
 	Enabled       = false,
 	Mode          = "Perfect",
 
@@ -1802,6 +1802,26 @@ local willHitMe = LPH_NO_VIRTUALIZE(function(th)
 		local st = string.lower(tostring(th.style or ""))
 		if st == "cqc" then cap = math.max(cap, 30) end
 		if dist2dEarly <= cap then
+			-- V307: m2-range said hit for ANY swing inside the radius. At
+			-- range > 9 a back-turned or sideways attacker (auto-face still
+			-- traveling) burned dodges/presses on swings that fly elsewhere.
+			-- At close range the hitbox covers us at any face — keep the
+			-- permissive classify there.
+			if dist2dEarly > 9 then
+				local look = aHRP.CFrame.LookVector
+				local toMeX, toMeZ = dxEarly, dzEarly
+				local distL = math.sqrt(toMeX * toMeX + toMeZ * toMeZ)
+				if distL > 0.05 then toMeX, toMeZ = toMeX / distL, toMeZ / distL end
+				local faceToMe = look.X * toMeX + look.Z * toMeZ
+				local velOk = velToMeEarly >= 3
+				if faceToMe < -0.34 and not velOk and not th.m2RangeLatch then
+					th.recognitionSource = "m2-offaxis"
+					th.geomDist2d = dist2dEarly
+					return whmSet(th, false)
+				end
+				if faceToMe >= -0.34 then th.m2RangeLatch = true end
+				if velOk then th.m2RangeLatch = true end
+			end
 			th.recognitionSource = "m2-range"
 			th.geomDist2d = dist2dEarly
 			th.offTarget = nil
@@ -1996,6 +2016,8 @@ local willHitMe = LPH_NO_VIRTUALIZE(function(th)
 
 	-- M2 step-in lands even when replica LookVector is >90°. look-away
 	-- vetoed m2-close and produced V279 Hakari M2 NO-PRESS at dist=5.
+	-- V307: >9 studs and still back-turned after the windup — off-axis,
+	-- this swing flies elsewhere (see m2-offaxis in the early classify).
 	if not hit and th.kind == "M2" then
 		local d2 = th.geomDist2d
 		if type(d2) ~= "number" then
@@ -2005,9 +2027,15 @@ local willHitMe = LPH_NO_VIRTUALIZE(function(th)
 		local st = string.lower(tostring(th.style or ""))
 		if st == "cqc" then cap = math.max(cap, 30) end
 		if type(d2) == "number" and d2 <= cap then
-			hit = true
-			th.offTarget = nil
-			th.recognitionSource = "m2-in-range"
+			if d2 > 9 and th.geomFaceToMe ~= nil and th.geomFaceToMe < -0.34
+				and (th.closeVel or 0) < 3 and not th.m2RangeLatch then
+				th.recognitionSource = "m2-offaxis-late"
+				th.offTarget = true
+			else
+				hit = true
+				th.offTarget = nil
+				th.recognitionSource = "m2-in-range"
+			end
 		end
 	end
 
@@ -6416,9 +6444,14 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 				local capM2 = Config.Range or 18
 				if styleKey(th.style) == "cqc" then capM2 = math.max(capM2, 30) end
 				if type(dM2) == "number" and dM2 <= capM2 then
-					threatens = true
-					th.offTarget = nil
-					th.recognitionSource = th.recognitionSource or "m2-in-range"
+					-- V307: skip the range re-promotion for an M2 we already
+					-- classified off-axis (back-turned, >9 studs, no closing).
+					if not (th.recognitionSource == "m2-offaxis"
+						or th.recognitionSource == "m2-offaxis-late") then
+						threatens = true
+						th.offTarget = nil
+						th.recognitionSource = th.recognitionSource or "m2-in-range"
+					end
 				end
 			end
 			th.velLead = velLead(th.attackerHRP, th)
@@ -7032,15 +7065,20 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 		for _, candidate in ipairs(imminent) do
 			if isMustDodge(candidate) then mustDodgeThreat = candidate; break end
 		end
-	if mustDodgeThreat and dodgeReady() and canDodgeNow() then
-		local mustDt = mustDodgeThreat.contactAbs - now
-		local mLo, mHi = _C.dodgeCoverWindow(ifLat, ifDur, true)
-		if mustDt >= mLo and mustDt <= mHi then
-			if performDodge(now, "must-dodge(unblockable→back)", true, false, true, mustDodgeThreat) then
-				return
+		-- V307: keep the dodge for the must-dodge M2. A held parry covered a
+		-- closer M1 (parry-then-dodge plan); waiting mLo..mHi on the M2 while
+		-- the block CD drains usually means the M2 contact passes 300ms+ of
+		-- dead time (V306 log: DODGE at contactIn=74ms, covered=0, MISS).
+		-- Fire when the M2 window OPENS (mLo), not when it's centered.
+		if mustDodgeThreat and dodgeReady() and canDodgeNow() then
+			local mustDt = mustDodgeThreat.contactAbs - now
+			local mLo, mHi = _C.dodgeCoverWindow(ifLat, ifDur, true)
+			if mustDt <= mHi and mustDt >= (mLo - (Config.MustDodgeEarlySlack or 0.08)) then
+				if performDodge(now, "must-dodge(unblockable→back)", true, false, true, mustDodgeThreat) then
+					return
+				end
 			end
 		end
-	end
 
 	if Config.SkillAddon and Config.SA_BlatantDodge and dodgeReady() and #imminent >= 1 then
 		local a  = imminent[1]
