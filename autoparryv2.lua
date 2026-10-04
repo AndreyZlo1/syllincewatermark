@@ -1,24 +1,21 @@
-do
-	local _E = (getgenv and getgenv()) or _G
-	if not _E["LPH_NO_VIRTUALIZE"] then
-		local id, nop = function(f) return f end, function() end
-		_E["LPH_NO_VIRTUALIZE"] = id
-		_E["LPH_JIT_MAX"] = id
-		_E["LPH_JIT"] = id
-		_E["LPH_ENCFUNC"] = id
-		_E["LPH_NO_UPVALUES"] = id
-		_E["LPH_ENCSTR"] = id
-		_E["LPH_ENCNUM"] = id
-		_E["LPH_SKIP"] = id
-		_E["LPH_CRASH"] = nop
-		_E["LPH_OBFUSCATED"] = false
-	end
+if not LPH_OBFUSCATED then
+	local id, nop = function(f) return f end, function() end
+	LPH_NO_VIRTUALIZE = id
+	LPH_JIT_MAX = id
+	LPH_JIT = id
+	LPH_ENCFUNC = id
+	LPH_NO_UPVALUES = id
+	LPH_ENCSTR = id
+	LPH_ENCNUM = id
+	LPH_SKIP = id
+	LPH_CRASH = nop
+	LPH_OBFUSCATED = false
 end
 local _C = {}
 local _D = {}
 
 local Config = {
-	Version       = "V308",
+	Version       = "V309",
 	Enabled       = false,
 	Mode          = "Perfect",
 
@@ -1160,11 +1157,11 @@ local isEnemyModel = LPH_NO_VIRTUALIZE(function(model)
 	return false
 end)
 
-local function flatDirTo(fromPos, targetPos)
+local flatDirTo = LPH_NO_VIRTUALIZE(function(fromPos, targetPos)
 	local d = Vector3.new(targetPos.X - fromPos.X, 0, targetPos.Z - fromPos.Z)
 	if d.Magnitude < 0.05 then return nil end
 	return d.Unit
-end
+end)
 
 local function faceDotToThreat(th)
 	local a = th and th.attackerHRP
@@ -1179,12 +1176,12 @@ local function faceDotToThreat(th)
 	return flatLook.Unit:Dot(dir)
 end
 
-local function heavyRank(th)
+local heavyRank = LPH_NO_VIRTUALIZE(function(th)
 	local k = th and th.kind
 	if k == "SKILL" then return 2 end
 	if k == "M2" then return 1 end
 	return 0
-end
+end)
 
 local aimedAtMe = LPH_NO_VIRTUALIZE(function(th)
 	if not th then return false end
@@ -1261,7 +1258,7 @@ local computeMultiFaceGoal = LPH_NO_VIRTUALIZE(function()
 	return base + perp * (math.min(a.dist, b.dist) * j * (side - 0.5) * 2)
 end)
 
-local function snapLookAtThreat(th)
+local snapLookAtThreat = LPH_NO_VIRTUALIZE(function(th)
 	if not Config.AutoFace then return end
 	local myHRP = localHRP()
 	local a = th and th.attackerHRP
@@ -1269,7 +1266,7 @@ local function snapLookAtThreat(th)
 	local dir = flatDirTo(myHRP.Position, a.Position)
 	if not dir then return end
 	myHRP.CFrame = CFrame.lookAt(myHRP.Position, myHRP.Position + dir)
-end
+end)
 
 local setFaceGoalPos = LPH_NO_VIRTUALIZE(function(pos, hard, holdFor)
 	if not Config.AutoFace then return end
@@ -1390,7 +1387,11 @@ local function watchHitboxFolder(folder)
 end
 
 local hitboxIndex = LPH_NO_VIRTUALIZE(function()
-	if V93.hbFrame == _C.FrameId then return V93.byOwner end
+	-- V309: full rescan (FindFirstChild x2 per part, up to 60 parts) every
+	-- frame even with zero live threats. Two-frame cache + Threats guard;
+	-- ChildAdded/Removed still force V93.hbFrame = -1 for instant picks.
+	if V93.hbFrame >= 0 and V93.hbFrame >= _C.FrameId - 1 then return V93.byOwner end
+	if #Threats == 0 and V93.hbFrame >= 0 then return V93.byOwner end
 	V93.hbFrame = _C.FrameId
 	local byOwner = V93.byOwner
 	for k in pairs(byOwner) do byOwner[k] = nil end
@@ -1799,8 +1800,7 @@ local willHitMe = LPH_NO_VIRTUALIZE(function(th)
 	-- and we faced/pressed rooftop M2 (V285 y-diff after the fact).
 	if th.kind == "M2" and yOk then
 		local cap = Config.Range or 18
-		local st = string.lower(tostring(th.style or ""))
-		if st == "cqc" then cap = math.max(cap, 30) end
+		if th.styleKey == "cqc" then cap = math.max(cap, 30) end
 		if dist2dEarly <= cap then
 			-- V307: m2-range said hit for ANY swing inside the radius. At
 			-- range > 9 a back-turned or sideways attacker (auto-face still
@@ -1959,8 +1959,7 @@ local willHitMe = LPH_NO_VIRTUALIZE(function(th)
 		th.geomDist2d   = dist2d
 		local rangeCap = Config.Range or 18
 		if th.kind == "M2" then
-			local st = string.lower(tostring(th.style or ""))
-			if st == "cqc" then
+			if th.styleKey == "cqc" then
 				rangeCap = math.max(rangeCap, 30)
 			end
 		end
@@ -2024,8 +2023,7 @@ local willHitMe = LPH_NO_VIRTUALIZE(function(th)
 			d2 = math.sqrt(ox * ox + oz * oz)
 		end
 		local cap = Config.Range or 18
-		local st = string.lower(tostring(th.style or ""))
-		if st == "cqc" then cap = math.max(cap, 30) end
+		if th.styleKey == "cqc" then cap = math.max(cap, 30) end
 		if type(d2) == "number" and d2 <= cap then
 			if d2 > 9 and th.geomFaceToMe ~= nil and th.geomFaceToMe < -0.34
 				and (th.closeVel or 0) < 3 and not th.m2RangeLatch then
@@ -2559,10 +2557,19 @@ _D.STYLE_ALIAS = {
 	kyokushin = "kyokushin", kyokushinkarate = "kyokushin",
 	mishima = "mishima", lethwei = "lethwei", jin = "jin",
 }
-local function styleKey(s)
+-- V309: styleKey allocates a string per call (lower+gsub) and sits in every
+-- hot path. Cache by input string; gsub stays for misses only.
+local styleKeyCache = {}
+local styleKey = LPH_NO_VIRTUALIZE(function(s)
+	local t = type(s)
+	if t ~= "string" and t ~= "nil" then s = tostring(s) end
+	local hit = styleKeyCache[s]
+	if hit ~= nil then return hit end
 	local sl = string.lower(tostring(s or "")):gsub("[%s_%-]", "")
-	return _D.STYLE_ALIAS[sl] or sl
-end
+	local out = _D.STYLE_ALIAS[sl] or sl
+	styleKeyCache[s] = out
+	return out
+end)
 
 local function cfgKnowsStyle(style)
 	loadGameModules()
@@ -3488,9 +3495,9 @@ local function styleM2BreaksHeldGuard(style)
 	return verdict
 end
 
-local function m2BreaksHeldGuard(th)
+local m2BreaksHeldGuard = LPH_NO_VIRTUALIZE(function(th)
 	return th ~= nil and th.kind == "M2" and styleM2BreaksHeldGuard(th.style)
-end
+end)
 State.m2BreaksHeldGuard = m2BreaksHeldGuard
 
 -- full=true: cover the whole iframe (grabs / ali abuse).
@@ -3969,7 +3976,7 @@ local function wcDecide(th, now, threatCount)
 		return "parry", string.format("multi-threat(%d) без iframes", threatCount)
 	end
 	if Config.WCSkipGrabs ~= false and th.kind == "M2" then
-		local st = styleKey(th.style)
+		local st = th.styleKey or styleKey(th.style)
 		if st == "wrestling" or st == "dirty" or st == "perfectcopy" or st == "kure" or st == "judo" then
 			return "parry", "grab-style M2 (" .. st .. ")"
 		end
@@ -5689,7 +5696,7 @@ local onAttack = function(attackerHRP, info, model, id, track, origin, hbPart)
 		trackPlaying = track.IsPlaying
 	end
 	local th = {
-		name = name, kind = info.t, style = info.s, mom = info.mom, id = id,
+		name = name, kind = info.t, style = info.s, styleKey = styleKey(info.s), mom = info.mom, id = id,
 		combo = combo, variant = info.variant, animName = info.name,
 		sprintLocked = info.sprint == true,
 		track = track, hitTL = hitTL, hitTLReal = hitTLReal, initTP = already,
@@ -6475,7 +6482,7 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 					end
 				end
 				local capM2 = Config.Range or 18
-				if styleKey(th.style) == "cqc" then capM2 = math.max(capM2, 30) end
+				if th.styleKey == "cqc" then capM2 = math.max(capM2, 30) end
 				if type(dM2) == "number" and dM2 <= capM2 then
 					-- V307: skip the range re-promotion for an M2 we already
 					-- classified off-axis (back-turned, >9 studs, no closing).
@@ -7981,13 +7988,13 @@ _C.animIdCache = setmetatable({}, { __mode = "k" })
 _C.ownerCache  = setmetatable({}, { __mode = "k" })
 _C.OWNER_TTL    = 8.0
 
-local function cachedAnimId(anim)
+local cachedAnimId = LPH_NO_VIRTUALIZE(function(anim)
 	local v = _C.animIdCache[anim]
 	if v ~= nil then return v or nil end
 	local parsed = tonumber(tostring(anim.AnimationId):match("(%d+)"))
 	_C.animIdCache[anim] = parsed or false
 	return parsed
-end
+end)
 
 local function cachedOwner(animator)
 	local now = os.clock()
@@ -8003,7 +8010,7 @@ end
 local function hookAnimator(animator)
 	if _C.hooked[animator] then return end
 	_C.hooked[animator] = true
-	animator.AnimationPlayed:Connect(function(track)
+	animator.AnimationPlayed:Connect(LPH_NO_VIRTUALIZE(function(track)
 		local anim = track and track.Animation
 		if not anim then return end
 		local id = cachedAnimId(anim)
@@ -8078,7 +8085,7 @@ local function hookAnimator(animator)
 		local info = resolveInfo(id, rec.model)
 		if not info then return end
 		onAttack(rec.hrp, info, rec.model, id, track)
-	end)
+	end))
 end
 
 local function scanAnimators()
@@ -8096,7 +8103,7 @@ local function scanAnimators()
 	end
 end
 
-_C.scanPlayingAttacks = function()
+_C.scanPlayingAttacks = LPH_NO_VIRTUALIZE(function()
 	if not Config.Enabled then return end
 	local now = os.clock()
 	if now - (_C.lastPlayScan or 0) < 0.18 then return end
@@ -8178,7 +8185,7 @@ _C.scanPlayingAttacks = function()
 			end
 		end
 	end
-end
+end)
 
 Workspace.DescendantAdded:Connect(function(d)
 	if d.ClassName == "Animator" then hookAnimator(d) end
@@ -9632,11 +9639,14 @@ Viz.drawRing = LPH_NO_VIRTUALIZE(function(cam, model, hrp, hot)
 			local r = radius * pulse * (1 + math.sin(a * 4 + t * 5) * 0.03)
 			wpts[i] = Vector3.new(cx + math.cos(a) * r, footY, cz + math.sin(a) * r)
 		end
+		local colA = Viz.grad(Config.RingA, Config.RingB, hot and 0.875 or 0.375)
+		local colB = Viz.grad(Config.RingA, Config.RingB, hot and 1 or 0.625)
 		local thick = hot and 4 or 2.5
-		for i = 0, seg - 1 do
-			local j = (i + 1) % seg
-			local f = 0.5 + 0.5 * math.sin(i / seg * math.pi * 2 + t * 2.2)
-			Viz.drawWorldSeg(cam, wpts[i], wpts[j], Viz.grad(Config.RingA, Config.RingB, f), thick)
+		-- One line per two points: 16 segs -> 8 WorldToViewport pairs, not 30.
+		local step = (seg >= 20) and 2 or 1
+		for i = 0, seg - 1, step do
+			local k = (i + step) % seg
+			Viz.drawWorldSeg(cam, wpts[i], wpts[k], (i % (step * 2) == 0) and colA or colB, thick)
 		end
 		return
 	end
