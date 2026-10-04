@@ -18,7 +18,7 @@ local _C = {}
 local _D = {}
 
 local Config = {
-	Version       = "V303",
+	Version       = "V304",
 	Enabled       = false,
 	Mode          = "Perfect",
 
@@ -681,6 +681,7 @@ local State = {
 	noParryActive = false,
 	noParryNow    = false,
 	interruptLockUntil = 0,
+	m2Tally       = {},
 }
 
 local Threats = {}
@@ -766,7 +767,13 @@ local V93 = {
 	pingBuf   = {},
 	pingBufN  = 0,
 	pingBufI  = 0,
+	gnpEma    = nil,
+	gnpJit    = nil,
+	gnpJumps  = 0,
+	gnpLastSample = nil,
+	uplinkSlow = nil,
 	pingSampleClock = -1,
+	pingCacheVal   = 0.08,
 	pingMedTmp = {},
 	hbFolder = nil,
 	sizes = {},
@@ -782,8 +789,6 @@ local V93 = {
 	hbLiveSid = {},
 	m1Streak = {},
 	lastSwingAt = {},
-	pingCacheClock = -1,
-	pingCacheVal   = 0.08,
 	imminentBuf = {},
 	clusterBuf  = {},
 	faceBuf     = {},
@@ -815,6 +820,18 @@ local samplePingSources = LPH_NO_VIRTUALIZE(function()
 	local gnp = LocalPlayer:GetNetworkPing()
 	if type(gnp) == "number" and gnp == gnp and gnp > 0 then
 		V93.gnpVal = gnp
+		-- V304: raw GNP jumps packet-to-packet; max(raw) at press time moved
+		-- pressAt by 20-40ms within one swing. Smooth GNP with an EMA
+		-- (~1s time constant) so uplink reflects sustained network state.
+		local prev = V93.gnpLastSample
+		V93.gnpLastSample = gnp
+		if prev then
+			local jump = gnp - prev
+			V93.gnpJit = (V93.gnpJit or 0) * 0.9 + math.abs(jump) * 0.1
+			if math.abs(jump) > 0.020 then V93.gnpJumps = (V93.gnpJumps or 0) + 1 end
+		end
+		local e = V93.gnpEma
+		V93.gnpEma = e and (e * 0.88 + gnp * 0.12) or gnp
 	end
 	local item = V93.statsPingItem
 	if item ~= false then
@@ -891,15 +908,31 @@ local uplink = LPH_NO_VIRTUALIZE(function()
 	local ping = (raw > med) and raw or med
 	local up = ping * (Config.UplinkFactor or 0.5) + (Config.UplinkMargin or 0.008)
 	if Config.UplinkPreferGnpOneWay ~= false then
-		local gnp, stats = V93.gnpVal, V93.statsVal
-		if type(gnp) == "number" and gnp > 0 then
-			up = math.max(up, gnp)
+		-- V304: prefer the SMOOTHED GNP EMA over the raw sample. The raw
+		-- GNP spikes frame-to-frame and max(raw) dragged pressAt around;
+		-- EMA tracks sustained latency, which is what the press needs.
+		local ema = V93.gnpEma
+		if type(ema) == "number" and ema > 0 then
+			up = math.max(up, ema)
+		else
+			local gnp, stats = V93.gnpVal, V93.statsVal
+			if type(gnp) == "number" and gnp > 0 then
+				up = math.max(up, gnp)
+			end
+			if type(stats) == "number" and stats > 0 then
+				up = math.max(up, stats * 0.5)
+			end
 		end
+		local stats = V93.statsVal
 		if type(stats) == "number" and stats > 0 then
 			up = math.max(up, stats * 0.5)
 		end
 	end
 	up = math.clamp(up, Config.UplinkMin, Config.UplinkMax)
+	-- V304: a smoothed estimate is allowed to rise fast but fall slowly —
+	-- a single clean GNP sample after a spike must not yank pressAt later.
+	local slow = V93.uplinkSlow
+	V93.uplinkSlow = (slow and slow > up) and (slow * 0.85 + up * 0.15) or up
 	local thr = Config.LowPingThresh or 0
 	if thr > 0 and ping < thr then
 		up = up + (Config.LowPingFloor or 0) * (1 - ping / thr)
@@ -6499,8 +6532,13 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 							newLead = target
 						end
 						if newLead < 0 then newLead = 0 end
-						if th.kind == "M2" and newLead < lead then
-							newLead = lead
+						-- V304: this M2-only ratchet kept M2 lead pinned at
+						-- PerfectLead=95ms while QUANT wanted ~90 - center 0.72.
+						-- M1 quantizes down fine; M2 never could. Allow the M2
+						-- quant target, but never below the same pmin floor M1 uses.
+						local quantFloor = math.max(pmin, pwin * (Config.LeadQuantFloorFrac or 0.64))
+						if th.kind == "M2" and newLead < lead and newLead < quantFloor then
+							newLead = math.min(lead, quantFloor)
 						end
 						if math.abs(newLead - lead) > 0.0005 then
 							if Config.DeepDiag and not th.jitLogged then
@@ -6675,7 +6713,17 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 							end
 						end
 						if take and isMustDodge(th) then take = false end
-					if take then wantBlock = th end
+						if take then
+							if wantBlock and wantBlock ~= th and Config.DeepDiag
+								and not th.choiceSwapLogged then
+								th.choiceSwapLogged = true
+								diagPush("CHOICE-SWAP t=%.2f wantBlock %s %s(%+.0fms) → %s %s(%+.0fms): враги в одном окне, приоритет отдан второму",
+									now, tostring(wantBlock.name), tostring(wantBlock.kind),
+									(wantBlock.contactAbs - now) * 1000,
+									tostring(th.name), tostring(th.kind), (th.contactAbs - now) * 1000)
+							end
+							wantBlock = th
+						end
 					end
 				end
 					if dt <= (Config.FaceLeadWindow + up) and dt >= -Config.HoldAfter
@@ -7389,26 +7437,39 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 					wantBlock.rec.faceDot = wantBlock.faceDot
 					local p1, ps = pingDiagSnapshot()
 					local tpNow = wantBlock.track and wantBlock.track.TimePosition or -1
-					diagTrace("TRACE-PRESS t=%.3f srv=%.3f %s %s s%d dt=%+.0fms lateBy=%+.0fms tp=%.3f | detect net1w=%sms stats=%sms raw=%.0f med=%.0f up=%.0f | press net1w=%sms stats=%sms raw=%.0f med=%.0f up=%.0f", now, serverNow, wantBlock.name or "?", wantBlock.kind or "?", wantBlock.strike or 1,
-							wantBlock.pressDt*1000, wantBlock.rec.pressLateBy*1000, tpNow,
-							wantBlock.pingOneWayDetect and string.format("%.0f", wantBlock.pingOneWayDetect*1000) or "?",
-							wantBlock.pingStatsDetect and string.format("%.0f", wantBlock.pingStatsDetect*1000) or "?",
-							(wantBlock.pingRawDetect or 0)*1000, (wantBlock.pingMedDetect or 0)*1000,
-							(wantBlock.uplinkDetect or 0)*1000,
-							p1 and string.format("%.0f", p1*1000) or "?", ps and string.format("%.0f", ps*1000) or "?",
-							getPingRaw()*1000, getPing()*1000, up*1000)
+					diagTrace("TRACE-PRESS t=%.3f srv=%.3f %s %s s%d dt=%+.0fms lateBy=%+.0fms tp=%.3f | detect net1w=%sms stats=%sms raw=%.0f med=%.0f up=%.0f | press net1w=%sms stats=%sms raw=%.0f med=%.0f up=%.0f ema=%.0f jit=%.0f", now, serverNow, wantBlock.name or "?", wantBlock.kind or "?", wantBlock.strike or 1,
+						wantBlock.pressDt*1000, wantBlock.rec.pressLateBy*1000, tpNow,
+						wantBlock.pingOneWayDetect and string.format("%.0f", wantBlock.pingOneWayDetect*1000) or "?",
+						wantBlock.pingStatsDetect and string.format("%.0f", wantBlock.pingStatsDetect*1000) or "?",
+						(wantBlock.pingRawDetect or 0)*1000, (wantBlock.pingMedDetect or 0)*1000,
+						(wantBlock.uplinkDetect or 0)*1000,
+						p1 and string.format("%.0f", p1*1000) or "?", ps and string.format("%.0f", ps*1000) or "?",
+						getPingRaw()*1000, getPing()*1000, up*1000,
+						(V93.gnpEma or 0)*1000, (V93.gnpJit or 0)*1000)
 				end
 			elseif State.blockedReason then
 				if wantBlock.rec then wantBlock.rec.blockedReason = State.blockedReason end
-				if wantBlock.lastReason ~= State.blockedReason then
+				if wantBlock.lastReason ~= State.blockedReason
+					or (State.blockedReason == "BlockCooldown"
+						and now - (wantBlock.lastReasonAt or 0) > 0.15) then
 					wantBlock.lastReason = State.blockedReason
-					diagPush("BLOCK? t=%.2f  %s  %s  refused: %s  (buffered=%s stun=%s cant=%s gb=%s pwd=%s pb=%s)", now, wantBlock.name, wantBlock.kind, State.blockedReason,
-							tostring(meC and parryBufferedNow(meC)),
-							tostring(meC and meC:GetAttribute("Stunned") and true or false),
-							tostring(meC and meC:GetAttribute("CantAnything") and true or false),
-							tostring(meC and meC:GetAttribute("GuardBroken") and true or false),
-							tostring(meC and meC:GetAttribute("ParryWindowDisabled") and true or false),
-							tostring(meC and meC:GetAttribute("PerfectBlocking") and true or false))
+					wantBlock.lastReasonAt = now
+					local cdLeft = -1
+					if State.blockedReason == "BlockCooldown" then
+						local rel = State.lastBlockRelease or State.lastPress
+						if rel then
+							cdLeft = math.max(0, rel + (Config.BlockCooldown or 0.5)
+								+ (Config.BlockCooldownSafety or 0.03) - now)
+						end
+					end
+					diagPush("BLOCK? t=%.2f  %s  %s  refused: %s  (buffered=%s stun=%s cant=%s gb=%s pwd=%s pb=%s)%s", now, wantBlock.name, wantBlock.kind, State.blockedReason,
+						tostring(meC and parryBufferedNow(meC)),
+						tostring(meC and meC:GetAttribute("Stunned") and true or false),
+						tostring(meC and meC:GetAttribute("CantAnything") and true or false),
+						tostring(meC and meC:GetAttribute("GuardBroken") and true or false),
+						tostring(meC and meC:GetAttribute("ParryWindowDisabled") and true or false),
+						tostring(meC and meC:GetAttribute("PerfectBlocking") and true or false),
+						(cdLeft >= 0) and string.format(" [CD left %.0fms, contactIn %+.0fms]", cdLeft*1000, (wantBlock.contactAbs - now)*1000) or "")
 				end
 				do
 					local remD = (wantBlock.contactAbs or now) - now
@@ -7635,6 +7696,15 @@ local function onOutcome(attacker, result, kind, eventClock)
 	State.tally[result] = (State.tally[result] or 0) + 1
 	State.lastResult    = result
 	State.flashUntil    = os.clock() + 0.25
+	if kind == "M2" then
+		-- V304: per-style M2 bucket for the diag header.
+		local sk = tostring(rec.style or "?") .. " s" .. tostring(rec.strike or 1)
+		local mt = State.m2Tally
+		if type(mt) ~= "table" then mt = {}; State.m2Tally = mt end
+		local b = mt[sk]
+		if type(b) ~= "table" then b = {}; mt[sk] = b end
+		b[result] = (b[result] or 0) + 1
+	end
 
 	if Config.DodgeTelemetry and State.lastDodgeInfo then
 		local di = State.lastDodgeInfo
@@ -9184,20 +9254,38 @@ local function summary()
 	local parryAcc = blockable > 0 and (100 * (t.PERFECT or 0) / blockable) or 0
 	local acc = blockable > 0 and (100 * ((t.PERFECT or 0) + (t.EARLY or 0)) / blockable) or 0
 	local rawAcc = total > 0 and (100 * (t.PERFECT or 0) / total) or 0
+	-- V304: per-style M2 outcome buckets (kind:style → PERFECT/BLOCK/HIT/GB).
+	-- "one M2 never times right" shows up here as a style with 0 PERFECT.
+	local m2Buckets = {}
+	do
+		local mt = State.m2Tally
+		if type(mt) == "table" then
+			local keys = {}
+			for k in pairs(mt) do keys[#keys + 1] = k end
+			table.sort(keys)
+			for _, k in ipairs(keys) do
+				local b = mt[k]
+				m2Buckets[#m2Buckets + 1] = string.format(
+					"%s P%d/B%d/H%d/GB%d", k,
+					b.PERFECT or 0, b.EARLY or 0, b.LATE or 0, b.GUARDBREAK or 0)
+			end
+		end
+	end
 	return table.concat({
 		string.format("===== AUTOPARRY %s DIAG =====  (dumped %s UTC)", tostring(Config.Version or "?"), os.date("!%Y-%m-%d %H:%M:%S")),
-		string.format("player=%s  ping=%.0fms  uplink=%.0fms  mode=%s  autoface=%s", LocalPlayer.Name, getPingRaw()*1000, uplink()*1000, Config.Mode, tostring(Config.AutoFace)),
+		string.format("player=%s  ping=%.0fms(raw) %.0fms(med) %.0fms(gnpEma) jit=%.0fms jumps>20ms=%d  uplink=%.0fms  mode=%s  autoface=%s", LocalPlayer.Name, getPingRaw()*1000, getPing()*1000, (V93.gnpEma or 0)*1000, (V93.gnpJit or 0)*1000, V93.gnpJumps or 0, uplink()*1000, Config.Mode, tostring(Config.AutoFace)),
 		string.format("scheduler: phase=%s src=%s fps=%.1f frame=%.1fms peak=%.1fms lookahead=%.1fms step=%.1fms lowFps=%s", tostring(V93.schedulerPhase or "?"), tostring(V93.schedulerSource or "?"), 1 / math.max(V93.frameDt or 1/60, 1/480),
-				(V93.frameDt or 0)*1000, (V93.frameDtPeak or 0)*1000,
-				(V93.lookahead or 0)*1000, (V93.stepCost or 0)*1000,
+			(V93.frameDt or 0)*1000, (V93.frameDtPeak or 0)*1000,
+			(V93.lookahead or 0)*1000, (V93.stepCost or 0)*1000,
 			V93.lowFps and "YES(aggressive)" or "no"),
 		string.format("model: V216 wall + live rate (no min(wall,live) EARLY) | lead=%.0fms hold=%.0fms window=[%.0f,%.0f]ms", Config.PerfectLead*1000, Config.HoldAfter*1000, Config.PerfectMin*1000, Config.PerfectWindow*1000),
 		string.format("outcomes: PERFECT=%d  BLOCK=%d  HIT=%d  GUARDBREAK=%d  total=%d", t.PERFECT or 0, t.EARLY or 0, t.LATE or 0, t.GUARDBREAK or 0, total),
+		"M2 by style: " .. (#m2Buckets > 0 and table.concat(m2Buckets, " | ") or "none"),
 		string.format("attacks=%d  presses=%d  dodges=%d  outnumbered-escapes=%d  desync-anims=%d  ac-muted=%d  kicks-blocked=%d  reports-blocked=%d", State.parryCount, State.fireCount, State.dodgeCount, State.grantEscapes or 0, State.desyncFires or 0, State.acMuted or 0, State.kicksBlocked or 0, State.reportsBlocked or 0),
 		string.format("HIT breakdown: %d total → %d game-state-locked (stun/attack/cooldown, unblockable) + %d real timing miss", hits, stateHits, realMiss),
 		string.format("landed = %.1f%%  (%d/%d PERFECT of all outcomes) | blockable-only = %.1f%% (%d/%d) | block-inclusive = %.1f%%", rawAcc, t.PERFECT or 0, total, parryAcc, t.PERFECT or 0, blockable, acc),
 		string.format("off-target swings rejected=%d  |  boxing-counter fired=%d  |  dodges skipped by counter i-frames=%d", State.offTargetRej or 0, State.counterCount or 0,
-				State.counterCoverSkips or 0),
+			State.counterCoverSkips or 0),
 		string.format("fresh-keep=%d  poll-detect=%d  decoy-drop=%d  lastSkip=%s  diag=%d/%d", State.decoyFreshKeep or 0, State.pollDetect or 0, State.decoyDropped or 0, tostring(State.lastAnimSkip or "-"), #_D.DiagLog, _D.DIAG_MAX),
 		"=============================",
 	}, "\n")
