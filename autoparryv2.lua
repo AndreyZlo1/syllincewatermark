@@ -533,7 +533,7 @@ _D.COUNTER_STANCE = {
 	},
 }
 
-local function counterStanceFor(sl)
+function _C.counterStanceFor(sl)
 	return _D.COUNTER_STANCE[sl]
 end
 
@@ -542,10 +542,10 @@ local function counterStanceWindow(cs)
 	return c and c.Window or 0.55
 end
 
-local function isCounterStance(info, id)
+function _C.isCounterStance(info, id)
 	if not info or info.t ~= "M2" then return nil end
 	local sl = string.lower(tostring(info.s or "")):gsub("[%s_%-]", "")
-	local cs = counterStanceFor(sl)
+	local cs = _C.counterStanceFor(sl)
 	if not cs then return nil end
 	local le = id and _D.LEGACY_ATTACKS[id]
 	if le and le.counter then return cs end
@@ -681,7 +681,7 @@ local diagTrace = function(fmt, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a1
 	log[#log + 1] = line
 	logTrim(log, _D.TRACE_MAX)
 end
-local function applyCombatDebug(on)
+function _C.applyCombatDebug(on)
 	on = on and true or false
 	Config.Debug = on
 	Config.DeepDiag = on
@@ -901,13 +901,13 @@ end
 
 local localChar = function() LPH_ATTRIBUTES(VM(NONE)) return LocalPlayer.Character end
 
-local planarDist = function(a, b)
+_C.planarDist = function(a, b)
 	LPH_ATTRIBUTES(VM(NONE))
 	local dx, dz = a.X - b.X, a.Z - b.Z
 	return math.sqrt(dx * dx + dz * dz)
 end
 
-local verticalOk = function(aPos, myPos, extra)
+_C.verticalOk = function(aPos, myPos, extra)
 	LPH_ATTRIBUTES(VM(NONE))
 	if not (aPos and myPos) then return false end
 	local ay, my = aPos.Y, myPos.Y
@@ -955,7 +955,7 @@ end
 
 _C.index = function(o, k) return o[k] end
 V93.humMove = function(hum, dir) return hum:Move(dir, false) end
-local safeGet = function(o, k, default)
+_C.safeGet = function(o, k, default)
 	if o == nil then return default end
 	local v = o[k]
 	if v ~= nil then return v end
@@ -1127,7 +1127,7 @@ local blockStamina = function()
 	return nil
 end
 
-local function ownerOf(animator)
+function _C.ownerOf(animator)
 	local p = animator.Parent
 	if p and (p:IsA("Humanoid") or p:IsA("AnimationController")) then return p.Parent end
 	return p
@@ -2151,7 +2151,7 @@ local willHitMe = function(th)
 		return whmSet(th, hit)
 	end
 
-local function nextCombo(attacker)
+function _C.nextCombo(attacker)
 	local now = os.clock()
 	local c = ComboState[attacker]
 	local isFresh = (c == nil)
@@ -2414,7 +2414,7 @@ local function kindFromName(nm)
 	if l:find("crit", 1, true) or l:find("momentum", 1, true) then return "M2" end
 	return nil
 end
-local function animIdOf(inst)
+function _C.animIdOf(inst)
 	if inst:IsA("Animation") then return tonumber(tostring(inst.AnimationId):match("(%d+)")) end
 	local a = inst:FindFirstChildWhichIsA("Animation")
 	if a then return tonumber(tostring(a.AnimationId):match("(%d+)")) end
@@ -2448,7 +2448,7 @@ local function indexAllAnims()
 							kind = kindFromName(child.Name)
 							if not kind and isStyleFolder then kind = "SKILL" end
 						end
-						local id = animIdOf(child)
+						local id = _C.animIdOf(child)
 						if id and defensive then _D.BlockIds[id] = true end
 						if kind and id then
 							_D.AttackIds[id] = {
@@ -3375,7 +3375,7 @@ local function counterStyle()
 	return out
 end
 
-local function wcStartup()
+function _C.wcStartup()
 	local base = Config.WCStartup or _D.WINGCHUN.StartupSecs or (7 / 60)
 	return math.clamp(base, 0.02, 0.9)
 end
@@ -3730,7 +3730,7 @@ function State.aliDodgeAbuseEligible(th, now, imminent, ifLat, ifDur)
 	return true, remaining, "primary-covered"
 end
 
-local function resolveM2Module()
+function _C.resolveM2Module()
 	if State.ap.m2 and type(State.ap.m2.OnM2Activated) == "function" then
 		return State.ap.m2
 	end
@@ -4963,7 +4963,7 @@ State.ap.tryInterrupt = function(now, th, threatCount)
 	local myH = localHRP()
 	local aH = th.attackerHRP
 	if not (myH and aH and aH.Parent) then return false end
-	if not verticalOk(aH.Position, myH.Position, 0) then
+	if not _C.verticalOk(aH.Position, myH.Position, 0) then
 		if realHitboxHitsMe(th.name, th) ~= true then return false end
 	end
 	if not ap.interruptible(th) or not ap.canAttack(true) then return false end
@@ -5851,7 +5851,7 @@ local function reachLimit(kind, approaching)
 	return off + half + pad + (Config.ReachSlack or 1) + localTorsoHalf()
 end
 
-local function serverHitboxProof(ownerName)
+function _C.serverHitboxProof(ownerName)
 	if not ownerName then return false end
 	local folder = Workspace:FindFirstChild("Hitboxes")
 	if not folder then return false end
@@ -5867,7 +5867,7 @@ local onAttack = function(attackerHRP, info, model, id, track, origin, hbPart)
 	local myHRP = localHRP()
 	if not myHRP then return end
 	if not insideAutoFOV(attackerHRP) then return end
-	local cs2 = isCounterStance(info, id)
+	local cs2 = _C.isCounterStance(info, id)
 	if cs2 then
 		if model then
 			WingChunCounter[model] = os.clock() + (cs2.Window or 0.55)
@@ -5877,7 +5877,7 @@ local onAttack = function(attackerHRP, info, model, id, track, origin, hbPart)
 			(cs2.Window or 0.55) * 1000, cs2.VictimHitStun or 2.2)
 		return
 	end
-	local dist = planarDist(attackerHRP.Position, myHRP.Position)
+	local dist = _C.planarDist(attackerHRP.Position, myHRP.Position)
 	local kindGuess = (info and info.t) or "M1"
 	local closingSpeed = planarClosing(attackerHRP, myHRP, nil)
 	local approaching = closingSpeed > (Config.ApproachVelMin or 0.5)
@@ -5984,7 +5984,7 @@ local onAttack = function(attackerHRP, info, model, id, track, origin, hbPart)
 
 	local attrProof = serverAttackProof(model)
 
-	local combo = (info.t == "M1") and (info.combo or nextCombo(name)) or 1
+	local combo = (info.t == "M1") and (info.combo or _C.nextCombo(name)) or 1
 
 	local aMult    = attackSpeedMult(model)
 	local heightAttr, bodyHeightScale, modelHeight = heightDiag(model)
@@ -8740,7 +8740,7 @@ local function cachedOwner(animator)
 	local now = os.clock()
 	local rec = _C.ownerCache[animator]
 	if rec and (now - rec.t) < _C.OWNER_TTL then return rec end
-	local model = ownerOf(animator)
+	local model = _C.ownerOf(animator)
 	local enemy, hrp = isEnemyModel(model)
 	rec = { model = model, isLocal = (model ~= nil and model == localChar()), enemy = enemy or false, hrp = hrp, t = now }
 	_C.ownerCache[animator] = rec
@@ -10104,7 +10104,7 @@ Config.ConeHit     = Config.ConeHit     or Color3.fromRGB(255, 84, 84)
 Config.RestrictCol = Config.RestrictCol or Color3.fromRGB(255, 72, 72)
 
 local vizUpdate, vizHideAll
-local RING_SEG  = 24
+_C.RING_SEG = 24
 local CONE_SEG  = 12
 local CONE_FILL = 0.32
 local VIZ_CONE_HALF = math.rad(64)
@@ -11256,7 +11256,7 @@ return function(_Lib, _Core)
 		boolToggle(dbLog, "Combat Debug", "Combat Debug",
 			function() return Config.Debug end,
 			function(v)
-				applyCombatDebug(v)
+				_C.applyCombatDebug(v)
 				if not v then
 					Config.TraceDiag = false
 					if verboseEl then pcall(function() verboseEl:UpdateState(false) end) end
