@@ -1,21 +1,16 @@
 if not LPH_OBFUSCATED then
-	local id, nop = function(f) return f end, function() end
-	LPH_NO_VIRTUALIZE = id
-	LPH_JIT_MAX = id
-	LPH_JIT = id
-	LPH_ENCFUNC = id
-	LPH_NO_UPVALUES = id
-	LPH_ENCSTR = id
-	LPH_ENCNUM = id
-	LPH_SKIP = id
-	LPH_CRASH = nop
-	LPH_OBFUSCATED = false
+	local __attribute = function() end
+	LPH_ATTRIBUTES = __attribute
+	VM = __attribute
+	NONE = __attribute
+	ERROR_HANDLING = __attribute
 end
+LPH_ATTRIBUTES(ERROR_HANDLING(false))
 local _C = {}
 local _D = {}
 
 local Config = {
-	Version       = "V309",
+	Version       = "A29",
 	Enabled       = false,
 	Mode          = "Perfect",
 
@@ -46,14 +41,8 @@ local Config = {
 	LatchStrict     = true,
 	LatchSidePad    = 8.0,
 	MultiHitKeep    = true,
-	-- Метки Hit в анимации — TimePosition. Height-aMult на нашем клиенте
-	-- в track.Speed не виден (spd=1.00 при aMult=1.10). Делить маркеры на
-	-- aMult нельзя: контакт уезжал на ~50мс раньше, исход при TP=0.725.
-	-- Pad на первом хите Boxing M2 давал contact=680 при маркере 600
-	-- (лог V188: meas=608, LATE при IN-WINDOW). Второй хит: 1130 vs ~1080.
 	MultiHitOverlapPad = 0,
 	HeavyFacePadDeg = 55,
-	-- Perfect: удержание гарда вне окна = BLOCK, чип бара, затем GB.
 	GuardLastResort        = false,
 	GuardLastResortHorizon = 0.18,
 
@@ -90,6 +79,9 @@ local Config = {
 
 	AnimTimeModel   = true,
 	AnimPingCompMax = 0.35,
+	ReplicaAgeOn     = false,
+	ReplicaAgeFrac   = 0.5,
+	ReplicaAgeMaxFrac= 0.35,
 	HitboxWindupExtra = 0.012,
 	SpeedSanityMin  = 0.20,
 	SpeedSanityMax  = 3.00,
@@ -110,8 +102,6 @@ local Config = {
 
 	ReleaseGap    = 0.40,
 
-	-- V189: face=0.36 BACK! при FaceGateMin=0.2 — FACETURN не срабатывал,
-	-- пакет уходил спиной, игра LATE при локальном EARLY. Ждём доворот до FaceGoodDot.
 	FaceGateMin   = 0.52,
 	FacePressFloor = 0.055,
 	CloseM1EarlyStuds = 4.5,
@@ -119,20 +109,17 @@ local Config = {
 
 	UplinkFactor  = 0.5,
 	UplinkMargin  = 0.008,
-	-- GetNetworkPing в дампе пишется как net1w и часто > RTT/2. Не делить его
-	-- повторно, иначе press уходит на ~30–40мс позже, чем пакет реально летит.
 	UplinkPreferGnpOneWay = true,
 	ThrottleCatchPad  = 0.07,
 	M2WallCapSlack    = 0.035,
 	UplinkMin     = 0.010,
 	LowPingFloor   = 0.0,
 	LowPingThresh  = 0.090,
-	UplinkMax     = 0.500,
-	PingCap       = 0.500,
+	UplinkMax     = 0.800,
+	PingCap       = 0.800,
 	PingSourceMaxRatio = 2.5,
 	PingWindow    = 24,
 	PingSampleGap = 0.03,
-	FallbackDodgeOnRefusal = true,
 
 	OverlapLeadBase = 2.0,
 	OverlapReaction = 0.050,
@@ -186,6 +173,7 @@ local Config = {
 	DashSpeed     = 30,
 	MaxHeightDiff = 8,
 	BoxingM2FirstFloor = 0.58,
+	JinM2FirstFloor = 0.48,
 	DashDuration  = 0.20,
 	DodgeConfirm  = 0.18,
 	DodgeCenter   = true,
@@ -206,8 +194,6 @@ local Config = {
 	LowFpsCapHi    = 0.13,
 	LowFpsEdgeMs   = 6,
 
-	-- Target gap is a FRACTION of live PerfectWindow. uplink() already
-	-- subtracts ping at press. Do not bake one player's ping into ms floors.
 	LeadQuantCenter = 0.72,
 	LeadQuantFloorFrac = 0.64,
 	GapEdgeMs     = 6,
@@ -216,20 +202,15 @@ local Config = {
 	HitboxRetime     = true,
 	HitboxContactLead = 0.02,
 	HitboxRetimeMinMs = 40,
-	-- Анимация реплицируется и её можно соврать (desync / AP-breaker).
-	-- Серверный хитбокс (AttackName, Owner, VictimSwingId) — источник контакта.
-	-- M2 жмётся по стене detect+hitTL; TimePosition не тянет press раньше.
-	-- Поздний хитбокс снимает ранний гард, если удержание уже > PerfectWindow.
 	HitboxCommitPress = true,
-	HitboxOriginDetect = true,
-	-- Анимация на клиенте часто появляется позже хитбокса (V204: meas=106
-	-- при pred=331, NO-PRESS — хитбокс отвергли из‑за окна 35мс).
+	HitboxOriginDetect = false, -- A29: хитбокс = удар уже на сервере; угроза «с хитбокса» жала hitTL спустя → фантом-нажатие
 	HitboxLookbackSec = 0.55,
 	HoldForLiveAnim   = true,
 	HoldLiveCap       = 1.15,
 	StunPressMaxRemain = 0.140,
 	StunPressMinRemain = 0.050,
 	EmergencyPress      = true,
+	EmergencyPressMaxUplink = 0.045, -- A29: при большем uplink пакет приходит после хита и только жжёт BlockCooldown
 	EmergencyPressGrace = 0.20,
 	TurnRateRad      = 6.0,
 	ReachSlack       = 1,
@@ -247,11 +228,6 @@ local Config = {
 	DodgeRejectMute     = 3.0,
 	DodgeOnlyWhenNoParry = true,
 	CounterOnlyWhenNoParry = true,
-	-- Boxing-counter ставит CantAnything: чужой M2 в том же окне пропускается
-	-- (V188: COUNTER-SEND → Hakari M2 refused). Не контрить, если M2 уже в полёте.
-	-- V216: Ali M2 — parry-only, но M2RagdollLaunchStrength>0 считался GB;
-	-- контра снимала гард на remaining≈80мс → LATE. Не контрить, если
-	-- iframes/ack заведомо не успеют до контакта.
 	CounterYieldToM2 = true,
 	CounterM2Horizon = 0.95,
 	CounterMinRemain = 0.22,
@@ -318,14 +294,9 @@ local Config = {
 	SA_BlatantWindow  = 0.32,
 
 	AutoPlay          = false,
-	AP_ForceNativeM1  = true,
-	-- V301: M1 after PERFECT vs a player = their AP's BUFFER-WAIT
-	-- free parry → ApplyLocalParriedStun on us → LATE. NPC-only.
+	AP_ForceNativeM1  = false,
 	AP_PunishOnParry  = false,
 	AP_Interrupt      = false,
-	-- Сбив только при AutoPlay. По умолчанию выключен: при включении
-	-- имеет приоритет над парри, если свой удар реально опережает чужой.
-	-- Margin 80мс: 25мс давал trade M1 vs Lethwei M2 и глушил парри.
 	AP_InterruptMargin= 0.08,
 	AP_InterruptNetK  = 0.25,
 	AP_BaseReach      = 5.5,
@@ -335,8 +306,6 @@ local Config = {
 	AP_M2BaseReach       = 6.5,
 	AP_M2Gap             = 0.30,
 	AP_M2IFrameMargin    = 0.08,
-	-- I-frames M2 обычно стартуют у первого хитбокса, не с кадра Activate.
-	-- Не прерываем удар, который прилетит раньше нашего окна неуязвимости.
 	AP_M2IFrameLead      = 0.10,
 	AP_AnimGuard    = true,
 	AP_AnimFallback = 0.45,
@@ -370,7 +339,7 @@ local Config = {
 	AntiDecoy      = true,
 	AntiDecoyGap   = 0.12,
 	AntiDecoyMaxBurst = 3,
-	DecoyRefireSec  = 0.60,
+	DecoyRefireSec  = 0.12,
 	DecoySpeedMin   = 0.30,
 	DecoySpeedMax   = 1.25,
 	DecoySpeedTol   = 0.50,
@@ -524,13 +493,12 @@ _D.LEGACY_ATTACKS = {
 
 _D.WINGCHUN = {
 	CounterWindow   = 0.58,
-	-- M2CounterParryDisableDuration was removed from CombatConfig this patch.
 	CounterParryDisable = 0,
-	CounterWhiffStun= 0.6,
+	CounterWhiffStun= 1.4,
 	CounterHoldSecs = 1.367,
 	CounterFps      = 60,
 	CounterFrames   = { 25, 41, 52, 62, 82 },
-	VictimHitStun   = 2.8,
+	VictimHitStun   = 1.367,
 	StartupFrame    = 7,
 	PostHitLockout  = 0.35,
 	Cooldown        = 10,
@@ -552,14 +520,11 @@ local function wingChunCounterActive(model)
 	return untilClock ~= nil and os.clock() < untilClock
 end
 
--- Counter-stance styles: wingchun (V299) + aikido (V303). Both are
--- M2RequiresCounterHit in CombatConfig: no damage during the window,
--- whiff = long self-stun. Attacking into the stance is a free counter.
 _D.COUNTER_STANCE = {
 	wingchun = {
 		Window   = 0.58,
-		WhiffStun = 0.6,
-		VictimHitStun = 2.8,
+		WhiffStun = 1.4,
+		VictimHitStun = 1.367,
 	},
 	aikido = {
 		Window   = 0.55,
@@ -572,7 +537,6 @@ local function counterStanceFor(sl)
 	return _D.COUNTER_STANCE[sl]
 end
 
--- Window length of a counter stance by style key; nil = not a stance style.
 local function counterStanceWindow(cs)
 	local c = _D.COUNTER_STANCE[cs]
 	return c and c.Window or 0.55
@@ -591,6 +555,7 @@ local function isCounterStance(info, id)
 end
 
 _D.LEGACY_M2_VARIANT = { M2 = "Left", M2Right = "Right", M2Left = "Left" }
+_D.ALI_M2_BY_ID = { [92831721340116] = "Left", [81488798354194] = "Right" }
 
 _D.LEGACY_M1_OFFSETS = {
 	ali      = {0.06, 0.15, 0.2, 0},
@@ -688,33 +653,34 @@ local Threats = {}
 local ComboState = {}
 local Pending = {}
 
-local logTrim = LPH_NO_VIRTUALIZE(function(t, cap)
+local logTrim = function(t, cap)
+	LPH_ATTRIBUTES(VM(NONE))
 	local n = #t
 	if n <= cap then return end
 	local drop = n - cap
 	if drop < 1 then return end
 	table.move(t, drop + 1, n, 1)
 	for i = n - drop + 1, n do t[i] = nil end
-end)
+end
 
--- Combat debug after Luraph: never pack `...` in a native proto (select/format of
--- varargs hitch the VM). Fixed arity + event-only lines. Default off.
-_D.DiagLog, _D.DIAG_MAX = {}, 3500
-_D.TraceLog, _D.TRACE_MAX = {}, 3500
-local diagPush = LPH_NO_VIRTUALIZE(function(fmt, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21, a22, a23, a24)
+_D.DiagLog, _D.DIAG_MAX = {}, 12000
+_D.TraceLog, _D.TRACE_MAX = {}, 4000
+local diagPush = function(fmt, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21, a22, a23, a24)
+	LPH_ATTRIBUTES(VM(NONE))
 	if not Config.Debug then return end
 	local line = string.format(fmt, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21, a22, a23, a24)
 	local log = _D.DiagLog
 	log[#log + 1] = line
 	logTrim(log, _D.DIAG_MAX)
-end)
-local diagTrace = LPH_NO_VIRTUALIZE(function(fmt, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21, a22, a23, a24)
+end
+local diagTrace = function(fmt, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21, a22, a23, a24)
+	LPH_ATTRIBUTES(VM(NONE))
 	if not (Config.Debug and Config.TraceDiag) then return end
 	local line = string.format(fmt, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20, a21, a22, a23, a24)
 	local log = _D.TraceLog
 	log[#log + 1] = line
 	logTrim(log, _D.TRACE_MAX)
-end)
+end
 local function applyCombatDebug(on)
 	on = on and true or false
 	Config.Debug = on
@@ -810,16 +776,14 @@ local V93 = {
 	uplinkVal = 0.08,
 }
 
-local samplePingSources = LPH_NO_VIRTUALIZE(function()
+local samplePingSources = function()
+	LPH_ATTRIBUTES(VM(NONE))
 	local nowc = os.clock()
 	if (nowc - V93.pingRawClock) < 0.12 then return end
 	V93.pingRawClock = nowc
 	local gnp = LocalPlayer:GetNetworkPing()
 	if type(gnp) == "number" and gnp == gnp and gnp > 0 then
 		V93.gnpVal = gnp
-		-- V304: raw GNP jumps packet-to-packet; max(raw) at press time moved
-		-- pressAt by 20-40ms within one swing. Smooth GNP with an EMA
-		-- (~1s time constant) so uplink reflects sustained network state.
 		local prev = V93.gnpLastSample
 		V93.gnpLastSample = gnp
 		if prev then
@@ -827,8 +791,24 @@ local samplePingSources = LPH_NO_VIRTUALIZE(function()
 			V93.gnpJit = (V93.gnpJit or 0) * 0.9 + math.abs(jump) * 0.1
 			if math.abs(jump) > 0.020 then V93.gnpJumps = (V93.gnpJumps or 0) + 1 end
 		end
-		local e = V93.gnpEma
-		V93.gnpEma = e and (e * 0.88 + gnp * 0.12) or gnp
+		local ref = _C.lastGoodPing
+		local use = gnp
+		if type(ref) == "number" and ref > 0.04 and gnp < 0.012 then
+			use = nil
+		else
+			local stats = V93.statsVal
+			if type(stats) == "number" and stats > 0 and gnp > stats * 1.6 then
+				use = stats
+			end
+		end
+		if use then
+			local e = V93.gnpEma
+			if not e or use >= e then
+				V93.gnpEma = use
+			else
+				V93.gnpEma = e * 0.88 + use * 0.12
+			end
+		end
 	end
 	local item = V93.statsPingItem
 	if item ~= false then
@@ -840,8 +820,6 @@ local samplePingSources = LPH_NO_VIRTUALIZE(function()
 				if item then V93.statsPingItem = item end
 			end
 		end
-		-- StatsItem:GetValue is PluginSecurity. Executor threads throw
-		-- "lacking capability Plugin"; one failure disables this source.
 		if item then
 			local ok, ms = pcall(item.GetValue, item)
 			if not ok then
@@ -851,28 +829,26 @@ local samplePingSources = LPH_NO_VIRTUALIZE(function()
 			end
 		end
 	end
-end)
+end
 local function pingDiagSnapshot()
+	LPH_ATTRIBUTES(VM(NONE))
 	samplePingSources()
 	return V93.gnpVal, V93.statsVal
 end
-local getPingRaw = LPH_NO_VIRTUALIZE(function()
+local getPingRaw = function()
+	LPH_ATTRIBUTES(VM(NONE))
 	samplePingSources()
-	local aRtt, bRtt = V93.gnpVal, V93.statsVal
-	local best
-	if bRtt and aRtt then
-		local ratio = Config.PingSourceMaxRatio or 2.5
-		best = (aRtt > bRtt * ratio) and bRtt or math.max(aRtt, bRtt)
-	else
-		best = bRtt or aRtt
-	end
+	local aRtt = V93.gnpVal
+	local best = aRtt
+	if not (best and best > 0) then best = V93.statsVal end
 	if best and best > 0 then
 		_C.lastGoodPing = math.clamp(best, 0.005, 1.5)
 	end
 	return _C.lastGoodPing
-end)
+end
 
-local getPing = LPH_NO_VIRTUALIZE(function()
+local getPing = function()
+	LPH_ATTRIBUTES(VM(NONE))
 	local nowc = os.clock()
 	if (nowc - V93.pingSampleClock) < (Config.PingSampleGap or 0.03) then
 		return V93.pingCacheVal
@@ -896,65 +872,52 @@ local getPing = LPH_NO_VIRTUALIZE(function()
 
 	V93.pingCacheVal = math.min(med, Config.PingCap)
 	return V93.pingCacheVal
-end)
+end
 
-local uplink = LPH_NO_VIRTUALIZE(function()
+local uplink = function()
+	LPH_ATTRIBUTES(VM(NONE))
 	if V93.uplinkFrame == _C.FrameId then return V93.uplinkVal end
 	local med = getPing()
-	local raw = getPingRaw()
-	local ping = (raw > med) and raw or med
-	local up = ping * (Config.UplinkFactor or 0.5) + (Config.UplinkMargin or 0.008)
-	if Config.UplinkPreferGnpOneWay ~= false then
-		-- V304: prefer the SMOOTHED GNP EMA over the raw sample. The raw
-		-- GNP spikes frame-to-frame and max(raw) dragged pressAt around;
-		-- EMA tracks sustained latency, which is what the press needs.
-		local ema = V93.gnpEma
-		if type(ema) == "number" and ema > 0 then
-			up = math.max(up, ema)
-		else
-			local gnp, stats = V93.gnpVal, V93.statsVal
-			if type(gnp) == "number" and gnp > 0 then
-				up = math.max(up, gnp)
-			end
-			if type(stats) == "number" and stats > 0 then
-				up = math.max(up, stats * 0.5)
-			end
-		end
-		local stats = V93.statsVal
-		if type(stats) == "number" and stats > 0 then
-			up = math.max(up, stats * 0.5)
-		end
+	local ema = V93.gnpEma
+	local base = (type(ema) == "number" and ema > 0) and ema or (med * 0.5)
+	local up = base + (Config.UplinkMargin or 0.008)
+	if type(ema) == "number" and ema > 0 and med > ema + 0.08 then
+		local capped = ema + 0.04
+		if up > capped then up = capped end
 	end
-	up = math.clamp(up, Config.UplinkMin, Config.UplinkMax)
-	-- V304: a smoothed estimate is allowed to rise fast but fall slowly —
-	-- a single clean GNP sample after a spike must not yank pressAt later.
-	local slow = V93.uplinkSlow
-	V93.uplinkSlow = (slow and slow > up) and (slow * 0.85 + up * 0.15) or up
-	local thr = Config.LowPingThresh or 0
-	if thr > 0 and ping < thr then
-		up = up + (Config.LowPingFloor or 0) * (1 - ping / thr)
-	end
+	up = math.clamp(up, Config.UplinkMin, 0.160)
 	V93.uplinkFrame = _C.FrameId
 	V93.uplinkVal = up
 	return up
-end)
+end
 
-local localChar = LPH_NO_VIRTUALIZE(function() return LocalPlayer.Character end)
+local timingOneWay = function()
+	LPH_ATTRIBUTES(VM(NONE))
+	if V93.towFrame == _C.FrameId then return V93.towVal end
+	local one = uplink()
+	V93.towFrame, V93.towVal = _C.FrameId, one
+	return one
+end
 
-local planarDist = LPH_NO_VIRTUALIZE(function(a, b)
+local localChar = function() LPH_ATTRIBUTES(VM(NONE)) return LocalPlayer.Character end
+
+local planarDist = function(a, b)
+	LPH_ATTRIBUTES(VM(NONE))
 	local dx, dz = a.X - b.X, a.Z - b.Z
 	return math.sqrt(dx * dx + dz * dz)
-end)
+end
 
-local verticalOk = LPH_NO_VIRTUALIZE(function(aPos, myPos, extra)
+local verticalOk = function(aPos, myPos, extra)
+	LPH_ATTRIBUTES(VM(NONE))
 	if not (aPos and myPos) then return false end
 	local ay, my = aPos.Y, myPos.Y
 	if type(ay) ~= "number" or type(my) ~= "number" then return false end
 	local maxYd = (Config.MaxHeightDiff or 8) + (extra or 0)
 	return math.abs(ay - my) <= maxYd
-end)
+end
 
-local localTorsoHalf = LPH_NO_VIRTUALIZE(function()
+local localTorsoHalf = function()
+	LPH_ATTRIBUTES(VM(NONE))
 	if _C.torsoFrame == _C.FrameId then return _C.torsoVal end
 	_C.torsoFrame = _C.FrameId
 	local c = localChar()
@@ -967,9 +930,10 @@ local localTorsoHalf = LPH_NO_VIRTUALIZE(function()
 	end
 	_C.torsoVal = val
 	return val
-end)
+end
 
-local localHeightYBudget = LPH_NO_VIRTUALIZE(function()
+local localHeightYBudget = function()
+	LPH_ATTRIBUTES(VM(NONE))
 	if _C.hyFrame == _C.FrameId then return _C.hyVal end
 	_C.hyFrame = _C.FrameId
 	local val = 0
@@ -987,7 +951,7 @@ local localHeightYBudget = LPH_NO_VIRTUALIZE(function()
 	end
 	_C.hyVal = val
 	return val
-end)
+end
 
 _C.index = function(o, k) return o[k] end
 V93.humMove = function(hum, dir) return hum:Move(dir, false) end
@@ -1000,17 +964,19 @@ end
 
 _C.FrameId = 0
 _C.hrpCache, _C.hrpFrame = nil, -1
-local localHRP = LPH_NO_VIRTUALIZE(function()
+local localHRP = function()
+	LPH_ATTRIBUTES(VM(NONE))
 	if _C.hrpFrame == _C.FrameId and _C.hrpCache and _C.hrpCache.Parent then return _C.hrpCache end
 	local c = localChar()
 	_C.hrpCache = (c and c:FindFirstChild("HumanoidRootPart")) or nil
 	_C.hrpFrame = _C.FrameId
 	return _C.hrpCache
-end)
+end
 
 _D.HARD_BLOCKERS = { "BlockCooldown", "Ragdoll", "Downed", "Greenzone",
                         "RpCombatLocked", "StaffModPeaceMode", "Grappling" }
-local parryBufferedNow = LPH_NO_VIRTUALIZE(function(c)
+local parryBufferedNow = function(c)
+	LPH_ATTRIBUTES(VM(NONE))
 	if Config.ComboEscape == false then return false end
 	c = c or localChar()
 	if not c then return false end
@@ -1020,12 +986,10 @@ local parryBufferedNow = LPH_NO_VIRTUALIZE(function(c)
 		and not c:GetAttribute("GuardBroken") and true or false
 	_C.pbFrame, _C.pbChar, _C.pbVal = _C.FrameId, c, ok
 	return ok
-end)
+end
 
--- Очередь нажатия в стане. Жёсткий отказ: GuardBroken / Ragdoll / Downed /
--- ParryWindowDisabled / Grappling. Свой M1/M2 (CantAnything без Stunned) —
--- не буфер. CombatRecovery без своей атаки — игра снова принимает Block.
-local stunEscapeNow = LPH_NO_VIRTUALIZE(function(c)
+local stunEscapeNow = function(c)
+	LPH_ATTRIBUTES(VM(NONE))
 	if Config.ComboEscape == false then return false end
 	c = c or localChar()
 	if not c then return false end
@@ -1048,19 +1012,46 @@ local stunEscapeNow = LPH_NO_VIRTUALIZE(function(c)
 	end
 	_C.seFrame, _C.seChar, _C.seVal = _C.FrameId, c, ok
 	return ok
-end)
+end
 
--- Block.Activated во время своего M2 срывает iframes контры (V178/V198).
--- Пока txn.pending — не жать парирование. После confirm follow-up снова в парри.
-local counterBusyNow = LPH_NO_VIRTUALIZE(function()
+local counterBusyNow = function()
+	LPH_ATTRIBUTES(VM(NONE))
 	local tx = State.counterTxn
 	return tx ~= nil and tx.pending and true or false
-end)
+end
 
-local canBlockNow = LPH_NO_VIRTUALIZE(function()
+_C.blockCdLeft = function(now)
+	local cd = (Config.BlockCooldown or 0.5) + (Config.BlockCooldownSafety or 0.03)
+	local left, saw = 0, false
+	if type(State.lastPress) == "number" then
+		saw = true
+		left = math.max(left, State.lastPress + cd - now)
+	end
+	if type(State.lastBlockRelease) == "number" then
+		saw = true
+		left = math.max(left, State.lastBlockRelease + cd - now)
+	end
+	if not saw then return nil end
+	if left < 0 then left = 0 end
+	return left
+end
+
+local canBlockNow = function()
+	LPH_ATTRIBUTES(VM(NONE))
 	local c = localChar()
 	if not c then return false, "no-char" end
-	if Config.RequireEquip ~= false and not c:GetAttribute("Equip") then
+	-- A29: Block.Block() при GrabSlamDefend шлёт Activated мимо Stunned/CantAnything
+	-- (после isInBlockingPreventedState: Equip/Ragdoll/GuardBroken, и BlockCooldown).
+	if c:GetAttribute("GrabSlamDefend") == true then
+		if c:GetAttribute("Equip") ~= true then return false, "Unequip" end
+		if c:GetAttribute("Ragdoll") then return false, "Ragdoll" end
+		if c:GetAttribute("GuardBroken") then return false, "GuardBroken" end
+		if c:GetAttribute("BlockCooldown") then return false, "BlockCooldown" end
+		return true, nil
+	end
+	local gameStripped = c:GetAttribute("Stunned") or c:GetAttribute("Ragdoll")
+		or c:GetAttribute("CantAnything") or c:GetAttribute("Downed")
+	if Config.RequireEquip ~= false and not c:GetAttribute("Equip") and not gameStripped then
 		return false, "Unequip"
 	end
 	if stunEscapeNow(c) then
@@ -1075,8 +1066,6 @@ local canBlockNow = LPH_NO_VIRTUALIZE(function()
 		end
 		return true, nil
 	end
-	-- Свой M1/CombatAttacking даёт CantAnything без стана. V204 на этом
-	-- молчал (Boxing M2 → HIT). Блок снимает M1; свой M2/контру не рвём.
 	if c:GetAttribute("CantAnything")
 	   and not c:GetAttribute("M2")
 	   and not c:GetAttribute("PendingM2")
@@ -1088,22 +1077,24 @@ local canBlockNow = LPH_NO_VIRTUALIZE(function()
 	   and not c:GetAttribute("ParryWindowDisabled") then
 		return true, nil
 	end
-	if Config.BlockCooldownPredict ~= false then
-	-- V305: the PREDICTED cooldown (lastBlockRelease + cd) no longer refuses
-	-- the press. Log proof (V304, clean 58ms ping): BLOCK? [CD left 10ms,
-	-- contactIn +0ms] still refused → OUT LATE STATE:BlockCooldown (twice),
-	-- while STUN-PARRY sends straight past this gate one swing later and the
-	-- server accepts (PERFECT). The server does not honor our predicted CD;
-	-- only the live BlockCooldown attribute below is a real refusal.
-	-- The predictor stays for planning (PLAN blockFreeAt / CD-DODGE), which
-	-- read State.lastBlockRelease directly.
-	end
 	do
 	local nowB = os.clock()
 	local skipCd = (type(State.allowRearmUntil) == "number" and nowB < State.allowRearmUntil)
 		or (type(State.multiRearmUntil) == "number" and nowB < State.multiRearmUntil)
 	for _, attr in ipairs(_D.HARD_BLOCKERS) do
-		if not (skipCd and attr == "BlockCooldown") and c:GetAttribute(attr) then
+		if attr == "BlockCooldown" then
+			if skipCd then
+			elseif c:GetAttribute("BlockCooldown") then
+				local left = _C.blockCdLeft(nowB)
+				if left == nil or left > 0 then
+					return false, "BlockCooldown"
+				end
+				if Config.DeepDiag and nowB - (State.staleCdLogged or 0) > 0.15 then
+					State.staleCdLogged = nowB
+					diagPush("BLOCK-CD-STALE t=%.2f live BlockCooldown, clock left=0 → replica lag, жмём", nowB)
+				end
+			end
+		elseif c:GetAttribute(attr) then
 			return false, attr
 		end
 	end
@@ -1112,9 +1103,10 @@ local canBlockNow = LPH_NO_VIRTUALIZE(function()
 		return false, c:GetAttribute("Stunned") and "Stunned" or "CantAnything"
 	end
 	return true, nil
-end)
+end
 
-local blockStamina = LPH_NO_VIRTUALIZE(function()
+local blockStamina = function()
+	LPH_ATTRIBUTES(VM(NONE))
 	local c = localChar()
 	if not c then return nil end
 	for _, name in ipairs(Config.StaminaAttrs) do
@@ -1133,7 +1125,7 @@ local blockStamina = LPH_NO_VIRTUALIZE(function()
 		end
 	end
 	return nil
-end)
+end
 
 local function ownerOf(animator)
 	local p = animator.Parent
@@ -1141,7 +1133,8 @@ local function ownerOf(animator)
 	return p
 end
 
-local isEnemyModel = LPH_NO_VIRTUALIZE(function(model)
+local isEnemyModel = function(model)
+	LPH_ATTRIBUTES(VM(NONE))
 	if not model or model == localChar() then return false end
 	local hum = model:FindFirstChildOfClass("Humanoid")
 	local hrp = model:FindFirstChild("HumanoidRootPart")
@@ -1155,15 +1148,17 @@ local isEnemyModel = LPH_NO_VIRTUALIZE(function(model)
 	end
 	if Config.IncludeNPCs then return true, hrp end
 	return false
-end)
+end
 
-local flatDirTo = LPH_NO_VIRTUALIZE(function(fromPos, targetPos)
+local flatDirTo = function(fromPos, targetPos)
+	LPH_ATTRIBUTES(VM(NONE))
 	local d = Vector3.new(targetPos.X - fromPos.X, 0, targetPos.Z - fromPos.Z)
 	if d.Magnitude < 0.05 then return nil end
 	return d.Unit
-end)
+end
 
-local function faceDotToThreat(th)
+local faceDotToThreat = function(th)
+	LPH_ATTRIBUTES(VM(NONE))
 	local a = th and th.attackerHRP
 	local targetPos = (a and a.Parent) and a.Position or nil
 	local myHRP = localHRP()
@@ -1176,14 +1171,16 @@ local function faceDotToThreat(th)
 	return flatLook.Unit:Dot(dir)
 end
 
-local heavyRank = LPH_NO_VIRTUALIZE(function(th)
+local heavyRank = function(th)
+	LPH_ATTRIBUTES(VM(NONE))
 	local k = th and th.kind
 	if k == "SKILL" then return 2 end
 	if k == "M2" then return 1 end
 	return 0
-end)
+end
 
-local aimedAtMe = LPH_NO_VIRTUALIZE(function(th)
+local aimedAtMe = function(th)
+	LPH_ATTRIBUTES(VM(NONE))
 	if not th then return false end
 	if th.kind == "M2" and type(th.geomDist2d) == "number" and th.geomDist2d <= (Config.Range or 18) then
 		return true
@@ -1193,9 +1190,10 @@ local aimedAtMe = LPH_NO_VIRTUALIZE(function(th)
 	if Config.FaceOnlyRealThreats == false then return true end
 	if th.trustedHit then return true end
 	return not th.geomLatched
-end)
+end
 
-local computeMultiFaceGoal = LPH_NO_VIRTUALIZE(function()
+local computeMultiFaceGoal = function()
+	LPH_ATTRIBUTES(VM(NONE))
 	if not Config.AutoFace then return nil end
 	local nThreat = 0
 	for _, th in ipairs(Threats) do
@@ -1256,9 +1254,10 @@ local computeMultiFaceGoal = LPH_NO_VIRTUALIZE(function()
 	local side = (math.sin((_C.FrameId % 12)/12 * math.pi * 2) + 1) * 0.5
 	local perp = Vector3.new(-bis.Z, 0, bis.X)
 	return base + perp * (math.min(a.dist, b.dist) * j * (side - 0.5) * 2)
-end)
+end
 
-local snapLookAtThreat = LPH_NO_VIRTUALIZE(function(th)
+local snapLookAtThreat = function(th)
+	LPH_ATTRIBUTES(VM(NONE))
 	if not Config.AutoFace then return end
 	local myHRP = localHRP()
 	local a = th and th.attackerHRP
@@ -1266,24 +1265,26 @@ local snapLookAtThreat = LPH_NO_VIRTUALIZE(function(th)
 	local dir = flatDirTo(myHRP.Position, a.Position)
 	if not dir then return end
 	myHRP.CFrame = CFrame.lookAt(myHRP.Position, myHRP.Position + dir)
-end)
+end
 
-local setFaceGoalPos = LPH_NO_VIRTUALIZE(function(pos, hard, holdFor)
+local setFaceGoalPos = function(pos, hard, holdFor)
+	LPH_ATTRIBUTES(VM(NONE))
 	if not Config.AutoFace then return end
 	if not pos then return end
 	State.faceGoalHRP = nil
 	State.faceGoalPos = pos
 	State.faceGoalHard = hard and true or false
 	State.faceGoalUntil = os.clock() + (holdFor or 0.15)
-end)
+end
 
-local setFaceGoal = LPH_NO_VIRTUALIZE(function(targetHRP, hard, holdFor)
+local setFaceGoal = function(targetHRP, hard, holdFor)
+	LPH_ATTRIBUTES(VM(NONE))
 	if not Config.AutoFace then return end
 	if not targetHRP or not targetHRP.Parent then return end
 	State.faceGoalHRP   = targetHRP
 	State.faceGoalHard  = hard and true or false
 	State.faceGoalUntil = os.clock() + (holdFor or 0.15)
-end)
+end
 
 local styleForward
 local styleStepForward
@@ -1291,31 +1292,33 @@ local hitboxSizeMult
 local registryKind
 
 _C.FaceTrack = setmetatable({}, { __mode = "k" })
-local attackerPrevPos = LPH_NO_VIRTUALIZE(function(aHRP)
+local attackerPrevPos = function(aHRP)
+	LPH_ATTRIBUTES(VM(NONE))
 	local rec = _C.FaceTrack[aHRP]
 	if rec then return rec.pos, rec.t end
 	return nil, nil
-end)
+end
 
-local attackerSamplePos = LPH_NO_VIRTUALIZE(function(aHRP)
+local attackerSamplePos = function(aHRP)
+	LPH_ATTRIBUTES(VM(NONE))
 	if not aHRP then return end
 	local rec = _C.FaceTrack[aHRP]
 	if rec then rec.t, rec.pos = os.clock(), aHRP.Position
 	else _C.FaceTrack[aHRP] = { t = os.clock(), pos = aHRP.Position } end
-end)
+end
 
-local sampleNearbyHRPs = LPH_NO_VIRTUALIZE(function()
+local sampleNearbyHRPs = function()
+	LPH_ATTRIBUTES(VM(NONE))
 	local me = localHRP()
 	if not me then return end
 	for i = 1, #Threats do
 		local h = Threats[i].attackerHRP
 		if h then attackerSamplePos(h) end
 	end
-end)
+end
 
--- Сближение в XZ: физика часто врёт на дэше (CFrame / 0 AssemblyLinearVelocity).
--- Берём max(физика, смещение с прошлого кадра).
-local planarClosing = LPH_NO_VIRTUALIZE(function(aHRP, meHRP, th)
+local planarClosing = function(aHRP, meHRP, th)
+	LPH_ATTRIBUTES(VM(NONE))
 	if not (aHRP and aHRP.Parent and meHRP and meHRP.Parent) then return 0 end
 	local aPos, mPos = aHRP.Position, meHRP.Position
 	local dx, dz = mPos.X - aPos.X, mPos.Z - aPos.Z
@@ -1345,7 +1348,26 @@ local planarClosing = LPH_NO_VIRTUALIZE(function(aHRP, meHRP, th)
 		end
 	end
 	return closing, dist
-end)
+end
+
+-- A29: игра (VictimHitboxServiceClient / CombatHitboxVisualizerClient) читает Owner/AttackName
+-- как АТРИБУТЫ хитбокса. До A29 скрипт искал дочерние StringValue → весь хитбокс-путь был мёртв
+-- (во всех логах sid=none, HB-RETIME ни разу). Читаем атрибут, child — только фолбэк.
+_C.hbMeta = function(part)
+	LPH_ATTRIBUTES(VM(NONE))
+	if not part then return nil, nil end
+	local o = part:GetAttribute("Owner")
+	local a = part:GetAttribute("AttackName")
+	if type(o) ~= "string" or o == "" then
+		local ov = part:FindFirstChild("Owner")
+		o = (ov and ov:IsA("StringValue") and ov.Value ~= "") and ov.Value or nil
+	end
+	if type(a) ~= "string" or a == "" then
+		local av = part:FindFirstChild("AttackName")
+		a = (av and av:IsA("StringValue") and av.Value ~= "") and av.Value or nil
+	end
+	return o, a
+end
 
 local function watchHitboxFolder(folder)
 	if folder == V93.hbWatched then return end
@@ -1355,6 +1377,7 @@ local function watchHitboxFolder(folder)
 	for _, child in ipairs(folder:GetChildren()) do
 		n = n + 1
 		kids[n] = child
+		if State.hbWatchPart then State.hbWatchPart(child) end
 	end
 	V93.hbKidsN = n
 	folder.ChildAdded:Connect(function(c)
@@ -1362,11 +1385,13 @@ local function watchHitboxFolder(folder)
 		k[nn] = c
 		V93.hbKidsN = nn
 		V93.hbFrame = -1
+		if State.hbWatchPart then State.hbWatchPart(c) end
 		local ingest = State.ingestHitbox
 		if ingest then
 			task.defer(function()
 				ingest(c)
-				if not (c:FindFirstChild("Owner") and c:FindFirstChild("AttackName")) then
+				local o, a = _C.hbMeta(c)
+				if not (o and a) then
 					task.delay(0.06, ingest, c)
 				end
 			end)
@@ -1386,10 +1411,8 @@ local function watchHitboxFolder(folder)
 	end)
 end
 
-local hitboxIndex = LPH_NO_VIRTUALIZE(function()
-	-- V309: full rescan (FindFirstChild x2 per part, up to 60 parts) every
-	-- frame even with zero live threats. Two-frame cache + Threats guard;
-	-- ChildAdded/Removed still force V93.hbFrame = -1 for instant picks.
+local hitboxIndex = function()
+	LPH_ATTRIBUTES(VM(NONE))
 	if V93.hbFrame >= 0 and V93.hbFrame >= _C.FrameId - 1 then return V93.byOwner end
 	if #Threats == 0 and V93.hbFrame >= 0 then return V93.byOwner end
 	V93.hbFrame = _C.FrameId
@@ -1412,18 +1435,17 @@ local hitboxIndex = LPH_NO_VIRTUALIZE(function()
 			local sidNow = child:GetAttribute("VictimSwingId")
 			local seenRec = V93.hbFirstSeen[child]
 			if not seenRec or seenRec.sid ~= sidNow then
-				seenRec = { sid = sidNow, t = os.clock() }
+				local ev = V93.hbEvt and V93.hbEvt[child]
+				seenRec = { sid = sidNow, t = (ev and ev.sid == sidNow and ev.t) or os.clock() }
 				V93.hbFirstSeen[child] = seenRec
 			end
-			local owner = child:FindFirstChild("Owner")
-			local atk   = child:FindFirstChild("AttackName")
-			if owner and atk and owner:IsA("StringValue") and atk:IsA("StringValue") then
+			local ownerNm, aType = _C.hbMeta(child)
+			if ownerNm and aType then
 				local sid = sidNow
 				if typeof(sid) == "string" and sid ~= "" then
 					liveSid[sid] = true
-					local aType = atk.Value
 					if aType == "M1" or aType == "M2" then V93.sizes[aType] = child.Size end
-					local nm  = owner.Value
+					local nm  = ownerNm
 					local lst = byOwner[nm]
 					if not lst then lst = {}; byOwner[nm] = lst end
 					lst[#lst + 1] = child
@@ -1435,18 +1457,19 @@ local hitboxIndex = LPH_NO_VIRTUALIZE(function()
 		if not liveSid[sid] then V93.hbClaimBySid[sid] = nil end
 	end
 	return byOwner
-end)
+end
 
-local associatedHitbox = LPH_NO_VIRTUALIZE(function(th)
+local associatedHitbox = function(th)
+	LPH_ATTRIBUTES(VM(NONE))
 	if th.serverHitbox and th.serverHitbox.Parent then return th.serverHitbox end
 	local lst = hitboxIndex()[th.name]
 	if not lst then return nil end
 	local best, bestScore
 	for i = 1, #lst do
 		local part = lst[i]
-		local atk = part and part:FindFirstChild("AttackName")
+		local _, atkName = _C.hbMeta(part)
 		local sid = part and part:GetAttribute("VictimSwingId")
-		if part.Parent and atk and atk:IsA("StringValue") and atk.Value == th.kind
+		if part.Parent and atkName == th.kind
 			and typeof(sid) == "string" and sid ~= "" then
 			local owner = V93.hbClaimBySid[sid]
 			local claimKey = th.group or th
@@ -1455,16 +1478,12 @@ local associatedHitbox = LPH_NO_VIRTUALIZE(function(th)
 				local seen = (seenRec2 and seenRec2.sid == sid and seenRec2.t) or os.clock()
 				local lookback = Config.HitboxLookbackSec or 0.55
 				local c0 = th.contact0 or 0
-				-- Strike 2 (Boxing M2 1050ms) must not look back a full second:
-				-- the first hitbox of the same swing was bound to s2 (+687→+20),
-				-- strike 1 never pressed.
 				if (th.strike or 1) <= 1 and c0 > lookback then
 					lookback = math.min(c0 + 0.08, 0.72)
 				end
 				if seen >= th.detectClock - lookback then
 					local expect = th.contactAbs or (th.detectClock + c0)
 					if (th.strike or 1) >= 2 and seen < expect - 0.28 then
-						-- first-hit box of this swing, not this strike
 					else
 						local score = math.abs(seen - expect)
 						if not bestScore or score < bestScore then best, bestScore = part, score end
@@ -1488,11 +1507,11 @@ local associatedHitbox = LPH_NO_VIRTUALIZE(function(th)
 		if Config.HitboxRetime ~= false and th.contactAbs then
 			local nowHb = os.clock()
 			local hbLead = Config.HitboxContactLead or 0.02
-			local hbContact = th.hbFirstClock + hbLead
-			-- First-seen давно в прошлом: это поздняя привязка анимации к уже
-			-- живому хитбоксу, а не контакт 200мс назад. Контакт = сейчас.
+			-- A29: хитбокс виден у нас в Ts+downlink; contactAbs после REPLICA-AGE живёт в кадре Ts.
+			-- Переводим в тот же кадр, иначе любой сдвиг = +one-way и «ретайм» всегда поздний.
+			local hbContact = th.hbFirstClock - (th.replicaAge or 0) + hbLead
 			if (nowHb - (th.hbFirstClock or nowHb)) > 0.15 then
-				hbContact = nowHb + hbLead
+				hbContact = nowHb - (th.replicaAge or 0) + hbLead
 			end
 			local minShift = Config.HitboxRetimeMinMs or 40
 			local meH, aH = localHRP(), th.attackerHRP
@@ -1500,14 +1519,17 @@ local associatedHitbox = LPH_NO_VIRTUALIZE(function(th)
 				local hdx, hdz = meH.Position.X - aH.Position.X, meH.Position.Z - aH.Position.Z
 				if hdx * hdx + hdz * hdz <= 81 then minShift = 18 end
 			end
+			if (th.strike or 1) <= 1 and th.styleKey == "jin" then
+				local floorAbs = (th.detectClock or nowHb) + (Config.JinM2FirstFloor or 0.48)
+				if hbContact < floorAbs then hbContact = floorAbs end
+			end
 			local shiftMs = (hbContact - th.contactAbs) * 1000
 			local pminR = Config.PerfectMin or 0.05
 			local upHb = uplink()
 			local hbRemain = hbContact - nowHb
-			-- HB-KEEP по остатку АНИМАЦИИ пропускал ранний хитбокс
-			-- (V214: meas=219 pred=335 LATE). Контакт всегда двигаем;
-			-- rearm только если второе нажатие ещё может попасть в окно.
-			if math.abs(shiftMs) >= minShift then
+			-- A29: хитбокс = удар уже идёт. Сдвиг ПОЗЖЕ ничего не спасает, но переоткрывает окно
+			-- и даёт нажатие после хита (сжигает BlockCooldown на следующий удар). Двигаем только раньше.
+			if shiftMs <= -minShift then
 				local oldContact = th.contactAbs
 				th.contactAbs = hbContact
 				th.hbContactAbs = hbContact
@@ -1530,7 +1552,6 @@ local associatedHitbox = LPH_NO_VIRTUALIZE(function(th)
 							th.pressed and " hold" or "")
 					end
 				else
-					-- Хитбокс в кадре контакта: повторное нажатие не доезжает.
 					diagPush("HB-RETIME t=%.2f %s %s контакт %+.0fms→%+.0fms (удар задержан: хитбокс появился только сейчас)%s",
 						os.clock(), tostring(th.name), tostring(th.kind),
 						(oldContact - os.clock()) * 1000, (hbContact - os.clock()) * 1000,
@@ -1546,9 +1567,10 @@ local associatedHitbox = LPH_NO_VIRTUALIZE(function(th)
 		end
 	end
 	return best
-end)
+end
 
-local realHitboxHitsMe = LPH_NO_VIRTUALIZE(function(ownerName, th)
+local realHitboxHitsMe = function(ownerName, th)
+	LPH_ATTRIBUTES(VM(NONE))
 	if th and th.gtQueryFrame == _C.FrameId then return th.gtQueryResult end
 	if not ownerName or not th then return nil end
 	local part = (th.group and th.group.serverHitbox) or th.serverHitbox or associatedHitbox(th)
@@ -1608,9 +1630,10 @@ local realHitboxHitsMe = LPH_NO_VIRTUALIZE(function(ownerName, th)
 	end
 	th.gtQueryFrame, th.gtQueryResult = _C.FrameId, hit
 	return hit
-end)
+end
 
-local hitboxNearestPart = LPH_NO_VIRTUALIZE(function(ownerName, kind)
+local hitboxNearestPart = function(ownerName, kind)
+	LPH_ATTRIBUTES(VM(NONE))
 	if not ownerName then return nil, nil end
 	local lst = hitboxIndex()[ownerName]
 	if not lst or #lst == 0 then return nil, nil end
@@ -1619,16 +1642,17 @@ local hitboxNearestPart = LPH_NO_VIRTUALIZE(function(ownerName, kind)
 	local best, bestD = nil, math.huge
 	for i = 1, #lst do
 		local part = lst[i]
-		local atk = part and part:FindFirstChild("AttackName")
-		if part.Parent and atk and atk:IsA("StringValue") and (not kind or atk.Value == kind) then
+		local _, atkName = _C.hbMeta(part)
+		if part.Parent and atkName and (not kind or atkName == kind) then
 			local d = (part.Position - me.Position).Magnitude
 			if d < bestD then bestD = d; best = part end
 		end
 	end
 	return best, bestD
-end)
+end
 
-local syncContactWithHitbox = LPH_NO_VIRTUALIZE(function(th, now)
+local syncContactWithHitbox = function(th, now)
+	LPH_ATTRIBUTES(VM(NONE))
 	if not Config.HitboxDodge then return end
 	if (th.strike or 1) > 1 then return end
 	if th.dodged or th.hitboxSynced then return end
@@ -1642,17 +1666,19 @@ local syncContactWithHitbox = LPH_NO_VIRTUALIZE(function(th, now)
 	if realHitboxHitsMe(th.name, th) == true then
 		th.gtConfirmed, th.hitboxSynced = true, true
 	end
-end)
+end
 
-local clampLeadToVictim = LPH_NO_VIRTUALIZE(function(lead, aPos, mePos)
+local clampLeadToVictim = function(lead, aPos, mePos)
+	LPH_ATTRIBUTES(VM(NONE))
 	local d = Vector3.new(aPos.X - mePos.X, 0, aPos.Z - mePos.Z).Magnitude
 	local maxLead = d * (Config.WillHitLeadFrac or 0.90)
 	if lead.Magnitude <= maxLead then return lead end
 	if maxLead <= 1e-3 then return Vector3.zero end
 	return lead.Unit * maxLead
-end)
+end
 
-local hitboxGeom = LPH_NO_VIRTUALIZE(function(th)
+local hitboxGeom = function(th)
+	LPH_ATTRIBUTES(VM(NONE))
 	if th.geomFrame == _C.FrameId then
 		return th.geomC, th.geomF, th.geomP, th.geomL
 	end
@@ -1692,8 +1718,6 @@ local hitboxGeom = LPH_NO_VIRTUALIZE(function(th)
 	local predA = Vector3.new(aPos.X + lead.X, 0, aPos.Z + lead.Z)
 	local look = aHRP.CFrame.LookVector
 	local flatLook = Vector3.new(look.X, 0, look.Z)
-	-- Dragon M2RootLock / aerial M2: LookVector is (0,1,0), flat=0, geom nil
-	-- → V280 source=none NO-PRESS. Aim at victim on the plane.
 	if flatLook.Magnitude < 0.05 then
 		if meG then
 			local toMeL = Vector3.new(meG.Position.X - aPos.X, 0, meG.Position.Z - aPos.Z)
@@ -1705,25 +1729,24 @@ local hitboxGeom = LPH_NO_VIRTUALIZE(function(th)
 	if flatLook.Magnitude < 0.05 then return nil end
 	flatLook = flatLook.Unit
 
-	local forward = styleForward(th.style, th.kind)
+	local skG = th.styleKey or string.lower(tostring(th.style or ""))
+	local forward = styleForward(skG, th.kind)
 	                or ((th.kind == "M2") and Config.M2Forward or Config.M1Forward)
 	do
-		local st = styleStepForward(th.style, th.kind, th.combo)
+		local st = styleStepForward(skG, th.kind, th.combo)
 		if type(st) == "number" and st > 0 then
 			forward = forward + st
 			th.geomStep = st
 		end
 	end
 	if th.kind == "M2" then
-		local ok, go = pcall(_C.grabOffFn, th.style)
+		local ok, go = pcall(_C.grabOffFn, skG)
 		if ok and type(go) == "number" and go > 0 then
 			forward = forward + go
 			th.geomGrab = go
 		end
 	end
 
-	-- Не сэмплируем FaceTrack здесь: иначе velLead в этом же кадре видит dt≈0
-	-- и CFrame-дэш даёт closing=0. Сэмпл — в конце кадра (sampleNearbyHRPs).
 	local prevPos, prevT = attackerPrevPos(aHRP)
 	th.prevPos  = prevPos
 	th.prevPosT = prevT
@@ -1745,9 +1768,10 @@ local hitboxGeom = LPH_NO_VIRTUALIZE(function(th)
 	local center = predA + flatLook * forward
 	th.geomFrame, th.geomC, th.geomF, th.geomP, th.geomL = _C.FrameId, center, forward, predA, flatLook
 	return center, forward, predA, flatLook
-end)
+end
 
-local attackerAnimThrottled = LPH_NO_VIRTUALIZE(function(th)
+local attackerAnimThrottled = function(th)
+	LPH_ATTRIBUTES(VM(NONE))
 	if Config.LatchTrustThrottled == false then return false end
 	local model = th and th.attackerModel
 	if not model then return false end
@@ -1765,18 +1789,16 @@ local attackerAnimThrottled = LPH_NO_VIRTUALIZE(function(th)
 	end
 	th.throttledNow = animator and animator.EvaluationThrottled == true
 	return th.throttledNow
-end)
+end
 
--- Luraph: LPH_NO_VIRTUALIZE emits native Luau. Nested `function` / `pcall(function`
--- inside that span become child protos that Luraph still virtualizes, then the
--- native parent cannot close over them — runtime break or a per-frame hitch.
--- Keep native bodies free of inner closures; hoist helpers to sibling macros.
-local whmSet = LPH_NO_VIRTUALIZE(function(th, hit)
+local whmSet = function(th, hit)
+	LPH_ATTRIBUTES(VM(NONE))
 	th.whmFrame, th.whmHit = _C.FrameId, hit
 	return hit
-end)
+end
 
-local willHitMe = LPH_NO_VIRTUALIZE(function(th)
+local willHitMe = function(th)
+	LPH_ATTRIBUTES(VM(NONE))
 	if th.whmFrame == _C.FrameId then return th.whmHit == true end
 	if Config.PerfProbe then V93.probeWHM = (V93.probeWHM or 0) + 1 end
 	local myHRP, aHRP = localHRP(), th.attackerHRP
@@ -1796,17 +1818,21 @@ local willHitMe = LPH_NO_VIRTUALIZE(function(th)
 	local velToMeEarly = planarClosing(aHRP, myHRP, th)
 	local maxYd = Config.MaxHeightDiff or 8
 	local yOk = math.abs(myPos.Y - aPos.Y) <= maxYd
-	-- Floors / pits: |dY| > maxYd cannot hit. m2-range used to skip this
-	-- and we faced/pressed rooftop M2 (V285 y-diff after the fact).
-	if th.kind == "M2" and yOk then
+	-- A29: AOE-путь «любой M2 в Range = в меня» оставляем только для стилей, чей M2-хитбокс
+	-- (выучен по серверным хитбоксам) реально большой. Узкие M2 идут через геометрию ниже.
+	local m2Narrow = false
+	if th.kind == "M2" and V93.learn and Config.AoeFromHitbox ~= false then
+		local gS = V93.learn.geo[tostring(th.styleKey) .. "|M2"]
+		if gS and (gS.n or 0) >= (Config.LearnGeoMinSamples or 2)
+			and math.max(gS.sx or 0, gS.sz or 0) < (Config.AoeM2MinSize or 12) then
+			m2Narrow = true
+			th.m2Narrow = true
+		end
+	end
+	if th.kind == "M2" and yOk and not m2Narrow then
 		local cap = Config.Range or 18
 		if th.styleKey == "cqc" then cap = math.max(cap, 30) end
 		if dist2dEarly <= cap then
-			-- V307: m2-range said hit for ANY swing inside the radius. At
-			-- range > 9 a back-turned or sideways attacker (auto-face still
-			-- traveling) burned dodges/presses on swings that fly elsewhere.
-			-- At close range the hitbox covers us at any face — keep the
-			-- permissive classify there.
 			if dist2dEarly > 9 then
 				local look = aHRP.CFrame.LookVector
 				local toMeX, toMeZ = dxEarly, dzEarly
@@ -1834,8 +1860,6 @@ local willHitMe = LPH_NO_VIRTUALIZE(function(th)
 		ovH = 0.38
 	end
 	local gt
-	-- GetPartBoundsInBox is the per-frame killer. Hitbox is not out for
-	-- most of the windup; dist<=9 used to query every PreSimulation.
 	if th.serverHitbox or (th.group and th.group.serverHitbox) or remain0 <= ovH then
 		gt = realHitboxHitsMe(th.name, th)
 	end
@@ -1874,12 +1898,32 @@ local willHitMe = LPH_NO_VIRTUALIZE(function(th)
 	origin = Vector3.new(predA.X, aPos.Y, predA.Z)
 	local sz = V93.sizes[th.kind]
 	local myAt = myPos
+	-- A29: сервер проверяет хитбокс против НАШЕЙ позиции в момент удара, а наша позиция на сервере
+	-- отстаёт на uplink. До удара (в серверном кадре) = remain; значит видна позиция через remain−uplink.
+	-- Своя скорость известна точно — уход/подход агрессивного игрока учитывается здесь.
+	do
+		local myV = myHRP.AssemblyLinearVelocity
+		local hz = math.clamp(remain0 - uplink(), 0, Config.SelfLeadCap or 0.30)
+		if myV and hz > 0 then
+			myAt = Vector3.new(myPos.X + myV.X * hz, myPos.Y, myPos.Z + myV.Z * hz)
+		end
+	end
 	local hbMul = hitboxSizeMult(th.attackerModel)
 	local halfW = (sz and sz.X * 0.5 or Config.HitHalfWidth or 3) * hbMul
 		+ (Config.HighSlack or 0.35)
 		+ localTorsoHalf()
 	local halfH = (sz and sz.Y * 0.5 or 3) * hbMul + 2.5 + localHeightYBudget()
 	local halfD = (sz and sz.Z * 0.5 or (Config.HitboxDepth or 4)) * hbMul
+	-- A29: размер/оффсет, выученные с реальных серверных хитбоксов этого стиля (уже с ростом атакующего).
+	local lg = _C.learnGeo and _C.learnGeo(th.styleKey, th.kind)
+	if lg then
+		halfW = lg.sx * 0.5 + (Config.HighSlack or 0.35) + localTorsoHalf()
+		halfH = lg.sy * 0.5 + 2.5 + localHeightYBudget()
+		halfD = lg.sz * 0.5
+		local fL = -(lg.oz or 0)
+		if fL > 0 then forward = fL + (th.geomStep or 0) end
+		th.geomLearned = true
+	end
 	if math.abs(myAt.Y - origin.Y) > halfH then
 		th.recognitionSource = "y-diff"
 		return whmSet(th, false)
@@ -1925,12 +1969,9 @@ local willHitMe = LPH_NO_VIRTUALIZE(function(th)
 			end
 			th.angPrev, th.angPrevT = angToMe, now
 		end
-		-- На малой дистанции ориентация атакующего недостоверна: его CFrame
-		-- реплицируется с задержкой, а сам свинг доворачивается автофейсом уже
-		-- на сервере. В радиусе halfD+halfW хитбокс накрывает нас при любом
-		-- face, поэтому проверку направления здесь отключаем полностью.
-		local faceExemptCore = (dist2d <= (halfD + halfW))
-			or (th.serverProven and dist2d <= coreReach)
+		local behind = depth < -1.0 and dist2d > 2.2
+		local faceExemptCore = (not behind) and ((dist2d <= (halfD + halfW))
+			or (th.serverProven and dist2d <= coreReach))
 		local faceOk, faceAllowDeg
 		if faceExemptCore then
 			faceOk, faceAllowDeg = true, 180
@@ -1943,6 +1984,16 @@ local willHitMe = LPH_NO_VIRTUALIZE(function(th)
 			local hardMax = math.rad(Config.FaceHardDeg or 100)
 			faceOk = (angNeed <= budget) and (angToMe <= hardMax)
 			faceAllowDeg = math.deg(math.atan2(halfW, math.max(dist2d, 0.5)) + budget)
+		end
+		-- A29: drag. Хитбокс ставит сервер по CFrame атакующего В МОМЕНТ удара, а разворот у игрока
+		-- мгновенный (shift-lock/камера). Значит до появления хитбокса взгляд атакующего — не
+		-- ограничение: в пределах досягаемости удар может прилететь в нас при любом face.
+		-- Отсев промахов — по дистанции (с предсказанием обеих позиций), а не по конусу взгляда.
+		if not faceOk and Config.DragAware ~= false and (th.kind == "M1" or th.kind == "M2") then
+			if dist2d <= coreReach + (Config.DragReachPad or 1.0) then
+				faceOk, faceAllowDeg = true, 180
+				th.dragEnvelope = true
+			end
 		end
 		th.geomFaceFloor  = faceOk and -1.01 or math.cos(math.rad(math.min(faceAllowDeg, 180)))
 		th.geomFaceAllow  = faceAllowDeg
@@ -1988,7 +2039,6 @@ local willHitMe = LPH_NO_VIRTUALIZE(function(th)
 				hit, faceOk = true, true
 			end
 		end
-		-- Серверные ярлыки не перекрывают удар в спину / мимо конуса.
 		local lookAway = (not faceOk) and (angToMe > math.rad(90))
 		if not lookAway then
 			if not hit and th.serverProven and attackerAnimThrottled(th) then
@@ -2013,11 +2063,7 @@ local willHitMe = LPH_NO_VIRTUALIZE(function(th)
 		end
 	end
 
-	-- M2 step-in lands even when replica LookVector is >90°. look-away
-	-- vetoed m2-close and produced V279 Hakari M2 NO-PRESS at dist=5.
-	-- V307: >9 studs and still back-turned after the windup — off-axis,
-	-- this swing flies elsewhere (see m2-offaxis in the early classify).
-	if not hit and th.kind == "M2" then
+	if not hit and th.kind == "M2" and not th.m2Narrow then
 		local d2 = th.geomDist2d
 		if type(d2) ~= "number" then
 			d2 = math.sqrt(ox * ox + oz * oz)
@@ -2103,7 +2149,7 @@ local willHitMe = LPH_NO_VIRTUALIZE(function(th)
 			end
 		end
 		return whmSet(th, hit)
-	end)
+	end
 
 local function nextCombo(attacker)
 	local now = os.clock()
@@ -2189,7 +2235,8 @@ end
 
 local HEIGHT_H_LO, HEIGHT_H_HI = 0.983, 1.45
 
-local resolveCharHeight = LPH_NO_VIRTUALIZE(function(model)
+local resolveCharHeight = function(model)
+	LPH_ATTRIBUTES(VM(NONE))
 	local h, src
 	local pd = model:FindFirstChild("PlayerData")
 	if pd then
@@ -2208,17 +2255,33 @@ local resolveCharHeight = LPH_NO_VIRTUALIZE(function(model)
 		return h, src
 	end
 	return nil, nil
-end)
+end
 
 _C.AttackMultCache = setmetatable({}, { __mode = "k" })
 _C.HeightSrcLogged = setmetatable({}, { __mode = "k" })
-local attackSpeedMult = LPH_NO_VIRTUALIZE(function(model)
+local attackSpeedMult = function(model)
+	LPH_ATTRIBUTES(VM(NONE))
 	if not model then return 1 end
 	local c = _C.AttackMultCache[model]
 	if c and (os.clock() - c.t) < 8.0 then return c.m end
 	if not GameData.resolved then loadGameModules() end
+	if not GameData.cu and os.clock() - (GameData.cuTry or -9) > 2 then
+		GameData.cuTry = os.clock()
+		local pk = ReplicatedStorage:FindFirstChild("Packages")
+		local cm = pk and pk:FindFirstChild("CombatUtils")
+		if cm then
+			local okR, m = pcall(require, cm)
+			if okR and type(m) == "table" then GameData.cu = m end
+		end
+	end
 	local mult, src = 1, nil
-	if GameData.cu then
+	-- A29: игра считает скорость атаки через GetCharacterAttackSpeedMultiplier (рост × SpecAttackSpeedMultiplier
+	-- × MonsterMash). Берём ровно её; рост-формула ниже — только если модуль недоступен.
+	if GameData.cu and GameData.cu.GetCharacterAttackSpeedMultiplier then
+		local okM, m = pcall(GameData.cu.GetCharacterAttackSpeedMultiplier, model)
+		if okM and type(m) == "number" and m > 0.05 and m == m then mult, src = m, "cu-char" end
+	end
+	if not src and GameData.cu then
 		local h = GameData.cu.GetCharacterHeight(model)
 		if type(h) == "number" then
 			local m = GameData.cu.GetAttackSpeedMultiplier(h)
@@ -2241,17 +2304,22 @@ local attackSpeedMult = LPH_NO_VIRTUALIZE(function(model)
 			end
 		end
 	end
-	mult = math.clamp(mult, 0.80, 1.20)
+	if src == "cu-char" then
+		mult = math.clamp(mult, 0.40, 2.50)
+	else
+		mult = math.clamp(mult, 0.80, 1.20)
+	end
 	if Config.DeepDiag and not _C.HeightSrcLogged[model] then
 		_C.HeightSrcLogged[model] = true
 		diagPush("HEIGHT-SRC %s → aMult=%.3f src=%s", tostring(model and model.Name), mult, tostring(src or "none(=1.0)"))
 	end
 	_C.AttackMultCache[model] = { m = mult, t = os.clock(), src = src }
 	return mult
-end)
+end
 
 _C.HbSizeCache = setmetatable({}, { __mode = "k" })
-hitboxSizeMult = LPH_NO_VIRTUALIZE(function(model)
+hitboxSizeMult = function(model)
+	LPH_ATTRIBUTES(VM(NONE))
 	if not model then return 1 end
 	local rec = _C.HbSizeCache[model]
 	if rec and (os.clock() - rec.t) < 8.0 then return rec.m end
@@ -2272,10 +2340,11 @@ hitboxSizeMult = LPH_NO_VIRTUALIZE(function(model)
 	end
 	_C.HbSizeCache[model] = { m = m, t = os.clock() }
 	return m
-end)
+end
 _C.hitboxSizeMult = hitboxSizeMult
 
 local function heightDiag(model)
+	LPH_ATTRIBUTES(VM(NONE))
 	local attrHeight, bodyScale, modelHeight = nil, nil, nil
 	local pd = model and model:FindFirstChild("PlayerData")
 	if pd then attrHeight = tonumber(pd:GetAttribute("CurrentHeight")) or tonumber(pd:GetAttribute("Height")) end
@@ -2299,7 +2368,8 @@ end
 _C.styleFn  = function(m) return GameData.cau.GetCombatStyleForCharacter(m) end
 _C.styleAttr = function(m) return m:GetAttribute("CombatStyle") end
 _C.styleCache = setmetatable({}, { __mode = "k" })
-local styleOf = LPH_NO_VIRTUALIZE(function(model)
+local styleOf = function(model)
+	LPH_ATTRIBUTES(VM(NONE))
 	local e = _C.styleCache[model]
 	local nowc = os.clock()
 	if e and nowc < e.t then return e.v end
@@ -2316,10 +2386,11 @@ local styleOf = LPH_NO_VIRTUALIZE(function(model)
 	out = out or "Basic"
 	if e then e.v, e.t = out, nowc + 0.5 else _C.styleCache[model] = { v = out, t = nowc + 0.5 } end
 	return out
-end)
+end
 
 _D.AttackIds = {}
 local function comboFromName(nm)
+	LPH_ATTRIBUTES(VM(NONE))
 	local n = nm:match("^(%d+)")
 	if n then return tonumber(n) end
 	local l = nm:lower()
@@ -2330,9 +2401,9 @@ local function comboFromName(nm)
 	return nil
 end
 local function kindFromName(nm)
+	LPH_ATTRIBUTES(VM(NONE))
 	if type(nm) ~= "string" or nm == "" then return nil end
 	local l = nm:lower()
-	-- M2Success / M2EHit = already-connected grab, not a new swing.
 	if l:find("success", 1, true) or l:find("ehit", 1, true)
 		or l:find("blockhit", 1, true) or l:find("block", 1, true)
 		or l:find("guard", 1, true) or l:find("parry", 1, true) then
@@ -2353,7 +2424,7 @@ _D.BlockIds = {}
 local function looksDefensive(nm)
 	local l = nm:lower()
 	return (l:find("block") or l:find("guard") or l:find("parry")
-		or l:find("deflect") or l:find("perfect")) ~= nil
+		or l:find("deflect") or l:find("perfectblock") or l:find("perfectparry")) ~= nil
 end
 local function indexAllAnims()
 	local anims  = ReplicatedStorage:FindFirstChild("Animations")
@@ -2384,6 +2455,7 @@ local function indexAllAnims()
 								kind = kind,
 								combo = (kind == "M1") and comboFromName(child.Name) or nil,
 								name = child.Name,
+								style = styleFolder.Name,
 								mom = lname:find("momentum") ~= nil,
 							}
 						end
@@ -2396,7 +2468,9 @@ local function indexAllAnims()
 					local id = tonumber(tostring(d.AnimationId):match("(%d+)"))
 					if id then
 						if looksDefensive(d.Name) or (d.Parent and looksDefensive(d.Parent.Name)) then
-							_D.BlockIds[id] = true
+							if not _D.AttackIds[id] then
+								_D.BlockIds[id] = true
+							end
 						end
 						if not _D.AttackIds[id] and not _D.BlockIds[id] then
 							local lname = d.Name:lower()
@@ -2418,24 +2492,27 @@ local function indexAllAnims()
 			end
 	end
 	for id, v in pairs(_D.LEGACY_ATTACKS) do
-		if not _D.AttackIds[id] then _D.AttackIds[id] = { kind = v.t, combo = nil } end
+		if not _D.AttackIds[id] then _D.AttackIds[id] = { kind = v.t, combo = v.c, style = v.s } end
 	end
 end
 
 local function attackEntry(id)
+	LPH_ATTRIBUTES(VM(NONE))
 	return _D.AttackIds[id]
 end
 
 GameData.m2VarCache = {}
 GameData.m2VariantId = function(style, animName)
 	if type(animName) ~= "string" or animName == "" then return nil end
-	local ck = tostring(style):lower() .. "|" .. animName
+	local sk = string.lower(tostring(style or "")):gsub("[%s_%-]", "")
+	sk = sk:gsub("anims$", ""):gsub("animations$", "")
+	local ck = sk .. "|" .. animName
 	local c = GameData.m2VarCache[ck]
 	if c ~= nil then return c or nil end
 	local out = false
 	loadGameModules()
 	if GameData.cfg and GameData.cfg.GetStyleM2Variants then
-		local vs = GameData.cfg.GetStyleM2Variants(style)
+		local vs = GameData.cfg.GetStyleM2Variants(sk)
 		if type(vs) == "table" then
 			for id, v in pairs(vs) do
 				if type(v) == "table" and v.Anim == animName then out = id; break end
@@ -2461,22 +2538,23 @@ end
 
 local function styleM2MultiHitCount(style)
 	loadGameModules()
+	local sk = string.lower(tostring(style or "")):gsub("[%s_%-]", "")
+	sk = sk:gsub("anims$", ""):gsub("animations$", "")
+	local alias = _D.STYLE_ALIAS
+	if type(alias) == "table" then sk = alias[sk] or sk end
 	local cfg = GameData.cfg
 	if cfg and cfg.GetStyleNumber then
-		local n = cfg.GetStyleNumber(style, "M2MultiHitCount", 1)
-		if type(n) == "number" then return n end
+		local n = cfg.GetStyleNumber(sk, "M2MultiHitCount", 1)
+		if type(n) == "number" and n > 1 then return n end
 	end
 	if cfg then
-		local sl = string.lower(tostring(style or "")):gsub("[%s_%-]", "")
-		local alias = _D.STYLE_ALIAS
-		if type(alias) == "table" then sl = alias[sl] or sl end
 		local styles = cfg.Styles
-		local s = type(styles) == "table" and (styles[style] or styles[sl]) or nil
+		local s = type(styles) == "table" and styles[sk] or nil
 		if type(s) == "table" and type(s.M2MultiHitCount) == "number" then
 			return s.M2MultiHitCount
 		end
 	end
-	return isBoxingStyle(style) and 2 or 1
+	return isBoxingStyle(sk) and 2 or 1
 end
 
 local function boxingM2ContactTable()
@@ -2487,46 +2565,66 @@ local function boxingM2ContactTable()
 		if type(mc[1]) == "number" then first = mc[1] end
 		if type(mc[2]) == "number" then second = mc[2] end
 	end
-	-- cfg M2HitboxDelay=0.43 is windup, not overlap. Live first contact
-	-- is ~0.60–0.63 (V209: pred=442 meas=606–629 → EARLY BLOCK + GB).
-	-- Never pull the first marker down to 0.43.
 	local floor = Config.BoxingM2FirstFloor or 0.58
 	if first < floor then first = floor end
 	return { first, second }
 end
 
--- Boxing first-hit floor is live-log only. Mishima/Jin use CombatConfig delays.
 _C.styleM2ContactTable = function(style)
+	LPH_ATTRIBUTES(VM(NONE))
 	loadGameModules()
-	if isBoxingStyle(style) then
-		return boxingM2ContactTable()
-	end
+	local key = tostring(style or "")
+	local awakened = key:find("@awakened", 1, true) ~= nil
 	local cfg = GameData.cfg
 	if cfg and cfg.GetStyleM2MultiHitDelays then
-		local ok, d = pcall(cfg.GetStyleM2MultiHitDelays, style)
-		if ok and type(d) == "table" and type(d[1]) == "number" and type(d[2]) == "number" then
-			return { d[1], d[2] }
+		local d = cfg.GetStyleM2MultiHitDelays(key)
+		if type(d) == "table" and type(d[1]) == "number" and type(d[2]) == "number" then
+			local copy = {}
+			for i = 1, #d do
+				if type(d[i]) ~= "number" then break end
+				copy[i] = d[i]
+			end
+			if type(copy[1]) == "number" and type(copy[2]) == "number" then
+				local base = key:gsub("@awakened$", "")
+				if base == "jin" and not awakened then
+					local floor = Config.JinM2FirstFloor or 0.48
+					if copy[1] < floor then copy[1] = floor end
+				end
+				return copy
+			end
 		end
+	end
+	if isBoxingStyle(key) and not awakened then
+		return boxingM2ContactTable()
 	end
 	return nil
 end
 
 local resolveInfo = function(id, model)
+	LPH_ATTRIBUTES(VM(NONE))
 	local entry  = _D.AttackIds[id]
 	if not entry then return nil end
 	local legacy = _D.LEGACY_ATTACKS[id]
 	local kind = entry.kind
 	local rk = registryKind and registryKind(model, id)
 	if rk == "M1" or rk == "M2" then kind = rk end
-	local style = styleOf(model) or (legacy and legacy.s) or "Basic"
+	local style = (entry and entry.style) or (legacy and legacy.s) or styleOf(model) or "Basic"
+	local cfgKey = _C.cfgStyleKey(style, model)
 	local variant = nil
 	if kind == "M2" then
+		local clipVar = (_D.ALI_M2_BY_ID and id and _D.ALI_M2_BY_ID[id])
+			or GameData.m2VariantId(style, entry and entry.name)
+		local attrVar = nil
 		if model then
 			local av = model:GetAttribute("M2VariantId")
-			if type(av) == "string" and av ~= "" then variant = av end
+			if type(av) == "string" and av ~= "" then attrVar = av end
 		end
-		if not variant then
-			variant = GameData.m2VariantId(style, entry and entry.name) or (legacy and legacy.v) or nil
+		if clipVar then
+			variant = clipVar
+		elseif attrVar then
+			variant = attrVar
+		else
+			variant = (legacy and legacy.v) or nil
 		end
 	end
 	local sprint = false
@@ -2538,8 +2636,9 @@ local resolveInfo = function(id, model)
 		s     = style,
 		id    = id,
 		hit   = entry.hit,
-		contacts = (kind == "M2" and styleM2MultiHitCount(style) >= 2)
-			and _C.styleM2ContactTable(style) or nil,
+		cfgKey = cfgKey,
+		contacts = (kind == "M2" and styleM2MultiHitCount(cfgKey) >= 2)
+			and _C.styleM2ContactTable(cfgKey) or nil,
 		combo = entry and entry.combo or (legacy and legacy.c) or nil,
 		mom   = (entry and entry.mom) or (legacy and legacy.mom) or false,
 		name  = entry and entry.name or nil,
@@ -2557,19 +2656,37 @@ _D.STYLE_ALIAS = {
 	kyokushin = "kyokushin", kyokushinkarate = "kyokushin",
 	mishima = "mishima", lethwei = "lethwei", jin = "jin",
 }
--- V309: styleKey allocates a string per call (lower+gsub) and sits in every
--- hot path. Cache by input string; gsub stays for misses only.
 local styleKeyCache = {}
-local styleKey = LPH_NO_VIRTUALIZE(function(s)
+local styleKey = function(s)
+	LPH_ATTRIBUTES(VM(NONE))
 	local t = type(s)
 	if t ~= "string" and t ~= "nil" then s = tostring(s) end
 	local hit = styleKeyCache[s]
 	if hit ~= nil then return hit end
 	local sl = string.lower(tostring(s or "")):gsub("[%s_%-]", "")
-	local out = _D.STYLE_ALIAS[sl] or sl
+	sl = sl:gsub("anims$", ""):gsub("animations$", "")
+	local out = _D.STYLE_ALIAS[sl]
+	if not out and #sl > 3 and sl:sub(1, 3) == "old" then
+		-- A29: Combat/oldmuay — копия MuayThaiAnims с теми же asset id (дамп _animations.json);
+		-- индекс id→папка берёт её, и стиль уходил в Styles.default (hitTL 328 на c1–c4).
+		local rest = sl:sub(4)
+		out = _D.STYLE_ALIAS[rest] or rest
+	end
+	out = out or sl
 	styleKeyCache[s] = out
 	return out
-end)
+end
+
+_C.cfgStyleKey = function(style, model)
+	LPH_ATTRIBUTES(VM(NONE))
+	local key = styleKey(style)
+	if not model then return key end
+	local aw = model:GetAttribute("AwakenedStyle")
+	if type(aw) == "string" and aw ~= "" and string.lower(aw) == key then
+		return key .. "@awakened"
+	end
+	return key
+end
 
 local function cfgKnowsStyle(style)
 	loadGameModules()
@@ -2579,11 +2696,41 @@ local function cfgKnowsStyle(style)
 	if type(styles) ~= "table" then
 		return false
 	end
-	local key = style
+	local key = styleKey(style)
 	if type(c.NormalizeStyleKey) == "function" then
-		key = c.NormalizeStyleKey(style)
+		key = c.NormalizeStyleKey(key)
 	end
 	return styles[key] ~= nil
+end
+
+_C.logUnknownSwing = function(now, id, model, info)
+	LPH_ATTRIBUTES(VM(NONE))
+	local seen = _D.unknownSeen
+	if not seen then
+		seen = {}
+		_D.unknownSeen = seen
+	end
+	if not info then
+		local k = "id|" .. tostring(id)
+		if seen[k] then return end
+		seen[k] = true
+		diagPush("UNKNOWN-ATTACK t=%.2f id=%s model=%s reason=no-catalog", now, tostring(id), tostring(model and model.Name))
+		return
+	end
+	if not cfgKnowsStyle(info.s) then
+		local k = "style|" .. tostring(info.s)
+		if not seen[k] then
+			seen[k] = true
+			diagPush("UNKNOWN-STYLE t=%.2f raw=%s key=%s id=%s", now, tostring(info.s), styleKey(info.s), tostring(id))
+		end
+	end
+	if info.t == "M2" and not info.contacts and styleM2MultiHitCount(info.cfgKey or info.s) >= 2 then
+		local k = "m2|" .. tostring(info.cfgKey or info.s)
+		if not seen[k] then
+			seen[k] = true
+			diagPush("UNKNOWN-M2 t=%.2f key=%s id=%s count>=2 no delay table", now, tostring(info.cfgKey), tostring(id))
+		end
+	end
 end
 
 _C.attackerSprinting = function(model, hrp)
@@ -2610,11 +2757,14 @@ _C.sprintM2Delay = function(style)
 end
 
 local function hitTimelineBase(info, combo)
+	LPH_ATTRIBUTES(VM(NONE))
 	if info.t == "SKILL" then
 		if info.hit and info.hit > 0 then return info.hit end
 		return 0.35
 	end
-	if info.id and not cfgKnowsStyle(info.s) then
+	local sk = info.cfgKey or styleKey(info.s)
+	local baseKey = styleKey(info.s)
+	if info.id and not cfgKnowsStyle(baseKey) then
 		local le0 = _D.LEGACY_ATTACKS[info.id]
 		if le0 and le0.t == info.t and type(le0.d) == "number" then
 			return le0.d + _D.WINDUP_EXTRA
@@ -2624,17 +2774,15 @@ local function hitTimelineBase(info, combo)
 		loadGameModules()
 		local cfgv, multi = nil, 1
 		if GameData.cfg then
-			local d = GameData.cfg.GetStyleM2HitboxDelay(info.s, info.mom, info.variant)
+			local d = GameData.cfg.GetStyleM2HitboxDelay(sk, info.mom, info.variant)
 			if type(d) == "number" then
-				-- Игра: GetScaled(d, heightMult) = d/aMult + windup/aMult.
-				-- База speed=1; aMult один раз в hitTimeline. Не d+WINDUP.
 				if GameData.cfg.GetScaledHitboxDelay then
 					local sc = GameData.cfg.GetScaledHitboxDelay(d, 1)
 					if type(sc) == "number" then cfgv = sc end
 				end
 				if not cfgv then cfgv = d + (GameData.windupExtra or _D.WINDUP_EXTRA) end
 			end
-			local mc = GameData.cfg.GetStyleNumber(info.s, "M2MultiHitCount", 1)
+			local mc = GameData.cfg.GetStyleNumber(sk, "M2MultiHitCount", 1)
 			if type(mc) == "number" then multi = mc end
 		end
 		if not cfgv then
@@ -2648,7 +2796,6 @@ local function hitTimelineBase(info, combo)
 				cfgv = (_D.LEGACY_M2_BASE[sl] or 0.30) + _D.WINDUP_EXTRA
 			end
 		end
-		-- Dragon standing 0.655 vs sprint 0.29. V292 pred=692 meas=335 NO-PRESS.
 		if info.sprint then
 			local sd = _C.sprintM2Delay(info.s)
 			if type(sd) == "number" then cfgv = sd end
@@ -2661,7 +2808,7 @@ local function hitTimelineBase(info, combo)
 
 	loadGameModules()
 	if GameData.cfg then
-		local d = GameData.cfg.GetScaledStyleM1HitboxDelay(info.s, combo or 1, 1)
+		local d = GameData.cfg.GetScaledStyleM1HitboxDelay(sk, combo or 1, 1)
 		if type(d) == "number" then return d end
 	end
 	local sl   = styleKey(info.s)
@@ -2672,8 +2819,25 @@ local function hitTimelineBase(info, combo)
 end
 
 local function hitTimeline(info, combo, mult, contactBase)
-	local base = contactBase or hitTimelineBase(info, combo)
+	LPH_ATTRIBUTES(VM(NONE))
 	local m = (type(mult) == "number" and mult > 0.05) and mult or 1
+	-- A29: та же формула, что у игры (M1_ModuleScript:94 / M2_ModuleScript:414-425):
+	-- M1 → GetScaledStyleM1HitboxDelay(style, combo, charMult) (там M1AnimSpeed и M1TallWindupBonus),
+	-- M2 → GetScaledHitboxDelay(delay, CapStyleM2HeightSpeed(style, charMult)).
+	if not contactBase and info and info.t ~= "SKILL" and GameData.cfg then
+		local sk = info.cfgKey or styleKey(info.s)
+		local cfg = GameData.cfg
+		if cfgKnowsStyle(styleKey(info.s)) then
+			if info.t == "M1" and cfg.GetScaledStyleM1HitboxDelay then
+				local ok, d = pcall(cfg.GetScaledStyleM1HitboxDelay, sk, combo or 1, m)
+				if ok and type(d) == "number" and d > 0 then return d end
+			elseif info.t == "M2" and cfg.CapStyleM2HeightSpeed and not info.sprint then
+				local ok, mc = pcall(cfg.CapStyleM2HeightSpeed, sk, m)
+				if ok and type(mc) == "number" and mc > 0.05 then m = mc end
+			end
+		end
+	end
+	local base = contactBase or hitTimelineBase(info, combo)
 	return base / math.max(0.05, m)
 end
 
@@ -2686,11 +2850,10 @@ local function markAttackStreak(name, kind, style, info)
 	if kind == "M2" then
 		streak[name] = 0
 	end
-	-- Momentum только из id анимации / M2VariantId. Streak≥3 ставил 480ms
-	-- на обычный Hakari M2 → pred=455 meas=348 LATE (V213).
 end
 
 local function gamePingAnimMult(animContact)
+	LPH_ATTRIBUTES(VM(NONE))
 	if type(animContact) ~= "number" or animContact <= 0 then return 1 end
 	local v = LocalPlayer:GetNetworkPing()
 	if type(v) ~= "number" or v ~= v or v <= 0 then return 1 end
@@ -2699,6 +2862,7 @@ local function gamePingAnimMult(animContact)
 end
 
 local function effAnimSpeed(track, aMult, animContact)
+	LPH_ATTRIBUTES(VM(NONE))
 	local sp
 	if track then
 		local v = track.Speed
@@ -2715,7 +2879,8 @@ local function effAnimSpeed(track, aMult, animContact)
 end
 
 
-local tpSpeed = LPH_NO_VIRTUALIZE(function(track)
+local tpSpeed = function(track)
+	LPH_ATTRIBUTES(VM(NONE))
 	if track then
 		local v = track.Speed
 		if type(v) == "number"
@@ -2725,7 +2890,7 @@ local tpSpeed = LPH_NO_VIRTUALIZE(function(track)
 		end
 	end
 	return 1
-end)
+end
 
 local function animToWall(animDelta, track, aMult, animContact)
 	local sp = effAnimSpeed(track, aMult, animContact)
@@ -2740,8 +2905,6 @@ _C.grabOffFn = function(st)
 	if not cfg or not cfg.GetStyleNumber then return 0 end
 	return cfg.GetStyleNumber(st, "M2GrabTargetForwardOffset", 0)
 end
--- V308: grab-style detector (PerfectCopy / Wrestling / kure / judo / dirty
--- via grab fields, or the SA list). Used by the poll-origin contact floor.
 _C.isGrabStyle = function(st)
 	local s = tostring(st or ""):lower()
 	if s == "wrestling" or s == "kure" or s == "judo" or s == "dirty"
@@ -2773,9 +2936,10 @@ _C.applyGrabSwingSpeed = function(info, track, hitTL)
 		if type(sp) == "number" and sp > 0.05 then live = sp end
 	end
 	if math.abs(live - 1) >= 0.08 then return hitTL end
-	return hitTL / gsp
+	return hitTL
 end
-styleForward = LPH_NO_VIRTUALIZE(function(style, kind)
+styleForward = function(style, kind)
+	LPH_ATTRIBUTES(VM(NONE))
 	local ck = tostring(style) .. "|" .. tostring(kind)
 	local hit = _C.fwdCache[ck]
 	if type(hit) == "number" then return hit end
@@ -2789,10 +2953,11 @@ styleForward = LPH_NO_VIRTUALIZE(function(style, kind)
 		_C.fwdCache[ck] = false
 	end
 	return (kind == "M2" or kind == "SKILL") and Config.M2Forward or Config.M1Forward
-end)
+end
 
 _C.stepCache = {}
-styleStepForward = LPH_NO_VIRTUALIZE(function(style, kind, combo)
+styleStepForward = function(style, kind, combo)
+	LPH_ATTRIBUTES(VM(NONE))
 	local ck = tostring(style) .. "|" .. tostring(kind) .. "|" .. tostring(combo or 1)
 	local v = _C.stepCache[ck]
 	if type(v) == "number" then return v end
@@ -2822,9 +2987,10 @@ styleStepForward = LPH_NO_VIRTUALIZE(function(style, kind, combo)
 	out = math.clamp(out, 0, 8)
 	_C.stepCache[ck] = out
 	return out
-end)
+end
 
-local velLead = LPH_NO_VIRTUALIZE(function(hrp, th)
+local velLead = function(hrp, th)
+	LPH_ATTRIBUTES(VM(NONE))
 	if th and th.kind == "M2" then return 0 end
 	local me = localHRP()
 	if not me or not hrp then return 0 end
@@ -2833,7 +2999,7 @@ local velLead = LPH_NO_VIRTUALIZE(function(hrp, th)
 	local full = Config.MoveSpeedFull or 22
 	local cap = Config.MoveLeadMax or 0.10
 	return math.clamp(closing / full, 0, 1) * cap
-end)
+end
 
 
 local Debris = game:GetService("Debris")
@@ -3127,16 +3293,18 @@ local function playDodgeMotion(dirOverride, speedOverride)
 	end)
 end
 
-local spoofStamp = LPH_NO_VIRTUALIZE(function(tsServer)
+local spoofStamp = function(tsServer)
+	LPH_ATTRIBUTES(VM(NONE))
 	local extra = State.pressSpoofExtra or 0
 	if Config.TimeSpoof then
 		extra = extra + ((Config.TimeShiftMs or 0) / 1000)
 	end
 	if extra <= 0 then return tsServer end
 	return tsServer - extra
-end)
+end
 
-local sendActivate = LPH_NO_VIRTUALIZE(function(tsServer, stunTap)
+local sendActivate = function(tsServer, stunTap)
+	LPH_ATTRIBUTES(VM(NONE))
 	local now = os.clock()
 	if now - State.lastAct < Config.MinActGap then return false end
 	State.lastAct = now
@@ -3158,9 +3326,10 @@ local sendActivate = LPH_NO_VIRTUALIZE(function(tsServer, stunTap)
 		spoofStamp(ts)
 	)
 	return true
-end)
+end
 
-local sendDeactivate = LPH_NO_VIRTUALIZE(function(force)
+local sendDeactivate = function(force)
+	LPH_ATTRIBUTES(VM(NONE))
 	local now = os.clock()
 	if not force and now - State.lastDeact < Config.MinDeactGap then return false end
 	State.lastDeact = now
@@ -3170,7 +3339,7 @@ local sendDeactivate = LPH_NO_VIRTUALIZE(function(force)
 	State.guardUp = false
 	stopBlockAnim()
 	return true
-end)
+end
 
 local function sendDodge(dir, speedOverride)
 	if State.guardUp or State.blocking then
@@ -3224,14 +3393,16 @@ local function steerM2Variant(want)
 	hum:Move(State.ap.steerDir, false)
 end
 
-local eHitActive = LPH_NO_VIRTUALIZE(function(c)
+local eHitActive = function(c)
+	LPH_ATTRIBUTES(VM(NONE))
 	local h = getHandler()
 	if not (c and h and h.GetAnims) then return false end
 	local ok, bucket = pcall(h.GetAnims, c, "EHit")
 	return ok and type(bucket) == "table" and next(bucket) ~= nil
-end)
+end
 
-local counterReady = LPH_NO_VIRTUALIZE(function()
+local counterReady = function()
+	LPH_ATTRIBUTES(VM(NONE))
 	if not Config.SkillAddon then return false, "SkillAddon-off" end
 	local c = localChar()
 	if not c then return false, "no-character" end
@@ -3255,7 +3426,7 @@ local counterReady = LPH_NO_VIRTUALIZE(function()
 	if not hum or hum.Health <= 0 then return false, "dead" end
 	if eHitActive(c) then return false, "EHit" end
 	return true, "ready"
-end)
+end
 
 function V93.markOwnM2IFrames(now, tag)
 	local style = tostring(styleOf(localChar()) or ""):lower()
@@ -3288,12 +3459,13 @@ function V93.markOwnM2IFrames(now, tag)
 	State.ownIFrameTag = tag
 end
 
-State.updateCounterTxn = LPH_NO_VIRTUALIZE(function(now)
+State.updateCounterTxn = function(now)
+	LPH_ATTRIBUTES(VM(NONE))
 	local tx = State.counterTxn
 	if not tx or (not tx.pending and not tx.confirmed) then return end
 	local th = tx.threat
 	local ch = localChar()
-	local liveIFrames = ch and (ch:GetAttribute("IFRAMES")
+	local liveIFrames = ch and (ch:GetAttribute("IFRAMES") or ch:GetAttribute("EvasiveIFrames")
 		or ch:GetAttribute("UltraInstinct")) or false
 	local enemyStopped, stopSource = false, nil
 	local enemy = th and th.attackerModel
@@ -3361,8 +3533,9 @@ State.updateCounterTxn = LPH_NO_VIRTUALIZE(function(now)
 		return
 	end
 
-	local coverageMiss = th and (th.contactAbs or 0) <= (tx.expectedIFramesAt or 0)
-	local timedOut = now >= (tx.ackDeadline or 0)
+	local stance = tx.source == "wingchun" or tx.source == "aikido"
+	local coverageMiss = (not stance) and th and (th.contactAbs or 0) <= (tx.expectedIFramesAt or 0)
+	local timedOut = (not stance) and now >= (tx.ackDeadline or 0)
 	if (tx.confirmed and not liveIFrames) or (tx.pending and (timedOut or coverageMiss)) then
 		if th then
 			th.counterPendingId = nil
@@ -3375,9 +3548,10 @@ State.updateCounterTxn = LPH_NO_VIRTUALIZE(function(now)
 		State.allowRearmUntil = now + 0.28
 		diagPush("COUNTER-FAIL/FALLBACK t=%.2f id=%s gate=%s sentAgo=%.0fms → normal defense restored", now, tostring(tx.threatId), why, (now - tx.sent) * 1000)
 	end
-end)
+end
 
-State.updateAliM2Cooldown = LPH_NO_VIRTUALIZE(function(now)
+State.updateAliM2Cooldown = function(now)
+	LPH_ATTRIBUTES(VM(NONE))
 	local cd = State.aliM2CD
 	local ch = localChar()
 	if ch ~= cd.char then
@@ -3408,10 +3582,11 @@ State.updateAliM2Cooldown = LPH_NO_VIRTUALIZE(function(now)
 		cd.known, cd.started = false, 0
 	end
 	cd.active = active
-end)
+end
 
 _C.PARRY_ONLY_M2_CACHE = {}
-local function m2IsParryOnlyStyle(style)
+local m2IsParryOnlyStyle = function(style)
+	LPH_ATTRIBUTES(VM(NONE))
 	local st = tostring(style or ""):lower()
 	if st == "" then return false end
 	local cached = _C.PARRY_ONLY_M2_CACHE[st]
@@ -3457,13 +3632,12 @@ function State.isParryOnlyM2(th)
 end
 
 _C.M2_BREAKS_GUARD = {}
-local function styleM2BreaksHeldGuard(style)
+local styleM2BreaksHeldGuard = function(style)
+	LPH_ATTRIBUTES(VM(NONE))
 	local st = tostring(style or ""):lower()
 	if st == "" then return false end
 	local cached = _C.M2_BREAKS_GUARD[st]
 	if cached ~= nil then return cached end
-	-- V216: Ali/Boxing M2 парируются. M2RagdollLaunchStrength на стиле
-	-- (Ali Left Ragdolls=false) ошибочно снимал гард под boxing-counter.
 	if m2IsParryOnlyStyle(st) then
 		_C.M2_BREAKS_GUARD[st] = false
 		return false
@@ -3474,9 +3648,6 @@ local function styleM2BreaksHeldGuard(style)
 	if cfg and cfg.GetStyleConfig then
 		local ok, sc = pcall(cfg.GetStyleConfig, st)
 		if ok and type(sc) == "table" then
-			-- Ragdoll-on-HIT (Hakari/Dragon/Striker) is parryable. V281
-			-- treated M2RagdollLaunchStrength as guard-break → SkillAddon
-			-- counter path skipped parry. Only grabs / fat chip.
 			if type(sc.M2BlockChipPercent) == "number" and sc.M2BlockChipPercent >= 0.45 then
 				verdict = true
 			elseif type(sc.M2GrabTargetForwardOffset) == "number" then
@@ -3495,13 +3666,12 @@ local function styleM2BreaksHeldGuard(style)
 	return verdict
 end
 
-local m2BreaksHeldGuard = LPH_NO_VIRTUALIZE(function(th)
+local m2BreaksHeldGuard = function(th)
+	LPH_ATTRIBUTES(VM(NONE))
 	return th ~= nil and th.kind == "M2" and styleM2BreaksHeldGuard(th.style)
-end)
+end
 State.m2BreaksHeldGuard = m2BreaksHeldGuard
 
--- full=true: cover the whole iframe (grabs / ali abuse).
--- full=false: center window used by optional dodges.
 _C.dodgeCoverWindow = function(ifLat, ifDur, full)
 	local lo = (ifLat or 0.08) - 0.03
 	local dur = ifDur or 0.30
@@ -3601,19 +3771,46 @@ local function resolveM2Module()
 	return State.ap.m2
 end
 
--- Игра ставит клиентский M2-кулдаун (HUD) только в OnM2Activated
--- (scheduleM2SwingCooldown). Голый ServerCheck HUD не видит.
 local function fireNativeM2()
-	local m2 = resolveM2Module()
-	if m2 and type(m2.OnM2Activated) == "function" then
-		local ok = pcall(m2.OnM2Activated)
-		return ok
+	local c = localChar()
+	if not c then return false end
+	local now = os.clock()
+	if c:GetAttribute("M2Cooldown") or c:GetAttribute("M2CD") then
+		diagPush("M2-NOSEND t=%.2f gate=M2Cooldown", now)
+		return false
+	end
+	if c:GetAttribute("CombatAttacking") then
+		diagPush("M2-NOSEND t=%.2f gate=CombatAttacking", now)
+		return false
+	end
+	if c:GetAttribute("Stunned") or c:GetAttribute("Ragdoll") then
+		diagPush("M2-NOSEND t=%.2f gate=Stunned", now)
+		return false
+	end
+	if c:GetAttribute("CantAnything") and not c:GetAttribute("CombatRecovery") then
+		diagPush("M2-NOSEND t=%.2f gate=CantAnything", now)
+		return false
+	end
+	if c:GetAttribute("Equip") == false then
+		diagPush("M2-NOSEND t=%.2f gate=Equip", now)
+		return false
+	end
+	if c:GetAttribute("Blocking") or State.blocking or (State.lastPress and (now - State.lastPress) < 0.35) then
+		c:SetAttribute("Blocking", nil)
+		State.blocking, State.holdUntil = false, 0
+		sendDeactivate(true)
+	end
+	if c:GetAttribute("ParryAttackLockout") or c:GetAttribute("BlockAttackLockout") then
+		diagPush("M2-NOSEND t=%.2f gate=lockout", now)
+		return false
 	end
 	ServerRemote:FireServer({ Type = "Combat", Action = "M2", Func = "ServerCheck" })
+	diagPush("M2-FIRE t=%.2f remote=M2.ServerCheck", now)
 	return true
 end
 
-local fireBoxingCounter = LPH_NO_VIRTUALIZE(function(th, targetDist)
+local fireBoxingCounter = function(th, targetDist)
+	LPH_ATTRIBUTES(VM(NONE))
 	local myHRP = localHRP()
 	local aHRP  = th and th.attackerHRP
 	if myHRP and aHRP and aHRP.Parent then
@@ -3622,12 +3819,12 @@ local fireBoxingCounter = LPH_NO_VIRTUALIZE(function(th, targetDist)
 		local faceHold = (counterStyle() == "ali") and (Config.AliFaceLockDur or 0.75)
 			or (Config.BoxingFaceLockDur or 0.55)
 		setFaceGoal(aHRP, true, faceHold)
-	end
-	if State.blocking then
-		State.blocking, State.holdUntil = false, 0
-		stopBlockAnim()
-		sendDeactivate(true)
-	end
+		end
+		if State.blocking or (State.lastPress and (os.clock() - State.lastPress) < 0.35) then
+			State.blocking, State.holdUntil = false, 0
+			stopBlockAnim()
+			sendDeactivate(true)
+		end
 	local cs = counterStyle()
 	if cs == "ali" then
 		if _D.aliM2HasVars == nil then
@@ -3658,8 +3855,8 @@ local fireBoxingCounter = LPH_NO_VIRTUALIZE(function(th, targetDist)
 	if rtt < net * 2 then rtt = net * 2 end
 	tx.pending, tx.confirmed, tx.sent = true, false, sentAt
 	tx.ackDeadline = sentAt + rtt + (V93.lookahead or 0) + 0.10
-	tx.expectedIFramesAt = (cs == "wingchun" or cs == "aikido") and math.huge
-			or (sentAt + net + math.max(V93.lookahead or 0, 0) + math.max(V93.frameDt or 0, 1 / 60))
+	tx.expectedIFramesAt = (cs == "wingchun" or cs == "aikido") and 0
+		or (sentAt + net + math.max(V93.lookahead or 0, 0) + math.max(V93.frameDt or 0, 1 / 60))
 	tx.threat, tx.source, tx.result = th, cs, "sent"
 	tx.threatId = tostring(th.serverSwingId or (th.group and th.group.serverSwingId)
 		or ((th.name or "?") .. "/" .. (th.kind or "?") .. "/" .. math.floor((th.detectClock or sentAt) * 1000)))
@@ -3668,32 +3865,47 @@ local fireBoxingCounter = LPH_NO_VIRTUALIZE(function(th, targetDist)
 	diagPush("COUNTER-SEND t=%.2f id=%s target=%s/%s dist=%.1f gate=M2-ready ack=%0.fms", sentAt, tx.threatId, tostring(th.name), tostring(th.kind), targetDist or -1,
 			(tx.ackDeadline - sentAt) * 1000)
 	if cs == "wingchun" or cs == "aikido" then
-		local su = wcStartup()
+		local win = counterStanceWindow(cs)
+		local whiff = (cs == "aikido") and 1.2 or _D.WINGCHUN.CounterWhiffStun
+		local hold = (cs == "aikido") and 1.95 or _D.WINGCHUN.CounterHoldSecs
+		local victim = (cs == "aikido") and 2.3 or _D.WINGCHUN.VictimHitStun
+		loadGameModules()
+		if GameData.cfg and GameData.cfg.GetStyleConfig then
+			local sc = GameData.cfg.GetStyleConfig(cs)
+			if type(sc) == "table" then
+				if type(sc.M2CounterWindowDuration) == "number" and sc.M2CounterWindowDuration > 0 then win = sc.M2CounterWindowDuration end
+				if type(sc.M2CounterWhiffStun) == "number" then whiff = sc.M2CounterWhiffStun end
+				if type(sc.M2CounterHoldSeconds) == "number" then hold = sc.M2CounterHoldSeconds end
+				if type(sc.M2CounterVictimHitStun) == "number" then victim = sc.M2CounterVictimHitStun end
+			end
+		end
 		_D.WCTxn.pending  = true
 		_D.WCTxn.sentAt   = sentAt
-		_D.WCTxn.openAt   = sentAt + net + su
-		_D.WCTxn.closeAt  = _D.WCTxn.openAt + counterStanceWindow(cs)
+		_D.WCTxn.openAt   = sentAt + net
+		_D.WCTxn.closeAt  = _D.WCTxn.openAt + win
 		_D.WCTxn.threat   = th
 		_D.WCTxn.threatId = tx.threatId
 		_D.WCTxn.style    = cs
-		_D.WCTxn.whiffStun = (cs == "aikido") and 1.2 or _D.WINGCHUN.CounterWhiffStun
-		_D.WCTxn.holdSecs = (cs == "aikido") and 1.95 or _D.WINGCHUN.CounterHoldSecs
-		_D.WCTxn.victimHitStun = (cs == "aikido") and 2.3 or _D.WINGCHUN.VictimHitStun
+		th.coveredByCounter = true
+		_D.WCTxn.whiffStun = whiff
+		_D.WCTxn.holdSecs = hold
+		_D.WCTxn.victimHitStun = victim
 		State.attackBusyUntil = math.max(State.attackBusyUntil or 0, _D.WCTxn.closeAt)
 		State.selfBusyUntil   = math.max(State.selfBusyUntil or 0, _D.WCTxn.closeAt)
 		diagPush("WC-COUNTER-SEND t=%.2f id=%s style=%s target=%s/%s dist=%.1f startup=%.0fms(%s) window=[%.0f..%.0f]ms contactIn=%.0fms iframes=NONE",
 			sentAt, tostring(tx.threatId), tostring(cs), tostring(th.name), tostring(th.kind), targetDist or -1,
-			su * 1000, "fixed+ping",
+			0, "packet",
 			(_D.WCTxn.openAt - sentAt) * 1000, (_D.WCTxn.closeAt - sentAt) * 1000,
 			((th.contactAbs or sentAt) - sentAt) * 1000)
 	else
 		V93.markOwnM2IFrames(os.clock(), "counter/" .. tostring(cs))
 	end
-end)
+end
 
-local tryAliEvasiveCounter = LPH_NO_VIRTUALIZE(function(now)
+local tryAliEvasiveCounter = function(now)
+	LPH_ATTRIBUTES(VM(NONE))
 	if not Config.SkillAddon or not Config.AliEvasiveCounter then return false end
-	if (styleOf(localChar()) or ""):lower() ~= "ali" then return false end
+	if styleKey(styleOf(localChar()) or "") ~= "ali" then return false end
 	local tx = State.dodgeTxn
 	if not (tx and tx.pending and tx.perfectConfirmed) then return false end
 	if tx.evCounterFired then return false end
@@ -3795,7 +4007,7 @@ local tryAliEvasiveCounter = LPH_NO_VIRTUALIZE(function(now)
 	State.status         = "ALI-EV-COUNTER"
 	diagPush("ALI-EVCOUNTER-SEND t=%.2f target=%s dist=%.1f range=%.0f specialCd=%.0fs ignoreNormalM2Cd=true variant=Left perfectAgo=%.0fms gate=one-StyleEvasiveCounter", now, best.name or "?", bestDist, range, cd, (now-(tx.perfectAt or now))*1000)
 	return true
-end)
+end
 
 function State.counterBlockedPerm()
 	if not Config.SkillAddon then return true end
@@ -3820,7 +4032,8 @@ function State.counterReadyAt(now)
 	return at
 end
 
-local counterCandidate = LPH_NO_VIRTUALIZE(function(now, ignoreTransient)
+local counterCandidate = function(now, ignoreTransient)
+	LPH_ATTRIBUTES(VM(NONE))
 	if ignoreTransient then
 		if State.counterBlockedPerm() then return nil end
 	else
@@ -3830,7 +4043,7 @@ local counterCandidate = LPH_NO_VIRTUALIZE(function(now, ignoreTransient)
 	local myHRP = localHRP()
 	if not myHRP then return nil end
 	local cs = counterStyle()
-	if Config.CounterOnlyWhenNoParry ~= false and cs ~= "wingchun" and cs ~= "aikido" then
+	if Config.CounterOnlyWhenNoParry ~= false and not cs then
 		local okB = canBlockNow()
 		if okB then
 			local pwin = Config.PerfectWindow or 0.125
@@ -3850,7 +4063,7 @@ local counterCandidate = LPH_NO_VIRTUALIZE(function(now, ignoreTransient)
 			if parrySoon then return nil, nil, "parry-available" end
 		end
 	end
-	if Config.CounterYieldToM2 ~= false and cs ~= "wingchun" and cs ~= "aikido" then
+	if Config.CounterYieldToM2 ~= false and not cs then
 		local m2H = Config.CounterM2Horizon or 0.95
 		for i = 1, #Threats do
 			local o = Threats[i]
@@ -3874,7 +4087,7 @@ local counterCandidate = LPH_NO_VIRTUALIZE(function(now, ignoreTransient)
 	local myPos = myHRP.Position
 	local best, bestDist
 	local mustDodgeFn = State.isMustDodge
-	local minCounterRemain = math.max(Config.CounterMinRemain or 0.22, uplink() + 0.08)
+	local minCounterRemain = math.max(uplink(), 0.02) + math.max(V93.frameDt or 0, 1/60)
 	local styleIsAli = (styleOf(localChar()) or ""):lower() == "ali"
 	local aliAbuseOn = styleIsAli and Config.SkillAddon and Config.AliDodgeAbuse
 		and Config.AliEvasiveCounter and Config.AutoDodge ~= false
@@ -3898,21 +4111,36 @@ local counterCandidate = LPH_NO_VIRTUALIZE(function(now, ignoreTransient)
 		   and not th.counterCommittedToParry
 		   and not (mustDodgeFn and mustDodgeFn(th))
 		   and (th.contactAbs - now) > minCounterRemain then
-			local dx, dz = myPos.X - aHRP.Position.X, myPos.Z - aHRP.Position.Z
-			local dist = math.sqrt(dx * dx + dz * dz)
-			if dist <= reach and (not bestDist or dist < bestDist) then
-				best, bestDist = th, dist
-			end
+		   local dx, dz = myPos.X - aHRP.Position.X, myPos.Z - aHRP.Position.Z
+		   local dist = math.sqrt(dx * dx + dz * dz)
+		   local facing = false
+		   local look = aHRP.CFrame.LookVector
+		   local flat = Vector3.new(look.X, 0, look.Z)
+		   if flat.Magnitude >= 0.05 then
+		   	local to = Vector3.new(dx, 0, dz)
+		   	if to.Magnitude < 0.05 then
+		   		facing = true
+		   	else
+		   		facing = flat.Unit:Dot(to.Unit) >= (Config.FaceGoodDot or 0.55)
+		   	end
+		   end
+		   if dist <= reach and facing and (not bestDist or dist < bestDist) then
+		   	best, bestDist = th, dist
+		   elseif dist <= reach and not facing and not th.counterFaceSkipLogged then
+		   	th.counterFaceSkipLogged = true
+		   	diagPush("COUNTER-SKIP/PARRY t=%.2f target=%s/%s dist=%.1f gate=not-facing", now, tostring(th.name), tostring(th.kind), dist)
+		   end
 		end
 	end
 	return best, bestDist
-end)
+end
 
 local function counterPreemptsDodge(now)
+	LPH_ATTRIBUTES(VM(NONE))
 	if State.counterPreemptFrame == _C.FrameId then return State.counterPreemptVal end
 	local ch = localChar()
 	if ch then
-		if ch:GetAttribute("IFRAMES") or ch:GetAttribute("UltraInstinct") then
+		if ch:GetAttribute("IFRAMES") or ch:GetAttribute("EvasiveIFrames") or ch:GetAttribute("UltraInstinct") then
 			local mustFn = State.isMustDodge
 			if mustFn then
 				for i = 1, #Threats do
@@ -3935,8 +4163,6 @@ local function counterPreemptsDodge(now)
 	end
 	if Config.CounterPreemptsDodge == false then return false end
 	local ctx = State.counterTxn
-	-- PENDING must not cover: V208 COUNTER-SEND → FAIL/IFRAMES → Karate c3 NO-PRESS HIT.
-	-- Only confirmed iframes skip dodge/parry overlap.
 	if ctx and ctx.confirmed and ctx.threat
 		and now < (State.counterIFramesUntil or 0) then
 		State.counterPreemptFrame, State.counterPreemptVal = _C.FrameId, true
@@ -3951,6 +4177,7 @@ local function wcPoll(now)
 	local net = math.max(uplink(), 0.02)
 	if now <= _D.WCTxn.closeAt + net then return end
 	_D.WCTxn.pending = false
+	if _D.WCTxn.threat then _D.WCTxn.threat.coveredByCounter = nil end
 	_D.WCTxn.whiffs  = (_D.WCTxn.whiffs or 0) + 1
 	local whiffStun = _D.WCTxn.whiffStun or _D.WINGCHUN.CounterWhiffStun
 	State.selfBusyUntil = math.max(State.selfBusyUntil or 0,
@@ -3963,13 +4190,19 @@ end
 
 local function wcDecide(th, now, threatCount)
 	local net    = math.max(uplink(), 0.02)
-	local su     = wcStartup()
-	local openIn = net + su
+	local openIn = net + math.max(V93.frameDt or 0, 1/60)
 	local cs     = counterStyle()
 	local win    = counterStanceWindow(cs)
+	loadGameModules()
+	if GameData.cfg and GameData.cfg.GetStyleConfig then
+		local sc = GameData.cfg.GetStyleConfig(cs)
+		if type(sc) == "table" and type(sc.M2CounterWindowDuration) == "number" and sc.M2CounterWindowDuration > 0 then
+			win = sc.M2CounterWindowDuration
+		end
+	end
 	local early  = Config.WCEarlyMargin or 0.045
 	local late   = Config.WCLateMargin or 0.10
-	local aimIn  = openIn + math.min((Config.WCAimFrac or 0.35) * win, win - late)
+	local closeIn = openIn + math.max(win - late, 0.05)
 	local contactIn = (th.contactAbs or now) - now
 
 	if Config.WCSoloOnly ~= false and threatCount > 1 then
@@ -3981,50 +4214,27 @@ local function wcDecide(th, now, threatCount)
 			return "parry", "grab-style M2 (" .. st .. ")"
 		end
 	end
-	if Config.WCRequireLiveTrack ~= false and th.spdSrc ~= "live" then
-		return "parry", "contact=predict (нет живого track.Speed)"
+	if not th.contactAbs then
+		return "parry", "no contactAbs"
 	end
 	if contactIn < openIn + early then
-		return "parry", string.format("contactIn=%.0fms < open=%.0f+%.0fms",
+		return "parry", string.format("contactIn=%.0fms < packet=%.0f+%.0fms",
 			contactIn * 1000, openIn * 1000, early * 1000)
 	end
-	if contactIn > aimIn then
-		return "wait", string.format("contactIn=%.0fms > aim=%.0fms",
-			contactIn * 1000, aimIn * 1000)
+	if contactIn > closeIn then
+		return "wait", string.format("contactIn=%.0fms > close=%.0fms",
+			contactIn * 1000, closeIn * 1000)
 	end
 	return "fire", string.format("contact на %.0f%% окна",
 		((contactIn - openIn) / win) * 100)
 end
 
-local tryBoxingCounter = LPH_NO_VIRTUALIZE(function(now)
+local tryBoxingCounter = function(now)
+	LPH_ATTRIBUTES(VM(NONE))
 	wcPoll(now)
 	if (State.interruptLockUntil or 0) > now then return false end
 	if not Config.SkillAddon then return false end
 	if not (Config.BoxingCounter or Config.AliCounter or Config.WingChunCounter or Config.AikidoCounter) then return false end
-	-- Hakari/Lethwei M2: m2BreaksHeldGuard=true → ниже releaseBlock, потом
-	-- COUNTER-YIELD. Гард снят, парри не жмётся. Skill Addon off = парри жив.
-	if Config.CounterYieldToM2 ~= false then
-		local cs0 = counterStyle()
-		if cs0 ~= "wingchun" and cs0 ~= "aikido" then
-			local m2H = Config.CounterM2Horizon or 0.95
-			for i = 1, #Threats do
-				local o = Threats[i]
-				if o and o.kind == "M2" and not o.dodged and not o.resolved and not o.staleTrack then
-					local dtM2 = (o.contactAbs or now) - now
-					if dtM2 > -0.05 and dtM2 < m2H then
-						if Config.DeepDiag and (now - (State.lastCounterM2YieldLog or 0)) > 0.35 then
-							State.lastCounterM2YieldLog = now
-							diagPush("COUNTER-YIELD-M2 t=%.2f skip counter: %s M2 contactIn=%.0fms keep-guard=%s",
-								now, tostring(o.name), dtM2 * 1000, tostring(State.blocking == true))
-						end
-						return false
-					end
-				end
-			end
-		end
-	end
-	-- Лог V178: COUNTER-SEND через 21мс после TRACE-PRESS сорвал гард
-	-- (IN-WINDOW → LATE). Контра и парри в одном кадре несовместимы.
 	local gbIn = false
 	for i = 1, #Threats do
 		if m2BreaksHeldGuard(Threats[i]) and not Threats[i].resolved and not Threats[i].dodged then
@@ -4032,13 +4242,29 @@ local tryBoxingCounter = LPH_NO_VIRTUALIZE(function(now)
 			break
 		end
 	end
-	-- Don't drop guard unless we actually fire. fireBoxingCounter releases.
-	if State.blocking and not gbIn then
+	local cs0 = counterStyle()
+	local wantCounter = (cs0 == "boxing" and Config.BoxingCounter)
+		or (cs0 == "ali" and Config.AliCounter)
+		or (cs0 == "aikido" and Config.AikidoCounter)
+		or (cs0 == "wingchun" and Config.WingChunCounter)
+	if not wantCounter then
+		if State.blocking and not gbIn then
+			return false
+		end
+		if State.lastPress and (now - State.lastPress) < 0.28 and not gbIn then return false end
+	end
+	local best, bestDist = counterCandidate(now, true)
+	if not best then
+		if not _D.WCTxn.pending then
+			for i = 1, #Threats do
+				local t = Threats[i]
+				if t and t.coveredByCounter and not t.counterPendingId then
+					t.coveredByCounter = nil
+				end
+			end
+		end
 		return false
 	end
-	if State.lastPress and (now - State.lastPress) < 0.28 and not gbIn then return false end
-	local best, bestDist = counterCandidate(now, true)
-	if not best then return false end
 	if wingChunCounterActive(best.attackerModel) then
 		best.counterCommittedToParry = true
 		if not best.wingChunGateLogged then
@@ -4050,6 +4276,7 @@ local tryBoxingCounter = LPH_NO_VIRTUALIZE(function(now)
 	end
 	local ready, gate = counterReady()
 	if not ready then
+		best.coveredByCounter = nil
 		local contactAt = best.contactAbs or now
 		local lead = math.max(uplink(), 0.02) + math.max(V93.lookahead or 0, 0)
 			+ math.max(V93.frameDt or 0, 1 / 60)
@@ -4063,7 +4290,7 @@ local tryBoxingCounter = LPH_NO_VIRTUALIZE(function(now)
 		end
 		return false
 	end
-	if cs == "wingchun" or cs == "aikido" then
+	if cs0 == "wingchun" or cs0 == "aikido" then
 		local live = 0
 		for i = 1, #Threats do
 			local t = Threats[i]
@@ -4077,50 +4304,78 @@ local tryBoxingCounter = LPH_NO_VIRTUALIZE(function(now)
 			return true
 		end
 		if act == "parry" then
+			best.coveredByCounter = nil
 			best.counterCommittedToParry = true
 			if best.wcSkipWhy ~= why then
 				best.wcSkipWhy = why
 				diagPush("WC-COUNTER-SKIP/PARRY t=%.2f target=%s/%s reason=%s", now,
 					tostring(best.name), tostring(best.kind), why)
 			end
-		elseif best.wcWaitWhy ~= why then
-			best.wcWaitWhy = why
-			diagPush("WC-COUNTER-WAIT t=%.2f target=%s/%s %s", now,
-				tostring(best.name), tostring(best.kind), why)
+		else
+			if not best.counterPendingId and not (_D.WCTxn.pending and _D.WCTxn.threat == best) then
+				best.coveredByCounter = nil
+			end
+			if best.wcWaitWhy ~= why then
+				best.wcWaitWhy = why
+				diagPush("WC-COUNTER-WAIT t=%.2f target=%s/%s %s", now,
+					tostring(best.name), tostring(best.kind), why)
+			end
 		end
 		return false
 	end
 	local contactIn = (best.contactAbs or now) - now
-		local fr = math.max(V93.frameDt or 0, 1 / 60)
-		local iframeLead = math.max(uplink(), 0.02) + math.max(V93.lookahead or 0, 0) + fr
-		local parryLead = math.max(Config.PerfectLead - math.max(uplink(), 0.02), 0) + fr
-	local yieldLead = math.max(iframeLead, parryLead, Config.CounterMinRemain or 0.22)
-	if contactIn <= yieldLead then
+	local packet = math.max(uplink(), 0.02) + math.max(V93.frameDt or 0, 1/60)
+	if contactIn <= packet then
+		best.coveredByCounter = nil
 		best.counterCommittedToParry = true
 		if not best.counterLateSkipLogged then
 			best.counterLateSkipLogged = true
-			diagPush("COUNTER-SKIP/PARRY t=%.2f target=%s/%s contactIn=%.0fms need=%.0fms (iframe=%.0f parry=%.0f) gate=%s", now, tostring(best.name), tostring(best.kind), contactIn * 1000,
-					yieldLead * 1000, iframeLead * 1000, parryLead * 1000,
-					parryLead >= iframeLead and "PARRY-DEADLINE-FIRST" or "IFRAMES-cannot-precede-contact")
+			diagPush("COUNTER-SKIP/PARRY t=%.2f target=%s/%s contactIn=%.0fms need=%.0fms gate=packet-too-late", now, tostring(best.name), tostring(best.kind), contactIn * 1000, packet * 1000)
 		end
 		return false
 	end
 	fireBoxingCounter(best, bestDist)
 	return true
-end)
+end
 
-local isMustDodge = LPH_NO_VIRTUALIZE(function(th)
+local isMustDodge = function(th)
+	LPH_ATTRIBUTES(VM(NONE))
 	if not th then return false end
-	local st = (th.style or ""):lower()
+	local st = styleKey(th.style)
+	if th.kind == "M2" and (st == "wrestling" or st == "kure" or st == "judo" or st == "dirty" or st == "cqc") then
+		return true
+	end
+	-- A29: грабы определяем по CombatConfig, с awakened-ключом (muaythai@awakened — граб с
+	-- M2GrabStrikes, а у базового muaythai граб-полей нет → раньше его парировали, LATE/чужой-хит).
+	-- Как и хардкод-список выше — не зависит от тумблера MustDodge: граб не парируется.
+	if th.kind == "M2" and Config.MustDodgeAutoGrab ~= false and st ~= "" then
+		local ck = _C.cfgStyleKey(th.style, th.attackerModel)
+		GameData.grabCache = GameData.grabCache or {}
+		local cached = GameData.grabCache[ck]
+		if cached == nil then
+			cached = false
+			if not GameData.resolved then loadGameModules() end
+			local getSC = GameData.cfg and GameData.cfg.GetStyleConfig
+			if getSC then
+				local ok, sc = pcall(getSC, ck)
+				if ok and type(sc) == "table" then
+					cached = sc.M2GrabAllowRagdollCombo
+						or (type(sc.M2GrabTargetForwardOffset) == "number")
+						or (type(sc.M2GrabLockDuration) == "number")
+						or (type(sc.M2SlamParryWindowDisableDuration) == "number")
+						or false
+				end
+			end
+			GameData.grabCache[ck] = cached and true or false
+		end
+		if cached then return true end
+	end
 	if Config.SkillAddon then
 		if Config.MustDodge and Config.SA_WrestlingGrab and st == "wrestling" and th.kind == "M2" then return true end
 		if Config.MustDodge and Config.SA_DirtyGrab and st == "dirty" and (th.kind == "M2" or th.kind == "SKILL") then return true end
 		if Config.MustDodge and Config.SA_CQCRingDodge and st == "cqc" and th.kind == "M2" then return true end
 	end
 	if not Config.MustDodge then return false end
-	-- Boxing/iframe/multi M2 are parryable. MustDodgeStyles listing them
-	-- (or leftover Grabbing) stripped wantBlock: entered=true want=nil.
-	-- SkillAddon CQC/wrestling/dirty already returned above.
 	if th.kind == "M2" and m2IsParryOnlyStyle(st) then return false end
 	local byStyle = Config.MustDodgeStyles and Config.MustDodgeStyles[st]
 	if byStyle and (byStyle[th.kind] or byStyle.all) then return true end
@@ -4145,12 +4400,8 @@ local isMustDodge = LPH_NO_VIRTUALIZE(function(th)
 		end
 		if cached then return true end
 	end
-	-- V292: Grabbing without grab fields is GrappleChance / leftover.
-	-- MuayThai M2 (GrappleChance 0.55, no M2Grab*) was must-dodged, wantBlock
-	-- stripped, dodge CD empty → NO-PRESS HIT. Unblockable/GuardBreak already
-	-- excluded; Grabbing follows the same rule.
 	return false
-end)
+end
 State.isMustDodge = isMustDodge
 
 State.ap = {
@@ -4233,43 +4484,37 @@ function State.ap.getM1()
 						if v == nil and i > 25 then break end
 					end
 					if not C then return end
-					local getSpeed = uv(C - 12)
-					local u19v     = uv(C - 11)
-					local getAnims = uv(C - 10)
-					local playSw   = uv(C - 8)
-					local u25v     = uv(C - 4)
-					local u26v     = uv(C - 3)
-					local u27v     = uv(C - 2)
-					local u28v     = uv(C - 1)
-					local u21v     = uv(C - 16)
-					local u32v     = uv(C - 15)
-					local u33v     = uv(C - 14)
+					local getSpeed = uv(C - 14)
+					local comboN   = uv(C - 13)
+					local getAnims = uv(C - 12)
+					local playSw   = uv(C - 10)
+					local idA      = uv(C - 4)
+					local idB      = uv(C - 3)
+					local tA       = uv(C - 2)
+					local tB       = uv(C - 1)
 					if type(getSpeed) == "function"
 					   and type(getAnims) == "function"
-					   and type(playSw)  == "function"
-					   and type(u19v) == "number" and u19v >= 0 and u19v <= 4
-					   and type(u25v) == "number" and type(u26v) == "number"
-					   and type(u27v) == "table"  and type(u28v) == "table" then
-						State.ap.comboIdx  = C - 11
+					   and type(playSw) == "function"
+					   and type(comboN) == "number" and comboN >= 0 and comboN <= 4
+					   and type(idA) == "number" and type(idB) == "number"
+					   and type(tA) == "table" and type(tB) == "table" then
+						State.ap.comboIdx  = C - 13
 						State.ap.u25idx    = C - 4
 						State.ap.u26idx    = C - 3
-						State.ap.u27tbl    = u27v
-						State.ap.u28tbl    = u28v
+						State.ap.u27tbl    = tA
+						State.ap.u28tbl    = tB
 						State.ap.crc       = uv(C)
 						State.ap.getSpeed  = getSpeed
 						State.ap.getAnims  = getAnims
 						State.ap.playSwing = playSw
 						State.ap.fireOK    = true
-						if type(u21v) == "boolean" then State.ap.u21idx = C - 16 end
-						if type(u32v) == "number"  then State.ap.u32idx = C - 15 end
-						if type(u33v) == "number"  then State.ap.u33idx = C - 14 end
 					end
 				end)
 			end
 		end
 	if State.ap.m1 then diagPush("AUTOPLAY: M1 module resolved (legit attacks ready)"
 		.. (State.ap.tryM1Fn and " +tryM1" or " (OnM1Activated only)")
-		.. (State.ap.fireOK and " +CUSTOM-FIRE(fast)" or ""))
+		.. (State.ap.fireOK and " +CUSTOM-FIRE(fast)" or " custom-fire NOT armed"))
 	else diagPush("AUTOPLAY: M1 module NOT found — attacks disabled") end
 	return State.ap.m1
 end
@@ -4340,7 +4585,7 @@ function State.ap.fireM1Custom(char, model, wantCombo, ignoreRate, priority, dro
 	pcall(function()
 		local now = os.clock()
 		if ap.m1TxnActive(now) then return end
-		if Config.CounterYieldToM2 ~= false then
+		if Config.CounterYieldToM2 ~= false and not priority then
 			local m2H = Config.CounterM2Horizon or 0.95
 			for i = 1, #Threats do
 				local o = Threats[i]
@@ -4417,6 +4662,7 @@ function State.ap.fireM1Custom(char, model, wantCombo, ignoreRate, priority, dro
 		if not played then
 			if owners and owners.__intent and owners.__intent.char == char then owners.__intent = nil end
 			State.swingAnimUntil = 0
+			diagPush("AUTOPLAY-FAIL t=%.2f playSwing=false combo=%d", now, combo)
 			return
 		end
 		ap.swingAnimAt  = now
@@ -4440,6 +4686,8 @@ function State.ap.fireM1Custom(char, model, wantCombo, ignoreRate, priority, dro
 				txid = ap.m1TxnSeq, swingId = newId, combo = combo, char = char,
 				sentAt = now, untilAt = now + len, suppressed = 0,
 			}
+			local hitD = ap.ownM1Delay and ap.ownM1Delay()
+			tx.hitAt = now + (type(hitD) == "number" and hitD or 0.32)
 			ap.m1Txn = tx
 			local tr = ap.markM1Track(char, v53, tx)
 			if owners and owners.__intent and owners.__intent.char == char then owners.__intent = nil end
@@ -4449,7 +4697,7 @@ function State.ap.fireM1Custom(char, model, wantCombo, ignoreRate, priority, dro
 	return ok
 end
 
-function State.ap.canAttack(ignoreBlocking)
+function State.ap.canAttack(ignoreBlocking, ignoreLockout)
 	local c = localChar()
 	if not c then return false end
 	if not c:GetAttribute("Equip") then return false end
@@ -4458,7 +4706,8 @@ function State.ap.canAttack(ignoreBlocking)
 	   or c:GetAttribute("M2") or c:GetAttribute("PendingM2") then return false end
 	if c:GetAttribute("Greenzone") or c:GetAttribute("RpCombatLocked") then return false end
 	for _, a in ipairs(State.ap.busyAttrs) do
-		if c:GetAttribute(a) then return false end
+		if ignoreLockout and (a == "ParryAttackLockout" or a == "BlockAttackLockout") then
+		elseif c:GetAttribute(a) then return false end
 	end
 	local hum = c:FindFirstChildOfClass("Humanoid")
 	if not hum or hum.Health <= 0 then return false end
@@ -4667,8 +4916,6 @@ function State.ap.interruptible(th)
 	return true
 end
 
--- AutoPlay/Skill не должны перебивать входящий M2: interrupt и punish
--- вешают CombatAttacking/CantAnything, и парри M2 срывается (V269).
 local function incomingHeavyM2(now, horizon)
 	horizon = horizon or 1.2
 	for i = 1, #Threats do
@@ -4683,28 +4930,23 @@ local function incomingHeavyM2(now, horizon)
 	return nil
 end
 
-State.ap.tryInterrupt = LPH_NO_VIRTUALIZE(function(now, th, threatCount)
+State.ap.tryInterrupt = function(now, th, threatCount)
+	LPH_ATTRIBUTES(VM(NONE))
 	local ap = State.ap
-	-- Без AutoPlay не трогаем парри. ownM1Delay/GetStyleConfig каждый кадр
-	-- сдвигали press (Hakari M2).
-	if Config.AutoPlay ~= true or Config.AP_Interrupt == false then return false end
-	-- Lethwei V278: interrupt fired on every M1 (ours 400 vs enemy 462) and
-	-- stole the parry — CombatAttacking then NO-PRESS / EARLY-block. Only
-	-- interrupt when Block is actually refused.
-	do
-		local okB = canBlockNow()
-		if okB then return false end
-	end
+	if Config.AP_Interrupt == false then return false end
 	if (State.lastCounter or 0) > 0 and (now - State.lastCounter) < 0.40 then return false end
 	if State.counterFiredFrame == _C.FrameId then return false end
 	if not th or th.pressed or th.dodged or th.interruptAttempted
 		or th.coveredByInterrupt or th.interruptGaveUp then return false end
 	if th.kind ~= "M1" then return false end
-	-- V306: never M1 into a live counter stance (wingchun/aikido). V305 log:
-	-- interrupt fired while canBlockNow was refused (ragdoll window), the
-	-- target held an aikido stance → AIKIDO-COUNTERED-BY, 2.3s stun, then a
-	-- full ragdoll-cascade of LATE MISSes. The stance deals no damage itself;
-	-- it only exists to punish exactly this attack.
+	if (threatCount or 0) >= 2 then
+		th.interruptGaveUp = true
+		if not th.multiHoldLogged then
+			th.multiHoldLogged = true
+			diagPush("INTERRUPT-SKIP t=%.2f %s multi(%d) no new swing", now, tostring(th.name), threatCount)
+		end
+		return false
+	end
 	if wingChunCounterActive(th.attackerModel) then
 		if not th.stanceSkipLogged then
 			th.stanceSkipLogged = true
@@ -4728,13 +4970,14 @@ State.ap.tryInterrupt = LPH_NO_VIRTUALIZE(function(now, th, threatCount)
 	local enemyLeft = (th.contactAbs or now) - now
 	if enemyLeft < 0.10 then return false end
 	local netLag = getPingRaw() * (Config.AP_InterruptNetK or 0.25)
+	local margin = Config.AP_InterruptMargin or 0.08
 	local reachM1 = ap.reach()
 	local distNow = ap.flatDist(th.attackerModel)
 
 	local m1Hit, m1Combo = nil, nil
 	if distNow <= reachM1 + 0.75 then
 		local d, combo = ap.ownM1Delay()
-		if d and (d + netLag + 0.03) < enemyLeft then
+		if d and (d + netLag + margin) < enemyLeft then
 			m1Hit, m1Combo = d + netLag, combo
 		end
 	end
@@ -4755,7 +4998,7 @@ State.ap.tryInterrupt = LPH_NO_VIRTUALIZE(function(now, th, threatCount)
 				if iframeReady + 0.04 < enemyLeft and ours < enemyLeft then
 					m2Hit, m2Var = ours, variant
 				end
-			elseif ours + 0.03 < enemyLeft then
+			elseif ours + margin < enemyLeft then
 				m2Hit, m2Var = ours, variant
 			end
 		end
@@ -4769,6 +5012,11 @@ State.ap.tryInterrupt = LPH_NO_VIRTUALIZE(function(now, th, threatCount)
 	end
 	if not useM2 and not m1Hit then
 		th.interruptGaveUp = true
+		if Config.DeepDiag and not th.interruptSlowLogged then
+			th.interruptSlowLogged = true
+			diagPush("INTERRUPT-SKIP t=%.2f %s %s enemy=%.0fms ours too slow (need hit+margin before contact)",
+				now, tostring(th.name), tostring(th.style), enemyLeft * 1000)
+		end
 		return false
 	end
 	if useM2 and m2Hit >= enemyLeft then return false end
@@ -4810,7 +5058,6 @@ State.ap.tryInterrupt = LPH_NO_VIRTUALIZE(function(now, th, threatCount)
 		tag = string.format("M1/c%d", m1Combo or 0)
 	end
 	th.interruptAttempted = true
-	-- coveredByInterrupt не ставим: промах trade не должен глушить парри.
 	State.interruptFiredFrame = _C.FrameId
 	State.interruptLockUntil = now + math.max(ownHit or 0.35, 0.28)
 	State.status = useM2 and "INTERRUPT-M2" or "INTERRUPT"
@@ -4819,7 +5066,7 @@ State.ap.tryInterrupt = LPH_NO_VIRTUALIZE(function(now, th, threatCount)
 			m1Hit and string.format("%.0fms", m1Hit * 1000) or "no",
 			m2Hit and string.format("%.0fms", m2Hit * 1000) or "no")
 	return true
-end)
+end
 
 function State.ap.fireM1(model, why, priority, dropGuard)
 		local ap = State.ap
@@ -4891,24 +5138,12 @@ function State.ap.onPerfectParry(attackerName, kind, th)
 		end
 		return
 	end
-	-- V302: never M1 into a player's stun. Their AP is already in
-	-- BUFFER-WAIT; our 335ms windup is a free PERFECT for them, then
-	-- we eat ApplyLocalParriedStun and the next swing is LATE (V301
-	-- 00:52: PUNISH-FIRE → CantAnything → Stunned → STUN-PARRY LATE).
-	if Players:GetPlayerFromCharacter(model) then
-		State.ap.punishTgt = nil
-		State.ap.punishFresh = false
-		diagPush("PUNISH-SKIP t=%.2f hvh-player %s", os.clock(), tostring(attackerName))
-		return
-	end
 	if Config.BoxingCounter and (os.clock() - (State.lastCounter or 0)) < 0.40 then
 		if Config.DeepDiag then
 			diagPush("PUNISH-SKIP t=%.2f counter-iframes", os.clock())
 		end
 		return
 	end
-	-- V306: a target in a counter stance (wingchun/aikido) eats our punish
-	-- M1 and counters it — the stance IS the punish window for attackers.
 	if wingChunCounterActive(model) then
 		State.ap.punishTgt = nil
 		State.ap.punishFresh = false
@@ -4916,10 +5151,9 @@ function State.ap.onPerfectParry(attackerName, kind, th)
 		return
 	end
 	local stun = (kind == "M2") and (Config.AP_M2Stun or 1.0) or (Config.AP_M1Stun or 0.5)
-	-- V300: until=stun (0.5s) expired while Stunned/ParryAttackLockout.
-	-- Stay armed through our stun so we M1 in the gap before their next swing.
 	State.ap.getM1()
 	State.ap.punishTgt   = model
+	State.ap.punishArmAt = os.clock()
 	State.ap.punishUntil = os.clock() + stun + stun
 	State.ap.punishFresh = true
 	if Config.DeepDiag then
@@ -4927,18 +5161,81 @@ function State.ap.onPerfectParry(attackerName, kind, th)
 	end
 end
 
+State.ap.windupSnap = function(now)
+	LPH_ATTRIBUTES(VM(NONE))
+	local tx = State.ap.m1Txn
+	if not tx or now >= (tx.hitAt or 0) then return end
+	if tx.snapLogged and (now - tx.snapLogged) < 0.15 then return end
+	local myH = localHRP()
+	if not myH then return end
+	local reach = State.ap.reach()
+	local a, b = nil, nil
+	for i = 1, #Threats do
+		local o = Threats[i]
+		if o and o.attackerHRP and o.attackerHRP.Parent and not o.resolved and not o.staleTrack then
+			local dt = (o.contactAbs or now) - now
+			if dt > 0.05 and State.ap.flatDist(o.attackerModel) <= reach + 1 then
+				if not a then
+					a = o
+				elseif o.attackerModel ~= a.attackerModel then
+					b = o
+					break
+				end
+			end
+		end
+	end
+	if not (a and b) then return end
+	if (a.contactAbs or 0) <= tx.hitAt + 0.04 and (b.contactAbs or 0) <= tx.hitAt + 0.04 then return end
+	local pa = a.attackerHRP.Position
+	local pb = b.attackerHRP.Position
+	local flat = (Vector3.new(pa.X, 0, pa.Z) - Vector3.new(pb.X, 0, pb.Z)).Magnitude
+	local toA = Vector3.new(pa.X - myH.Position.X, 0, pa.Z - myH.Position.Z)
+	local toB = Vector3.new(pb.X - myH.Position.X, 0, pb.Z - myH.Position.Z)
+	if toA.Magnitude < 0.2 or toB.Magnitude < 0.2 then return end
+	local dot = toA.Unit:Dot(toB.Unit)
+	if flat > 5 and dot < 0.8 then return end
+	setFaceGoalPos((pa + pb) * 0.5, true, math.max(0.08, tx.hitAt - now))
+	tx.snapLogged = now
+	diagPush("AUTOPLAY-SNAP t=%.2f %s+%s flat=%.1f dot=%.2f hitIn=%.0fms",
+		now, tostring(a.name), tostring(b.name), flat, dot, (tx.hitAt - now) * 1000)
+end
+
 function State.ap.step(now)
+	LPH_ATTRIBUTES(VM(NONE))
+	State.ap.windupSnap(now)
 	if Config.AP_PunishOnParry == false then return end
-	if incomingHeavyM2(now, 1.2) then return end
 	local ap = State.ap
-	local tgt = ap.punishTgt
-	if not tgt then return end
-	if Players:GetPlayerFromCharacter(tgt) then
-		ap.punishTgt = nil
-		ap.punishFresh = false
-		diagPush("PUNISH-SKIP t=%.2f hvh-player-step", now)
+	if incomingHeavyM2(now, 1.2) then
+		if Config.DeepDiag and (now - (ap.punishWaitLog or 0)) > 0.20 then
+			ap.punishWaitLog = now
+			diagPush("PUNISH-SKIP t=%.2f incoming-M2", now)
+		end
 		return
 	end
+	local liveN = 0
+	for i = 1, #Threats do
+		local o = Threats[i]
+		if o and o.attackerModel and not o.resolved and not o.staleTrack then
+			local dt = (o.contactAbs or now) - now
+			if dt > -0.05 and dt < 1.2 then
+				local seen = false
+				for j = 1, i - 1 do
+					local p = Threats[j]
+					if p and p.attackerModel == o.attackerModel then seen = true break end
+				end
+				if not seen then liveN = liveN + 1 end
+			end
+		end
+	end
+	if liveN >= 2 then
+		if Config.DeepDiag and (now - (ap.multiHoldLog or 0)) > 0.40 then
+			ap.multiHoldLog = now
+			diagPush("AUTOPLAY-HOLD t=%.2f attackers=%d no new swing", now, liveN)
+		end
+		return
+	end
+	local tgt = ap.punishTgt
+	if not tgt then return end
 	local hum = tgt:FindFirstChildOfClass("Humanoid")
 	if (not hum) or hum.Health <= 0 then
 		ap.punishTgt = nil
@@ -4953,24 +5250,29 @@ function State.ap.step(now)
 		ap.punishFresh = false
 		return
 	end
-	if not ap.canAttack(true) then
+	local lockClock = (ap.punishArmAt or 0) + 0.16
+	if now < lockClock then
 		if Config.DeepDiag and (now - (ap.punishWaitLog or 0)) > 0.20 then
 			ap.punishWaitLog = now
-			local c = localChar()
-			local why = "no-char"
-			if c then
-				if not c:GetAttribute("Equip") then why = "no-equip"
-				elseif c:GetAttribute("Stunned") then why = "Stunned"
-				elseif c:GetAttribute("CantAnything") then why = "CantAnything"
-				elseif c:GetAttribute("ParryAttackLockout") then why = "ParryAttackLockout"
-				elseif c:GetAttribute("BlockAttackLockout") then why = "BlockAttackLockout"
-				elseif c:GetAttribute("M1Cooldown") then why = "M1Cooldown"
-				elseif c:GetAttribute("CombatAttacking") then why = "CombatAttacking"
-				elseif c:GetAttribute("Ragdoll") then why = "Ragdoll"
-				else why = "busy"
-				end
-			end
-			diagPush("PUNISH-WAIT t=%.2f %s", now, why)
+			diagPush("PUNISH-WAIT t=%.2f lockout-clock", now)
+		end
+		return
+	end
+	local me = localChar()
+	if not me then return end
+	local blocked = nil
+	if not me:GetAttribute("Equip") then blocked = "no-equip"
+	elseif me:GetAttribute("Stunned") == true then blocked = "Stunned"
+	elseif me:GetAttribute("Ragdoll") == true then blocked = "Ragdoll"
+	elseif me:GetAttribute("Downed") == true then blocked = "Downed"
+	elseif me:GetAttribute("Grappling") == true then blocked = "Grappling"
+	elseif me:GetAttribute("CantAnything") == true and me:GetAttribute("CombatRecovery") ~= true then
+		blocked = "CantAnything"
+	end
+	if blocked then
+		if Config.DeepDiag and (now - (ap.punishWaitLog or 0)) > 0.20 then
+			ap.punishWaitLog = now
+			diagPush("PUNISH-WAIT t=%.2f %s", now, blocked)
 		end
 		return
 	end
@@ -4978,6 +5280,10 @@ function State.ap.step(now)
 		local meStyle = styleKey(styleOf(localChar()) or "")
 		if not (Config.SkillAddon and Config.SA_WrestlingPunishM2 and meStyle == "wrestling"
 			and ap.flatDist(tgt) <= math.max(Config.AP_M2BaseReach or 6.5, 8)) then
+			if Config.DeepDiag and (now - (ap.punishWaitLog or 0)) > 0.20 then
+				ap.punishWaitLog = now
+				diagPush("PUNISH-SKIP t=%.2f range", now)
+			end
 			return
 		end
 	end
@@ -4988,24 +5294,44 @@ function State.ap.step(now)
 	end
 	local meStyle = styleKey(styleOf(localChar()) or "")
 	if Config.SkillAddon and Config.SA_WrestlingPunishM2 and meStyle == "wrestling" then
-		if ap.fireM2(tgt, "punish-grab") then ap.punishFresh = false end
+		if ap.fireM2(tgt, "punish-grab") then
+			ap.punishTgt = nil
+			ap.punishFresh = false
+		end
 		return
 	end
-	-- dropGuard: ignore Blocking leftover from the parry tap
-	if ap.fireM1(tgt, "punish", ap.punishFresh, true) then
+	if now - (ap.punishTryAt or 0) < 0.08 then return end
+	ap.punishTryAt = now
+	me:SetAttribute("ParryAttackLockout", nil)
+	me:SetAttribute("BlockAttackLockout", nil)
+	me:SetAttribute("Blocking", nil)
+	local hrp = tgt:FindFirstChild("HumanoidRootPart")
+	if hrp then ap.snapTo(hrp) end
+	ap.getM1()
+	local swung = false
+	if ap.fireOK then
+		swung = ap.fireM1Custom(me, tgt, nil, true, true, true) == true
+	end
+	if swung then
+		ap.punishTgt = nil
 		ap.punishFresh = false
 		if Config.DeepDiag then
-			diagPush("PUNISH-FIRE t=%.2f", now)
+			diagPush("PUNISH-FIRE t=%.2f custom", now)
 		end
+	elseif Config.DeepDiag and (now - (ap.punishWaitLog or 0)) > 0.20 then
+		ap.punishWaitLog = now
+		diagPush("PUNISH-FAIL t=%.2f custom fireOK=%s", now, tostring(ap.fireOK))
 	end
 end
 
 local function evasiveGranted()
+	LPH_ATTRIBUTES(VM(NONE))
 	local c = localChar()
 	return c and c:GetAttribute("OutnumberedEvasiveGrant") == true or false
 end
 
 local function dodgeReady()
+	LPH_ATTRIBUTES(VM(NONE))
 	local c = localChar()
 	if (os.clock() - State.lastDodge) < Config.DodgeMinSpacing then return false end
 	if c then
@@ -5025,11 +5351,13 @@ local function dodgeReady()
 			return false
 		end
 		if since < grantFloor then
-			if not State.dodgeGateSaid then
-				State.dodgeGateSaid = true
-				diagPush("DODGE-GATE  грант активен → серверный Evasive.Cooldown %.2fс, прошло %.2fс", grantFloor, since)
+			if not (Config.UseServerCooldown and c) then
+				if not State.dodgeGateSaid then
+					State.dodgeGateSaid = true
+					diagPush("DODGE-GATE  грант активен → серверный Evasive.Cooldown %.2fс, прошло %.2fс", grantFloor, since)
+				end
+				return false
 			end
-			return false
 		end
 		State.dodgeGateSaid = nil
 		return true
@@ -5042,23 +5370,22 @@ local function dodgeReady()
 end
 
 local function canDodgeNow(force)
+	LPH_ATTRIBUTES(VM(NONE))
 	local c = localChar()
 	if not c then return false, "no-char" end
-	if not c:GetAttribute("Equip") then return false, "Unequipped" end
+	local gameStripped = c:GetAttribute("Stunned") or c:GetAttribute("Ragdoll")
+		or c:GetAttribute("CantAnything") or c:GetAttribute("Downed")
+	if Config.RequireEquip ~= false and not c:GetAttribute("Equip") and not gameStripped then
+		return false, "Unequip"
+	end
 	for _, attr in ipairs(Config.DodgeHardStates) do
 		if c:GetAttribute(attr) then return false, attr end
 	end
-	-- Evasive-грант на клиенте не отменяет серверный отказ: в Stunned/CantAnything
-	-- Evasive.Server отклоняет запрос, IFRAMES не выставляются, а угроза уже
-	-- помечена как «накрытая доджем» и парри не жмётся. Диагностика V185:
-	-- 12 доджей из 12 в стане — все DODGE-REJECT, все закончились HIT.
-	-- Рабочий путь в стане — combo-escape Activated (BUFFER-PARRY / STUN-PARRY).
 	if Config.NoDodgeWhileStunned
-	   and (c:GetAttribute("Stunned") or c:GetAttribute("CantAnything")) then
+	   and (c:GetAttribute("Stunned") or c:GetAttribute("CantAnything"))
+	   and not (c:GetAttribute("GrabSlamDefend") == true and not c:GetAttribute("CantAnything")) then
 		return false, "Stunned"
 	end
-	-- Два подряд неподтверждённых гранта означают, что Evasive недоступен по
-	-- серверному кулдауну. Дальнейшие попытки только съедают защиту.
 	if not force and (State.dodgeRejects or 0) >= 2
 	   and os.clock() < (State.dodgeMuteUntil or 0) then
 		return false, "reject-mute"
@@ -5073,16 +5400,113 @@ local function canDodgeNow(force)
 	return true, nil
 end
 
-local releaseBlock = LPH_NO_VIRTUALIZE(function()
+_C.widenCluster = function(cluster, now)
+	LPH_ATTRIBUTES(VM(NONE))
+	local n = #cluster
+	for i = 1, #Threats do
+		local th = Threats[i]
+		if th and not th.resolved and not th.staleTrack and not th.pressed and not th.dodged and th.contactAbs then
+			local dt = th.contactAbs - now
+			if dt > 0.05 and dt <= 0.90 then
+				local seen = false
+				for j = 1, n do
+					if cluster[j] == th then seen = true break end
+				end
+				if not seen then
+					n = n + 1
+					cluster[n] = th
+					if th.kind == "M2" then cluster.heavy = true end
+				end
+			end
+		end
+	end
+	if n > 1 then table.sort(cluster, V93.sortByContact) end
+end
+
+_C.planDual = function(cluster, now, ifLat, ifDur)
+	LPH_ATTRIBUTES(VM(NONE))
+	V93.dualStrat = nil
+	V93.dualSuppress = false
+	V93.dualParry = nil
+	V93.dualFire = false
+	local n = #cluster
+	if n < 2 then return end
+	local distinct = 0
+	for i = 1, n do
+		local m = cluster[i].attackerModel
+		local seen = false
+		for j = 1, i - 1 do
+			if cluster[j].attackerModel == m then seen = true break end
+		end
+		if not seen then distinct = distinct + 1 end
+	end
+	if distinct < 2 then return end
+	local first = cluster[1]
+	local last = cluster[n]
+	local spread = last.contactAbs - first.contactAbs
+	local iframe = math.max(ifDur or 0.30, 0.05)
+	local canCover = spread <= (iframe - 0.04)
+	local dodgeOk = Config.AutoDodge ~= false and dodgeReady() and canDodgeNow() and not counterPreemptsDodge(now)
+	if canCover and dodgeOk then
+		local fireLo = last.contactAbs - ifLat - iframe
+		local fireHi = first.contactAbs - ifLat
+		if now <= fireHi then
+			V93.dualStrat = "IFRAME_CLUSTER"
+			V93.dualSuppress = true
+			if now >= fireLo then V93.dualFire = true end
+			for i = 1, n do
+				cluster[i].plannedParry = nil
+				if V93.dualFire then
+					cluster[i].plannedDodge = true
+					cluster[i].planStamp = now
+				end
+			end
+			if Config.TraceDiag then
+				diagPush("PLAN t=%.2f IFRAME_CLUSTER (%d угроз): додж на оба, spread=%.0fms fire=[%+.0f,%+.0f]ms",
+					now, n, spread * 1000, (fireLo - now) * 1000, (fireHi - now) * 1000)
+			end
+			return
+		end
+	end
+	local earliest = nil
+	for i = 1, n do
+		local th = cluster[i]
+		if th and not isMustDodge(th) and not th.pressed and not th.dodged then
+			earliest = th
+			break
+		end
+	end
+	V93.dualStrat = "PARRY"
+	V93.dualParry = earliest
+	V93.dualSuppress = false
+	for i = 1, n do
+		local th = cluster[i]
+		th.plannedDodge = nil
+		th.plannedParry = (th == earliest) or nil
+	end
+	if Config.TraceDiag then
+		diagPush("PLAN t=%.2f PARRY-EARLIEST (%d угроз): парри %s %s(+%.0fms), второй не в одном окне spread=%.0fms dodge=%s",
+			now, n,
+			earliest and tostring(earliest.name) or "?",
+			earliest and tostring(earliest.kind) or "?",
+			earliest and (earliest.contactAbs - now) * 1000 or 0,
+			spread * 1000,
+			(canCover and not dodgeOk) and "not-ready" or "narrow")
+	end
+end
+
+local releaseBlock = function()
+	LPH_ATTRIBUTES(VM(NONE))
 	if not State.blocking then return end
 	State.blocking  = false
 	State.holdUntil = 0
 	State.lastBlockRelease = os.clock()
 	sendDeactivate(true)
-end)
+end
 State.releaseBlock = releaseBlock
 
-local fireBlock = LPH_NO_VIRTUALIZE(function(tsServer, allowComboEscape)
+local fireBlock = function(tsServer, allowComboEscape)
+	LPH_ATTRIBUTES(VM(NONE))
 	if not Config.Enabled then return nil end
 	local me = localChar()
 	local stunTap = me and stunEscapeNow(me) or false
@@ -5091,9 +5515,6 @@ local fireBlock = LPH_NO_VIRTUALIZE(function(tsServer, allowComboEscape)
 	end
 	local ok, reason = canBlockNow()
 	if not ok then
-		-- V298 waited until Stunned dropped, then pressed at rem=37-67 LATE.
-		-- We FireServer Block.Activated ourselves — dump Block() early-return
-		-- does not apply. Tap in the perfect window even without ParryBuffered.
 		local hard = false
 		if me then
 			if me:GetAttribute("GuardBroken") or me:GetAttribute("Ragdoll")
@@ -5108,9 +5529,6 @@ local fireBlock = LPH_NO_VIRTUALIZE(function(tsServer, allowComboEscape)
 		end
 	end
 	State.blockedReason = nil
-	-- Combo-escape tap (без Blocking/анимации) — живой Stunned.
-	-- CombatRecovery после своего M1/сбива/контры даёт stunEscapeNow=true,
-	-- но M2 в этот момент нужен обычный гард.
 	if not stunTap then
 		State.stunQueued = false
 	end
@@ -5133,6 +5551,10 @@ local fireBlock = LPH_NO_VIRTUALIZE(function(tsServer, allowComboEscape)
 			return nil
 		end
 	end
+	if stunTap and not liveBuf and not allowComboEscape then
+		State.blockedReason = "BUFFER-WAIT"
+		return nil
+	end
 	if not sendActivate(ts, stunTap) then return nil end
 	if stunTap and not allowComboEscape then
 		State.lastStunArm = nowS
@@ -5148,17 +5570,30 @@ local fireBlock = LPH_NO_VIRTUALIZE(function(tsServer, allowComboEscape)
 			nowS, tostring(liveBuf))
 	end
 	State.stunQueued = false
-	State.blocking   = true
+	if not stunTap then
+		State.blocking = true
+	end
 	State.lastPress  = os.clock()
 	State.fireCount  = (State.fireCount or 0) + 1
 	State.status     = "PARRY"
 	State.flashUntil = os.clock() + 0.14
 	return ts
-end)
+end
 
-local refreshContact = LPH_NO_VIRTUALIZE(function(th)
+local refreshContact = function(th)
+	LPH_ATTRIBUTES(VM(NONE))
 	local now = os.clock()
 	if th.kind == "M2" and not th.variantLocked and th.attackerModel then
+		local clipVar = (_D.ALI_M2_BY_ID and th.id and _D.ALI_M2_BY_ID[th.id])
+			or GameData.m2VariantId(th.style, th.animName)
+		if clipVar then
+			th.variantLocked = true
+			local av = th.attackerModel:GetAttribute("M2VariantId")
+			if type(av) == "string" and av ~= "" and av ~= clipVar and not th.variantClipLogged then
+				th.variantClipLogged = true
+				diagPush("VARIANT-CLIP t=%.2f %s anim=%s clip=%s attr=%s (attr ignored)", now, tostring(th.name), tostring(th.animName), clipVar, av)
+			end
+		else
 		local av = th.attackerModel:GetAttribute("M2VariantId")
 		if type(av) == "string" and av ~= "" then
 			th.variantLocked = true
@@ -5186,10 +5621,9 @@ local refreshContact = LPH_NO_VIRTUALIZE(function(th)
 			end
 		end
 	end
-	-- Dragon sprint M2: standing delay 0.655, sprint 0.29. Attribute may
-	-- land a frame late — retarget in the first 120ms.
-	if th.kind == "M2" and not th.sprintLocked and (now - (th.detectClock or now)) < 0.12
-		and th.attackerModel and _C.attackerSprinting(th.attackerModel, th.attackerHRP) then
+end
+if th.kind == "M2" and not th.sprintLocked and (now - (th.detectClock or now)) < 0.12
+	and th.attackerModel and _C.attackerSprinting(th.attackerModel, th.attackerHRP) then
 		local sd = _C.sprintM2Delay(th.style)
 		if type(sd) == "number" then
 			th.sprintLocked = true
@@ -5276,8 +5710,6 @@ local refreshContact = LPH_NO_VIRTUALIZE(function(th)
 				local nominal = math.max(th.initSpeed or 1, 0.05)
 				local floor   = nominal * (Config.LiveM1SpeedFloor or 0.45)
 				local sp      = math.max(th.liveSpeed or nominal, floor)
-				-- Маркер в времени анимации. Остаток = (маркер − tp) / темп.
-				-- min(стена, live) на Lethwei давал EARLY: стена 501, meas 627.
 				local trustRateM1 = (Config.LiveRateTrust ~= false)
 					and (th.liveSamples or 0) >= (Config.LiveRateMinSamples or 3)
 					and sp <= nominal * 1.02
@@ -5291,21 +5723,16 @@ local refreshContact = LPH_NO_VIRTUALIZE(function(th)
 					liveRemain = hbReal - tp / math.max(sp, 0.05)
 				end
 				local wallRemain = math.max(0, (th.contact0 or 0) - (now - th.detectClock))
-				-- V292: trustRateM1 skipped this cap. Frozen tp keeps
-				-- liveRemain=(hb-tp)/sp ≈ 27ms forever, contactAbs slides,
-				-- releaseByGap never fires (meas=814 vs pred=294).
-				local stalled = (now - (th.lastAdvanceClock or th.detectClock)) > 0.08
-				if Config.LiveM1WallCap ~= false and liveRemain > wallRemain
-					and not th.replicaAge then
+				if th.replicaAge then
+					if liveRemain > wallRemain then liveRemain = wallRemain end
+				elseif Config.LiveM1WallCap ~= false and liveRemain > wallRemain then
+					local stalled = (now - (th.lastAdvanceClock or th.detectClock)) > 0.08
 					local dLive = liveRemain - wallRemain
 					local slack = Config.M1WallCapSlack or 0.040
 					if stalled or ((not trustRateM1) and not th.residPad and dLive < slack) then
 						liveRemain = wallRemain
 					end
 					end
-					-- V293: crawling replica still ticks tp so stall=false.
-					-- wall already passed + liveRemain still in the future
-					-- (meas=812-881 vs pred=328) — do not slide contactAbs.
 					local pwinW = (Config.PerfectWindowLive ~= false and GameData.perfectWindow)
 						or Config.PerfectWindow or 0.125
 					if wallRemain <= 0 and liveRemain > pwinW then
@@ -5344,7 +5771,6 @@ local refreshContact = LPH_NO_VIRTUALIZE(function(th)
 				elseif liveClamped > remaining then
 					remaining = liveClamped
 				elseif not stalledM2 and liveClamped < remaining then
-					-- V300 M2 meas=428 pred=511: wall-only refused to pull earlier.
 					remaining = liveClamped
 				end
 				th.heldBy = held and
@@ -5367,9 +5793,6 @@ local refreshContact = LPH_NO_VIRTUALIZE(function(th)
 	th.trackPlaying = playing
 	remaining = math.max(remaining, 0)
 	th.contactAbs = now + remaining
-	-- Для удержания блока берём БОЛЕЕ ПОЗДНИЙ контакт: wall-cap нужен
-	-- нажатию (иначе LATE), но отпускать гард по стене при живой анимации
-	-- ещё до маркера = HIT (V204: meas=708 vs pred=331, pressDt=173ms).
 	local holdRem = remaining
 	if playing and th.track then
 		local skipLiveHold = Config.HitboxCommitPress ~= false and th.kind == "M2"
@@ -5379,9 +5802,6 @@ local refreshContact = LPH_NO_VIRTUALIZE(function(th)
 		local hbH = th.hitTLReal or th.hitTL
 		if type(tpH) == "number" and type(hbH) == "number" and tpH < hbH - 0.001 then
 			local liveH = (hbH - tpH) / math.max(tpSpeed(th.track), 0.05)
-			-- V204: extend hold while anim ADVANCES toward the marker.
-			-- V292: frozen tp is not a slow marker — extending hold here
-			-- kept guard 500ms past wall (EARLY BLOCK-NOT-PARRY).
 			local stallHold = (now - (th.lastAdvanceClock or th.detectClock)) > 0.08
 			local wallGone = ((th.contact0 or 0) - (now - (th.detectClock or now))) <= 0
 			local crawl = th.liveSpeed and th.initSpeed and th.liveSpeed < th.initSpeed * 0.5
@@ -5393,9 +5813,10 @@ local refreshContact = LPH_NO_VIRTUALIZE(function(th)
 	if holdRem > holdCap then holdRem = holdCap end
 	th.holdRemain = holdRem
 	return remaining
-end)
+end
 
 local function insideAutoFOV(attackerHRP)
+	LPH_ATTRIBUTES(VM(NONE))
 	local fov = math.clamp(tonumber(Config.FOV) or 360, 1, 360)
 	if fov >= 359.5 then return true end
 	local cam = Workspace.CurrentCamera
@@ -5409,16 +5830,14 @@ local function insideAutoFOV(attackerHRP)
 	return angle <= fov * 0.5
 end
 
-local serverAttackProof = LPH_NO_VIRTUALIZE(function(model)
+local serverAttackProof = function(model)
+	LPH_ATTRIBUTES(VM(NONE))
 	if not model then return false end
-	-- Truthy, not `== true`: Luraph's VM sometimes boxes attribute booleans so
-	-- a set M1/M2 fails a strict equality and the press waits for CombatAttacking
-	-- (~200ms), which is already inside the LATE side of the perfect window.
 	if model:GetAttribute("M1") then return true end
 	if model:GetAttribute("M2") then return true end
 	if model:GetAttribute("CombatAttacking") then return true end
 	return false
-end)
+end
 
 local function reachLimit(kind, approaching)
 	local sz = V93.sizes and V93.sizes[kind]
@@ -5437,17 +5856,14 @@ local function serverHitboxProof(ownerName)
 	local folder = Workspace:FindFirstChild("Hitboxes")
 	if not folder then return false end
 	for _, part in ipairs(folder:GetChildren()) do
-		local o = part:FindFirstChild("Owner")
-		if o and o.Value == ownerName then
-			local a = part:FindFirstChild("AttackName")
-			local an = a and a.Value
-			if an == "M1" or an == "M2" then return true end
-		end
+		local o, an = _C.hbMeta(part)
+		if o == ownerName and (an == "M1" or an == "M2") then return true end
 	end
 	return false
 end
 
 local onAttack = function(attackerHRP, info, model, id, track, origin, hbPart)
+	LPH_ATTRIBUTES(VM(NONE))
 	local myHRP = localHRP()
 	if not myHRP then return end
 	if not insideAutoFOV(attackerHRP) then return end
@@ -5516,9 +5932,6 @@ local onAttack = function(attackerHRP, info, model, id, track, origin, hbPart)
 	if origin == "hitbox" then
 		local sidNew = hbPart and hbPart:GetAttribute("VictimSwingId")
 		local prevT = swingRec[info.t]
-		-- Сначала склеиваем с живым свингом. Kyokushin M2 ~828ms: окно
-		-- lookback 0.55с не покрывало появление хитбокса, плодился второй
-		-- SWING-HB contact=20ms → срыв гарда и BlockCooldown.
 		for i = 1, #Threats do
 			local old = Threats[i]
 			if old and old.name == name and old.kind == info.t
@@ -5585,6 +5998,7 @@ local onAttack = function(attackerHRP, info, model, id, track, origin, hbPart)
 	end
 	local hitTL
 	local remaining0
+	local fromTable = false
 	if origin == "hitbox" then
 		hitTL = hitTimeline(info, combo, aMult)
 		hitTL = _C.applyGrabSwingSpeed(info, track, hitTL)
@@ -5612,10 +6026,8 @@ local onAttack = function(attackerHRP, info, model, id, track, origin, hbPart)
 	else
 		markAttackStreak(name, info.t, info.s, info)
 		if info.contacts and info.contacts[1] then
-			-- Маркеры Hit — это TimePosition. На чужом клиенте Speed читается ~1,
-			-- даже если у атакующего height-mult. Деление на aMult в логе V178
-			-- дало contact=547ms при фактическом TP удара 0.725.
 			hitTL = info.contacts[1]
+			fromTable = true
 		else
 			hitTL = hitTimeline(info, combo, aMult)
 		end
@@ -5626,8 +6038,22 @@ local onAttack = function(attackerHRP, info, model, id, track, origin, hbPart)
 	if origin ~= "hitbox" then
 		remaining0 = math.max(0, hitTLReal - already / tpSpeed(track))
 	end
-	-- Ali c3 вблизи: хитбокс на ~75% таблицы (V189: dist=4 meas=338 vs pred=451 LATE;
-	-- dist=5 тот же id — PERFECT в 451). Режем только ближний контакт.
+	-- A29: таблица CombatConfig + выученный по серверным хитбоксам остаток (стиль/тип/комбо).
+	-- Запоминаем старт анимации, чтобы хитбокс этого свинга дал сэмпл (см. _C.hbLearn).
+	if origin ~= "hitbox" and not fromTable and (info.t == "M1" or info.t == "M2") then
+		local ckL = styleKey(info.s)
+		local animStart = os.clock() - already / tpSpeed(track)
+		V93.learn.last[name] = { clock = animStart, base = hitTLReal, mult = aMult, ck = ckL,
+			combo = combo, kind = info.t, hrp = model and model:FindFirstChild("HumanoidRootPart"), used = false }
+		local cal = _C.calTiming(ckL, info.t, combo, aMult)
+		if cal ~= 0 then
+			hitTL, hitTLReal = hitTL + cal, hitTLReal + cal
+			remaining0 = math.max(0, remaining0 + cal)
+			if Config.DeepDiag then
+				diagPush("LEARN-APPLY %s %s(%s c%d) table %+.0fms (выучено по хитбоксам)", name, info.t, tostring(ckL), combo or 0, cal * 1000)
+			end
+		end
+	end
 	if origin ~= "hitbox" and info.t == "M1" and combo == 3 and dist <= (Config.CloseM1EarlyStuds or 4.5) then
 		local sk = styleKey(info.s)
 		if sk == "ali" then
@@ -5638,13 +6064,6 @@ local onAttack = function(attackerHRP, info, model, id, track, origin, hbPart)
 			end
 		end
 	end
-	-- Poll origin: the attacker's animation REPLICA is late (we found the
-	-- track at tp=0.067, not 0). For a grab-style M2 (PerfectCopy/Wrestling
-	-- forked swing + PairCinematic), the server-side grab runs on its own
-	-- hitbox delay from the REAL swing start - subtracting the poll tp
-	-- shortens the contact. V307 log: poll tp=0.067, contact=267ms, real
-	-- server hit landed at +1153ms (Grappling lock). Floor the poll
-	-- contact at the full hitTL for grab M2s.
 	if origin == "poll" and info.t == "M2" and _C.isGrabStyle
 		and _C.isGrabStyle(styleKey(tostring(info.s or ""))) then
 		if hitTLReal and remaining0 < hitTLReal then
@@ -5735,52 +6154,30 @@ local onAttack = function(attackerHRP, info, model, id, track, origin, hbPart)
 		end
 	end
 	if th.serverProven then th.serverProofClock = nowClock end
-	if already < 0.04 and remaining0 > 0.12 then
-		local replicaAge = 0
-		local throttledDet = false
-		local par = track and track.Parent
-		if par and par.EvaluationThrottled == true then throttledDet = true end
-		local upD = uplinkDetect or 0.08
-		if throttledDet then
-			replicaAge = math.min(upD, remaining0 * 0.5)
-		end
-		-- V207 combo-age при throttled=false у Kikila: pred 263, meas 347–375.
-		-- Не укорачивать незатроттленный combo.
-		if replicaAge > 0.025 then
-			remaining0 = math.max(0.06, remaining0 - replicaAge)
+	if origin ~= "hitbox" and already < 0.04 and not fromTable then
+		local oneWay = timingOneWay()
+		if oneWay > 0.025 and remaining0 > 0.10 then
+			remaining0 = math.max(0.06, remaining0 - oneWay)
 			th.contact0 = remaining0
 			th.contactAbs = nowClock + remaining0
-			th.replicaAge = replicaAge
+			th.replicaAge = oneWay
 			if Config.DeepDiag then
-				diagPush("REPLICA-AGE t=%.2f %s %s c%d tp=%.3f throttled=%s −%.0fms → contact %.0fms",
-					nowClock, name, tostring(info.t), combo, already, tostring(throttledDet),
-					replicaAge * 1000, remaining0 * 1000)
+				diagPush("REPLICA-AGE t=%.2f %s %s −%.0fms → contact %.0fms",
+					nowClock, name, tostring(info.t), oneWay * 1000, remaining0 * 1000)
 			end
-		end
-	end
-	do
-		local ksTab = _D.ResidByKS
-		local ksKey = tostring(info.t) .. ":" .. tostring(info.s or "?") .. ":1"
-		local ks = ksTab and ksTab[ksKey]
-		if ks and (ks.n or 0) >= 3 then
-			local avg = ks.sum / ks.n
-			-- V305: threshold 22 never triggered on a +21..+29ms systematic
-			-- residual (V304 log: resAvg 21-30 across 26 PERFECTs, half the
-			-- presses EARLY/BLOCK-NOT-PARRY). Trigger from 15ms.
-			if avg > 15 then
-				local pad = math.min(avg / 1000, 0.040)
-				remaining0 = remaining0 + pad
-				th.contact0 = remaining0
-				th.contactAbs = nowClock + remaining0
-				th.residPad = pad
-				if Config.DeepDiag and not th.residLogged then
-					th.residLogged = true
-					diagPush("RESID-PAD t=%.2f %s %s +%.0fms (n=%d avg=%+.0f) → contact %.0fms",
-						nowClock, name, tostring(info.t), pad * 1000, ks.n, avg, remaining0 * 1000)
-				end
 			end
-		end
-	end
+			end
+			do
+			local upLate = th.uplinkDetect or 0
+			local floorLate = (Config.PerfectMin or 0.05) + upLate
+			if (th.contact0 or 0) > 0 and th.contact0 < floorLate then
+			th.bornLate = true
+			if Config.DeepDiag then
+				diagPush("LATE-SEE t=%.2f %s %s contact=%.0fms uplink=%.0fms need=%.0fms → жать уже некуда, пакет не успеет в окно",
+					nowClock, name, tostring(info.t), th.contact0 * 1000, upLate * 1000, floorLate * 1000)
+			end
+			end
+			end
 	if track then
 		for i = #Threats, 1, -1 do
 			local old = Threats[i]
@@ -5821,7 +6218,8 @@ local onAttack = function(attackerHRP, info, model, id, track, origin, hbPart)
 
 	local rec = { clock = nowClock, detectServer = nowServer, type = info.t, style = info.s,
 	              id = id, contact = remaining0, pingRaw = pingRawDetect, combo = combo,
-	              speed = speed, matched = false, th = th, strike = 1 }
+	              speed = speed, matched = false, th = th, strike = 1,
+	              hitTL = th.hitTL, bornLate = th.bornLate }
 	th.rec = rec
 	local q = Pending[name]; if not q then q = {}; Pending[name] = q end
 	q[#q+1] = rec
@@ -5901,15 +6299,10 @@ end
 local function ingestHitboxPart(part)
 	if not Config.Enabled or Config.HitboxOriginDetect == false then return end
 	if not (part and part.Parent and part:IsA("BasePart")) then return end
-	local ownerVal = part:FindFirstChild("Owner")
-	local atkVal = part:FindFirstChild("AttackName")
-	if not (ownerVal and atkVal and ownerVal:IsA("StringValue") and atkVal:IsA("StringValue")) then
-		return
-	end
-	local kind = atkVal.Value
+	local ownerName, kind = _C.hbMeta(part)
+	if not (ownerName and kind) then return end
 	if kind ~= "M1" and kind ~= "M2" then return end
 	if kind == "M2" and not Config.HeavyEnabled then return end
-	local ownerName = ownerVal.Value
 	if type(ownerName) ~= "string" or ownerName == "" then return end
 	local plr = Players:FindFirstChild(ownerName)
 	local model = (plr and plr:IsA("Player") and plr.Character) or nil
@@ -5937,6 +6330,279 @@ local function ingestHitboxPart(part)
 	onAttack(hrp, info, model, nil, nil, "hitbox", part)
 end
 State.ingestHitbox = ingestHitboxPart
+
+-- ===================== A29: рантайм-обучение по серверным хитбоксам =====================
+-- Хитбокс создаёт сервер в момент удара (Ts) и реплицирует всем. Анимация атакующего и хитбокс
+-- идут к нам одним путём (через сервер), поэтому  (хитбокс увиден) − (анимация увидена)  =
+-- реальная серверная задержка удара, БЕЗ пинга. Учим по каждому стилю/комбо остаток к таблице
+-- CombatConfig и геометрию хитбокса (размер + оффсет в кадре атакующего). Сохраняется в файл,
+-- сбрасывается при смене game.PlaceVersion → баланс-патчи подхватываются сами.
+V93.learn   = { geo = {}, tim = {}, last = {}, dirty = false }
+V93.hbEvt   = setmetatable({}, { __mode = "k" })
+V93.hbConn  = setmetatable({}, { __mode = "k" })
+V93.hbBySid = {}
+V93.pb      = { rise = nil, fall = nil, lat = nil, latN = 0, adj = 0, n = 0, winObs = nil }
+_C.learnFile = "gakuran_ap_learn.json"
+
+_C.learnKey = function(ck, kind, combo)
+	return tostring(ck) .. "|" .. tostring(kind) .. "|" .. tostring(kind == "M1" and (combo or 1) or 0)
+end
+
+_C.calTiming = function(ck, kind, combo, mult)
+	LPH_ATTRIBUTES(VM(NONE))
+	if Config.LearnTiming == false then return 0 end
+	local r = V93.learn.tim[_C.learnKey(ck, kind, combo)]
+	if not r or (r.n or 0) < (Config.LearnMinSamples or 3) then return 0 end
+	local cap = Config.LearnMaxShift or 0.12
+	local v = math.clamp(r.e or 0, -cap, cap)
+	local m = (type(mult) == "number" and mult > 0.05) and mult or 1
+	return v / m
+end
+
+_C.learnGeo = function(ck, kind)
+	LPH_ATTRIBUTES(VM(NONE))
+	local g = V93.learn.geo[tostring(ck) .. "|" .. tostring(kind)]
+	if g and (g.n or 0) >= (Config.LearnGeoMinSamples or 2) then return g end
+	g = V93.learn.geo["*|" .. tostring(kind)]
+	if g and (g.n or 0) >= (Config.LearnGeoMinSamples or 2) then return g end
+	return nil
+end
+
+_C.geoUpdate = function(gk, sz, off)
+	local L = V93.learn
+	local g = L.geo[gk]
+	if not g then
+		g = { sx = sz.X, sy = sz.Y, sz = sz.Z, ox = off.X, oy = off.Y, oz = off.Z, n = 0 }
+		L.geo[gk] = g
+	end
+	local b = (g.n < 4) and (1 / (g.n + 1)) or 0.2
+	g.sx = g.sx + (sz.X - g.sx) * b
+	g.sy = g.sy + (sz.Y - g.sy) * b
+	g.sz = g.sz + (sz.Z - g.sz) * b
+	g.ox = g.ox + (off.X - g.ox) * b
+	g.oy = g.oy + (off.Y - g.oy) * b
+	g.oz = g.oz + (off.Z - g.oz) * b
+	g.n = g.n + 1
+	return g
+end
+
+_C.hbLearn = function(part, tSeen)
+	LPH_ATTRIBUTES(VM(NONE))
+	if not (part and part.Parent) then return end
+	local owner, kind = _C.hbMeta(part)
+	if not (owner and (kind == "M1" or kind == "M2")) then return end
+	local sid = part:GetAttribute("VictimSwingId")
+	if typeof(sid) == "string" and sid ~= "" then
+		V93.hbBySidN = (V93.hbBySidN or 0) + 1
+		if V93.hbBySidN > 400 then V93.hbBySid, V93.hbBySidN = {}, 0 end
+		V93.hbBySid[sid] = { t = tSeen, owner = owner, kind = kind }
+	end
+	V93.hbLastByOwner = V93.hbLastByOwner or {}
+	V93.hbLastByOwner[owner] = { t = tSeen, kind = kind }
+	local L = V93.learn
+	local last = L.last[owner]
+	if not last or last.used or last.kind ~= kind then return end
+	local meas = tSeen - last.clock
+	if meas < 0.04 or meas > 1.8 then return end
+	last.used = true
+	local m = last.mult or 1
+	local residN = (meas - last.base) * m
+	if math.abs(residN) > (Config.LearnRejectAbs or 0.25) then
+		diagPush("LEARN-REJECT t=%.2f %s %s(%s c%d) meas=%.0fms table=%.0fms resid=%+.0fms (вне допуска — чужой хитбокс/отмена)",
+			tSeen, owner, kind, tostring(last.ck), last.combo or 0, meas * 1000, last.base * 1000, residN * 1000)
+		return
+	end
+	local key = _C.learnKey(last.ck, kind, last.combo)
+	local r = L.tim[key]
+	if not r then r = { e = residN, n = 0 }; L.tim[key] = r end
+	local a = (r.n < 4) and (1 / (r.n + 1)) or (Config.LearnAlpha or 0.2)
+	r.e = r.e + (residN - r.e) * a
+	r.n = r.n + 1
+	local g
+	local hrp = last.hrp
+	if hrp and hrp.Parent then
+		local off = hrp.CFrame:PointToObjectSpace(part.Position)
+		if off.Magnitude < 40 then
+			g = _C.geoUpdate(tostring(last.ck) .. "|" .. kind, part.Size, off)
+			_C.geoUpdate("*|" .. kind, part.Size, off)
+		end
+	end
+	L.dirty = true
+	diagPush("LEARN t=%.2f %s %s(%s c%d) meas=%.0fms table=%.0fms resid=%+.0fms → ema=%+.0fms n=%d | size=(%.1f,%.1f,%.1f) off=(%.1f,%.1f,%.1f)",
+		tSeen, owner, kind, tostring(last.ck), last.combo or 0, meas * 1000, last.base * 1000, residN * 1000,
+		r.e * 1000, r.n, part.Size.X, part.Size.Y, part.Size.Z,
+		g and g.ox or 0, g and g.oy or 0, g and g.oz or 0)
+end
+
+State.hbWatchPart = function(part)
+	if not (part and part:IsA("BasePart")) then return end
+	if V93.hbConn[part] then return end
+	local function onSid()
+		local now = os.clock()
+		V93.hbEvt[part] = { sid = part:GetAttribute("VictimSwingId"), t = now }
+		task.defer(_C.hbLearn, part, now)
+	end
+	V93.hbConn[part] = part:GetAttributeChangedSignal("VictimSwingId"):Connect(onSid)
+	onSid()
+end
+_C.watchHB = watchHitboxFolder
+
+_C.learnLoad = function()
+	if type(readfile) ~= "function" or type(isfile) ~= "function" then return end
+	local ok, raw = pcall(function() return isfile(_C.learnFile) and readfile(_C.learnFile) or nil end)
+	if not ok or type(raw) ~= "string" or raw == "" then return end
+	local Http = game:GetService("HttpService")
+	local ok2, data = pcall(Http.JSONDecode, Http, raw)
+	if not ok2 or type(data) ~= "table" then return end
+	if data.pv ~= game.PlaceVersion then
+		dbg(string.format("learn: PlaceVersion %s → %s, таблица сброшена (новый билд игры)", tostring(data.pv), tostring(game.PlaceVersion)))
+		return
+	end
+	if type(data.tim) == "table" then V93.learn.tim = data.tim end
+	if type(data.geo) == "table" then V93.learn.geo = data.geo end
+	if type(data.pbAdj) == "number" then V93.pb.adj = math.clamp(data.pbAdj, -0.04, 0.04); V93.pb.n = data.pbN or 0 end
+	if type(data.pbLat) == "number" then V93.pb.lat = data.pbLat; V93.pb.latN = 4 end
+end
+
+_C.learnSave = function()
+	if not V93.learn.dirty or type(writefile) ~= "function" then return end
+	V93.learn.dirty = false
+	local Http = game:GetService("HttpService")
+	local ok, s = pcall(Http.JSONEncode, Http, {
+		pv = game.PlaceVersion, tim = V93.learn.tim, geo = V93.learn.geo,
+		pbAdj = V93.pb.adj, pbN = V93.pb.n, pbLat = V93.pb.lat,
+	})
+	if ok then pcall(writefile, _C.learnFile, s) end
+end
+
+task.spawn(function()
+	pcall(_C.learnLoad)
+	local f = Workspace:WaitForChild("Hitboxes", 60)
+	if f then
+		V93.hbFolder = f
+		_C.watchHB(f)
+	end
+	while true do
+		task.wait(15)
+		pcall(_C.learnSave)
+	end
+end)
+
+-- ===================== A29: PB-loop (замкнутый контур тайминга) =====================
+-- PerfectBlocking ставит СЕРВЕР при приёме Activated; хитбокс создаёт СЕРВЕР в момент удара.
+-- Оба приходят к нам одним downlink'ом, значит  t(хитбокс) − t(PB↑)  = Ts − Tact  на сервере,
+-- без оценки пинга. Это ровно та величина, по которой сервер решает perfect. Подстраиваем
+-- момент нажатия так, чтобы она сидела в aimGap. Триггер — наш собственный VictimHitConfirm.
+_C.pbBind = function(char)
+	if not char then return end
+	if V93.pbConnChar == char then return end
+	V93.pbConnChar = char
+	if V93.pbConn then pcall(function() V93.pbConn:Disconnect() end) end
+	V93.pbConn = char:GetAttributeChangedSignal("PerfectBlocking"):Connect(function()
+		local now = os.clock()
+		local P = V93.pb
+		if char:GetAttribute("PerfectBlocking") == true then
+			P.rise = now
+			local la = State.lastAct
+			if type(la) == "number" and now - la > 0 and now - la < 0.6 then
+				local lat = now - la
+				P.lat = P.lat and (P.lat + (lat - P.lat) * 0.25) or lat
+				P.latN = (P.latN or 0) + 1
+			end
+		else
+			if P.rise and now - P.rise < 0.5 then
+				local w = now - P.rise
+				P.winObs = P.winObs and (P.winObs + (w - P.winObs) * 0.25) or w
+			end
+			P.fall = now
+		end
+	end)
+end
+task.spawn(function()
+	_C.pbBind(LocalPlayer.Character)
+	LocalPlayer.CharacterAdded:Connect(function(c) task.defer(_C.pbBind, c) end)
+end)
+
+-- A29: GrabSlamDefend — сервер даёт жертве ответить на слэм (perfectcopy, M2GrabSlamAnswerable).
+-- Игра шлёт ровно один Activated без локального Blocking; нажатие за <0.1с до атрибута уже засчитано.
+_C.gsdBind = function(char)
+	if not char or V93.gsdChar == char then return end
+	V93.gsdChar = char
+	if V93.gsdConn then pcall(function() V93.gsdConn:Disconnect() end) end
+	V93.gsdConn = char:GetAttributeChangedSignal("GrabSlamDefend"):Connect(function()
+		if char:GetAttribute("GrabSlamDefend") ~= true then return end
+		if not Config.Enabled or Config.GrabSlamAnswer == false then return end
+		local t0 = os.clock()
+		if type(State.lastAct) == "number" and t0 - State.lastAct < 0.1 then
+			diagPush("GRAB-SLAM-DEFEND t=%.2f нажатие %.0fms назад уже засчитано игрой", t0, (t0 - State.lastAct) * 1000)
+			return
+		end
+		task.delay(Config.GrabSlamAnswerDelay or 0, function()
+			if char:GetAttribute("GrabSlamDefend") ~= true then return end
+			local ok, why = canBlockNow()
+			local sent = ok and sendActivate(nil, true) or false
+			diagPush("GRAB-SLAM-DEFEND t=%.2f ответ на слэм: sent=%s why=%s", os.clock(), tostring(sent), tostring(why or "-"))
+		end)
+	end)
+end
+task.spawn(function()
+	_C.gsdBind(LocalPlayer.Character)
+	LocalPlayer.CharacterAdded:Connect(function(c) task.defer(_C.gsdBind, c) end)
+end)
+
+_C.onVictimConfirm = function(attacker, attack, sid, blk, pb)
+	LPH_ATTRIBUTES(VM(NONE))
+	local now = os.clock()
+	local P = V93.pb
+	local ev = (typeof(sid) == "string") and V93.hbBySid[sid] or nil
+	if not ev then
+		local lo = V93.hbLastByOwner and V93.hbLastByOwner[tostring(attacker)]
+		if lo and (lo.kind == attack) and now - lo.t < 0.45 then ev = lo end
+	end
+	local tHB = ev and ev.t or nil
+	if not tHB then
+		diagPush("VHC    t=%.2f %s %s res=%s | хитбокса этого свинга не видели → PB-loop без сэмпла", now, tostring(attacker), tostring(attack), tostring(pb))
+		return
+	end
+	local la = State.lastAct
+	V93.vhcLast = V93.vhcLast or {}
+	local rec = { t = now, tHB = tHB, blk = blk, pb = pb, gap = nil }
+	V93.vhcLast[tostring(attacker)] = rec
+	local pwin = GameData.perfectWindow or Config.PerfectWindow or 0.125
+	local aim = math.min(pwin * 0.72, pwin - 0.006)
+	local gap, why
+	if type(la) == "number" and tHB - la > 0 and tHB - la < 0.6 then
+		if P.rise and P.rise >= la and P.rise <= tHB + 0.02 then
+			gap, why = tHB - P.rise, "pb-rise"
+		elseif P.lat and (P.latN or 0) >= 2 then
+			gap, why = tHB - (la + P.lat), "est"
+		end
+	end
+	rec.gap = gap
+	local sample = nil
+	if gap and Config.PBLoop ~= false then
+		local e = gap - aim
+		if math.abs(e) <= 0.2 then
+			sample = e
+			P.n = (P.n or 0) + 1
+			local a = (P.n < 5) and 0.35 or 0.18
+			local lim = Config.PBLoopMax or 0.04
+			P.adj = math.clamp((P.adj or 0) + e * a, -lim, lim)
+			V93.learn.dirty = true
+		end
+	end
+	diagPush("VHC    t=%.2f %s %s sid=%s flags blk=%s pb=%s | hb→pb gap=%s (%s) aim=%.0fms e=%s adj=%+.0fms n=%d pbLat=%s win=%s",
+		now, tostring(attacker), tostring(attack), tostring(sid), tostring(blk), tostring(pb),
+		gap and string.format("%.0fms", gap * 1000) or "?", tostring(why or "no-press"), aim * 1000,
+		sample and string.format("%+.0fms", sample * 1000) or "-", (P.adj or 0) * 1000, P.n or 0,
+		P.lat and string.format("%.0fms", P.lat * 1000) or "?",
+		P.winObs and string.format("%.0fms", P.winObs * 1000) or "?")
+end
+_C.pbAdjNow = function()
+	local P = V93.pb
+	if Config.PBLoop == false or (P.n or 0) < (Config.PBLoopMinSamples or 4) then return 0 end
+	return P.adj or 0
+end
 
 local function dirIsClear(origin, dir, allowedModel)
 	if not Config.DodgeWallCheck then return true end
@@ -6054,19 +6720,70 @@ function State.bestAliForwardDodgeDir(th)
 	return nil, "blocked"
 end
 
+local function dodgeReservedForGrab()
+	LPH_ATTRIBUTES(VM(NONE))
+	if _C.dodgeHoldFrame == _C.FrameId then return _C.dodgeHold end
+	_C.dodgeHoldFrame = _C.FrameId
+	_C.dodgeHold, _C.dodgeHoldName = false, nil
+	local me = localHRP()
+	if not me then return false end
+	local cap = (Config.Range or 18) + 6
+	local cap2 = cap * cap
+	local function holds(model, name)
+		if not model or model == localChar() then return false end
+		local hrp = model:FindFirstChild("HumanoidRootPart")
+		if not hrp then return false end
+		local dx, dz = hrp.Position.X - me.Position.X, hrp.Position.Z - me.Position.Z
+		if dx * dx + dz * dz > cap2 then return false end
+		local sk = styleKey(styleOf(model))
+		local needs = sk == "wrestling" or sk == "kure" or sk == "judo" or sk == "dirty" or sk == "cqc"
+			or (_C.isGrabStyle and _C.isGrabStyle(_C.cfgStyleKey(styleOf(model), model)))
+		if not needs then return false end
+		if model:GetAttribute("M2Cooldown") or model:GetAttribute("M2CD") then return false end
+		_C.dodgeHold, _C.dodgeHoldName = true, name or model.Name
+		return true
+	end
+	for i = 1, #Threats do
+		local th = Threats[i]
+		if holds(th.attackerModel, th.name) then return true end
+	end
+	return false
+end
+
 local function performDodge(now, reason, preferBack, force, bypassAutoOff, dodgeTarget)
-	if Config.AutoDodge == false and not bypassAutoOff then
+	LPH_ATTRIBUTES(VM(NONE))
+	local mustHit = dodgeTarget and isMustDodge(dodgeTarget)
+	if Config.AutoDodge == false and not mustHit then
 		if State.lastDodgeRefuse ~= "AutoDodge-off" then
 			State.lastDodgeRefuse = "AutoDodge-off"
 			diagPush("DODGE-SKIP t=%.2f  %s  (AutoDodge disabled)", now, reason)
 		end
 		return false
 	end
+	local mustReason = type(reason) == "string" and reason:sub(1, 10) == "must-dodge"
+	if dodgeTarget and isMustDodge(dodgeTarget) then
+		preferBack = true
+		mustReason = true
+	end
+	if not mustReason and dodgeReservedForGrab() then
+		if State.lastDodgeRefuse ~= "save-for-grab" then
+			State.lastDodgeRefuse = "save-for-grab"
+			diagPush("DODGE-SAVE t=%.2f %s → додж держим, у %s M2 не на кулдауне",
+				now, tostring(reason), tostring(_C.dodgeHoldName))
+		end
+		return false
+	end
 	local tx0 = State.dodgeTxn
-	if tx0 and tx0.pending then return false end
+	if tx0 and tx0.pending then
+		if Config.DeepDiag and (not State.dodgePendingSkipLog or os.clock() - State.dodgePendingSkipLog > 0.4) then
+			State.dodgePendingSkipLog = os.clock()
+			diagPush("DODGE-SKIP t=%.2f  %s  (txn pending)", os.clock(), tostring(reason))
+		end
+		return false
+	end
 	do
 		local ch0 = localChar()
-		if ch0 and (ch0:GetAttribute("IFRAMES") or ch0:GetAttribute("UltraInstinct")) then
+		if ch0 and (ch0:GetAttribute("IFRAMES") or ch0:GetAttribute("EvasiveIFrames") or ch0:GetAttribute("UltraInstinct")) then
 			if State.lastDodgeRefuse ~= "already-iframed" then
 				State.lastDodgeRefuse = "already-iframed"
 				diagPush("DODGE-SKIP t=%.2f  %s  (already invulnerable: IFRAMES live, src=%s)", now, reason, tostring(State.ownIFrameTag or "game"))
@@ -6124,10 +6841,11 @@ local function performDodge(now, reason, preferBack, force, bypassAutoOff, dodge
 			end
 			return false
 		end
-		if contactIn <= net + frame then
+		local coverLo = net - 0.04
+		if contactIn < coverLo then
 			if not timingTarget.dodgeTooLateLogged then
 				timingTarget.dodgeTooLateLogged = true
-				diagPush("DODGE-SKIP/TOO-LATE t=%.2f %s contactIn=%.0fms minArrival=%.0fms", now, tostring(reason), contactIn*1000, (net+frame)*1000)
+				diagPush("DODGE-SKIP/TOO-LATE t=%.2f %s contactIn=%.0fms iframeStarts=%.0fms", now, tostring(reason), contactIn*1000, net*1000)
 			end
 			return false
 		end
@@ -6157,7 +6875,9 @@ local function performDodge(now, reason, preferBack, force, bypassAutoOff, dodge
 		State.ap.dodgeSteerUntil = now + math.max((uplink() * 0.5) + 0.06, 0.12)
 	end
 	sendDodge(dir, dodgeSpeed)
-	if granted then State.grantEscapes = (State.grantEscapes or 0) + 1 end
+	if granted and reason == "outnumbered-escape" then
+		State.grantEscapes = (State.grantEscapes or 0) + 1
+	end
 	if type(reason) == "string" and reason:sub(1, 4) == "dual" then
 		State.dualDodgeCount = (State.dualDodgeCount or 0) + 1
 	end
@@ -6169,10 +6889,6 @@ local function performDodge(now, reason, preferBack, force, bypassAutoOff, dodge
 	local iframeHi = iframeLo + ifDur0
 	tx.pending, tx.confirmed = true, false
 	tx.fire, tx.lo, tx.hi = now, iframeLo, iframeHi
-	-- V293 log: ack=610ms, contact already gone, parry restored dead.
-	-- Floor 0.6 ignored ping. Ack = 2*uplink + 50ms, never a baked 600.
-	-- GRANT is local prediction. 1.2s ack left parry dead until after the HIT
-	-- (V297 stun-exit: ack=1203ms, IFRAMES never came). Always ping-based.
 	local ackWindow = math.max(GameData.confirmTimeout or Config.DodgeConfirm or Config.EvasiveAckTimeout or 0.18, uplink() * 2 + 0.05)
 	tx.ackDeadline = now + ackWindow
 	tx.untilAt, tx.reason = iframeHi + 0.08, reason
@@ -6204,11 +6920,12 @@ local function performDodge(now, reason, preferBack, force, bypassAutoOff, dodge
 	return true
 end
 
-local updateDodgeTxn = LPH_NO_VIRTUALIZE(function(now)
+local updateDodgeTxn = function(now)
+	LPH_ATTRIBUTES(VM(NONE))
 	local tx = State.dodgeTxn
 	if not tx or not tx.pending then return end
 	local c = localChar()
-	if not tx.confirmed and c and c:GetAttribute("IFRAMES") then
+	if not tx.confirmed and c and (c:GetAttribute("IFRAMES") or c:GetAttribute("EvasiveIFrames")) then
 		tx.confirmed = true
 		State.dodgeRejects, State.dodgeMuteUntil = 0, 0
 		tx.lo, tx.hi = now, now + (GameData.iframeDur or Config.IFrameDur or 0.30)
@@ -6268,11 +6985,12 @@ local updateDodgeTxn = LPH_NO_VIRTUALIZE(function(now)
 		tx.abuseThreat, tx.perfectConfirmed, tx.perfectAt = nil, false, nil
 		State.ap.dodgeSteerDir, State.ap.dodgeSteerUntil = nil, 0
 	end
-end)
+end
 
 _C.pubTargetModel, _C.pubThreat = nil, nil
 
-local publishVizTarget = LPH_NO_VIRTUALIZE(function(model, hrp)
+local publishVizTarget = function(model, hrp)
+	LPH_ATTRIBUTES(VM(NONE))
 	if not model then
 		if _C.pubTargetModel ~= nil then _C.pubTargetModel = nil; getgenv().AP_TARGET = nil end
 		return
@@ -6301,22 +7019,26 @@ local publishVizTarget = LPH_NO_VIRTUALIZE(function(model, hrp)
 	t.contactIn = th and math.max((th.contactAbs or 0) - os.clock(), 0) or nil
 	t.threatens = th and th.threatens == true or false
 	t.t = os.clock()
-end)
+end
 
-local heldGuardCovers = LPH_NO_VIRTUALIZE(function(th, heldPwin, up)
+local heldGuardCovers = function(th, heldPwin, up)
+	LPH_ATTRIBUTES(VM(NONE))
 	if th.plannedDodge or isMustDodge(th) then return false end
 	if m2BreaksHeldGuard(th) then return false end
 	if State.lastPressEarly then return false end
 	local since = State.lastPress
 	if type(since) ~= "number" or since <= 0 then return false end
 	return th.contactAbs <= since + heldPwin + up
-end)
+end
 
-local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
-	updateDodgeTxn(now)
-	State.updateAliM2Cooldown(now)
-	State.updateCounterTxn(now)
-	if State.interruptFiredFrame ~= _C.FrameId and tryAliEvasiveCounter(now) then return end
+local schedulerStep = function(now)
+	LPH_ATTRIBUTES(VM(NONE))
+	local dodgeTx = State.dodgeTxn
+	local dodgeLive = dodgeTx and dodgeTx.pending
+	if dodgeLive then updateDodgeTxn(now) end
+	local cTx = State.counterTxn
+	if cTx and (cTx.pending or cTx.confirmed) then State.updateCounterTxn(now) end
+	if dodgeLive and State.interruptFiredFrame ~= _C.FrameId and tryAliEvasiveCounter(now) then return end
 	if #Threats == 0 and not State.blocking and not Config.AutoPlay then
 		State.interruptCandidate = nil
 		State.interruptThreatCount = 0
@@ -6328,6 +7050,7 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 		_C.pubThreat = nil
 		return
 	end
+	State.updateAliM2Cooldown(now)
 	local serverNow = Workspace:GetServerTimeNow()
 	local up        = uplink()
 	local ifDur     = GameData.iframeDur or Config.IFrameDur or 0.30
@@ -6356,13 +7079,9 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 				th.stallDt, th.stallSince = dt, now
 			end
 			local animStalled = (now - (th.stallSince or now)) > (Config.ThreatStallSec or 0.45)
-			-- Hitbox-origin remaining зажат в 0 после контакта → dt вечно +0ms.
-			-- Stall-expire в 450ms снимал угрозу до нажатия. Возраст — отдельно.
 			if th.origin == "hitbox" then
 				animStalled = false
 			end
-			-- M2 windup 360–600ms. Stall 450ms + trackGone@500ms снимали
-			-- угрозу до willHitMe (V280/V281 source=none на любом M2).
 			if th.kind == "M2" then
 				animStalled = false
 			end
@@ -6388,11 +7107,6 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 					or am:GetAttribute("Ragdoll")
 					or am:GetAttribute("Downed")
 					or am:GetAttribute("GuardBroken")
-				-- V306: NEUTRALIZED ran up to 5s early while the swing was still
-				-- flying (V305 log: SWING → NEUTRALIZED at +150ms, OUT LATE at
-				-- +835ms HIT). The attacker hit someone/something mid-swing; the
-				-- THREAT still lands on us. Only drop the threat after its own
-				-- window is spent.
 				if atkNeutralized and dt > 0.20 and th.kind == "M1" then
 					if not th.neutEarlyLogged then
 						th.neutEarlyLogged = true
@@ -6431,6 +7145,12 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 				table.remove(Threats, i)
 			elseif dt < -0.35 or wallRemain < -0.35 or noTrackExpired or animStalled or ageCapped or hbOriginAged
 			or (th.kind ~= "M2" and trackGone and (now - th.detectClock) > 0.5 and dt < Config.PerfectLead) then
+			local turnWait = th.trackPlaying and (th.geomFaceToMe or 1) < 0.2
+				and (th.geomDist2d or 99) <= (Config.Range or 18)
+				and (now - th.detectClock) < ((th.hitTL or 0.4) + 0.8)
+			if turnWait then
+				-- доворот: маркер прошёл, анимация ещё играет, в радиусе, смотрит мимо
+			else
 			local coveredByGuard = th.coveredByHeldGuard == true
 				or (Config.OmniBlock and State.blocking and th.enteredWindow
 					and th.contactAbs <= (State.holdUntil or 0) + 0.05)
@@ -6460,9 +7180,10 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 						th.modelHeight and string.format("%.2f", th.modelHeight) or "?",
 						th.attackMult or 1, reason)
 				State.independentMiss = (State.independentMiss or 0) + 1
-			end
-			table.remove(Threats, i)
-		elseif not th.dodged then
+				end
+				table.remove(Threats, i)
+				end
+				elseif not th.dodged then
 			local threatens = willHitMe(th)
 			if th.kind == "M2" and not th.m2WhmLogged then
 				th.m2WhmLogged = true
@@ -6484,9 +7205,10 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 				local capM2 = Config.Range or 18
 				if th.styleKey == "cqc" then capM2 = math.max(capM2, 30) end
 				if type(dM2) == "number" and dM2 <= capM2 then
-					-- V307: skip the range re-promotion for an M2 we already
-					-- classified off-axis (back-turned, >9 studs, no closing).
-					if not (th.recognitionSource == "m2-offaxis"
+					local face = th.geomFaceToMe
+					local turning = (th.angClose or 0) > 0.6
+					if not (face ~= nil and face < -0.15 and not turning and dM2 > 2.2)
+						and not (th.recognitionSource == "m2-offaxis"
 						or th.recognitionSource == "m2-offaxis-late") then
 						threatens = true
 						th.offTarget = nil
@@ -6495,6 +7217,26 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 				end
 			end
 			th.velLead = velLead(th.attackerHRP, th)
+			if th.trackPlaying and (th.geomFaceToMe or 1) < 0.2
+				and (th.geomDist2d or 99) <= (Config.Range or 18)
+				and (th.angClose or 0) > 0.5 then
+				local need = math.max(0, math.rad(th.geomAngToMe or 90) - math.rad(55))
+				local eta = need / th.angClose
+				if eta < 0.35 and (th.geomFaceToMe or -1) > -0.4 then
+					local late = now + eta
+					if late > (th.contactAbs or 0) then
+						th.contactAbs = late
+						th.turnHeld = true
+						if not th.turnLogged then
+							th.turnLogged = true
+							diagPush("TURN-IN t=%.2f %s %s face=%.2f eta=%.0fms → жмём на доворот, не на маркер",
+								now, tostring(th.name), tostring(th.kind), th.geomFaceToMe or 0, eta * 1000)
+						end
+					end
+					threatens = true
+					th.offTarget = nil
+				end
+			end
 			if not threatens and th.serverProven and th.everThreatened
 			   and (th.contactAbs - now) > 0.08 then
 				local latchOk = true
@@ -6592,101 +7334,22 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 		end
 					local pwin = (Config.PerfectWindowLive ~= false and GameData.perfectWindow)
 						or Config.PerfectWindow or 0.125
-						local gapBias = 0
-						local edgeS = (Config.GapEdgeMs or 6) / 1000
-						local pmin0 = Config.PerfectMin or 0.05
-						-- lead/velLead are the intended remaining gap ON THE SERVER after
-						-- the activate packet arrives. pressAt already subtracts uplink.
-						local vlCap = math.max(pwin - edgeS - pmin0 - gapBias, 0)
-						if (th.velLead or 0) > vlCap then
-							if Config.DeepDiag and not th.vlClampLogged then
-								th.vlClampLogged = true
-								diagTrace("VLEAD-CLAMP t=%.2f %s %s velLead %.0f→%.0fms (окно=%.0fms невязка=%.0fms)",
-									now, tostring(th.name), tostring(th.kind),
-									(th.velLead or 0) * 1000, vlCap * 1000, pwin * 1000, gapBias * 1000)
-							end
-							th.velLead = vlCap
-						end
-						local leadCap = math.max(pwin - edgeS - gapBias, pmin0)
-					if lead > leadCap then
-						if Config.DeepDiag and not th.leadClampLogged then
-							th.leadClampLogged = true
-							diagTrace("LEAD-CLAMP t=%.2f %s %s lead %.0f→%.0fms (window=%.0fms velLead=%.0fms)",
-								now, tostring(th.name), tostring(th.kind), lead*1000, leadCap*1000,
-								pwin*1000, (th.velLead or 0)*1000)
-						end
-						lead = leadCap
-					end
-						if Config.LeadQuantComp ~= false then
-							local edge    = (Config.LowFpsEdgeMs or 6) / 1000
-						local vl      = th.velLead or 0
-						local pmin    = Config.PerfectMin or 0.05
-						local q = V93.frameDt or (1/60)
-						local qPeak = (V93.frameDtPeak or q) * (Config.LowFpsQuantPeakK or 0.75)
-						if qPeak > q then q = qPeak end
-							local centerFrac = Config.LeadQuantCenter or 0.90
-							local center = pwin * centerFrac
-							local target = center + q * 0.5
-							local hiCap  = pwin - edge
-							local loCap  = math.max(pmin, pwin * (Config.LeadQuantFloorFrac or 0.86))
-						if target > hiCap then target = hiCap end
-						if target < loCap then target = loCap end
-						-- velLead уже вычитается в pressAt как более ранний оверлап.
-						-- QUANT двигает только lead, иначе vl снимается дважды (M2 EARLY в V184).
-						local newLead = lead
-						if math.abs(lead - target) > 0.0005 then
-							newLead = target
-						end
-						if newLead < 0 then newLead = 0 end
-						-- V304: this M2-only ratchet kept M2 lead pinned at
-						-- PerfectLead=95ms while QUANT wanted ~90 - center 0.72.
-						-- M1 quantizes down fine; M2 never could. Allow the M2
-						-- quant target, but never below the same pmin floor M1 uses.
-						local quantFloor = math.max(pmin, pwin * (Config.LeadQuantFloorFrac or 0.64))
-						if th.kind == "M2" and newLead < lead and newLead < quantFloor then
-							newLead = math.min(lead, quantFloor)
-						end
-						if math.abs(newLead - lead) > 0.0005 then
-							if Config.DeepDiag and not th.jitLogged then
-								th.jitLogged = true
-								diagTrace("LEAD-QUANT t=%.2f %s %s lead %.0f→%.0fms (кадр=%.0fms peak=%.0fms q=%.0fms velLead=%.0fms serverGap=[%.0f..%.0f]ms localRemain=[%.0f..%.0f]ms окно=[%.0f..%.0f]ms)",
-									now, tostring(th.name), tostring(th.kind), lead*1000, newLead*1000,
-									(V93.frameDt or 0)*1000, (V93.frameDtPeak or 0)*1000, q*1000, vl*1000,
-									(newLead + vl + gapBias - q)*1000, (newLead + vl + gapBias)*1000,
-									(newLead + vl + gapBias + up - q)*1000, (newLead + vl + gapBias + up)*1000,
-									pmin*1000, pwin*1000)
-							end
-							lead = newLead
-						end
-					end
-						-- V208: lead+velLead 100+69 sat at 169 > window 125 → EARLY.
-						-- V291: cap the SUM at QUANT center, not pwin-edge (119).
-						-- velLead filling the 125 wall undoes LeadQuantCenter 0.72.
-						local serverGap = lead + (th.velLead or 0)
-						local maxGap = pwin * (Config.LeadQuantCenter or 0.72)
-						local wall = pwin - edgeS
-						if maxGap > wall then maxGap = wall end
-						if maxGap < pmin0 then maxGap = pmin0 end
-						if serverGap > maxGap then serverGap = maxGap end
-						local gapFloor = math.max(pmin0, pwin * (Config.LeadQuantFloorFrac or 0.64))
-						if serverGap < gapFloor then serverGap = gapFloor end
-						th.aimGap = serverGap
-						local pressAt = th.contactAbs - serverGap - up
+					local pmin0 = Config.PerfectMin or 0.05
+					local gap = pwin * 0.72
+					if gap < pmin0 then gap = pmin0 end
+					local wall = pwin - ((Config.GapEdgeMs or 6) / 1000)
+					if gap > wall then gap = wall end
+					lead = gap
+					th.aimGap = gap
+					local pkt = timingOneWay()
+					th.pktLead = pkt
+					local pressAt = th.contactAbs - gap - pkt + _C.pbAdjNow()
 					local holdEnd = th.contactAbs + hold
-					local qLook = V93.lookahead or 0
-					local room = maxGap - serverGap
-					if room < 0 then room = 0 end
-					if qLook > room then qLook = room end
-					local pressAtQ = pressAt - qLook
+					local pressAtQ = pressAt
 					do
 						local meS = localChar()
-						-- V300 floor-aim on unbuffered stun-tap: trueGap 76-91 still
-						-- HIT in clash AND more LATE than V299 (90.6% → 86.4%).
-						-- Clash is not a 10ms QUANT problem. Keep the live window
-						-- center; only clamp earliest when the buffer is up.
 						if meS and stunEscapeNow(meS) and parryBufferedNow(meS) then
-							local stunMax = pwin + up
-							local earliest = th.contactAbs - stunMax
+							local earliest = th.contactAbs - pwin - pkt
 							if pressAtQ < earliest then pressAtQ = earliest end
 						end
 					end
@@ -6727,6 +7390,7 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 					local emergency = false
 					if Config.EmergencyPress ~= false and not th.pressed and not th.didPressClock
 					   and th.hbOverlapClock
+					   and up <= (Config.EmergencyPressMaxUplink or 0.045)
 					   and (th.serverProven or th.hbOverlapClock)
 					   and now < th.hbOverlapClock + (Config.EmergencyPressGrace or 0.20) then
 						local remainEm = (th.contactAbs or now) - now
@@ -6747,8 +7411,6 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 							end
 						end
 					end
-					-- Очередь: только если буфера ещё нет. Живой ParryBuffered +
-					-- Activated = combo-escape сейчас — это только в окне pressAt.
 					if not emergency and not th.pressed and th.serverProven
 					   and not th.coveredByCounter
 					   and (th.threatens or th.everThreatened
@@ -6765,10 +7427,6 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 					end
 				if ((now >= pressAtQ and now <= holdEnd) or emergency) and not th.coveredByCounter then
 					th.enteredWindow = true
-					-- HOLD only bait/decoy suspects. After Luraph, GetAttribute("M1") at
-					-- detect is often still nil; waiting for CombatAttacking (~+200ms)
-					-- makes every M1 press LATE. Source proves on the first frame and
-					-- fires at pressAt — non-suspect swings must do the same.
 					if Config.ServerProofGate and not th.serverProven and th.suspect
 					   and th.kind ~= "M2"
 					   and (th.contactAbs - now) > (Config.ProofGraceSec or 0.06) then
@@ -6797,7 +7455,6 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 								if Config.HeavyFirst ~= false and dHeavy ~= 0 and gap < cd then
 									local light = dHeavy > 0 and wantBlock or th
 									local lightDt = (light.contactAbs or now) - now
-									-- V204: M2 +456ms перебивал M1 +20ms → NO-PRESS HIT.
 									if lightDt <= 0.30 then
 										take = (th == light)
 									elseif m2BreaksHeldGuard(dHeavy > 0 and th or wantBlock) and lightDt <= 0.45 then
@@ -6818,7 +7475,17 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 								end
 							end
 						end
-						if take and isMustDodge(th) then take = false end
+						if take and wantBlock and wantBlock ~= th then
+							local pminS = Config.PerfectMin or 0.05
+							local thDtS = (th.contactAbs or now) - now
+							local wbDtS = (wantBlock.contactAbs or now) - now
+							if thDtS < pminS and wbDtS >= pminS then
+								take = false
+							end
+						end
+						if take and isMustDodge(th) then
+							take = false
+						end
 						if take then
 							if wantBlock and wantBlock ~= th and Config.DeepDiag
 								and not th.choiceSwapLogged then
@@ -6865,7 +7532,7 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 	if State.interruptFiredFrame ~= _C.FrameId and (State.interruptLockUntil or 0) <= now then
 		tryBoxingCounter(now)
 	end
-	if wantBlock and State.counterFiredFrame == _C.FrameId then
+	if wantBlock and (State.counterFiredFrame == _C.FrameId or wantBlock.coveredByCounter) then
 		wantBlock = nil
 	end
 
@@ -6876,6 +7543,11 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 		cluster[#cluster + 1] = th
 		if th.kind == "M2" then clusterHeavy = true end
 	end
+	V93.dualStrat = nil
+	V93.dualSuppress = false
+	V93.dualParry = nil
+	V93.dualFire = false
+	_C.widenCluster(cluster, now)
 	local clusterN = #cluster
 	local clusterFirst = cluster[1]
 	local clusterLast = cluster[#cluster]
@@ -6894,6 +7566,7 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 		clusterStrategy = "DODGE_TXN"
 	end
 	if not clusterStrategy and Config.MultiThreatGuard and clusterN >= (Config.MultiThreatMinN or 2) then
+		_C.planDual(cluster, now, ifLat, ifDur)
 		local iframeSpan = math.max(0, ifDur - 0.07)
 		local blockCd = Config.BlockCooldown or 0.5
 		local frame   = math.max(V93.frameDt or 0, 1 / 60)
@@ -6902,7 +7575,8 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 
 		local pwinPlan = (Config.PerfectWindowLive ~= false and GameData.perfectWindow)
 			or Config.PerfectWindow or 0.125
-		local parryCover  = math.max(pwinPlan - (Config.GapEdgeMs or 6) / 1000, 0.04)
+		local pminPlan = Config.PerfectMin or 0.05
+		local parryCover  = math.max(pwinPlan - pminPlan - (Config.GapEdgeMs or 6) / 1000, 0.04)
 		local dodgeCover  = math.max(iframeSpan, 0.05)
 		local plannedParries, plannedDodges, planParts = 0, 0, nil
 		local blockFreeAt = now
@@ -6910,6 +7584,7 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 			blockFreeAt = math.max(blockFreeAt, State.lastBlockRelease + blockCd)
 		end
 
+		if not V93.dualStrat then
 		for i = 1, clusterN do
 			local anchor = cluster[i]
 			if anchor and not anchor.planCovered then
@@ -6923,6 +7598,7 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 					for j = i + 1, clusterN do
 						local o = cluster[j]
 						if o and not o.planCovered and not isMustDodge(o)
+							and o.attackerModel == anchor.attackerModel
 							and (o.contactAbs - anchor.contactAbs) <= parryCover then
 							o.planCovered, o.plannedParry = true, true
 							covered = covered + 1
@@ -6979,23 +7655,30 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 				diagPush("PLAN t=%.2f %s (%d угроз): %s", now, clusterStrategy, clusterN, planParts)
 			end
 		end
-		for _, th in ipairs(cluster) do th.planCovered = nil end
-	if not clusterStrategy then
-		clusterStrategy = clusterSpread <= iframeSpan and "IFRAME_CLUSTER" or "HELD_GUARD"
 		end
+		for _, th in ipairs(cluster) do th.planCovered = nil end
+	if not clusterStrategy and not V93.dualStrat then
+		clusterStrategy = clusterSpread <= iframeSpan and "IFRAME_CLUSTER" or "HELD_GUARD"
+	end
+	if V93.dualStrat then
+		clusterStrategy = V93.dualStrat
+	end
 		for _, th in ipairs(cluster) do
 			th.clusterStrategy = clusterStrategy
 		end
 		local meLock = localChar()
-		if clusterStrategy == "IFRAME_CLUSTER" and meLock
-		   and (meLock:GetAttribute("Stunned") or meLock:GetAttribute("CantAnything")) then
-			clusterStrategy = "PARRY"
+		if Config.AutoDodge ~= false and meLock and (meLock:GetAttribute("Stunned") or meLock:GetAttribute("CantAnything"))
+		   and clusterStrategy == "PARRY" then
+			clusterStrategy = "IFRAME_CLUSTER"
 			for _, th in ipairs(cluster) do
 				th.clusterStrategy = clusterStrategy
 			end
-		end
+			end
+			if V93.dualFire then
+			if performDodge(now, "dual-cover") then return end
+			end
 
-		local sigN = clusterN
+			local sigN = clusterN
 		if State.lastClusterSigN ~= sigN
 			or State.lastClusterSigStrat ~= clusterStrategy then
 			State.lastClusterSigN = sigN
@@ -7005,7 +7688,7 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 					(clusterFirst.contactAbs - now) * 1000, (clusterLast.contactAbs - now) * 1000)
 		end
 
-			if clusterStrategy == "IFRAME_CLUSTER" and Config.EmergencyDualDodge
+			if Config.AutoDodge ~= false and (clusterStrategy == "IFRAME_CLUSTER" or clusterStrategy == "PARRY" or clusterStrategy == "PARRY_THEN_DODGE" or clusterStrategy == "SEQUENTIAL") and Config.EmergencyDualDodge
 				and not canBlockNow()
 			and not State.clusterHasAliBoxingM2(cluster)
 			and Config.MultiDodgeCover ~= false and dodgeReady() and canDodgeNow()
@@ -7075,18 +7758,15 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 
 	if Config.CooldownDodge ~= false and Config.AutoDodge then
 		local okBlock, whyBlock = canBlockNow()
-		if not okBlock and (whyBlock == "BlockCooldown" or whyBlock == "Unequip")
-			and dodgeReady() and canDodgeNow() and not counterPreemptsDodge(now) then
-			-- BlockCooldown здесь предсказанный (lastPress + 0.5с), а не серверный
-			-- отказ: диагностика V186 показывает PERFECT-нажатия сразу после
-			-- «refused: BlockCooldown». Уходим доджем только если кулдаун
-			-- физически не успеет истечь до момента нажатия по этой угрозе.
-			local cdReadyAt = now + (Config.BlockCooldown or 0.5)
-				+ (Config.BlockCooldownSafety or 0.03)
+		if not okBlock and whyBlock == "BlockCooldown"
+		and dodgeReady() and canDodgeNow() and not counterPreemptsDodge(now) then
+			local left = _C.blockCdLeft(now)
+			local cdReadyAt = now + (left or ((Config.BlockCooldown or 0.5)
+				+ (Config.BlockCooldownSafety or 0.03)))
 			for _, th in ipairs(imminent) do
-				local pressBy = th.contactAbs - (Config.PerfectLead or 0.0625) - ifLat
+				local windowClose = th.contactAbs - (Config.PerfectMin or 0.05)
 				if not th.coveredByDodge and not th.pressed
-					and (whyBlock ~= "BlockCooldown" or cdReadyAt > pressBy) then
+					and cdReadyAt > windowClose then
 					local cdDt = th.contactAbs - now
 					local cdLo, cdHi = _C.dodgeCoverWindow(ifLat, ifDur, isMustDodge(th))
 					if cdDt >= cdLo and cdDt <= cdHi then
@@ -7101,26 +7781,58 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 		end
 	end
 
+	if Config.AutoDodge ~= false and Config.PingShortDodge ~= false
+		and dodgeReady() and canDodgeNow() and not counterPreemptsDodge(now) then
+		local pmin = Config.PerfectMin or 0.05
+		local slack = Config.MustDodgeEarlySlack or 0.08
+		for _, th in ipairs(imminent) do
+			if not th.pressed and not th.coveredByDodge and not th.plannedDodge
+				and not isMustDodge(th) then
+				local rem = th.contactAbs - now
+				if rem > 0 and rem < pmin then
+					local dLo, dHi = _C.dodgeCoverWindow(ifLat, ifDur, false)
+					if rem >= dLo - slack and rem <= dHi then
+						if performDodge(now, "ping-short", false, false, false, th) then
+							diagPush("PING-SHORT t=%.2f %s %s contactIn=%.0fms < pmin → too late to parry, dodge",
+								now, tostring(th.name), tostring(th.kind), rem * 1000)
+							return
+						end
+					end
+				end
+			end
+		end
+	end
+
 		local mustDodgeThreat = nil
 		for _, candidate in ipairs(imminent) do
 			if isMustDodge(candidate) then mustDodgeThreat = candidate; break end
 		end
-		-- V307: keep the dodge for the must-dodge M2. A held parry covered a
-		-- closer M1 (parry-then-dodge plan); waiting mLo..mHi on the M2 while
-		-- the block CD drains usually means the M2 contact passes 300ms+ of
-		-- dead time (V306 log: DODGE at contactIn=74ms, covered=0, MISS).
-		-- Fire when the M2 window OPENS (mLo), not when it's centered.
 		if mustDodgeThreat and dodgeReady() and canDodgeNow() then
 			local mustDt = mustDodgeThreat.contactAbs - now
-			local mLo, mHi = _C.dodgeCoverWindow(ifLat, ifDur, true)
-			if mustDt <= mHi and mustDt >= (mLo - (Config.MustDodgeEarlySlack or 0.08)) then
+			local coverLo = ifLat - 0.04
+			local coverHi = ifLat + ifDur - 0.04
+			if mustDt >= coverLo and mustDt <= coverHi then
 				if performDodge(now, "must-dodge(unblockable→back)", true, false, true, mustDodgeThreat) then
 					return
 				end
+			elseif Config.DeepDiag and not mustDodgeThreat.mustDodgeCoverLogged then
+				mustDodgeThreat.mustDodgeCoverLogged = true
+				diagPush("MUST-DODGE-SKIP t=%.2f %s %s contactIn=%.0fms iframeStarts=%.0fms → i-frame не накроет граб",
+					now, tostring(mustDodgeThreat.name), tostring(mustDodgeThreat.kind),
+					mustDt * 1000, ifLat * 1000)
+			end
+		elseif mustDodgeThreat then
+			local mustDt = mustDodgeThreat.contactAbs - now
+			local okD, whyD = canDodgeNow()
+			if not mustDodgeThreat.mustDodgeSkipLogged then
+				mustDodgeThreat.mustDodgeSkipLogged = true
+				diagPush("MUST-DODGE-SKIP t=%.2f %s %s contactIn=%.0fms ready=%s can=%s/%s",
+					now, tostring(mustDodgeThreat.name), tostring(mustDodgeThreat.kind),
+					mustDt * 1000, tostring(dodgeReady()), tostring(okD), tostring(whyD))
 			end
 		end
 
-	if Config.SkillAddon and Config.SA_BlatantDodge and dodgeReady() and #imminent >= 1 then
+	if Config.AutoDodge ~= false and Config.SkillAddon and Config.SA_BlatantDodge and dodgeReady() and #imminent >= 1 then
 		local a  = imminent[1]
 		local dt = a.contactAbs - now
 		local normalOk = canDodgeNow(false)
@@ -7135,7 +7847,7 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 		end
 	end
 
-	if dodgeReady() and canDodgeNow() and #imminent >= 1 then
+	if Config.AutoDodge ~= false and dodgeReady() and canDodgeNow() and #imminent >= 1 then
 		local a = imminent[1]
 		local soonestDt = a.contactAbs - now
 
@@ -7191,20 +7903,24 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 		end
 		if Config.OutnumberEscape and evasiveGranted() and coverable and not aAlreadyDefended
 		   and not State.isAliBoxingM2(a) and not counterPreemptsDodge(now) then
+			local other = false
+			for oi = 1, #imminent do
+				local om = imminent[oi].attackerModel
+				if om and om ~= a.attackerModel then other = true break end
+			end
+			if other then
 			local coverableCount = 0
 			for _, t in ipairs(imminent) do
 				if (t.contactAbs - now) >= coverLoEff and (t.contactAbs - now) <= coverHiEff then coverableCount = coverableCount + 1 end
 			end
-			-- Парри строго приоритетнее доджа: оно даёт PERFECT и стан атакующему,
-			-- тогда как додж тратит Evasive и снимает угрозу с обработки парри.
-			-- Уходим доджем только когда блок физически отказан.
 			local preferBlock = Config.OutnumberEscapePreferBlock ~= false
 				and canBlockNow()
 				and (Config.DodgeOnlyWhenNoParry ~= false or coverableCount <= 1)
 			if not preferBlock then
 				if performDodge(now, "outnumbered-escape") then return end
 			end
-		elseif aAlreadyDefended and Config.DeepDiag and not a.escapeSkipLogged then
+			end
+			elseif aAlreadyDefended and Config.DeepDiag and not a.escapeSkipLogged then
 			a.escapeSkipLogged = true
 			diagPush("ESCAPE-SKIP t=%.2f %s %s уже накрыт (pressed=%s dodge=%s heldGuard=%s blocking=%s) → додж не нужен",
 				now, tostring(a.name), tostring(a.kind), tostring(a.pressed), tostring(a.coveredByDodge),
@@ -7330,24 +8046,23 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 		wantBlock = nil
 	end
 	if wantBlock and isMustDodge(wantBlock) then
-		-- Keep parry if dodge will not cover this frame (naked M2 otherwise).
-		local dtMd = (wantBlock.contactAbs or now) - now
-		local mLo, mHi = _C.dodgeCoverWindow(ifLat, ifDur, true)
-		if dodgeReady() and canDodgeNow() and dtMd >= mLo and dtMd <= mHi then
+		wantBlock = nil
+	end
+	if V93.dualSuppress then
+		wantBlock = nil
+	elseif V93.dualParry and not V93.dualParry.pressed and not V93.dualParry.resolved then
+		wantBlock = V93.dualParry
+	elseif V93.dualParry and (now - (State.lastPress or 0)) < (Config.BlockCooldown or 0.5) then
+		if wantBlock and wantBlock.attackerModel ~= V93.dualParry.attackerModel then
 			wantBlock = nil
 		end
 	end
-	-- V284 Kyokushin M2: rem<0.35 stole wantBlock 350ms before contact,
-	-- fireBlock ignored pressAtQ (comboOk is stun-only) → trueGap +312 GB.
-	-- Do not assign wantBlock here. M2-NOPRESS below is the log.
 	if wantBlock then
 		local dtx2 = State.dodgeTxn
 		if dtx2 and dtx2.pending then
 			local cAbs = wantBlock.contactAbs
 			if type(cAbs) == "number" and cAbs >= (dtx2.lo or 0) - 0.05
 				and cAbs <= (dtx2.hi or 0) + 0.05 then
-				-- Predicted i-frame is not IFRAMES. V293 Ali M2 rem=0 want=nil
-				-- then DODGE-REJECT ack=610ms — parry was already stripped.
 				if dtx2.confirmed then
 					wantBlock = nil
 				end
@@ -7465,8 +8180,6 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 			if meC and stunEscapeNow(meC) then
 				faceHold = false
 				local remS = (wantBlock.contactAbs or now) - now
-				-- Sticky stunTooLate ate the press after stun dropped (V296 HvH
-				-- NO-PRESS / LATE pressDt=78). Skip only this frame while stunned.
 				if remS < (Config.StunPressMinRemain or 0.05) then
 					wantBlock.stunTooLate = true
 				else
@@ -7491,15 +8204,11 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 				State.prevStunEsc = stunnedNow
 			end
 			if not faceHold and not wantBlock.stunTooLate and not tooEarly then
-				-- V308: a second press closer than BlockCooldown to the first is
-				-- silently eaten by the server (V307 log: Mishima M2 s2 - five
-				-- presses at IN-WINDOW trueGap, all LATE; press2-press1 =
-				-- 475ms < 500ms CD). When the s2 press would land inside the CD
-				-- window, release the guard and mark the gap reason so the OUT
-				-- line explains the HIT.
 				local pressGap = now - (State.lastPress or 0)
 				local cdGap   = (Config.BlockCooldown or 0.5) - (Config.BlockCooldownSafety or 0.03)
-				if (wantBlock.strike or 1) >= 2 and pressGap < cdGap then
+				local stunnedPress = meC and stunEscapeNow(meC)
+				local multiHit = wantBlock.kind == "M2" and (wantBlock.strike or 1) >= 2
+				if multiHit and not stunnedPress and pressGap < cdGap then
 					if not wantBlock.cdPressLogged then
 						wantBlock.cdPressLogged = true
 						diagPush("CD-PRESS t=%.2f %s s2 press2−press1=%.0fms < CD %.0fms → сервер молча съест нажатие; гард снят",
@@ -7512,23 +8221,37 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 					wantBlock.pressed = true
 					wantBlock.pressDt  = wantBlock.contactAbs - now
 					wantBlock.cdSwallowed = true
+					if (Config.AutoDodge ~= false or isMustDodge(wantBlock)) and dodgeReady() and canDodgeNow(true)
+						and not wantBlock.coveredByDodge then
+						if performDodge(now, "must-dodge(m2-s2-cd)", false, true, false, wantBlock) then
+							diagPush("CD-DODGE-S2 t=%.2f %s s2 contactIn=%.0fms → CD съест парри, уходим доджем",
+								now, tostring(wantBlock.name), (wantBlock.contactAbs - now) * 1000)
+						end
+					end
 				else
-				if (wantBlock.strike or 1) >= 2 and State.blocking then
-					releaseBlock()
+					if (wantBlock.strike or 1) >= 2 and State.blocking then
+						releaseBlock()
+					end
+					snapLookAtThreat(wantBlock)
+					local ideal
+					if type(wantBlock.detectServer) == "number" and type(wantBlock.detectClock) == "number" then
+						ideal = wantBlock.detectServer + (wantBlock.contactAbs - wantBlock.detectClock) - (wantBlock.aimGap or 0.09)
+					end
+					local back = 0
+					if ideal then
+						local late = serverNow - ideal
+						if late > 0.004 then
+							local cap = math.max(V93.frameDt or 0.016, V93.lookahead or 0) + 0.012
+							if cap > 0.08 then cap = 0.08 end
+							back = (late < cap) and late or cap
+						end
+					end
+					State.pressSpoofExtra = back
+					if wantBlock.rec then wantBlock.rec.stampBack = back end
+					sent, armOnly = fireBlock(serverNow, comboOk)
+					State.pressSpoofExtra = 0
 				end
-				snapLookAtThreat(wantBlock)
-				State.pressSpoofExtra = 0
-				if wantBlock.origin == "hitbox" then
-					local pmin = Config.PerfectMin or 0.05
-					local pwin = Config.PerfectWindow or 0.125
-					local extra = up + (pmin + pwin) * 0.5
-					if extra > 0.16 then extra = 0.16 end
-					State.pressSpoofExtra = extra
-				end
-				sent, armOnly = fireBlock(serverNow, comboOk)
-				State.pressSpoofExtra = 0
-				end
-				end
+			end
 				if sent and armOnly then
 				wantBlock.stunArmed = true
 			elseif sent then
@@ -7563,9 +8286,17 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 				end
 				if wantBlock.rec then
 					wantBlock.rec.pressDt = wantBlock.pressDt
+					wantBlock.rec.blockedReason = nil
+					do
+						local meP = localChar()
+						wantBlock.rec.pressState = string.format("stun=%s buf=%s atk=%s",
+							tostring(meP and meP:GetAttribute("Stunned") == true),
+							tostring(meP and meP:GetAttribute("ParryBuffered") == true),
+							tostring(meP and (meP:GetAttribute("CombatAttacking") or meP:GetAttribute("M1") or meP:GetAttribute("M2")) == true))
+					end
 					wantBlock.rec.pressServer = serverNow
 					wantBlock.rec.pressClock = now
-					wantBlock.rec.pressAt = wantBlock.contactAbs - (wantBlock.aimGap or Config.PerfectLead or 0) - up
+					wantBlock.rec.pressAt = wantBlock.contactAbs - (wantBlock.aimGap or Config.PerfectLead or 0)
 					wantBlock.rec.pressLateBy = now - wantBlock.rec.pressAt
 					wantBlock.rec.uplinkAtPress = up
 					wantBlock.rec.faceDot = wantBlock.faceDot
@@ -7590,11 +8321,8 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 					wantBlock.lastReasonAt = now
 					local cdLeft = -1
 					if State.blockedReason == "BlockCooldown" then
-						local rel = State.lastBlockRelease or State.lastPress
-						if rel then
-							cdLeft = math.max(0, rel + (Config.BlockCooldown or 0.5)
-								+ (Config.BlockCooldownSafety or 0.03) - now)
-						end
+						local left = _C.blockCdLeft(now)
+						if left ~= nil then cdLeft = left end
 					end
 					diagPush("BLOCK? t=%.2f  %s  %s  refused: %s  (buffered=%s stun=%s cant=%s gb=%s pwd=%s pb=%s)%s", now, wantBlock.name, wantBlock.kind, State.blockedReason,
 						tostring(meC and parryBufferedNow(meC)),
@@ -7605,26 +8333,9 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 						tostring(meC and meC:GetAttribute("PerfectBlocking") and true or false),
 						(cdLeft >= 0) and string.format(" [CD left %.0fms, contactIn %+.0fms]", cdLeft*1000, (wantBlock.contactAbs - now)*1000) or "")
 				end
-				do
-					local remD = (wantBlock.contactAbs or now) - now
-					if not wantBlock.pressed and not wantBlock.coveredByDodge
-					   and not wantBlock.stunArmed
-					   and not (meC and stunEscapeNow(meC))
-					   and remD > 0.09
-					   and Config.AutoDodge ~= false and Config.FallbackDodgeOnRefusal ~= false
-					   and dodgeReady() and canDodgeNow() and not counterPreemptsDodge(now) then
-						if performDodge(now, "must-dodge(block-refused:" .. tostring(State.blockedReason) .. ")",
-							false, true, false, wantBlock) then
-							diagPush("FALLBACK-DODGE t=%.2f %s %s contactIn=%.0fms → блок отказан (%s), додж как последний рубеж",
-								now, tostring(wantBlock.name), tostring(wantBlock.kind),
-								remD * 1000, tostring(State.blockedReason))
-							return
-						end
-					end
 				end
-			end
-		end
-		local holdExtra = (wantBlock.kind == "M2" and Config.M2WidenWindow) and Config.M2WidenHold or 0
+				end
+				local holdExtra = (wantBlock.kind == "M2" and Config.M2WidenWindow) and Config.M2WidenHold or 0
 		local base = wantBlock.contactAbs
 			if Config.Mode ~= "Perfect" and multiThreat and farContact and farContact > base
 				and clusterStrategy ~= "SEQUENTIAL"
@@ -7634,8 +8345,6 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 		if m2BreaksHeldGuard(wantBlock) then
 			base = wantBlock.contactAbs
 		end
-		-- Jin/Mishima M2 s2 is +550ms. Extending holdUntil to s2 keeps s1 guard
-		-- up the whole gap; the 2nd hit never gets a fresh Activated (ragdoll phase).
 		if not ((wantBlock.strike or 1) >= 2 and not wantBlock.pressed) then
 			State.holdUntil = math.max(State.holdUntil,
 				base + Config.HoldAfter + (Config.HoldLateGrace or 0) + holdExtra)
@@ -7681,7 +8390,7 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 				local cd   = Config.BlockCooldown or 0.5
 				local lead = Config.PerfectLead or 0.0625
 				local readyAt = now + cd + (Config.BlockCooldownSafety or 0.03)
-				local pressBy = soonest.contactAbs - lead - uplink()
+				local pressBy = soonest.contactAbs - (soonest.aimGap or (pwinHold * 0.72))
 				local canRepress = readyAt <= pressBy
 				local canDodgeIt = Config.AutoDodge and dodgeReady() and canDodgeNow()
 					and not counterPreemptsDodge(now)
@@ -7732,17 +8441,12 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 		end
 	end
 
-	-- Своя атака выставляет CombatAttacking/CantAnything на ~0.4с, а это ровно
-	-- то состояние, в котором парри отказано (V186: «refused: CantAnything»
-	-- с последующим HIT). Бьём только когда ни одного отслеживаемого свинга нет.
-	-- Punish is NPC-only (V302). Never swing while a tracked threat
-	-- still needs a parry — M1 sets CantAnything and the next parry dies.
 	if Config.AP_PunishOnParry ~= false and not wantBlock and #imminent == 0 and #Threats == 0 then
 		if Config.AutoPlay or State.ap.punishTgt then
 			State.ap.step(now)
 		end
 	end
-end)
+end
 
 local function parseEvent(ev)
 	local kind = ev:match("^(M%d)")
@@ -7783,7 +8487,6 @@ local function onOutcome(attacker, result, kind, eventClock)
 					if not otherOpen then leftover = false end
 				end
 				if leftover then
-					-- leftover Hit from a previous swing, not this rec
 				elseif not r.matched then
 					local score = math.abs((eventClock - r.clock) - (r.contact or 0))
 					if r.type == kind then
@@ -7831,7 +8534,6 @@ local function onOutcome(attacker, result, kind, eventClock)
 	State.lastResult    = result
 	State.flashUntil    = os.clock() + 0.25
 	if kind == "M2" then
-		-- V304: per-style M2 bucket for the diag header.
 		local sk = tostring(rec.style or "?") .. " s" .. tostring(rec.strike or 1)
 		local mt = State.m2Tally
 		if type(mt) ~= "table" then mt = {}; State.m2Tally = mt end
@@ -7861,6 +8563,9 @@ local function onOutcome(attacker, result, kind, eventClock)
 
 	rec.matched = true
 	if rec.th then rec.th.resolved = true end
+	if rec.pressDt and _C.onVictimConfirm then
+		pcall(_C.onVictimConfirm, attacker, kind, rec.th and rec.th.serverSwingId, nil, result)
+	end
 
 	if result == "GUARDBREAK" then
 		State.blocking, State.holdUntil = false, 0
@@ -7905,32 +8610,25 @@ local function onOutcome(attacker, result, kind, eventClock)
 
 	local ksKey = tostring(kind) .. ":" .. tostring(rec.style or "?") .. ":" .. tostring(rec.strike or 1)
 	local ks = _D.ResidByKS[ksKey]; if not ks then ks = { sum = 0, n = 0 }; _D.ResidByKS[ksKey] = ks end
-	-- Delayed-hitbox LATE (+146ms) must not poison RESID-PAD for the next swing.
-	-- PERFECT predErr trains Jin/Mishima M2 s1 (cfg 280ms, live ~320). LATE-only
-	-- mixed s2 residuals and never padded the first hit.
-	-- LATE predErr mixes miss causes (−87 fast / +61 slow) and kills the pad
-	-- (avg drops under 22). PERFECT is the only clean residual.
-	if result == "PERFECT" and predErr > -90 and predErr < 90 then
-		ks.sum = ks.sum + predErr; ks.n = ks.n + 1
-		if ks.n > 100 then ks.sum = ks.sum * (100 / ks.n); ks.n = 100 end
-	end
-	local resAvg = (ks.n > 0) and (ks.sum / ks.n) or 0
-	local resNShown = ks.n
+	local resAvg = 0
+	local resNShown = 0
 
-
-	local upAtPress = (type(rec.uplinkAtPress) == "number" and rec.uplinkAtPress or uplink()) * 1000
 	local eventServer = rec.detectServer and (rec.detectServer + measured) or nil
 	local blockGap = nil
 	if rec.pressServer and eventServer then blockGap = (eventServer - rec.pressServer) * 1000 end
-	local trueGap = blockGap and (blockGap - upAtPress) or nil
-	local gapStr  = blockGap and string.format("%+.0f→true%+.0fms", blockGap, trueGap) or "NO-PRESS"
+	local trueGap = rec.pressDt and rec.pressDt * 1000 or nil
+	local arrGap = trueGap
+	if trueGap and type(rec.uplinkAtPress) == "number" then
+		arrGap = trueGap - rec.uplinkAtPress * 1000
+	end
+	local gapStr  = trueGap and string.format("rem=%.0f arr=%.0f stamp=%s", trueGap, arrGap or 0, blockGap and string.format("%+.0f", blockGap) or "?") or "NO-PRESS"
 	local pressStr = rec.pressDt and string.format("%.0fms", rec.pressDt*1000) or "—"
 	local hint = "?"
-	if trueGap then
+	if arrGap then
 		local pwinMs = ((Config.PerfectWindowLive ~= false and GameData.perfectWindow)
 			or Config.PerfectWindow or 0.125) * 1000
-		if trueGap < Config.PerfectMin*1000 then hint = string.format("LATE(<%.0f)", Config.PerfectMin*1000)
-		elseif trueGap > pwinMs then hint = string.format("EARLY(>%.0f)=BLOCK-NOT-PARRY", pwinMs)
+		if arrGap < Config.PerfectMin*1000 then hint = string.format("LATE(<%.0f)", Config.PerfectMin*1000)
+		elseif arrGap > pwinMs then hint = string.format("EARLY(>%.0f)=BLOCK-NOT-PARRY", pwinMs)
 		else hint = "IN-WINDOW" end
 	elseif rec.pressServer == nil then
 		hint = "NOT-BLOCKED"
@@ -7944,10 +8642,15 @@ local function onOutcome(attacker, result, kind, eventClock)
 		if b.n > 100 then b.sum = b.sum * (100 / b.n); b.n = 100 end
 	end
 
-	local reasonStr = rec.blockedReason and (" STATE:" .. rec.blockedReason) or ""
-	-- IN-WINDOW press that the server still HIT is clash, not state-lock.
-	-- V300 counted those as locked (8/9) while we did tap.
-	if rec.blockedReason and (result == "LATE" or result == "GUARDBREAK") then
+	local reasonStr = ""
+	if rec.pressDt then
+		reasonStr = rec.pressState and (" " .. rec.pressState) or ""
+	elseif rec.blockedReason then
+		reasonStr = " STATE:" .. rec.blockedReason
+	elseif rec.th and rec.th.lastReason then
+		reasonStr = " STATE:" .. tostring(rec.th.lastReason)
+	end
+	if rec.blockedReason and not rec.pressDt and (result == "LATE" or result == "GUARDBREAK") then
 		local inWin = trueGap and trueGap >= (Config.PerfectMin or 0.05) * 1000
 			and trueGap <= (((Config.PerfectWindowLive ~= false and GameData.perfectWindow)
 				or Config.PerfectWindow or 0.125) * 1000)
@@ -7979,8 +8682,44 @@ local function onOutcome(attacker, result, kind, eventClock)
 		end
 	end
 
-	diagPush("OUT    t=%.2f  %s  %s(c%d,s%d)  %-10s  meas=%.0fms pred=%.0fms predErr=%+.0fms resAvg=%+.0fms(n=%d) | blockGap=%s guard=%s pressDt=%s%s | face=%s%s spd=%.2f ping=%.0f", eventClock, attacker, kind, rec.combo or 0, rec.strike or 1, result, measured*1000, rec.contact*1000,
-		        predErr, resAvg, resNShown, gapStr, hint, pressStr, reasonStr, faceStr, faceFlag, rec.speed or 1, (rec.pingRaw or 0)*1000)
+	local dhtMs = nil
+	if type(rec.hitTL) == "number" then
+		dhtMs = (measured - rec.hitTL) * 1000
+	end
+	local pwinMsK = ((Config.PerfectWindowLive ~= false and GameData.perfectWindow)
+		or Config.PerfectWindow or 0.125) * 1000
+	local floorMs = (Config.PerfectMin or 0.05) * 1000
+	local klass = "ok"
+	if not rec.pressDt then
+		klass = "no-packet"
+	elseif predErr > 250 or (dhtMs and math.abs(dhtMs) > 180) then
+		klass = "stale"
+	elseif rec.faceDot ~= nil and rec.faceDot < (Config.FaceGoodDot or 0.55) then
+		klass = "back"
+	elseif rec.bornLate then
+		klass = "seen-late"
+	elseif arrGap and result == "LATE" and arrGap >= floorMs and arrGap <= pwinMsK then
+		klass = "in-window-hit"
+	elseif arrGap and (arrGap < floorMs or arrGap > pwinMsK) then
+		klass = "edge"
+	end
+	if result ~= "PERFECT" then
+		local mc = State.missClass
+		if type(mc) ~= "table" then mc = {}; State.missClass = mc end
+		mc[klass] = (mc[klass] or 0) + 1
+	end
+	local klassRu = "ок"
+	if klass == "no-packet" then klassRu = "пакета-не-было"
+	elseif klass == "stale" then klassRu = "чужой-хит"
+	elseif klass == "back" then klassRu = "спина"
+	elseif klass == "seen-late" then klassRu = "поздно-увидели"
+	elseif klass == "in-window-hit" then klassRu = "окно-а-хит"
+	elseif klass == "edge" then klassRu = "край-окна"
+	end
+	local vsTable = dhtMs and string.format("%+.0fms", dhtMs) or "?"
+
+	diagPush("OUT    t=%.2f  %s  %s(c%d,s%d)  %-10s  meas=%.0fms pred=%.0fms predErr=%+.0fms vsTable=%s class=%s resAvg=%+.0fms(n=%d) | blockGap=%s guard=%s pressDt=%s%s | face=%s%s spd=%.2f ping=%.0f", eventClock, attacker, kind, rec.combo or 0, rec.strike or 1, result, measured*1000, rec.contact*1000,
+		        predErr, vsTable, klassRu, resAvg, resNShown, gapStr, hint, pressStr, reasonStr, faceStr, faceFlag, rec.speed or 1, (rec.pingRaw or 0)*1000)
 end
 
 _C.hooked = setmetatable({}, { __mode = "k" })
@@ -7988,13 +8727,14 @@ _C.animIdCache = setmetatable({}, { __mode = "k" })
 _C.ownerCache  = setmetatable({}, { __mode = "k" })
 _C.OWNER_TTL    = 8.0
 
-local cachedAnimId = LPH_NO_VIRTUALIZE(function(anim)
+local cachedAnimId = function(anim)
+	LPH_ATTRIBUTES(VM(NONE))
 	local v = _C.animIdCache[anim]
 	if v ~= nil then return v or nil end
 	local parsed = tonumber(tostring(anim.AnimationId):match("(%d+)"))
 	_C.animIdCache[anim] = parsed or false
 	return parsed
-end)
+end
 
 local function cachedOwner(animator)
 	local now = os.clock()
@@ -8010,7 +8750,8 @@ end
 local function hookAnimator(animator)
 	if _C.hooked[animator] then return end
 	_C.hooked[animator] = true
-	animator.AnimationPlayed:Connect(LPH_NO_VIRTUALIZE(function(track)
+	animator.AnimationPlayed:Connect(function(track)
+		LPH_ATTRIBUTES(VM(NONE))
 		local anim = track and track.Animation
 		if not anim then return end
 		local id = cachedAnimId(anim)
@@ -8032,7 +8773,8 @@ local function hookAnimator(animator)
 			if not k then return end
 			_D.AttackIds[id] = {
 				kind = k, combo = (k == "M1") and comboFromName(nm) or nil,
-				name = nm, mom = tostring(nm):lower():find("momentum") ~= nil,
+				name = nm, style = anim.Parent and anim.Parent.Name or nil,
+				mom = tostring(nm):lower():find("momentum") ~= nil,
 			}
 		end
 		local knownKind = attackEntry(id) and attackEntry(id).kind
@@ -8082,110 +8824,39 @@ local function hookAnimator(animator)
 				end
 			end
 		end
+		local farHrp = rec.hrp
+		local myHrp = localHRP()
+		if not (farHrp and myHrp) then return end
+		local dx = farHrp.Position.X - myHrp.Position.X
+		local dz = farHrp.Position.Z - myHrp.Position.Z
+		local cap = (Config.Range or 18) + 6
+		if dx * dx + dz * dz > cap * cap then return end
 		local info = resolveInfo(id, rec.model)
+		_C.logUnknownSwing(os.clock(), id, rec.model, info)
 		if not info then return end
 		onAttack(rec.hrp, info, rec.model, id, track)
-	end))
+	end)
 end
 
 local function scanAnimators()
+	if not _C.hookedPlr then _C.hookedPlr = {} end
+	local hooked = _C.hookedPlr
 	for _, plr in ipairs(Players:GetPlayers()) do
+		if not hooked[plr] then
+			hooked[plr] = true
+			plr.CharacterAdded:Connect(function(char)
+				task.wait(0.2)
+				local hum = char:FindFirstChildOfClass("Humanoid")
+				local animator = hum and hum:FindFirstChildOfClass("Animator")
+				if animator then hookAnimator(animator) end
+			end)
+		end
 		local ch  = plr.Character
 		local hum = ch and ch:FindFirstChildOfClass("Humanoid")
 		local an  = hum and hum:FindFirstChildOfClass("Animator")
 		if an then hookAnimator(an) end
 	end
-	if not State.didInitialAnimatorSweep then
-		State.didInitialAnimatorSweep = true
-		for _, d in ipairs(Workspace:GetDescendants()) do
-			if d:IsA("Animator") then hookAnimator(d) end
-		end
-	end
 end
-
-_C.scanPlayingAttacks = LPH_NO_VIRTUALIZE(function()
-	if not Config.Enabled then return end
-	local now = os.clock()
-	if now - (_C.lastPlayScan or 0) < 0.18 then return end
-	_C.lastPlayScan = now
-	local me = localHRP()
-	if not me then return end
-	local rangeCap = math.min(Config.Range or 18, 20)
-	local players = Players:GetPlayers()
-	for pi = 1, #players do
-		local plr = players[pi]
-		if plr ~= LocalPlayer then
-			local ch = plr.Character
-			if ch then
-				local hrp = ch:FindFirstChild("HumanoidRootPart")
-				local hum = ch:FindFirstChildOfClass("Humanoid")
-				local an = hum and hum:FindFirstChildOfClass("Animator")
-				if hrp and an then
-					local dx = hrp.Position.X - me.Position.X
-					local dz = hrp.Position.Z - me.Position.Z
-					-- Anim-only poll is free bait. Resolver: server attr must
-					-- already be up (CombatAttacking/M1/M2). Fake tracks don't replicate that.
-					if not serverAttackProof(ch) then
-					elseif (dx * dx + dz * dz) > rangeCap * rangeCap then
-					else
-						local recAt = V93.lastSwingAt[plr.Name]
-						local seenRecent = false
-						if recAt then
-							local a = recAt.M1
-							local b = recAt.M2
-							if type(a) == "number" and (now - a) < 0.45 then seenRecent = true end
-							if type(b) == "number" and (now - b) < 0.45 then seenRecent = true end
-						end
-						if seenRecent then
-						else
-						local tracks = an:GetPlayingAnimationTracks()
-						for ti = 1, #tracks do
-							local track = tracks[ti]
-							local anim = track and track.Animation
-							local id = anim and cachedAnimId(anim)
-							if id and attackEntry(id) then
-								local spdP = track.Speed
-								if type(spdP) == "number" and spdP > 0 then
-									local loP = Config.DecoySpeedMin or 0.30
-									local hiP = Config.DecoySpeedMax or 1.25
-									if spdP < loP or spdP > hiP then
-										id = nil
-									end
-								end
-							end
-							if id and attackEntry(id) then
-								local info = resolveInfo(id, ch)
-								if info then
-									local live = false
-									for k = 1, #Threats do
-										local thP = Threats[k]
-										if thP and not thP.resolved and thP.track == track then
-											live = true
-											break
-										end
-									end
-									if not live and not (State.seenAnimTrack and State.seenAnimTrack[track]) then
-										local tp = track.TimePosition
-										-- AnimationPlayed fires at tp=0. Mid-track poll is the
-										-- same swing after PERFECT/NEUTRALIZED (V295: 165x contact=0).
-										if type(tp) == "number" and tp <= 0.08 then
-											State.pollDetect = (State.pollDetect or 0) + 1
-											if Config.DeepDiag then
-												diagPush("POLL-SWING t=%.2f %s %s id=%s tp=%.3f proof=attr", now, plr.Name, tostring(info.t), tostring(id), type(tp) == "number" and tp or -1)
-											end
-											onAttack(hrp, info, ch, id, track, "poll")
-										end
-									end
-								end
-							end
-						end
-						end
-					end
-				end
-			end
-		end
-	end
-end)
 
 Workspace.DescendantAdded:Connect(function(d)
 	if d.ClassName == "Animator" then hookAnimator(d) end
@@ -8232,12 +8903,11 @@ task.spawn(function()
 			return
 		end
 		if eventName == "StyleCounterHit" then
-			-- Aikido M2CounterHitEvent (V303). Same shape as WingChunCounterHit:
-			-- (attacker, victim, phase?). Server confirms our counter landed.
 			local now = os.clock()
 			if attacker == myName then
 				if _D.WCTxn.pending then
 					_D.WCTxn.pending = false
+					if _D.WCTxn.threat then _D.WCTxn.threat.coveredByCounter = nil end
 					_D.WCTxn.hits    = (_D.WCTxn.hits or 0) + 1
 					State.selfBusyUntil = math.max(State.selfBusyUntil or 0,
 						now + (_D.WCTxn.holdSecs or 1.95) + 0.35)
@@ -8744,6 +9414,7 @@ local function getTestDecoy(animator)
 		end
 		return _C.testTrack, id
 end
+_C.getTestDecoy = getTestDecoy
 function toggleDesyncTest()
 	local char = LocalPlayer.Character
 	local hum = char and char:FindFirstChildOfClass("Humanoid")
@@ -8842,7 +9513,7 @@ local function firePreRunDecoy()
 	if now < _D.PreRun.busyUntil then return end
 	_D.PreRun.busyUntil = now + 0.22
 	local animator = localAnimator(); if not animator then return end
-	local track, id = getTestDecoy(animator); if not track then return end
+	local track, id = (_C.getTestDecoy or function() end)(animator); if not track then return end
 	local topPrio = topPriority()
 	local wgt = Config.DesyncClientVisible and 1 or 0.92
 	local dur = (Config.DesyncDelayMs or 140) / 1000
@@ -9183,7 +9854,8 @@ task.spawn(function()
 		}
 		local nc_getMethod = getnamecallmethod
 		local oldNamecall
-		oldNamecall = hookmetamethod(game, "__namecall", LPH_NO_VIRTUALIZE(function(self, ...)
+		oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+			LPH_ATTRIBUTES(VM(NONE))
 			local method = nc_getMethod()
 			if not NC_WATCHED[method] then return oldNamecall(self, ...) end
 			if method == "FireServer" then
@@ -9204,7 +9876,7 @@ task.spawn(function()
 				end
 			end
 			return oldNamecall(self, ...)
-		end))
+		end)
 		AnimLib.desyncHooked = true
 		dbg("combat hook active (namecall fallback)")
 		aclog("[desync] hook=namecall fallback")
@@ -9214,7 +9886,8 @@ task.spawn(function()
 	end
 end)
 
-local activeRestrictZone = LPH_NO_VIRTUALIZE(function(now)
+local activeRestrictZone = function(now)
+	LPH_ATTRIBUTES(VM(NONE))
 	if not Config.RestrictZone then return nil end
 	local best, bestC
 	for _, th in ipairs(Threats) do
@@ -9235,9 +9908,10 @@ local activeRestrictZone = LPH_NO_VIRTUALIZE(function(now)
 		center = center, keepOut = radius + Config.RestrictPad, radius = radius,
 		aPos = aPos, look = look, th = best,
 	}
-end)
+end
 
-local restrictStep = LPH_NO_VIRTUALIZE(function(now)
+local restrictStep = function(now)
+	LPH_ATTRIBUTES(VM(NONE))
 	if not Config.RestrictZone then return end
 	if #Threats == 0 then return end
 	local hrp = localHRP(); if not hrp then return end
@@ -9258,10 +9932,11 @@ local restrictStep = LPH_NO_VIRTUALIZE(function(now)
 		local b = z.center - inward * z.keepOut
 		hrp.CFrame = CFrame.new(Vector3.new(b.X, pos.Y, b.Z)) * (hrp.CFrame - hrp.CFrame.Position)
 	end
-end)
+end
 
-V93.schedulerPhase = RunService.PreSimulation and "PreSimulation" or "Heartbeat-fallback"
-local frameHandler = LPH_NO_VIRTUALIZE(function(hbDt, source)
+V93.schedulerPhase = "Heartbeat"
+local frameHandler = function(hbDt, source)
+	LPH_ATTRIBUTES(VM(NONE))
 	local nowWall = os.clock()
 	if (nowWall - (V93.lastStepClock or 0)) < 0.00045 then
 		return
@@ -9310,7 +9985,6 @@ local frameHandler = LPH_NO_VIRTUALIZE(function(hbDt, source)
 	end
 	local now = nowWall
 	_C.FrameId = _C.FrameId + 1
-	if _C.scanPlayingAttacks then _C.scanPlayingAttacks() end
 	local wantSteer = State.ap.steerUntil and now < State.ap.steerUntil and State.ap.steerDir
 	local wantDodgeSteer = State.ap.dodgeSteerUntil and now < State.ap.dodgeSteerUntil and State.ap.dodgeSteerDir
 	if wantSteer or wantDodgeSteer then
@@ -9364,19 +10038,11 @@ local frameHandler = LPH_NO_VIRTUALIZE(function(hbDt, source)
 		V93.hrpSampleAt = nowWall
 		sampleNearbyHRPs()
 	end
-end)
-;(RunService.PreSimulation or RunService.Heartbeat):Connect(LPH_NO_VIRTUALIZE(function(hbDt)
-	frameHandler(hbDt, V93.schedulerPhase)
-end))
-if RunService.PreSimulation and Config.SchedulerWatchdog ~= false then
-	RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function()
-		local now = os.clock()
-		local staleAfter = math.max((V93.frameDt or 1/60) * 1.85, 0.028)
-		if (now - (V93.lastStepClock or 0)) > staleAfter then
-			frameHandler(0, "Heartbeat-watchdog")
-		end
-	end))
 end
+RunService.Heartbeat:Connect(function(hbDt)
+	LPH_ATTRIBUTES(VM(NONE))
+	frameHandler(hbDt, "Heartbeat")
+end)
 
 local function summary()
 	local t = State.tally
@@ -9388,8 +10054,6 @@ local function summary()
 	local parryAcc = blockable > 0 and (100 * (t.PERFECT or 0) / blockable) or 0
 	local acc = blockable > 0 and (100 * ((t.PERFECT or 0) + (t.EARLY or 0)) / blockable) or 0
 	local rawAcc = total > 0 and (100 * (t.PERFECT or 0) / total) or 0
-	-- V304: per-style M2 outcome buckets (kind:style → PERFECT/BLOCK/HIT/GB).
-	-- "one M2 never times right" shows up here as a style with 0 PERFECT.
 	local m2Buckets = {}
 	do
 		local mt = State.m2Tally
@@ -9412,8 +10076,16 @@ local function summary()
 			(V93.frameDt or 0)*1000, (V93.frameDtPeak or 0)*1000,
 			(V93.lookahead or 0)*1000, (V93.stepCost or 0)*1000,
 			V93.lowFps and "YES(aggressive)" or "no"),
-		string.format("model: V216 wall + live rate (no min(wall,live) EARLY) | lead=%.0fms hold=%.0fms window=[%.0f,%.0f]ms", Config.PerfectLead*1000, Config.HoldAfter*1000, Config.PerfectMin*1000, Config.PerfectWindow*1000),
+		string.format("model: %s", tostring(Config.Version or "?")),
+		string.format("gap=%.0fms hold=%.0fms window=[%.0f,%.0f]ms", ((Config.PerfectWindowLive ~= false and GameData.perfectWindow) or Config.PerfectWindow or 0.125)*720, Config.HoldAfter*1000, Config.PerfectMin*1000, Config.PerfectWindow*1000),
 		string.format("outcomes: PERFECT=%d  BLOCK=%d  HIT=%d  GUARDBREAK=%d  total=%d", t.PERFECT or 0, t.EARLY or 0, t.LATE or 0, t.GUARDBREAK or 0, total),
+		string.format("miss-class: поздно-увидели=%d чужой-хит=%d пакета-не-было=%d спина=%d край=%d окно-хит=%d",
+			(State.missClass and State.missClass["seen-late"]) or 0,
+			(State.missClass and State.missClass.stale) or 0,
+			(State.missClass and State.missClass["no-packet"]) or 0,
+			(State.missClass and State.missClass.back) or 0,
+			(State.missClass and State.missClass.edge) or 0,
+			(State.missClass and State.missClass["in-window-hit"]) or 0),
 		"M2 by style: " .. (#m2Buckets > 0 and table.concat(m2Buckets, " | ") or "none"),
 		string.format("attacks=%d  presses=%d  dodges=%d  outnumbered-escapes=%d  desync-anims=%d  ac-muted=%d  kicks-blocked=%d  reports-blocked=%d", State.parryCount, State.fireCount, State.dodgeCount, State.grantEscapes or 0, State.desyncFires or 0, State.acMuted or 0, State.kicksBlocked or 0, State.reportsBlocked or 0),
 		string.format("HIT breakdown: %d total → %d game-state-locked (stun/attack/cooldown, unblockable) + %d real timing miss", hits, stateHits, realMiss),
@@ -9439,26 +10111,24 @@ local VIZ_CONE_HALF = math.rad(64)
 local VIZ_CONE_PAD  = 5.0
 local VIEW_DIST = 100
 
--- Luraph VM does not always see executor globals via GETGLOBAL. Drawing lives on getgenv().
--- Nested `pcall(function() ln = Drawing.new(...) end)` also fails to write the upvalue
--- after obfuscation, so the pool latches ok=false and visuals stay dark forever.
--- This pipeline is module-scope (not a `do` block): Luraph remaps `do`-block upvalues
--- poorly, so wrapping vizUpdate while it still lived in `do` made drawings vanish.
-local drawingLib = LPH_NO_VIRTUALIZE(function()
+local drawingLib = function()
+	LPH_ATTRIBUTES(VM(NONE))
 	local genv = getgenv and getgenv()
 	return (genv and genv.Drawing) or rawget(_G, "Drawing") or Drawing
-end)
-local drawingNew = LPH_NO_VIRTUALIZE(function(kind)
+end
+local drawingNew = function(kind)
+	LPH_ATTRIBUTES(VM(NONE))
 	local D = drawingLib()
 	if not (D and D.new) then return nil end
 	local ok, obj = pcall(D.new, kind)
 	if ok then return obj end
 	return nil
-end)
+end
 
 local LinePool = { items = {}, used = 0, ok = true }
-LinePool.begin = LPH_NO_VIRTUALIZE(function(self) self.used = 0 end)
-LinePool.get = LPH_NO_VIRTUALIZE(function(self)
+LinePool.begin = function(self) LPH_ATTRIBUTES(VM(NONE)) self.used = 0 end
+LinePool.get = function(self)
+	LPH_ATTRIBUTES(VM(NONE))
 	self.used = self.used + 1
 	local ln = self.items[self.used]
 	if ln then return ln end
@@ -9471,20 +10141,23 @@ LinePool.get = LPH_NO_VIRTUALIZE(function(self)
 	self.ok = true
 	self.items[self.used] = ln
 	return ln
-end)
-LinePool.finish = LPH_NO_VIRTUALIZE(function(self)
+end
+LinePool.finish = function(self)
+	LPH_ATTRIBUTES(VM(NONE))
 	local hidden = self.hiddenTo or #self.items
 	for i = self.used + 1, hidden do self.items[i].Visible = false end
 	self.hiddenTo = self.used
-end)
-LinePool.hideAll = LPH_NO_VIRTUALIZE(function(self)
+end
+LinePool.hideAll = function(self)
+	LPH_ATTRIBUTES(VM(NONE))
 	for _, ln in ipairs(self.items) do ln.Visible = false end
 	self.used, self.hiddenTo = 0, 0
-end)
+end
 
 local TriPool = { items = {}, used = 0, ok = true }
-TriPool.begin = LPH_NO_VIRTUALIZE(function(self) self.used = 0 end)
-TriPool.get = LPH_NO_VIRTUALIZE(function(self)
+TriPool.begin = function(self) LPH_ATTRIBUTES(VM(NONE)) self.used = 0 end
+TriPool.get = function(self)
+	LPH_ATTRIBUTES(VM(NONE))
 	self.used = self.used + 1
 	local tr = self.items[self.used]
 	if tr then return tr end
@@ -9498,39 +10171,45 @@ TriPool.get = LPH_NO_VIRTUALIZE(function(self)
 	tr.Filled = true
 	self.items[self.used] = tr
 	return tr
-end)
-TriPool.finish = LPH_NO_VIRTUALIZE(function(self)
+end
+TriPool.finish = function(self)
+	LPH_ATTRIBUTES(VM(NONE))
 	local hidden = self.hiddenTo or #self.items
 	for i = self.used + 1, hidden do self.items[i].Visible = false end
 	self.hiddenTo = self.used
-end)
-TriPool.hideAll = LPH_NO_VIRTUALIZE(function(self)
+end
+TriPool.hideAll = function(self)
+	LPH_ATTRIBUTES(VM(NONE))
 	for _, tr in ipairs(self.items) do tr.Visible = false end
 	self.used, self.hiddenTo = 0, 0
-end)
+end
 
-vizHideAll = LPH_NO_VIRTUALIZE(function() LinePool:hideAll(); TriPool:hideAll() end)
+vizHideAll = function() LPH_ATTRIBUTES(VM(NONE)) LinePool:hideAll(); TriPool:hideAll() end
 
 local Viz = { t = 0 }
 
 local NEAR = 0.6
 
-Viz.rotY = LPH_NO_VIRTUALIZE(function(v, ang)
+Viz.rotY = function(v, ang)
+	LPH_ATTRIBUTES(VM(NONE))
 	local c, s = math.cos(ang), math.sin(ang)
 	return Vector3.new(v.X * c - v.Z * s, 0, v.X * s + v.Z * c)
-end)
+end
 
-Viz.projRaw = LPH_NO_VIRTUALIZE(function(cam, world)
+Viz.projRaw = function(cam, world)
+	LPH_ATTRIBUTES(VM(NONE))
 	local sp = cam:WorldToViewportPoint(world)
 	return sp.X, sp.Y, sp.Z
-end)
+end
 
-Viz.proj = LPH_NO_VIRTUALIZE(function(cam, world)
+Viz.proj = function(cam, world)
+	LPH_ATTRIBUTES(VM(NONE))
 	local x, y, z = Viz.projRaw(cam, world)
 	return Vector2.new(x, y), z
-end)
+end
 
-Viz.drawWorldSeg = LPH_NO_VIRTUALIZE(function(cam, a, b, color, thick)
+Viz.drawWorldSeg = function(cam, a, b, color, thick)
+	LPH_ATTRIBUTES(VM(NONE))
 	local ax, ay, az = Viz.projRaw(cam, a)
 	local bx, by, bz = Viz.projRaw(cam, b)
 	if az <= NEAR and bz <= NEAR then return end
@@ -9542,38 +10221,38 @@ Viz.drawWorldSeg = LPH_NO_VIRTUALIZE(function(cam, a, b, color, thick)
 	local ln = LinePool:get(); if not ln then return end
 	ln.From, ln.To = Vector2.new(ax, ay), Vector2.new(bx, by)
 	ln.Color, ln.Thickness, ln.Transparency, ln.Visible = color, thick, 1, true
-end)
+end
 
-Viz.pickTarget = LPH_NO_VIRTUALIZE(function()
-	-- Nearest enemy always. vizTarget is the swinging attacker — user
-	-- wants rings on whoever is closest, not only the one mid-swing.
-	local nowc = os.clock()
-	if Viz.pickCacheHrp and Viz.pickCacheHrp.Parent and (nowc - (Viz.pickCacheT or 0)) < 0.15 then
-		return Viz.pickCacheModel, Viz.pickCacheHrp
-	end
-	local me = localHRP(); if not me then return nil end
-	local best, bestHrp, bestD = nil, nil, (Config.VizRange or VIEW_DIST)
-	for _, p in ipairs(Players:GetPlayers()) do
-		local ch = p.Character
-		if ch then
-			local ok, hrp = isEnemyModel(ch)
-			if ok and hrp then
-				local d = (hrp.Position - me.Position).Magnitude
-				if d < bestD then best, bestHrp, bestD = ch, hrp, d end
+Viz.pickTarget = function()
+	LPH_ATTRIBUTES(VM(NONE))
+	local vt = State.vizTarget
+	if vt and vt.hrp and vt.hrp.Parent then return vt.model, vt.hrp end
+	local me = localHRP()
+	if not me then return nil end
+	local best, bestHrp, bestD2 = nil, nil, (Config.VizRange or VIEW_DIST)
+	bestD2 = bestD2 * bestD2
+	for i = 1, #Threats do
+		local hrp = Threats[i].attackerHRP
+		if hrp and hrp.Parent then
+			local dx = hrp.Position.X - me.Position.X
+			local dz = hrp.Position.Z - me.Position.Z
+			local d2 = dx * dx + dz * dz
+			if d2 < bestD2 then
+				best, bestHrp, bestD2 = Threats[i].attackerModel, hrp, d2
 			end
 		end
 	end
-	Viz.pickCacheModel, Viz.pickCacheHrp, Viz.pickCacheT = best, bestHrp, nowc
 	return best, bestHrp
-end)
+end
 
-Viz.bboxRaw = LPH_NO_VIRTUALIZE(function(m) return m:GetBoundingBox() end)
+Viz.bboxRaw = function(m) LPH_ATTRIBUTES(VM(NONE)) return m:GetBoundingBox() end
 Viz.bbModel, Viz.bbClock, Viz.bbC, Viz.bbS = nil, -1, nil, nil
 Viz.ringPts = {}
 Viz.coneW   = {}
 Viz.cone2d  = {}
 Viz.coneZ   = {}
-Viz.bboxOf = LPH_NO_VIRTUALIZE(function(model)
+Viz.bboxOf = function(model)
+	LPH_ATTRIBUTES(VM(NONE))
 	local nowc = os.clock()
 	if model == Viz.bbModel and (nowc - Viz.bbClock) < 0.004 then return Viz.bbC, Viz.bbS end
 	local ok, c, s = pcall(Viz.bboxRaw, model)
@@ -9582,9 +10261,10 @@ Viz.bboxOf = LPH_NO_VIRTUALIZE(function(model)
 		return c, s
 	end
 	return nil
-end)
+end
 
-Viz.ribbonQuad = LPH_NO_VIRTUALIZE(function(cam, a, b, c, d, color, transp)
+Viz.ribbonQuad = function(cam, a, b, c, d, color, transp)
+	LPH_ATTRIBUTES(VM(NONE))
 	local ax, ay, az = Viz.projRaw(cam, a)
 	local bx, by, bz = Viz.projRaw(cam, b)
 	local cx, cy, cz = Viz.projRaw(cam, c)
@@ -9602,10 +10282,11 @@ Viz.ribbonQuad = LPH_NO_VIRTUALIZE(function(cam, a, b, c, d, color, transp)
 		t2.PointA, t2.PointB, t2.PointC = a2, c2, d2
 		t2.Color, t2.Transparency, t2.Visible = color, transp, true
 	end
-end)
+end
 
 Viz.gradLUT, Viz.gradA, Viz.gradB = {}, nil, nil
-Viz.grad = LPH_NO_VIRTUALIZE(function(a, b, f)
+Viz.grad = function(a, b, f)
+	LPH_ATTRIBUTES(VM(NONE))
 	if Viz.gradA ~= a or Viz.gradB ~= b then
 		Viz.gradA, Viz.gradB = a, b
 		local lut = Viz.gradLUT
@@ -9614,9 +10295,10 @@ Viz.grad = LPH_NO_VIRTUALIZE(function(a, b, f)
 	local i = f * 32 + 0.5
 	i = (i < 0 and 0) or (i > 32 and 32) or (i // 1)
 	return Viz.gradLUT[i]
-end)
+end
 
-Viz.drawRing = LPH_NO_VIRTUALIZE(function(cam, model, hrp, hot)
+Viz.drawRing = function(cam, model, hrp, hot)
+	LPH_ATTRIBUTES(VM(NONE))
 	local footY = hrp.Position.Y - 2.8
 	local radius = 3.2
 	local bc, bs = Viz.bboxOf(model)
@@ -9642,7 +10324,6 @@ Viz.drawRing = LPH_NO_VIRTUALIZE(function(cam, model, hrp, hot)
 		local colA = Viz.grad(Config.RingA, Config.RingB, hot and 0.875 or 0.375)
 		local colB = Viz.grad(Config.RingA, Config.RingB, hot and 1 or 0.625)
 		local thick = hot and 4 or 2.5
-		-- One line per two points: 16 segs -> 8 WorldToViewport pairs, not 30.
 		local step = (seg >= 20) and 2 or 1
 		for i = 0, seg - 1, step do
 			local k = (i + step) % seg
@@ -9681,15 +10362,17 @@ Viz.drawRing = LPH_NO_VIRTUALIZE(function(cam, model, hrp, hot)
 				Viz.grad(Config.RingA, Config.RingB, 1 - f), hot and 3 or 2)
 		end
 	end
-end)
+end
 
-Viz.footYOf = LPH_NO_VIRTUALIZE(function(model, hrp)
+Viz.footYOf = function(model, hrp)
+	LPH_ATTRIBUTES(VM(NONE))
 	local y = hrp.Position.Y - 2.8
 	local bc, bs = Viz.bboxOf(model)
 	if bc and bs then y = bc.Y - bs.Y * 0.5 + 0.05 end
 	return y
-end)
-Viz.drawTargetHitbox = LPH_NO_VIRTUALIZE(function(cam, model, hrp)
+end
+Viz.drawTargetHitbox = function(cam, model, hrp)
+	LPH_ATTRIBUTES(VM(NONE))
 	local look = hrp.CFrame.LookVector
 	local flook = Vector3.new(look.X, 0, look.Z)
 	if flook.Magnitude < 0.05 then return end
@@ -9736,9 +10419,10 @@ Viz.drawTargetHitbox = LPH_NO_VIRTUALIZE(function(cam, model, hrp)
 	Viz.drawWorldSeg(cam, origin, wArc[0], col, 2)
 	Viz.drawWorldSeg(cam, origin, wArc[CONE_SEG], col, 2)
 	for i = 0, CONE_SEG - 1 do Viz.drawWorldSeg(cam, wArc[i], wArc[i + 1], col, 2) end
-end)
+end
 
-Viz.drawRestrictZone = LPH_NO_VIRTUALIZE(function(cam)
+Viz.drawRestrictZone = function(cam)
+	LPH_ATTRIBUTES(VM(NONE))
 	if not (Config.RestrictZone and Config.RestrictShowZone) then return end
 	local z = activeRestrictZone(os.clock()); if not z then return end
 	local aHRP = z.th.attackerHRP; if not (aHRP and aHRP.Parent) then return end
@@ -9772,9 +10456,10 @@ Viz.drawRestrictZone = LPH_NO_VIRTUALIZE(function(cam)
 			Viz.drawWorldSeg(cam, from, edge, Config.RestrictCol, 1.5)
 		end
 	end
-end)
+end
 
-vizUpdate = LPH_NO_VIRTUALIZE(function(dt)
+vizUpdate = function(dt)
+	LPH_ATTRIBUTES(VM(NONE))
 	local cam = Workspace.CurrentCamera
 	if not (Config.Enabled and Config.ShowVisuals and cam) then vizHideAll(); return end
 	local nowc = os.clock()
@@ -9803,9 +10488,10 @@ vizUpdate = LPH_NO_VIRTUALIZE(function(dt)
 	end
 	if Config.VizRestrict ~= false then Viz.drawRestrictZone(cam) end
 	LinePool:finish(); TriPool:finish()
-end)
+end
 
-local applyFacing = LPH_NO_VIRTUALIZE(function()
+local applyFacing = function()
+	LPH_ATTRIBUTES(VM(NONE))
 	local goalPos = State.faceGoalPos
 	local goalHRP = State.faceGoalHRP
 	if not (goalHRP or goalPos) and not State.faceHum then return end
@@ -9880,16 +10566,18 @@ local applyFacing = LPH_NO_VIRTUALIZE(function()
 	else
 		myHRP.CFrame = myHRP.CFrame:Lerp(goal, Config.FaceLerp or 0.8)
 	end
-end)
+end
 
-RunService.Heartbeat:Connect(LPH_NO_VIRTUALIZE(function(dt)
+RunService.Heartbeat:Connect(function(dt)
+	LPH_ATTRIBUTES(VM(NONE))
 	if not (Config.Enabled and Config.ShowVisuals) then return end
 	vizUpdate(dt)
-end))
+end)
 
-RunService.RenderStepped:Connect(LPH_NO_VIRTUALIZE(function()
+RunService.RenderStepped:Connect(function()
+	LPH_ATTRIBUTES(VM(NONE))
 	applyFacing()
-end))
+end)
 
 indexAllAnims()
 task.spawn(function()
@@ -9914,9 +10602,6 @@ Players.PlayerAdded:Connect(function(plr)
 		local animator = hum and hum:FindFirstChildOfClass("Animator")
 		if animator then hookAnimator(animator) end
 	end)
-end)
-task.spawn(function()
-	while true do task.wait(8); scanAnimators() end
 end)
 
 return function(_Lib, _Core)
@@ -10359,7 +11044,7 @@ return function(_Lib, _Core)
 			Title = "AutoPlay", Flag = "AP_AutoPlay",
 			get = function() return Config.AutoPlay end,
 			set = function(v) Config.AutoPlay = v end,
-			Desc = "Automatically attacks nearby enemies.",
+			Desc = "Keeps AutoPlay running when nobody is swinging.",
 		})
 
 		apPlay:Divider()
@@ -10369,14 +11054,14 @@ return function(_Lib, _Core)
 		apPlay:SubLabel({ Text = "Uses the game M1 to attack." })
 		boolToggle(apPlay, "Punish After Parry", "Punish After Parry",
 			function() return Config.AP_PunishOnParry ~= false end, function(v) Config.AP_PunishOnParry = v end)
-	apPlay:SubLabel({ Text = "Attacks NPCs after your parry stuns them." })
+	apPlay:SubLabel({ Text = "M1 after you parry, once they are stunned." })
 	boolToggle(apPlay, "Smooth Swings", "Smooth Swings",
 		function() return Config.AP_AnimGuard ~= false end,
 		function(v) Config.AP_AnimGuard = v end)
 	apPlay:SubLabel({ Text = "Keeps the swing animation from restarting." })
 	boolToggle(apPlay, "Counter Interrupt", "Counter Interrupt",
 		function() return Config.AP_Interrupt == true end, function(v) Config.AP_Interrupt = v end)
-	apPlay:SubLabel({ Text = "Attacks instead of parrying when your hit lands first." })
+	apPlay:SubLabel({ Text = "Hits them first instead of parrying when your M1/M2 lands sooner." })
 	boolToggle(apPlay, "Interrupt With M2", "Interrupt With M2",
 		function() return Config.AP_InterruptM2 ~= false end, function(v) Config.AP_InterruptM2 = v end)
 	apPlay:SubLabel({ Text = "Allows interrupt to use M2." })
