@@ -10,7 +10,7 @@ local _C = {}
 local _D = {}
 
 local Config = {
-	Version       = "A39",
+	Version       = "A40",
 	Enabled       = false,
 	Mode          = "Perfect",
 
@@ -368,7 +368,6 @@ local Config = {
 	VizRingSpeed  = 1.0,
 	VizRingScale  = 1.0,
 	VizRange      = 100,
-	VizMaxTargets = 5,
 	VizMaxFPS     = 30,
 	VizSkipNearPress = 0.20,
 	VizSkipMaxFrames = 2,
@@ -9756,36 +9755,60 @@ Viz.refreshEnemies = function(nowc)
 end
 Viz.byDist = function(a, b) return a.d2 < b.d2 end
 Viz.tail = {}
-Viz.put = function(model, hrp, hot, mp)
+Viz.pubModel, Viz.pubHrp = nil, nil
+Viz.put = function(model, hrp, hot, mp, r2, camPos, camLook)
 	LPH_ATTRIBUTES(VM(NONE))
+	local p = hrp.Position
+	local dx, dz = p.X - mp.X, p.Z - mp.Z
+	local d2 = dx * dx + dz * dz
+	if d2 > r2 then return end
+	-- цель за спиной камеры (и дальше 15 ст.) нарисовать нечем: экономим всё построение геометрии
+	if d2 > 225 and ((p.X - camPos.X) * camLook.X + (p.Z - camPos.Z) * camLook.Z) < 0 then return end
 	local picks, n = Viz.picks, Viz.pickN
 	for i = 1, n do
 		local e = picks[i]
 		if e.model == model then e.hot = e.hot or hot; return end
 	end
+	if n >= 8 then return end
 	n = n + 1
 	Viz.pickN = n
 	local e = picks[n]
 	if not e then e = {}; picks[n] = e end
-	local p = hrp.Position
-	local dx, dz = p.X - mp.X, p.Z - mp.Z
-	e.model, e.hrp, e.hot, e.d2 = model, hrp, hot, dx * dx + dz * dz
+	e.model, e.hrp, e.hot, e.d2 = model, hrp, hot, d2
+	e.far = d2 > r2 * 0.36
 end
-Viz.pickTargets = function(nowc)
+Viz.pickTargets = function(nowc, cam)
 	LPH_ATTRIBUTES(VM(NONE))
 	Viz.pickN = 0
+	Viz.pubModel, Viz.pubHrp = nil, nil
 	local me = localHRP()
 	if not me then return 0 end
 	local mp = me.Position
 	local range = Config.VizRange or VIEW_DIST
 	local r2 = range * range
-	local maxN = math.clamp(math.floor(Config.VizMaxTargets or 5), 1, 12)
+	local cf = cam.CFrame
+	local camPos, camLook = cf.Position, cf.LookVector
+	-- AP_TARGET (наружу) не зависит от радиуса отрисовки: цель разворота, иначе ближайшая угроза
 	local vt = State.vizTarget
-	if vt and vt.hrp and vt.hrp.Parent then Viz.put(vt.model, vt.hrp, true, mp) end
+	local havePub = false
+	if vt and vt.hrp and vt.hrp.Parent then
+		havePub = true
+		Viz.pubModel, Viz.pubHrp = vt.model, vt.hrp
+		Viz.put(vt.model, vt.hrp, true, mp, r2, camPos, camLook)
+	end
+	local bestD2 = math.huge
 	for i = 1, #Threats do
 		local th = Threats[i]
 		local hrp = th.attackerHRP
-		if hrp and hrp.Parent and th.attackerModel then Viz.put(th.attackerModel, hrp, true, mp) end
+		if hrp and hrp.Parent and th.attackerModel then
+			Viz.put(th.attackerModel, hrp, true, mp, r2, camPos, camLook)
+			if not havePub then
+				local p = hrp.Position
+				local dx, dz = p.X - mp.X, p.Z - mp.Z
+				local d2 = dx * dx + dz * dz
+				if d2 < bestD2 then bestD2, Viz.pubModel, Viz.pubHrp = d2, th.attackerModel, hrp end
+			end
+		end
 	end
 	local nThreat = Viz.pickN
 	Viz.refreshEnemies(nowc)
@@ -9794,13 +9817,11 @@ Viz.pickTargets = function(nowc)
 		local e = en[i]
 		local hrp = e.hrp
 		if hrp.Parent and not (e.hum and e.hum.Health <= 0) then
-			local p = hrp.Position
-			local dx, dz = p.X - mp.X, p.Z - mp.Z
-			if dx * dx + dz * dz <= r2 then Viz.put(e.model, hrp, false, mp) end
+			Viz.put(e.model, hrp, false, mp, r2, camPos, camLook)
 		end
 	end
 	local picks, n = Viz.picks, Viz.pickN
-	-- угрозы в начале всегда; остальные сортируем по дистанции и режем по лимиту
+	-- угрозы в начале, остальные по дистанции (при переполнении лимита 8 остаются ближайшие угрозы + первые найденные)
 	if n > nThreat + 1 then
 		local tail = Viz.tail
 		table.clear(tail)
@@ -9808,9 +9829,6 @@ Viz.pickTargets = function(nowc)
 		table.sort(tail, Viz.byDist)
 		for i = 1, #tail do picks[nThreat + i] = tail[i] end
 	end
-	local keep = math.max(maxN, nThreat)
-	if n > keep then n = keep end
-	Viz.pickN = n
 	return n
 end
 
@@ -9867,7 +9885,7 @@ Viz.grad = function(a, b, f)
 	return Viz.gradLUT[i]
 end
 
-Viz.drawRing = function(cam, model, hrp, hot)
+Viz.drawRing = function(cam, model, hrp, hot, far)
 	LPH_ATTRIBUTES(VM(NONE))
 	local footY = hrp.Position.Y - 2.8
 	local radius = 3.2
@@ -9878,8 +9896,9 @@ Viz.drawRing = function(cam, model, hrp, hot)
 	end
 	radius = radius * (Config.VizRingScale or 1.0)
 	local spd   = Config.VizRingSpeed or 1.0
-	local style = Config.VizRingStyle or "Flat"
+	local style = far and "Flat" or (Config.VizRingStyle or "Flat")
 	local seg   = math.clamp(math.floor(Config.VizRingSeg or 30), 8, 48)
+	if far then seg = math.max(8, seg // 2) end
 	local t     = Viz.t * spd
 	local cx, cz = hrp.Position.X, hrp.Position.Z
 
@@ -9941,7 +9960,7 @@ Viz.footYOf = function(model, hrp)
 	if bc and bs then y = bc.Y - bs.Y * 0.5 + 0.05 end
 	return y
 end
-Viz.drawTargetHitbox = function(cam, model, hrp)
+Viz.drawTargetHitbox = function(cam, model, hrp, far)
 	LPH_ATTRIBUTES(VM(NONE))
 	local look = hrp.CFrame.LookVector
 	local flook = Vector3.new(look.X, 0, look.Z)
@@ -9977,7 +9996,7 @@ Viz.drawTargetHitbox = function(cam, model, hrp)
 	local o2d, oz = Viz.proj(cam, origin)
 	local a2d, az = Viz.cone2d, Viz.coneZ
 	for i = 0, CONE_SEG do a2d[i], az[i] = Viz.proj(cam, wArc[i]) end
-	for i = 0, CONE_SEG - 1 do
+	for i = 0, far and -1 or CONE_SEG - 1 do
 		if oz > NEAR and az[i] > NEAR and az[i + 1] > NEAR then
 			local tr = TriPool:get()
 			if tr then
@@ -10049,16 +10068,16 @@ vizUpdate = function(dt)
 	Viz.skipRun = 0
 
 	LinePool:begin(); TriPool:begin()
-	local n = Viz.pickTargets(nowc)
+	local n = Viz.pickTargets(nowc, cam)
 	local picks = Viz.picks
-	-- AP_TARGET наружу как раньше: только цель-угроза, не просто ближайший враг
-	if n > 0 and picks[1].hot then publishVizTarget(picks[1].model, picks[1].hrp) else publishVizTarget(nil) end
+	-- AP_TARGET наружу как раньше: только цель-угроза (по радиусу отрисовки не режется)
+	publishVizTarget(Viz.pubModel, Viz.pubHrp)
 	local stHot = (State.status == "PARRY" or State.status == "DODGE")
 	for i = 1, n do
 		local e = picks[i]
 		if e.hrp.Parent then
-			if Config.VizHitbox ~= false then Viz.drawTargetHitbox(cam, e.model, e.hrp) end
-			if Config.VizRing ~= false then Viz.drawRing(cam, e.model, e.hrp, e.hot and stHot) end
+			if Config.VizHitbox ~= false then Viz.drawTargetHitbox(cam, e.model, e.hrp, e.far) end
+			if Config.VizRing ~= false then Viz.drawRing(cam, e.model, e.hrp, e.hot and stHot, e.far) end
 		end
 	end
 	if Config.VizRestrict ~= false then Viz.drawRestrictZone(cam) end
@@ -10766,9 +10785,6 @@ return function(_Lib, _Core)
 		slider(apVis, { Name = "Draw Distance", Flag = "AP_VizRange",
 			Default = Config.VizRange or 100, Min = 20, Max = 250, Suffix = " st",
 			Callback = function(v) Config.VizRange = v end })
-		slider(apVis, { Name = "Max Targets", Flag = "AP_VizMaxTargets",
-			Default = Config.VizMaxTargets or 5, Min = 1, Max = 12, Suffix = "",
-			Callback = function(v) Config.VizMaxTargets = v end })
 
 		local DS = ctx.tabs.Desync
 
