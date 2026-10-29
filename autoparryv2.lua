@@ -10,7 +10,7 @@ local _C = {}
 local _D = {}
 
 local Config = {
-	Version       = "A32",
+	Version       = "A33",
 	Enabled       = false,
 	Mode          = "Perfect",
 
@@ -1561,6 +1561,16 @@ local associatedHitbox = function(th)
 		end
 
 		if Config.TraceDiag then
+			do
+				local c = LocalPlayer.Character
+				local r = c and c:FindFirstChild("HumanoidRootPart")
+				if r then
+					local dx, dz = r.Position.X - best.Position.X, r.Position.Z - best.Position.Z
+					diagTrace("TRACE-HBME t=%.3f %s %s s%d sid=%s xzDist=%.1f half=%.1f myHRP=(%.1f,%.1f) hb=(%.1f,%.1f) v=(%.1f,%.1f)", os.clock(), th.name or "?", th.kind or "?", th.strike or 1, tostring(sid),
+						math.sqrt(dx*dx + dz*dz), best.Size.X * 0.5, r.Position.X, r.Position.Z, best.Position.X, best.Position.Z,
+						r.AssemblyLinearVelocity.X, r.AssemblyLinearVelocity.Z)
+				end
+			end
 			diagTrace("TRACE-HB t=%.3f %s %s s%d sid=%s first=%+.0fms edge→hb=%s tbl=%.0fms toPred=%+.0fms pos=(%.1f,%.1f,%.1f) size=(%.1f,%.1f,%.1f)", os.clock(), th.name or "?", th.kind or "?", th.strike or 1, tostring(sid),
 				(th.hbFirstClock - th.detectClock)*1000,
 				(function() local er = th.attackerModel and V93.attrEdge[th.attackerModel]; local e = er and er[th.kind]; return e and string.format("%+.0fms", (th.hbFirstClock - e)*1000) or "?" end)(),
@@ -1894,7 +1904,7 @@ local willHitMe = function(th)
 	-- Своя скорость известна точно — уход/подход агрессивного игрока учитывается здесь.
 	do
 		local myV = myHRP.AssemblyLinearVelocity
-		local hz = math.clamp(remain0 - uplink(), 0, Config.SelfLeadCap or 0.30)
+		local hz = math.clamp(remain0 + (th.replicaAge or 0), 0, Config.SelfLeadCap or 0.30)
 		if myV and hz > 0 then
 			myAt = Vector3.new(myPos.X + myV.X * hz, myPos.Y, myPos.Z + myV.Z * hz)
 		end
