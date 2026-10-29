@@ -10,7 +10,7 @@ local _C = {}
 local _D = {}
 
 local Config = {
-	Version       = "A37",
+	Version       = "A39",
 	Enabled       = false,
 	Mode          = "Perfect",
 
@@ -22,7 +22,6 @@ local Config = {
 	PbAim         = 0.103,
 	PbLatAim      = true,
 	ReachCloseCap = 8,
-	RequireFacing = false,
 	IncludeNPCs   = true,
 	ParryWhitelist = {},
 	HeavyEnabled  = true,
@@ -35,22 +34,16 @@ local Config = {
 	HitboxSlack   = 1.25,
 	HighSlack     = 1.25,
 	HighReachPad  = 6.0,
-	HighFaceFloor = -0.50,
 	ProvenReachPad    = 4.0,
 	ProvenReachWindow = 0.22,
 	WillHitLeadFrac = 0.90,
 	FaceHardDeg     = 115,
 	TurnSnapDeg     = 50,
 	StickyStrict    = true,
-	StickyReachPad  = 8.0,
-	StickyFaceAllowPadDeg = 45,
 	LatchStrict     = true,
 	LatchSidePad    = 8.0,
 	MultiHitKeep    = true,
-	MultiHitOverlapPad = 0,
 	HeavyFacePadDeg = 55,
-	GuardLastResort        = false,
-	GuardLastResortHorizon = 0.18,
 
 	WillHitVelCap   = 8.0,
 	WillHitCloseCap = 14,
@@ -59,12 +52,10 @@ local Config = {
 	ApproachVelMin  = 0.5,
 	ClosingEtaSlack = 0.12,
 	ClosingFacePadDeg = 45,
-	OvGapEps        = 1.25,
 
 	ComboEscape        = true,
 	ComboEscapeDodge   = true,
 	DodgeOnParryCooldown = true,
-	StunReleaseLead    = 0.14,
 	GuardbreakProtect  = true,
 	StaminaFloor       = 18,
 	StaminaAttrs       = { "Stamina", "BlockStamina", "GuardStamina", "Posture", "Guard" },
@@ -75,19 +66,11 @@ local Config = {
 	PerfectLead   = 0.095,
 	HoldAfter     = 0.12,
 	HoldLateGrace = 0.14,
-	GapOffsetCap  = 0.28,
 	LatchTrustMultiHit = true,
-	SchedulerWatchdog    = false,
 	LatchTrustThrottled  = true,
 
-	ServerGapOffsetMs = 0,
-	GapCalibDiag  = true,
 
-	AnimTimeModel   = true,
 	AnimPingCompMax = 0.35,
-	ReplicaAgeOn     = false,
-	ReplicaAgeFrac   = 0.5,
-	ReplicaAgeMaxFrac= 0.35,
 	HitboxWindupExtra = 0.012,
 	SpeedSanityMin  = 0.20,
 	SpeedSanityMax  = 3.00,
@@ -100,9 +83,6 @@ local Config = {
 	BlockFaceHard   = true,
 	BlockFaceHardDt = 0.30,
 
-	M2WidenWindow = false,
-	M2WidenFront  = 0.22,
-	M2WidenHold   = 0.10,
 
 	HitboxDodge     = true,
 
@@ -113,17 +93,11 @@ local Config = {
 	CloseM1EarlyStuds = 4.5,
 	CloseAliC3HitTL = 0.36,
 
-	UplinkFactor  = 0.5,
 	UplinkMargin  = 0.008,
-	UplinkPreferGnpOneWay = true,
 	ThrottleCatchPad  = 0.07,
 	M2WallCapSlack    = 0.035,
 	UplinkMin     = 0.010,
-	LowPingFloor   = 0.0,
-	LowPingThresh  = 0.090,
-	UplinkMax     = 0.800,
 	PingCap       = 0.800,
-	PingSourceMaxRatio = 2.5,
 	PingWindow    = 24,
 	PingSampleGap = 0.03,
 
@@ -161,15 +135,7 @@ local Config = {
 	MultiDodgeLate      = true,
 	MultiDodgeLateGrace = 0.06,
 
-	OutnumberedDashSpeedMult    = 1.5,
-	OutnumberedDashDurationMult = 1.2,
 	EvasiveAckTimeout  = 0.18,
-	LocalParryAttackLockout = 0.15,
-	LocalBlockAttackLockout = 0.15,
-	LocalM2AttemptLockout   = 0.20,
-	ParryAttackLockout = 0.15,
-	GuardbreakLockout  = 2.0,
-	ParryBufferAfterHit = 2.0,
 	DodgeMinSpacing = 0.35,
 	OutnumberEscape = true,
 	ExposedEscapeDodge = true,
@@ -179,11 +145,11 @@ local Config = {
 	DashSpeed     = 30,
 	MaxHeightDiff = 8,
 	BoxingM2FirstFloor = 0.58,
-	JinM2FirstFloor = 0.48,
+	JinM2FirstFloor = 0.0,   -- A38: пол 0.48 был неверным: хитбокс Jin M2#1 приходит на +200..313мс (конфиг 0.28)
+	JinM2SecondHit  = 0.68,  -- A38: M2#2 по 4 замерам атрибута: +561..730мс от детекта (конфиг 0.83 не сходится)
 	DashDuration  = 0.20,
 	DodgeConfirm  = 0.18,
 	DodgeCenter   = true,
-	HeavyDodgeInset = 0.075,
 	DodgeCenterBias = 0.00,
 	HeavyDodgeBias  = 0.00,
 	FrameLookahead   = 0.5,
@@ -198,22 +164,16 @@ local Config = {
 	LowFpsFrameMs  = 25,
 	LowFpsPeakK    = 0.85,
 	LowFpsCapHi    = 0.13,
-	LowFpsEdgeMs   = 6,
 
-	LeadQuantCenter = 0.72,
-	LeadQuantFloorFrac = 0.64,
 	GapEdgeMs     = 6,
 
-	HitboxDuration   = 0.15,
 	HitboxRetime     = true,
 	HitboxContactLead = 0.02,
 	HitboxRetimeMinMs = 40,
 	HitboxCommitPress = true,
-	HitboxOriginDetect = false, -- A29: хитбокс = удар уже на сервере; угроза «с хитбокса» жала hitTL спустя → фантом-нажатие
 	HitboxLookbackSec = 0.55,
 	HoldForLiveAnim   = true,
 	HoldLiveCap       = 1.15,
-	StunPressMaxRemain = 0.140,
 	StunPressMinRemain = 0.050,
 	EmergencyPress      = true,
 	EmergencyPressMaxUplink = 0.045, -- A29: при большем uplink пакет приходит после хита и только жжёт BlockCooldown
@@ -236,7 +196,6 @@ local Config = {
 	CounterOnlyWhenNoParry = true,
 	CounterYieldToM2 = true,
 	CounterM2Horizon = 0.95,
-	CounterMinRemain = 0.22,
 	DodgeTelemetry  = true,
 
 	LiveHeavyTimer    = true,
@@ -254,10 +213,6 @@ local Config = {
 
 	EmergencyDualDodge = true,
 	MultiDodgeCover = true,
-	MultiDodgeConfirmSlack = 0.03,
-	TurnRateDegPerSec  = 720,
-	RearmBudget        = 0.06,
-	DualDodgeMaxGap     = 0.22,
 
 	DeepDiag           = false,
 	TraceDiag          = false,
@@ -272,7 +227,6 @@ local Config = {
 	AikidoCounter       = false,
 	AikidoCounterReach  = 6.5,
 	WCStartup           = 7 / 60,
-	WCCalibrate         = false,
 	WCAimFrac           = 0.35,
 	WCEarlyMargin       = 0.045,
 	WCLateMargin        = 0.10,
@@ -320,7 +274,6 @@ local Config = {
 	AP_PunishFastGap  = 0.08,
 	AP_M2Stun         = 1.0,
 	AP_M1Stun         = 0.5,
-	AP_PollGap        = 0,
 	AP_FaceHold       = 0.35,
 	AP_ComboMode      = "Follow",
 	AP_FixedHit       = 1,
@@ -348,7 +301,6 @@ local Config = {
 	DecoyRefireSec  = 0.12,
 	DecoySpeedMin   = 0.30,
 	DecoySpeedMax   = 1.25,
-	DecoySpeedTol   = 0.50,
 	DecoyHardDrop   = true,
 	DecoySweepSec   = 5,
 	DecoySeenMax    = 512,
@@ -368,16 +320,12 @@ local Config = {
 	MultiThreatGuard  = true,
 	MultiThreatMinN   = 2,
 	BlockCooldown     = 0.50,
-	BlockCooldownPredict = true,
 	BlockCooldownSafety  = 0.03,
-	SequentialMargin  = 0.05,
 	PlanLatchSec      = 1.2,
 	CooldownDodge     = true,
-	SequentialSpread  = 0.78,
 	MultiFaceAngleMax = 70,
 	MultiFaceJitter   = 0.30,
 	MultiFaceOnlyFront= true,
-	DesyncSafeDecoy   = true,
 
 	AntiCheatBypass = true,
 	HideHooks       = true,
@@ -392,8 +340,6 @@ local Config = {
 	HeavyFirst        = true,
 
 	DodgeHorizon      = 0.34,
-	MinBlockSeparation= 0.17,
-	DodgeArmWindow    = 0.05,
 
 	LegitAnims    = true,
 
@@ -401,8 +347,6 @@ local Config = {
 	FaceLerp      = 0.80,
 	FaceLeadWindow= 0.30,
 	FaceGoodDot   = 0.55,
-	FaceLead      = 0.07,
-	FaceLeadMax   = 4,
 	FacePingLead  = 1.0,
 	FaceLeadCap   = 0.28,
 	FaceLeadMaxStuds = 16,
@@ -424,27 +368,12 @@ local Config = {
 	VizRingSpeed  = 1.0,
 	VizRingScale  = 1.0,
 	VizRange      = 100,
+	VizMaxTargets = 5,
 	VizMaxFPS     = 30,
-	VizAutoDegrade   = true,
-	VizFrameShare    = 1.5,
 	VizSkipNearPress = 0.20,
 	VizSkipMaxFrames = 2,
 	Debug         = false,
 
-	Key_Toggle    = Enum.KeyCode.K,
-	Key_Mode      = Enum.KeyCode.N,
-	Key_Desync    = Enum.KeyCode.J,
-	Key_Boxing    = Enum.KeyCode.V,
-	Key_Double    = Enum.KeyCode.H,
-	Key_Face      = Enum.KeyCode.G,
-	Key_LogDump   = Enum.KeyCode.L,
-	Key_Save      = Enum.KeyCode.P,
-	Key_ACScan    = Enum.KeyCode.O,
-	Key_DesyncSave = Enum.KeyCode.Semicolon,
-	Key_DesyncTest = Enum.KeyCode.LeftBracket,
-	Key_DesyncMode = Enum.KeyCode.RightBracket,
-	AutoScanAC    = false,
-	Key_Panel     = Enum.KeyCode.RightShift,
 }
 
 _D.LEGACY_ATTACKS = {
@@ -610,7 +539,6 @@ local State = {
 	guardUp      = false,
 	holdUntil    = 0,
 	status       = "ARMED",
-	lastThreat   = nil,
 	parryCount   = 0,
 	dodgeCount   = 0,
 	grantEscapes = 0,
@@ -636,9 +564,6 @@ local State = {
 	lastAct      = -99,
 	lastDeact    = -99,
 	flashUntil   = 0,
-	lastResult   = "—",
-	lastErrMs    = 0,
-	lastGapMs    = 0,
 	tally        = { PERFECT=0, EARLY=0, LATE=0, GUARDBREAK=0 },
 	vizTarget    = nil,
 	faceGoalHRP   = nil,
@@ -662,9 +587,10 @@ local Pending = {}
 local logTrim = function(t, cap)
 	LPH_ATTRIBUTES(VM(NONE))
 	local n = #t
-	if n <= cap then return end
+	-- A39: триммим пачкой (запас cap/8), а не по 1 элементу: раньше каждая строка лога при полном буфере
+	-- двигала весь массив (12000/4000 элементов) прямо в бою.
+	if n <= cap + (cap // 8) then return end
 	local drop = n - cap
-	if drop < 1 then return end
 	table.move(t, drop + 1, n, 1)
 	for i = n - drop + 1, n do t[i] = nil end
 end
@@ -732,7 +658,6 @@ local V93 = {
 	stepCost  = 0,
 	nearPress = math.huge,
 	nearPressStamp = 0,
-	vizLast   = 0,
 	pingBuf   = {},
 	pingBufN  = 0,
 	pingBufI  = 0,
@@ -740,7 +665,6 @@ local V93 = {
 	gnpJit    = nil,
 	gnpJumps  = 0,
 	gnpLastSample = nil,
-	uplinkSlow = nil,
 	pingSampleClock = -1,
 	pingCacheVal   = 0.08,
 	pingMedTmp = {},
@@ -761,13 +685,11 @@ local V93 = {
 	imminentBuf = {},
 	clusterBuf  = {},
 	faceBuf     = {},
-	seenAttackers = {},
 	threatSeen = {},
 	interruptSeen = {},
 	boxingM2Contacts = { 0.6000000, 1.0500000 },
 	ownM1Info = { t = "M1", s = "Basic" },
 	ownM2Info = { t = "M2", s = "Basic", mom = false, variant = nil },
-	hbInfoScratch = { t = "M1", s = "Basic", mom = false, variant = nil, name = "hitbox" },
 	sortByContact = function(a, b) return a.contactAbs < b.contactAbs end,
 	dodgeParams = nil,
 	dodgeChar = nil,
@@ -959,14 +881,6 @@ local localHeightYBudget = function()
 	return val
 end
 
-_C.index = function(o, k) return o[k] end
-V93.humMove = function(hum, dir) return hum:Move(dir, false) end
-_C.safeGet = function(o, k, default)
-	if o == nil then return default end
-	local v = o[k]
-	if v ~= nil then return v end
-	return default
-end
 
 _C.FrameId = 0
 _C.hrpCache, _C.hrpFrame = nil, -1
@@ -1392,16 +1306,6 @@ local function watchHitboxFolder(folder)
 		V93.hbKidsN = nn
 		V93.hbFrame = -1
 		if State.hbWatchPart then State.hbWatchPart(c) end
-		local ingest = State.ingestHitbox
-		if ingest then
-			task.defer(function()
-				ingest(c)
-				local o, a = _C.hbMeta(c)
-				if not (o and a) then
-					task.delay(0.06, ingest, c)
-				end
-			end)
-		end
 	end)
 	folder.ChildRemoved:Connect(function(c)
 		local k, nn = V93.hbKids, V93.hbKidsN or 0
@@ -1504,8 +1408,6 @@ local associatedHitbox = function(th)
 		th.serverHitbox, th.serverSwingId = best, sid
 		local bestSeen = V93.hbFirstSeen[best]
 		th.hbFirstClock = (bestSeen and bestSeen.sid == sid and bestSeen.t) or os.clock()
-		th.hbFirstServer = Workspace:GetServerTimeNow()
-		th.hbFirstPos, th.hbFirstSize = best.Position, best.Size
 		if th.group then
 			th.group.serverHitbox, th.group.serverSwingId = best, sid
 			th.group.hbFirstClock = th.hbFirstClock
@@ -1526,7 +1428,7 @@ local associatedHitbox = function(th)
 				if hdx * hdx + hdz * hdz <= 81 then minShift = 18 end
 			end
 			if (th.strike or 1) <= 1 and th.styleKey == "jin" then
-				local floorAbs = (th.detectClock or nowHb) + (Config.JinM2FirstFloor or 0.48)
+				local floorAbs = (th.detectClock or nowHb) + (Config.JinM2FirstFloor or 0)
 				if hbContact < floorAbs then hbContact = floorAbs end
 			end
 			local shiftMs = (hbContact - th.contactAbs) * 1000
@@ -1539,14 +1441,12 @@ local associatedHitbox = function(th)
 				local oldContact = th.contactAbs
 				th.contactAbs = hbContact
 				th.hbContactAbs = hbContact
-				th.contactRetimed = true
 				if th.group then th.group.contactAbs = hbContact end
 				if shiftMs < 0 then
 					local canRearm = hbRemain > (upHb + pminR + 0.02)
 					if canRearm then
 						th.pressed = nil
 						if th.group then th.group.pressed = nil end
-						th.hbEarlyRearm = true
 						State.allowRearmUntil = os.clock() + 0.14
 						diagPush("HB-RETIME t=%.2f %s %s контакт %+.0fms→%+.0fms (хитбокс РАНЬШЕ таблицы — пересчёт)",
 							os.clock(), tostring(th.name), tostring(th.kind),
@@ -1739,7 +1639,7 @@ local syncContactWithHitbox = function(th, now)
 		th.hitboxSeen, th.hitboxPart = now, part
 	end
 	if realHitboxHitsMe(th.name, th) == true then
-		th.gtConfirmed, th.hitboxSynced = true, true
+		th.hitboxSynced = true
 	end
 end
 
@@ -1818,7 +1718,6 @@ local hitboxGeom = function(th)
 		local ok, go = pcall(_C.grabOffFn, skG)
 		if ok and type(go) == "number" and go > 0 then
 			forward = forward + go
-			th.geomGrab = go
 		end
 	end
 
@@ -1936,7 +1835,7 @@ local willHitMe = function(th)
 	end
 
 	if gt == true then
-		th.gtConfirmed, th.trustedHit = true, true
+		th.trustedHit = true
 		th.recognitionSource = "server-overlap"
 		return whmSet(th, true)
 	end
@@ -2009,7 +1908,6 @@ local willHitMe = function(th)
 		local approaching = velToMe > velMin
 		local reach = coreReach + (Config.HighReachPad or 2.0)
 		th.geomApproach = approachAllow
-		th.ovDelay = 0
 
 		local angToMe = math.acos(math.clamp(faceToMe, -1, 1))
 		do
@@ -2046,10 +1944,8 @@ local willHitMe = function(th)
 		if not faceOk and Config.DragAware ~= false and (th.kind == "M1" or th.kind == "M2") then
 			if dist2d <= coreReach + (Config.DragReachPad or 1.0) then
 				faceOk, faceAllowDeg = true, 180
-				th.dragEnvelope = true
 			end
 		end
-		th.geomFaceFloor  = faceOk and -1.01 or math.cos(math.rad(math.min(faceAllowDeg, 180)))
 		th.geomFaceAllow  = faceAllowDeg
 		th.geomAngToMe    = math.deg(angToMe)
 		local reachEff = reach + approachAllow
@@ -2083,7 +1979,6 @@ local willHitMe = function(th)
 				if faceDashOk then
 					hit, faceOk = true, true
 					th.recognitionSource = "closing-eta"
-					th.geomEta = eta
 				end
 			end
 		end
@@ -2262,7 +2157,6 @@ local function loadGameModules()
 			GameData.evPredictCooldown = cpe.Cooldown
 		end
 		if type(ev) == "table" and type(ev.DashDuration) == "number" and ev.DashDuration > 0 then
-			GameData.dashDuration = ev.DashDuration
 		end
 		local bl = GameData.cfg and GameData.cfg.Block
 		if bl and type(bl.PerfectBlockWindow) == "number" then
@@ -2395,7 +2289,6 @@ hitboxSizeMult = function(model)
 	_C.HbSizeCache[model] = { m = m, t = os.clock() }
 	return m
 end
-_C.hitboxSizeMult = hitboxSizeMult
 
 local function heightDiag(model)
 	LPH_ATTRIBUTES(VM(NONE))
@@ -2641,8 +2534,9 @@ _C.styleM2ContactTable = function(style)
 			if type(copy[1]) == "number" and type(copy[2]) == "number" then
 				local base = key:gsub("@awakened$", "")
 				if base == "jin" and not awakened then
-					local floor = Config.JinM2FirstFloor or 0.48
+					local floor = Config.JinM2FirstFloor or 0
 					if copy[1] < floor then copy[1] = floor end
+					if Config.JinM2SecondHit and copy[2] > Config.JinM2SecondHit then copy[2] = Config.JinM2SecondHit end
 				end
 				return copy
 			end
@@ -3429,11 +3323,6 @@ local function counterStyle()
 	return out
 end
 
-function _C.wcStartup()
-	local base = Config.WCStartup or _D.WINGCHUN.StartupSecs or (7 / 60)
-	return math.clamp(base, 0.02, 0.9)
-end
-
 local function steerM2Variant(want)
 	local c = localChar(); if not c then return end
 	local hum = c:FindFirstChildOfClass("Humanoid"); if not hum then return end
@@ -3724,7 +3613,6 @@ local m2BreaksHeldGuard = function(th)
 	LPH_ATTRIBUTES(VM(NONE))
 	return th ~= nil and th.kind == "M2" and styleM2BreaksHeldGuard(th.style)
 end
-State.m2BreaksHeldGuard = m2BreaksHeldGuard
 
 _C.dodgeCoverWindow = function(ifLat, ifDur, full)
 	local lo = (ifLat or 0.08) - 0.03
@@ -3782,47 +3670,6 @@ function State.aliDodgeAbuseEligible(th, now, imminent, ifLat, ifDur)
 	local dt = th.contactAbs - now
 	if dt < innerLo or dt > innerHi then return false, nil, "primary-outside-iframe" end
 	return true, remaining, "primary-covered"
-end
-
-function _C.resolveM2Module()
-	if State.ap.m2 and type(State.ap.m2.OnM2Activated) == "function" then
-		return State.ap.m2
-	end
-	local mod
-	pcall(function()
-		local csc = ReplicatedStorage:FindFirstChild("CombatSystemClient")
-		local base = csc and csc:FindFirstChild("Combat")
-		base = base and base:FindFirstChild("Base")
-		mod = base and base:FindFirstChild("M2")
-	end)
-	if not mod then
-		pcall(function()
-			for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
-				if d.Name == "M2" and d:IsA("ModuleScript")
-				   and d.Parent and d.Parent.Name == "Base" then
-					mod = d
-					break
-				end
-			end
-		end)
-	end
-	if mod then
-		local ok, tbl = pcall(require, mod)
-		if ok and type(tbl) == "table" and type(tbl.OnM2Activated) == "function" then
-			State.ap.m2 = tbl
-		end
-	end
-	if not State.ap.m2 and type(filtergc) == "function" then
-		pcall(function()
-			local t = filtergc("table", {
-				Keys = { "OnM2Activated", "ServerResponse", "OnServerSwing" },
-			}, true)
-			if type(t) == "table" and type(t.OnM2Activated) == "function" then
-				State.ap.m2 = t
-			end
-		end)
-	end
-	return State.ap.m2
 end
 
 local function fireNativeM2()
@@ -4557,7 +4404,6 @@ function State.ap.getM1()
 						State.ap.u26idx    = C - 3
 						State.ap.u27tbl    = tA
 						State.ap.u28tbl    = tB
-						State.ap.crc       = uv(C)
 						State.ap.getSpeed  = getSpeed
 						State.ap.getAnims  = getAnims
 						State.ap.playSwing = playSw
@@ -5094,7 +4940,6 @@ State.ap.tryInterrupt = function(now, th, threatCount)
 		sendDeactivate(true)
 	end
 
-	ap.skipM2YieldUntil = now + 0.08
 	local ownHit, tag
 	if useM2 then
 		if not ap.fireM2(th.attackerModel, "interrupt", m2Var) then
@@ -5133,7 +4978,7 @@ function State.ap.fireM1(model, why, priority, dropGuard)
 	local hrp = model and model:FindFirstChild("HumanoidRootPart")
 	if not hrp then return false end
 	ap.snapTo(hrp)
-	ap.nextM1At = now + (Config.AP_PollGap or 0)
+	ap.nextM1At = now
 		local swung = false
 		local useFast = ap.fireOK and (Config.AP_ForceNativeM1 == false)
 		if useFast then
@@ -5200,7 +5045,6 @@ function State.ap.onPerfectParry(attackerName, kind, th)
 	end
 	if wingChunCounterActive(model) then
 		State.ap.punishTgt = nil
-		State.ap.punishFresh = false
 		diagPush("PUNISH-SKIP t=%.2f counter-stance %s", os.clock(), tostring(attackerName))
 		return
 	end
@@ -5209,7 +5053,6 @@ function State.ap.onPerfectParry(attackerName, kind, th)
 	State.ap.punishTgt   = model
 	State.ap.punishArmAt = os.clock()
 	State.ap.punishUntil = os.clock() + stun + stun
-	State.ap.punishFresh = true
 	if Config.DeepDiag then
 		diagPush("PUNISH-ARM t=%.2f %s until=+%.0fms", os.clock(), tostring(attackerName), (stun + stun) * 1000)
 	end
@@ -5293,7 +5136,6 @@ function State.ap.step(now)
 	local hum = tgt:FindFirstChildOfClass("Humanoid")
 	if (not hum) or hum.Health <= 0 then
 		ap.punishTgt = nil
-		ap.punishFresh = false
 		return
 	end
 	if now > ap.punishUntil then
@@ -5301,7 +5143,6 @@ function State.ap.step(now)
 			diagPush("PUNISH-EXPIRE t=%.2f", now)
 		end
 		ap.punishTgt = nil
-		ap.punishFresh = false
 		return
 	end
 	local lockClock = (ap.punishArmAt or 0) + 0.16
@@ -5350,7 +5191,6 @@ function State.ap.step(now)
 	if Config.SkillAddon and Config.SA_WrestlingPunishM2 and meStyle == "wrestling" then
 		if ap.fireM2(tgt, "punish-grab") then
 			ap.punishTgt = nil
-			ap.punishFresh = false
 		end
 		return
 	end
@@ -5368,7 +5208,6 @@ function State.ap.step(now)
 	end
 	if swung then
 		ap.punishTgt = nil
-		ap.punishFresh = false
 		if Config.DeepDiag then
 			diagPush("PUNISH-FIRE t=%.2f custom", now)
 		end
@@ -5469,7 +5308,6 @@ _C.widenCluster = function(cluster, now)
 				if not seen then
 					n = n + 1
 					cluster[n] = th
-					if th.kind == "M2" then cluster.heavy = true end
 				end
 			end
 		end
@@ -5558,7 +5396,6 @@ local releaseBlock = function()
 	State.lastBlockRelease = os.clock()
 	sendDeactivate(true)
 end
-State.releaseBlock = releaseBlock
 
 local fireBlock = function(tsServer, allowComboEscape)
 	LPH_ATTRIBUTES(VM(NONE))
@@ -5828,8 +5665,6 @@ if th.kind == "M2" and not th.sprintLocked and (now - (th.detectClock or now)) <
 				elseif not stalledM2 and liveClamped < remaining then
 					remaining = liveClamped
 				end
-				th.heldBy = held and
-					(liveRemain - math.max(th.contact0 - (now - th.detectClock), 0)) or 0
 			end
 		end
 
@@ -5904,17 +5739,6 @@ local function reachLimit(kind, approaching)
 	local off = (kind == "M2") and 3 or 4
 	local pad = 6
 	return off + half + pad + (Config.ReachSlack or 1) + localTorsoHalf()
-end
-
-function _C.serverHitboxProof(ownerName)
-	if not ownerName then return false end
-	local folder = Workspace:FindFirstChild("Hitboxes")
-	if not folder then return false end
-	for _, part in ipairs(folder:GetChildren()) do
-		local o, an = _C.hbMeta(part)
-		if o == ownerName and (an == "M1" or an == "M2") then return true end
-	end
-	return false
 end
 
 local onAttack = function(attackerHRP, info, model, id, track, origin, hbPart)
@@ -6193,7 +6017,6 @@ local onAttack = function(attackerHRP, info, model, id, track, origin, hbPart)
 		th.serverProven = true
 		th.provenBy = "hitbox"
 		th.hbFirstClock = nowClock
-		th.hbFirstServer = nowServer
 		if typeof(sidHb) == "string" and sidHb ~= "" then
 			V93.hbClaimBySid[sidHb] = th
 		end
@@ -6286,7 +6109,6 @@ local onAttack = function(attackerHRP, info, model, id, track, origin, hbPart)
 		local rem2 = math.max(0, hit2Real - already / tpSpeed(track))
 		local th2 = table.clone(th)
 		th2.hitTL, th2.hitTLReal, th2.contact0, th2.contactAbs = hit2, hit2Real, rem2, nowClock + rem2
-		group.lastContact = th2.contactAbs
 		th2.strike, th2.pressed, th2.dodged = 2, false, false
 		group.second = th2
 		th2.pressDt, th2.faceDot, th2.rec = nil, nil, nil
@@ -6302,7 +6124,6 @@ local onAttack = function(attackerHRP, info, model, id, track, origin, hbPart)
 	end
 	while #q > 10 do table.remove(q, 1) end
 
-	State.lastThreat = { name = name, type = info.t, dist = dist, hitIn = remaining0 }
 	if State.status ~= "PARRY" then State.status = "THREAT" end
 	State.parryCount = State.parryCount + 1
 
@@ -6350,41 +6171,6 @@ local onAttack = function(attackerHRP, info, model, id, track, origin, hbPart)
 						or Config.PerfectWindow or 0.125)*1000)
 		end
 end
-
-local function ingestHitboxPart(part)
-	if not Config.Enabled or Config.HitboxOriginDetect == false then return end
-	if not (part and part.Parent and part:IsA("BasePart")) then return end
-	local ownerName, kind = _C.hbMeta(part)
-	if not (ownerName and kind) then return end
-	if kind ~= "M1" and kind ~= "M2" then return end
-	if kind == "M2" and not Config.HeavyEnabled then return end
-	if type(ownerName) ~= "string" or ownerName == "" then return end
-	local plr = Players:FindFirstChild(ownerName)
-	local model = (plr and plr:IsA("Player") and plr.Character) or nil
-	if not model then
-		local inst = Workspace:FindFirstChild(ownerName)
-		if inst and inst:FindFirstChildOfClass("Humanoid") then model = inst end
-	end
-	if not model or model == localChar() then return end
-	local enemy, hrp = isEnemyModel(model)
-	if not (enemy and hrp and hrp.Parent) then return end
-	local style = styleOf(model) or "Basic"
-	local variant = model:GetAttribute("M2VariantId")
-	if type(variant) ~= "string" or variant == "" then variant = nil end
-	local info = V93.hbInfoScratch
-	if not info then
-		info = { t = kind, s = style, mom = false, variant = variant, name = "hitbox" }
-		V93.hbInfoScratch = info
-	else
-		info.t = kind
-		info.s = style
-		info.mom = false
-		info.variant = variant
-		info.name = "hitbox"
-	end
-	onAttack(hrp, info, model, nil, nil, "hitbox", part)
-end
-State.ingestHitbox = ingestHitboxPart
 
 -- A29: пассивный учёт появления серверных хитбоксов (только таймстемпы для HB-RETIME/диагностики,
 -- ничего не калибрует). Хитбокс реплицируется тем же путём, что и анимация.
@@ -6778,7 +6564,6 @@ local function performDodge(now, reason, preferBack, force, bypassAutoOff, dodge
 	tx.ackDeadline = now + ackWindow
 	tx.untilAt, tx.reason = iframeHi + 0.08, reason
 	tx.abuseThreat = isAliAbuse and dodgeTarget or nil
-	tx.forced = (preferBack == true) or (force == true)
 	tx.dodgeDirMode = dirMode
 	tx.perfectConfirmed, tx.perfectAt = false, nil
 	if (counterStyle() or "") == "ali" and Config.SkillAddon and Config.AliEvasiveCounter then
@@ -7111,7 +6896,6 @@ local schedulerStep = function(now)
 					local late = now + eta
 					if late > (th.contactAbs or 0) then
 						th.contactAbs = late
-						th.turnHeld = true
 						if not th.turnLogged then
 							th.turnLogged = true
 							diagPush("TURN-IN t=%.2f %s %s face=%.2f eta=%.0fms → жмём на доворот, не на маркер",
@@ -7213,10 +6997,6 @@ local schedulerStep = function(now)
 				end
 				local lead = Config.PerfectLead
 				local hold = Config.HoldAfter
-		if Config.M2WidenWindow and th.kind == "M2" then
-			lead = lead + Config.M2WidenFront
-			hold = hold + Config.M2WidenHold
-		end
 					local pwin = (Config.PerfectWindowLive ~= false and GameData.perfectWindow)
 						or Config.PerfectWindow or 0.125
 					local pmin0 = Config.PerfectMin or 0.05
@@ -7231,12 +7011,10 @@ local schedulerStep = function(now)
 						-- лидирование от измеренной задержки сервера: press = trueContact - (pbLat + PbAim),
 						-- trueContact = contactAbs + replicaAge (хитбокс приходит через hitTL после детекта, пинг тут не нужен)
 						gap = math.clamp(V93.pbLat + (Config.PbAim or 0.103) - (th.replicaAge or 0) - timingOneWay(), 0.02, 0.30)
-						th.pbLatAimed = true
 					end
 					lead = gap
 					th.aimGap = gap
 					local pkt = timingOneWay()
-					th.pktLead = pkt
 					local pressAt = th.contactAbs - gap - pkt
 					local holdEnd = th.contactAbs + hold
 					local pressAtQ = pressAt
@@ -7326,7 +7104,6 @@ local schedulerStep = function(now)
 					   and (th.contactAbs - now) > (Config.ProofGraceSec or 0.06) then
 						if not th.baitHeldLogged then
 							th.baitHeldLogged = true
-							th.proofHoldClock = now
 							diagTrace("TRACE-PROOF t=%.3f %s %s HOLD unproven%s | dt=%+.0fms", now, tostring(th.name), tostring(th.kind),
 									th.suspect and " SUSPECT(no swing-id)" or "",
 									(th.contactAbs - now) * 1000)
@@ -7595,7 +7372,6 @@ local schedulerStep = function(now)
 			or State.lastClusterSigStrat ~= clusterStrategy then
 			State.lastClusterSigN = sigN
 			State.lastClusterSigStrat = clusterStrategy
-			State.lastClusterLogAt = now
 			diagPush("CLUSTER t=%.2f n=%d spread=%.0fms strategy=%s contacts=[+%.0f,+%.0f]ms", now, clusterN, clusterSpread * 1000, clusterStrategy,
 					(clusterFirst.contactAbs - now) * 1000, (clusterLast.contactAbs - now) * 1000)
 		end
@@ -8111,10 +7887,6 @@ local schedulerStep = function(now)
 			local sent, armOnly
 			local tooEarly = type(pAt) == "number" and now < pAt - 0.008
 				and not wantBlock.needComboEscape
-			do
-				local stunnedNow = meC and stunEscapeNow(meC) and true or false
-				State.prevStunEsc = stunnedNow
-			end
 			if not faceHold and not wantBlock.stunTooLate and not tooEarly then
 				local pressGap = now - (State.lastPress or 0)
 				local cdGap   = (Config.BlockCooldown or 0.5) - (Config.BlockCooldownSafety or 0.03)
@@ -8132,7 +7904,6 @@ local schedulerStep = function(now)
 					releaseBlock()
 					wantBlock.pressed = true
 					wantBlock.pressDt  = wantBlock.contactAbs - now
-					wantBlock.cdSwallowed = true
 					if (Config.AutoDodge ~= false or isMustDodge(wantBlock)) and dodgeReady() and canDodgeNow(true)
 						and not wantBlock.coveredByDodge then
 						if performDodge(now, "must-dodge(m2-s2-cd)", false, true, false, wantBlock) then
@@ -8159,14 +7930,11 @@ local schedulerStep = function(now)
 						end
 					end
 					State.pressSpoofExtra = back
-					if wantBlock.rec then wantBlock.rec.stampBack = back end
 					sent, armOnly = fireBlock(serverNow, comboOk)
 					State.pressSpoofExtra = 0
 				end
 			end
-				if sent and armOnly then
-				wantBlock.stunArmed = true
-			elseif sent then
+				if sent and not armOnly then
 				wantBlock.pressed  = true
 				wantBlock.didPressClock = now
 				wantBlock.pressDt  = wantBlock.contactAbs - now
@@ -8207,7 +7975,6 @@ local schedulerStep = function(now)
 							tostring(meP and (meP:GetAttribute("CombatAttacking") or meP:GetAttribute("M1") or meP:GetAttribute("M2")) == true))
 					end
 					wantBlock.rec.pressServer = serverNow
-					wantBlock.rec.pressClock = now
 					wantBlock.rec.pressAt = wantBlock.contactAbs - (wantBlock.aimGap or Config.PerfectLead or 0)
 					wantBlock.rec.pressLateBy = now - wantBlock.rec.pressAt
 					wantBlock.rec.uplinkAtPress = up
@@ -8248,7 +8015,6 @@ local schedulerStep = function(now)
 				end
 				end
 				end
-				local holdExtra = (wantBlock.kind == "M2" and Config.M2WidenWindow) and Config.M2WidenHold or 0
 		local base = wantBlock.contactAbs
 			if Config.Mode ~= "Perfect" and multiThreat and farContact and farContact > base
 				and clusterStrategy ~= "SEQUENTIAL"
@@ -8260,7 +8026,7 @@ local schedulerStep = function(now)
 		end
 		if not ((wantBlock.strike or 1) >= 2 and not wantBlock.pressed) then
 			State.holdUntil = math.max(State.holdUntil,
-				base + Config.HoldAfter + (Config.HoldLateGrace or 0) + holdExtra)
+				base + Config.HoldAfter + (Config.HoldLateGrace or 0))
 		end
 	elseif State.blocking then
 		local keepForCluster = Config.Mode ~= "Perfect" and ((multiThreat and farContact
@@ -8279,53 +8045,6 @@ local schedulerStep = function(now)
 					break
 				end
 			end
-		end
-
-		local keepAsLastResort, lastResortTh = false, nil
-		if Config.GuardLastResort ~= false then
-			local horizon = now + (Config.GuardLastResortHorizon or 0.18)
-			local soonest = nil
-			for i = 1, #Threats do
-				local th = Threats[i]
-				if th.threatens and not th.pressed and not th.coveredByDodge
-					and not th.coveredByCounter and not th.offTarget
-					and not m2BreaksHeldGuard(th)
-					and not State.lastPressEarly
-					and th.contactAbs > now and th.contactAbs <= horizon
-					and (not soonest or th.contactAbs < soonest.contactAbs) then
-					soonest = th
-				end
-			end
-			if soonest then
-				local remainHold = soonest.contactAbs - now
-				local pwinHold = (Config.PerfectWindowLive ~= false and GameData.perfectWindow)
-					or Config.PerfectWindow or 0.125
-				local cd   = Config.BlockCooldown or 0.5
-				local lead = Config.PerfectLead or 0.0625
-				local readyAt = now + cd + (Config.BlockCooldownSafety or 0.03)
-				local pressBy = soonest.contactAbs - (soonest.aimGap or (pwinHold * 0.72))
-				local canRepress = readyAt <= pressBy
-				local canDodgeIt = Config.AutoDodge and dodgeReady() and canDodgeNow()
-					and not counterPreemptsDodge(now)
-				if remainHold <= (pwinHold + 0.06)
-				   and not canRepress and not canDodgeIt then
-					local stam = blockStamina()
-					if stam == nil or stam > (Config.StaminaFloor or 18) then
-						keepAsLastResort, lastResortTh = true, soonest
-						State.holdUntil = math.max(State.holdUntil or 0,
-							soonest.contactAbs + Config.HoldAfter + (Config.HoldLateGrace or 0))
-						soonest.coveredByHeldGuard = true
-					end
-				end
-			end
-		end
-		if keepAsLastResort and Config.DeepDiag
-			and (not State.lastResortLogAt or now - State.lastResortLogAt > 0.25) then
-			State.lastResortLogAt = now
-			diagPush("GUARD-HOLD t=%.2f  %s  %s  → парри на кулдауне и додж недоступен, "
-				.. "гард НЕ отпускаем (contactIn=%+.0fms): обычный блок вместо пропуска",
-				now, tostring(lastResortTh.name), tostring(lastResortTh.kind),
-				(lastResortTh.contactAbs - now) * 1000)
 		end
 
 		local liveWindup = false
@@ -8347,7 +8066,7 @@ local schedulerStep = function(now)
 			end
 		end
 
-		if not keepForCluster and not keepAsLastResort and not liveWindup
+		if not keepForCluster and not liveWindup
 			and (now >= State.holdUntil or releaseByGap) then
 			releaseBlock()
 			State.multiHoldUntil = 0
@@ -8444,7 +8163,6 @@ local function onOutcome(attacker, result, kind, eventClock)
 	end
 
 	State.tally[result] = (State.tally[result] or 0) + 1
-	State.lastResult    = result
 	State.flashUntil    = os.clock() + 0.25
 	if kind == "M2" then
 		local sk = tostring(rec.style or "?") .. " s" .. tostring(rec.strike or 1)
@@ -8516,7 +8234,6 @@ local function onOutcome(attacker, result, kind, eventClock)
 
 	local measured = eventClock - rec.clock
 	local predErr  = (measured - rec.contact) * 1000
-	State.lastErrMs = predErr
 
 	local ksKey = tostring(kind) .. ":" .. tostring(rec.style or "?") .. ":" .. tostring(rec.strike or 1)
 	local ks = _D.ResidByKS[ksKey]; if not ks then ks = { sum = 0, n = 0 }; _D.ResidByKS[ksKey] = ks end
@@ -8671,7 +8388,6 @@ _C.edgeApply = function(th, edge, how)
 	LPH_ATTRIBUTES(VM(NONE))
 	if th.edgeApplied or th.resolved or not th.contactAbs then return end
 	local d = edge - th.detectClock
-	th.edgeDelta = d
 	local thr = Config.AttrAnchorMs or 0.10
 	if Config.AttrAnchor ~= true or math.abs(d) < thr or math.abs(d) > 0.5 then
 		th.edgeApplied = true
@@ -8683,7 +8399,6 @@ _C.edgeApply = function(th, edge, how)
 	th.edgeApplied = true
 	local old = th.contactAbs
 	th.contactAbs = old + d
-	th.contactEdge = true
 	if th.group then th.group.contactAbs = th.contactAbs end
 	if d > 0 and th.pressed and not th.resolved and (th.contactAbs - os.clock()) > (uplink() + (Config.PerfectMin or 0.05) + 0.02) then
 		-- пакет ушёл по старому контакту, а сервер стартовал позже: окно ещё можно переоткрыть
@@ -9098,197 +8813,6 @@ local function neutralizeAC()
 	end
 end
 
-local function scanAC()
-	local L = {}
-	local function w(s) L[#L + 1] = s end
-	local function has(name)
-		local v = getgenv()[name] or getfenv(0)[name]
-		return type(v) == "function", v
-	end
-	local function trunc(s, n)
-		s = tostring(s):gsub("[%z\1-\8\11-\31]", ".")
-		if #s > n then return s:sub(1, n) .. "…(" .. #s .. ")" end
-		return s
-	end
-
-	w("===== AUTOPARRY ANTICHEAT SCAN =====")
-	do
-		local okId, exe, ver = pcall(function() local a, b = identifyexecutor(); return a, b end)
-		w(string.format("executor: %s %s", okId and tostring(exe) or "?", okId and tostring(ver or "") or ""))
-	end
-	do
-		local caps = { "getscriptclosure","getgc","filtergc","getconnections","getscriptbytecode",
-			"getscripthash","getrunningscripts","getscriptthread","getcallingscript","decompile",
-			"debug","hookfunction","newcclosure","setstackhidden","getsenv","getscripts" }
-		local line = {}
-		for _, c in ipairs(caps) do line[#line + 1] = (has(c) and "+" or "-") .. c end
-		w("caps: " .. table.concat(line, " "))
-	end
-
-	local ac = findACScript()
-	if not ac then
-		w("!! AC script NOT FOUND by findACScript(). Listing candidate LocalScripts (name/parent):")
-		local okScr, scripts = pcall(getscripts)
-		if okScr and scripts then
-			local shown = 0
-			for _, s in ipairs(scripts) do
-				local okA = pcall(function() return s:IsA("LocalScript") end)
-				if okA and s:IsA("LocalScript") and shown < 60 then
-					w(string.format("   %s  <%s>", tostring(s.Name), tostring(s.Parent and s.Parent:GetFullName() or "?")))
-					shown = shown + 1
-				end
-			end
-		end
-	else
-		w(string.format("AC script: %s", tostring(ac:GetFullName())))
-		pcall(function() w("  hash: " .. tostring(getscripthash(ac))) end)
-		pcall(function() local bc = getscriptbytecode(ac); w("  bytecode bytes: " .. tostring(bc and #bc or "?")) end)
-
-		local hasGSC, gsc = has("getscriptclosure")
-		local mainFn
-		if hasGSC then local ok, f = pcall(gsc, ac); if ok then mainFn = f end end
-		if type(mainFn) ~= "function" then
-			w("  getscriptclosure: unavailable/failed — cannot walk protos")
-		else
-			local seen, fnCount = {}, 0
-			local function walk(fn, depth, tag)
-				if type(fn) ~= "function" or seen[fn] or depth > 6 or fnCount > 400 then return end
-				seen[fn] = true; fnCount = fnCount + 1
-				local info = {}
-				pcall(function() local i = debug.getinfo(fn); if i then
-					info = { nups = i.nups, npar = i.numparams, line = i.linedefined, name = i.name } end end)
-				w(string.format("  fn[%s] d%d line=%s nups=%s name=%s", tag, depth,
-					tostring(info.line or "?"), tostring(info.nups or "?"), tostring(info.name or "")))
-				pcall(function()
-					local cs = debug.getconstants(fn)
-					if cs then for i, c in pairs(cs) do
-						local t = type(c)
-						if t == "string" and #c > 0 then
-							w(string.format("     const[%s] %q", tostring(i), trunc(c, 90)))
-						elseif t == "boolean" or t == "number" then
-							w(string.format("     const[%s] = %s", tostring(i), tostring(c)))
-						end
-					end end
-				end)
-				pcall(function()
-					local ups = debug.getupvalues(fn)
-					if ups then for name, v in pairs(ups) do
-						local t = type(v)
-						local desc
-						if t == "boolean" or t == "number" then desc = tostring(v)
-						elseif t == "string" then desc = string.format("%q", trunc(v, 60))
-						elseif t == "table" then
-							local n = 0; pcall(function() for _ in pairs(v) do n = n + 1 end end)
-							desc = string.format("table(#%d)", n)
-						elseif t == "userdata" then
-							local cls; pcall(function() cls = v.ClassName end)
-							desc = "Instance<" .. tostring(cls or "userdata") .. ">"
-							pcall(function() if v.Name then desc = desc .. ' "' .. tostring(v.Name) .. '"' end end)
-						else desc = t end
-						w(string.format("     up[%s] %s = %s", tostring(name), t, desc))
-					end end
-				end)
-				pcall(function()
-					local ps = debug.getprotos(fn)
-					if ps then for i, p in ipairs(ps) do walk(p, depth + 1, tag .. "." .. i) end end
-				end)
-			end
-			walk(mainFn, 0, "main")
-			w(string.format("  (walked %d functions)", fnCount))
-		end
-
-		local hasGC, gc = has("getgc")
-		if hasGC then
-			local okSrc, acSrc = pcall(function() local i = debug.getinfo(mainFn); return i and i.source end)
-			acSrc = okSrc and acSrc or nil
-			local fnHit, tblHit = 0, 0
-			local ok = pcall(function()
-				for _, o in ipairs(gc(true)) do
-					local t = type(o)
-					if t == "function" and fnHit < 40 then
-						local src; pcall(function() local i = debug.getinfo(o); src = i and i.source end)
-						if src and acSrc and src == acSrc then
-							local ln; pcall(function() ln = debug.getinfo(o).linedefined end)
-							w(string.format("  gc.fn line=%s (AC-owned, live in GC)", tostring(ln)))
-							fnHit = fnHit + 1
-						end
-					elseif t == "table" and tblHit < 25 then
-						local keys = {}
-						local okK = pcall(function()
-							for k in pairs(o) do
-								if type(k) == "string" then keys[#keys + 1] = k:lower() end
-								if #keys > 24 then break end
-							end
-						end)
-						if okK then
-							local blob = table.concat(keys, ",")
-							if blob:find("kick") or blob:find("detect") or blob:find("report")
-							   or blob:find("flag") or blob:find("ban") or blob:find("exploit")
-							   or blob:find("cheat") or blob:find("suspic") then
-								w(string.format("  gc.table keys={%s}", trunc(blob, 120)))
-								tblHit = tblHit + 1
-							end
-						end
-					end
-				end
-			end)
-			w(string.format("  gc sweep: %s (AC fns=%d, suspicious tables=%d)", ok and "ok" or "err", fnHit, tblHit))
-		end
-
-		local hasConn, gconn = has("getconnections")
-		if hasConn then
-			local RS = game:GetService("RunService")
-			local sigs = {
-				{ "Heartbeat", RS.Heartbeat }, { "RenderStepped", RS.RenderStepped }, { "Stepped", RS.Stepped },
-				{ "PreSimulation", RS.PreSimulation }, { "PostSimulation", RS.PostSimulation },
-				{ "PreRender", RS.PreRender }, { "PreAnimation", RS.PreAnimation },
-				{ "game.DescendantAdded", game.DescendantAdded }, { "game.ChildAdded", game.ChildAdded },
-				{ "ws.DescendantAdded", workspace.DescendantAdded },
-			}
-			pcall(function()
-				local lp = Players.LocalPlayer
-				if lp then
-					sigs[#sigs+1] = { "LP.CharacterAdded", lp.CharacterAdded }
-					sigs[#sigs+1] = { "LP.Idled", lp.Idled }
-					if lp.Character then
-						local hum = lp.Character:FindFirstChildOfClass("Humanoid")
-						if hum then sigs[#sigs+1] = { "Humanoid.StateChanged", hum.StateChanged } end
-					end
-				end
-			end)
-			for _, pair in ipairs(sigs) do
-				pcall(function()
-					local total, mine = 0, 0
-					for _, conn in ipairs(gconn(pair[2])) do
-						total = total + 1
-						if conn.Script == ac then mine = mine + 1 end
-					end
-					if total > 0 then w(string.format("  sig %s: %d conns (%d AC-owned)", pair[1], total, mine)) end
-				end)
-			end
-		end
-
-		pcall(function()
-			local okT, th = pcall(getscriptthread, ac)
-			if okT and th then w(string.format("  script thread: %s status=%s", tostring(th), tostring(coroutine.status(th)))) end
-		end)
-	end
-
-	w("===== END SCAN =====")
-	local report = table.concat(L, "\n")
-	statusPush(report)
-	local saved
-	pcall(function()
-		if type(writefile) == "function" then
-			writefile("AutoParry_ACScan.txt", report); saved = "AutoParry_ACScan.txt"
-		end
-	end)
-	pcall(function() if type(setclipboard) == "function" then setclipboard(report) end end)
-	aclog(string.format("[AC] scan complete — %d lines%s%s", #L,
-		saved and (" · saved " .. saved) or "",
-		type(setclipboard) == "function" and " · copied to clipboard" or ""))
-end
-
 if Config.AntiCheatBypass then
 	task.spawn(function()
 		aclog("[AC] scanning for anticheat…")
@@ -9317,14 +8841,6 @@ if Config.AntiCheatBypass then
 	end)
 end
 
-if Config.AntiCheatBypass and Config.AutoScanAC then
-	task.spawn(function()
-		task.wait(5)
-		aclog("[AC] auto-running deep scan (also on key O)…")
-		local ok, err = pcall(scanAC)
-		if not ok then aclog("[AC] auto-scan ERROR: " .. tostring(err)) end
-	end)
-end
 
 local classifyCombat = function(a)
 	if type(a) ~= "table" or a.Type ~= "Combat" then return nil end
@@ -10106,7 +9622,6 @@ Config.ConeHit     = Config.ConeHit     or Color3.fromRGB(255, 84, 84)
 Config.RestrictCol = Config.RestrictCol or Color3.fromRGB(255, 72, 72)
 
 local vizUpdate, vizHideAll
-_C.RING_SEG = 24
 local CONE_SEG  = 12
 local CONE_FILL = 0.32
 local VIZ_CONE_HALF = math.rad(64)
@@ -10225,30 +9740,82 @@ Viz.drawWorldSeg = function(cam, a, b, color, thick)
 	ln.Color, ln.Thickness, ln.Transparency, ln.Visible = color, thick, 1, true
 end
 
-Viz.pickTarget = function()
+-- A39: визуализация на всех врагов в VizRange сразу (угрожающие всегда первыми и «горячими»), а не только в момент атаки.
+Viz.enemies, Viz.enemyAt, Viz.picks, Viz.pickN = {}, -1e9, {}, 0
+Viz.refreshEnemies = function(nowc)
 	LPH_ATTRIBUTES(VM(NONE))
-	local vt = State.vizTarget
-	if vt and vt.hrp and vt.hrp.Parent then return vt.model, vt.hrp end
+	if nowc - Viz.enemyAt < 0.5 then return end
+	Viz.enemyAt = nowc
+	local list = Viz.enemies
+	table.clear(list)
+	for _, plr in ipairs(Players:GetPlayers()) do
+		local ch = plr ~= LocalPlayer and plr.Character
+		local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+		if hrp then list[#list + 1] = { model = ch, hrp = hrp, hum = ch:FindFirstChildOfClass("Humanoid") } end
+	end
+end
+Viz.byDist = function(a, b) return a.d2 < b.d2 end
+Viz.tail = {}
+Viz.put = function(model, hrp, hot, mp)
+	LPH_ATTRIBUTES(VM(NONE))
+	local picks, n = Viz.picks, Viz.pickN
+	for i = 1, n do
+		local e = picks[i]
+		if e.model == model then e.hot = e.hot or hot; return end
+	end
+	n = n + 1
+	Viz.pickN = n
+	local e = picks[n]
+	if not e then e = {}; picks[n] = e end
+	local p = hrp.Position
+	local dx, dz = p.X - mp.X, p.Z - mp.Z
+	e.model, e.hrp, e.hot, e.d2 = model, hrp, hot, dx * dx + dz * dz
+end
+Viz.pickTargets = function(nowc)
+	LPH_ATTRIBUTES(VM(NONE))
+	Viz.pickN = 0
 	local me = localHRP()
-	if not me then return nil end
-	local best, bestHrp, bestD2 = nil, nil, (Config.VizRange or VIEW_DIST)
-	bestD2 = bestD2 * bestD2
+	if not me then return 0 end
+	local mp = me.Position
+	local range = Config.VizRange or VIEW_DIST
+	local r2 = range * range
+	local maxN = math.clamp(math.floor(Config.VizMaxTargets or 5), 1, 12)
+	local vt = State.vizTarget
+	if vt and vt.hrp and vt.hrp.Parent then Viz.put(vt.model, vt.hrp, true, mp) end
 	for i = 1, #Threats do
-		local hrp = Threats[i].attackerHRP
-		if hrp and hrp.Parent then
-			local dx = hrp.Position.X - me.Position.X
-			local dz = hrp.Position.Z - me.Position.Z
-			local d2 = dx * dx + dz * dz
-			if d2 < bestD2 then
-				best, bestHrp, bestD2 = Threats[i].attackerModel, hrp, d2
-			end
+		local th = Threats[i]
+		local hrp = th.attackerHRP
+		if hrp and hrp.Parent and th.attackerModel then Viz.put(th.attackerModel, hrp, true, mp) end
+	end
+	local nThreat = Viz.pickN
+	Viz.refreshEnemies(nowc)
+	local en = Viz.enemies
+	for i = 1, #en do
+		local e = en[i]
+		local hrp = e.hrp
+		if hrp.Parent and not (e.hum and e.hum.Health <= 0) then
+			local p = hrp.Position
+			local dx, dz = p.X - mp.X, p.Z - mp.Z
+			if dx * dx + dz * dz <= r2 then Viz.put(e.model, hrp, false, mp) end
 		end
 	end
-	return best, bestHrp
+	local picks, n = Viz.picks, Viz.pickN
+	-- угрозы в начале всегда; остальные сортируем по дистанции и режем по лимиту
+	if n > nThreat + 1 then
+		local tail = Viz.tail
+		table.clear(tail)
+		for i = nThreat + 1, n do tail[#tail + 1] = picks[i] end
+		table.sort(tail, Viz.byDist)
+		for i = 1, #tail do picks[nThreat + i] = tail[i] end
+	end
+	local keep = math.max(maxN, nThreat)
+	if n > keep then n = keep end
+	Viz.pickN = n
+	return n
 end
 
 Viz.bboxRaw = function(m) LPH_ATTRIBUTES(VM(NONE)) return m:GetBoundingBox() end
-Viz.bbModel, Viz.bbClock, Viz.bbC, Viz.bbS = nil, -1, nil, nil
+Viz.bbCache = setmetatable({}, { __mode = "k" })
 Viz.ringPts = {}
 Viz.coneW   = {}
 Viz.cone2d  = {}
@@ -10256,10 +9823,11 @@ Viz.coneZ   = {}
 Viz.bboxOf = function(model)
 	LPH_ATTRIBUTES(VM(NONE))
 	local nowc = os.clock()
-	if model == Viz.bbModel and (nowc - Viz.bbClock) < 0.004 then return Viz.bbC, Viz.bbS end
+	local ent = Viz.bbCache[model]
+	if ent and (nowc - ent.t) < 0.05 then return ent.c, ent.s end
 	local ok, c, s = pcall(Viz.bboxRaw, model)
 	if ok and typeof(c) == "CFrame" and typeof(s) == "Vector3" then
-		Viz.bbModel, Viz.bbClock, Viz.bbC, Viz.bbS = model, nowc, c, s
+		if ent then ent.t, ent.c, ent.s = nowc, c, s else Viz.bbCache[model] = { t = nowc, c = c, s = s } end
 		return c, s
 	end
 	return nil
@@ -10481,12 +10049,17 @@ vizUpdate = function(dt)
 	Viz.skipRun = 0
 
 	LinePool:begin(); TriPool:begin()
-	local model, hrp = Viz.pickTarget()
-	publishVizTarget(model, hrp)
-	if model and hrp then
-		local hot = (State.status == "PARRY" or State.status == "DODGE")
-		if Config.VizHitbox ~= false then Viz.drawTargetHitbox(cam, model, hrp) end
-		if Config.VizRing ~= false then Viz.drawRing(cam, model, hrp, hot) end
+	local n = Viz.pickTargets(nowc)
+	local picks = Viz.picks
+	-- AP_TARGET наружу как раньше: только цель-угроза, не просто ближайший враг
+	if n > 0 and picks[1].hot then publishVizTarget(picks[1].model, picks[1].hrp) else publishVizTarget(nil) end
+	local stHot = (State.status == "PARRY" or State.status == "DODGE")
+	for i = 1, n do
+		local e = picks[i]
+		if e.hrp.Parent then
+			if Config.VizHitbox ~= false then Viz.drawTargetHitbox(cam, e.model, e.hrp) end
+			if Config.VizRing ~= false then Viz.drawRing(cam, e.model, e.hrp, e.hot and stHot) end
+		end
 	end
 	if Config.VizRestrict ~= false then Viz.drawRestrictZone(cam) end
 	LinePool:finish(); TriPool:finish()
@@ -11193,6 +10766,9 @@ return function(_Lib, _Core)
 		slider(apVis, { Name = "Draw Distance", Flag = "AP_VizRange",
 			Default = Config.VizRange or 100, Min = 20, Max = 250, Suffix = " st",
 			Callback = function(v) Config.VizRange = v end })
+		slider(apVis, { Name = "Max Targets", Flag = "AP_VizMaxTargets",
+			Default = Config.VizMaxTargets or 5, Min = 1, Max = 12, Suffix = "",
+			Callback = function(v) Config.VizMaxTargets = v end })
 
 		local DS = ctx.tabs.Desync
 
