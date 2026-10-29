@@ -10,14 +10,16 @@ local _C = {}
 local _D = {}
 
 local Config = {
-	Version       = "A40",
+	Version       = "A42",
 	Enabled       = false,
 	Mode          = "Perfect",
 
 	Range         = 18,
 	M2Range       = 14,
 	AimShift      = 0.045,
-	PressMaxDist  = 9.0,
+	PressGate     = true,
+	PressPadM1    = 3.3,   -- A42: запас над (вынос + полуразмер бокса): A36/A37 M1 = 0 потерь из 60 попаданий на пороге ~9 ст.
+	PressPadM2    = 4.3,   -- M2 несут рывок: попадания до 8.0 ст. (13 шт.), запас шире
 	MergeAfterContact = 0.20,
 	PbAim         = 0.103,
 	PbLatAim      = true,
@@ -58,6 +60,11 @@ local Config = {
 	DodgeOnParryCooldown = true,
 	GuardbreakProtect  = true,
 	StaminaFloor       = 18,
+	GuardExit          = true,   -- A41: выход из затянувшегося блока в додж назад (если додж готов)
+	GuardHoldMax       = 0.90,   -- пассивное удержание (с последнего нажатия) дольше -> выходим
+	GuardExitMinAge    = 0.30,   -- свежее нажатие (окно PB ещё живо) не бросаем
+	GuardChipWindow    = 3.0,    -- окно учёта непарированных блоков (чипов)
+	GuardMaxStamina    = 100,    -- НЕ подтверждено дампом: предел стамины блока (расход = BlockHitStaminaDrain)
 	StaminaAttrs       = { "Stamina", "BlockStamina", "GuardStamina", "Posture", "Guard" },
 
 	PerfectWindow = 0.125,
@@ -367,7 +374,7 @@ local Config = {
 	VizRestrict   = true,
 	VizRingSpeed  = 1.0,
 	VizRingScale  = 1.0,
-	VizRange      = 100,
+	VizRange      = 20,
 	VizMaxFPS     = 30,
 	VizSkipNearPress = 0.20,
 	VizSkipMaxFrames = 2,
@@ -1580,15 +1587,16 @@ local realHitboxHitsMe = function(ownerName, th)
 		local remain = (th.contactAbs or os.clock()) - os.clock()
 		if remain <= 0.26 then
 		local leadTime = getPing() + (Config.OverlapReaction or 0.050)
+		-- A42: серверный бокс стоит на месте по XZ (TRACE-HBTRAIL: f/s константны, падает только Y), так что
+		-- раздувать его скоростью АТАКУЮЩЕГО нельзя. Двигаюсь я: берём свою скорость и собственную скорость бокса.
 		local sp = 0
 		local pv = part.AssemblyLinearVelocity
 		if pv then sp = math.sqrt(pv.X * pv.X + pv.Z * pv.Z) end
-		local ah = th.attackerHRP
-		if ah and ah.Parent then
-			local apv = ah.AssemblyLinearVelocity
-			if apv then local asp = math.sqrt(apv.X * apv.X + apv.Z * apv.Z); if asp > sp then sp = asp end end
-			local closing = planarClosing(ah, localHRP(), th)
-			if closing > sp then sp = closing end
+		local mh = localHRP()
+		local mvv = mh and mh.AssemblyLinearVelocity
+		if mvv then
+			local msp = math.sqrt(mvv.X * mvv.X + mvv.Z * mvv.Z)
+			if msp > sp then sp = msp end
 		end
 		local lead = math.clamp((Config.OverlapLeadBase or 2.0) + sp * leadTime, 0, Config.OverlapLeadCap or 18.0)
 		local yPad = math.min(lead, 1.25)
@@ -6700,6 +6708,43 @@ local heldGuardCovers = function(th, heldPwin, up)
 	return th.contactAbs <= since + heldPwin + up
 end
 
+-- A41: выход из блока в додж назад. Додж сам снимает блок (sendDodge шлёт Deactivate перед Evasive),
+-- а игровой Evasive при атрибуте Blocking вообще return-ит, так что порядок «снять -> додж» обязателен.
+_C.guardChipDrain = function()
+	LPH_ATTRIBUTES(VM(NONE))
+	local cfg, c, drain = GameData.cfg, localChar(), 35
+	if cfg and cfg.GetStyleNumber and c then
+		local ok, v = pcall(cfg.GetStyleNumber, styleKey(styleOf(c) or ""), "BlockHitStaminaDrain", 35)
+		if ok and type(v) == "number" and v > 0 then drain = v end
+	end
+	return drain
+end
+_C.guardExitReason = function(now)
+	LPH_ATTRIBUTES(VM(NONE))
+	local pressAge = now - (State.lastPress or 0)
+	if pressAge < (Config.GuardExitMinAge or 0.30) then return nil end
+	local liveN, breaker = 0, false
+	for i = 1, #Threats do
+		local th = Threats[i]
+		if th.threatens and not th.resolved and not th.coveredByDodge and not th.offTarget
+			and not th.staleTrack and (th.contactAbs or 0) > now - 0.02 then
+			liveN = liveN + 1
+			if th.contactAbs - now <= 0.6 and m2BreaksHeldGuard(th) then breaker = true end
+		end
+	end
+	if liveN == 0 then return nil end
+	if breaker then return "m2-breaks-guard" end
+	local ct = State.chipTimes
+	if ct and #ct > 0 then
+		local win, n = Config.GuardChipWindow or 3.0, 0
+		for i = 1, #ct do if now - ct[i] <= win then n = n + 1 end end
+		local limit = math.max(1, math.ceil((Config.GuardMaxStamina or 100) / _C.guardChipDrain()) - 1)
+		if n >= limit then return string.format("fatigue(%d/%d)", n, limit) end
+	end
+	if pressAge > (Config.GuardHoldMax or 0.90) then return "held-long" end
+	return nil
+end
+
 local schedulerStep = function(now)
 	LPH_ATTRIBUTES(VM(NONE))
 	local dodgeTx = State.dodgeTxn
@@ -7185,20 +7230,23 @@ local schedulerStep = function(now)
 				local reachPhantom = (th.recognitionSource == "geom-sticky/OUT-OF-REACH")
 					or (th.geomLatched and not th.trustedHit
 						and (now - (th.geomLatchSince or now)) > (Config.LatchClusterGrace or 0.25))
-				if not reachPhantom and Config.PressMaxDist and th.kind == "M1" and dt <= 0.26 and not th.hbOverlapClock
+				local gateKind = th.kind == "M1" or (th.kind == "M2" and th.styleKey ~= "cqc" and not m2BreaksHeldGuard(th))
+				if not reachPhantom and Config.PressGate ~= false and gateKind and dt <= 0.26 and not th.hbOverlapClock
 					and th.attackerHRP and th.attackerHRP.Parent then
-					-- A37: на подходе к нажатию (горизонт ~200мс) линейный прогноз дистанции работает: на логе A36
-					-- порог 9 ст. = 0 потерянных попаданий из 57, отсекает 4 из 11 пустых нажатий.
+					-- A37/A42: на подходе к нажатию (горизонт ~200мс) линейный прогноз дистанции работает.
+					-- Порог = вынос стиля + полуразмер бокса + запас; грабы/слэмы (ломают гард) и cqc не гейтим: у них досягаемость другая.
 					local mh2 = localHRP()
 					if mh2 then
 						local ap2, mp2 = th.attackerHRP.Position, mh2.Position
 						local ddx, ddz = mp2.X - ap2.X, mp2.Z - ap2.Z
 						local dpred = math.sqrt(ddx * ddx + ddz * ddz) - (th.closeVel or 0) * (dt + (th.replicaAge or 0.085))
-						if dpred > Config.PressMaxDist then
+						local fwdG = th.geomForward or styleForward(th.style or th.styleKey, th.kind) or 4
+						local limG = fwdG + (th.geomHalfD or 1.7) + (th.kind == "M2" and Config.PressPadM2 or Config.PressPadM1)
+						if dpred > limG then
 							reachPhantom = true
 							if Config.TraceDiag and not th.pressGateLogged then
 								th.pressGateLogged = true
-								diagTrace("PRESS-GATE t=%.3f %s %s dpred=%.1f > %.1f (close=%.1f toContact=%+.0fms) → не жмём", now, tostring(th.name), tostring(th.kind), dpred, Config.PressMaxDist, th.closeVel or 0, dt * 1000)
+								diagTrace("PRESS-GATE t=%.3f %s %s dpred=%.1f > %.1f (fwd=%.1f close=%.1f toContact=%+.0fms) → не жмём", now, tostring(th.name), tostring(th.kind), dpred, limG, fwdG, th.closeVel or 0, dt * 1000)
 							end
 						end
 					end
@@ -8072,6 +8120,16 @@ local schedulerStep = function(now)
 		end
 	end
 
+	if State.blocking and Config.GuardExit ~= false and Config.AutoDodge ~= false then
+		local why = _C.guardExitReason(now)
+		if why and dodgeReady() and canDodgeNow() and not counterPreemptsDodge(now) then
+			if performDodge(now, "guard-exit(" .. why .. ")", true) then
+				diagPush("GUARD-EXIT t=%.2f %s held=%.0fms chips=%d → блок снят, додж назад", now, why,
+					(now - (State.lastPress or now)) * 1000, State.chipTimes and #State.chipTimes or 0)
+			end
+		end
+	end
+
 	if Config.AP_PunishOnParry ~= false and not wantBlock and #imminent == 0 and #Threats == 0 then
 		if Config.AutoPlay or State.ap.punishTgt then
 			State.ap.step(now)
@@ -8194,6 +8252,9 @@ local function onOutcome(attacker, result, kind, eventClock)
 	rec.matched = true
 	if rec.th then rec.th.resolved = true end
 
+	if result == "GUARDBREAK" or result == "PERFECT" then
+		if State.chipTimes then table.clear(State.chipTimes) end
+	end
 	if result == "GUARDBREAK" then
 		State.blocking, State.holdUntil = false, 0
 		State.blockChipStreak = 0
@@ -8203,6 +8264,10 @@ local function onOutcome(attacker, result, kind, eventClock)
 		if not (State.multiThreat and holding) then State.blocking, State.holdUntil = false, 0 end
 	elseif result == "EARLY" then
 		State.blockChipStreak = (State.blockChipStreak or 0) + 1
+		local ct = State.chipTimes
+		if not ct then ct = {}; State.chipTimes = ct end
+		ct[#ct + 1] = os.clock()
+		if #ct > 6 then table.remove(ct, 1) end
 		State.lastPressEarly = true
 		if Config.Mode == "Perfect" then
 			State.holdUntil = math.min(State.holdUntil or 0, os.clock() + (Config.HoldAfter or 0.12))
@@ -10783,7 +10848,7 @@ return function(_Lib, _Core)
 		apVis:Divider()
 		apVis:Header({ Name = "Performance" })
 		slider(apVis, { Name = "Draw Distance", Flag = "AP_VizRange",
-			Default = Config.VizRange or 100, Min = 20, Max = 250, Suffix = " st",
+			Default = Config.VizRange or 20, Min = 10, Max = 250, Suffix = " st",
 			Callback = function(v) Config.VizRange = v end })
 
 		local DS = ctx.tabs.Desync
