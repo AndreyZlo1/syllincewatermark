@@ -10,7 +10,7 @@ local _C = {}
 local _D = {}
 
 local Config = {
-	Version       = "A34",
+	Version       = "A35",
 	Enabled       = false,
 	Mode          = "Perfect",
 
@@ -1566,6 +1566,7 @@ local associatedHitbox = function(th)
 				local r = c and c:FindFirstChild("HumanoidRootPart")
 				if r then
 					local dx, dz = r.Position.X - best.Position.X, r.Position.Z - best.Position.Z
+					th.hbGap0 = math.sqrt(dx * dx + dz * dz) - best.Size.X * 0.5
 					diagTrace("TRACE-HBME t=%.3f %s %s s%d sid=%s xzDist=%.1f half=%.1f myHRP=(%.1f,%.1f) hb=(%.1f,%.1f) v=(%.1f,%.1f)", os.clock(), th.name or "?", th.kind or "?", th.strike or 1, tostring(sid),
 						math.sqrt(dx*dx + dz*dz), best.Size.X * 0.5, r.Position.X, r.Position.Z, best.Position.X, best.Position.Z,
 						r.AssemblyLinearVelocity.X, r.AssemblyLinearVelocity.Z)
@@ -1608,6 +1609,28 @@ local associatedHitbox = function(th)
 						(best.Position - p0).Magnitude,
 						(h0 and ah.Parent) and (ah.Position - h0).Magnitude or -1,
 						n1 and n1.Name or "?", (n1 and n1.Parent and n1p) and (n1.Position - n1p).Magnitude or -1)
+				end)
+				-- A35: покадровый след хитбокса за его жизнь. g=зазор до моего HRP по XZ (центр), f/s/y = позиция
+				-- хитбокса в системе HRP атакующего (вперёд/вбок/вверх), v = скорость хитбокса. Отвечает на вопрос,
+				-- едет ли хитбокс к жертве и сколько живёт, и когда относительно этого приходит серверный исход.
+				local tr, t0, lastS, conn = {}, os.clock(), -1, nil
+				conn = RunService.Heartbeat:Connect(function()
+					local el = os.clock() - t0
+					if not best.Parent or el > 0.5 or #tr >= 24 then
+						conn:Disconnect()
+						diagTrace("TRACE-HBTRAIL %s %s s%d t0=%.3f life=%s | %s", th.name or "?", th.kind or "?", th.strike or 1, t0,
+							best.Parent and ">" .. string.format("%.0f", el * 1000) or string.format("%.0f", el * 1000) .. "ms", table.concat(tr, " "))
+						return
+					end
+					if el - lastS < 0.025 then return end
+					lastS = el
+					local c2 = LocalPlayer.Character
+					local r2 = c2 and c2:FindFirstChild("HumanoidRootPart")
+					local bp = best.Position
+					local gap = r2 and math.sqrt((r2.Position.X - bp.X) ^ 2 + (r2.Position.Z - bp.Z) ^ 2) or -1
+					local rel = ah and ah.Parent and ah.CFrame:PointToObjectSpace(bp)
+					tr[#tr + 1] = string.format("%.0f:g%.1f/f%.1f/s%.1f/y%.1f/v%.0f", el * 1000, gap,
+						rel and -rel.Z or 0, rel and rel.X or 0, rel and rel.Y or 0, best.AssemblyLinearVelocity.Magnitude)
 				end)
 			end
 		end
@@ -6404,8 +6427,11 @@ _C.pbBind = function(char)
 	V93.pbChar = char
 	for _, a in ipairs({ "PerfectBlocking", "Blocking" }) do
 		char:GetAttributeChangedSignal(a):Connect(function()
-			if not Config.TraceDiag then return end
 			local now = os.clock()
+			if a == "PerfectBlocking" then
+				if char:GetAttribute(a) == true then V93.pbOn = now else V93.pbOff = now end
+			end
+			if not Config.TraceDiag then return end
 			diagTrace("PB-SEEN t=%.3f %s=%s sincePress=%s sinceHb=%s", now, a, tostring(char:GetAttribute(a)),
 				type(State.lastPress) == "number" and string.format("%+.0fms", (now - State.lastPress) * 1000) or "?",
 				V93.lastHbClock and string.format("%+.0fms", (now - V93.lastHbClock) * 1000) or "?")
@@ -8484,7 +8510,7 @@ local function onOutcome(attacker, result, kind, eventClock)
 		local th = rec.th
 		local p1, ps = pingDiagSnapshot()
 		local tpOut = th and th.track and th.track.TimePosition or -1
-		diagTrace("TRACE-OUT t=%.3f %s %s s%d result=%s age=%.0fms tp=%.3f | firstThreat=%sms hbFirst=%sms hbOverlap=%sms sid=%s src=%s | pressLate=%sms | net1w=%sms stats=%sms raw=%.0f med=%.0f up=%.0f", eventClock, attacker, kind, rec.strike or 1, result, measured*1000, tpOut,
+		diagTrace("TRACE-OUT t=%.3f %s %s s%d result=%s age=%.0fms tp=%.3f | firstThreat=%sms hbFirst=%sms hbOverlap=%sms sid=%s src=%s | pressLate=%sms | net1w=%sms stats=%sms raw=%.0f med=%.0f up=%.0f | pbOn=%s pbOff=%s hbGap=%s evtAfterHb=%s", eventClock, attacker, kind, rec.strike or 1, result, measured*1000, tpOut,
 				th and th.firstThreatClock and string.format("%.0f", (th.firstThreatClock-rec.clock)*1000) or "?",
 				th and th.hbFirstClock and string.format("%.0f", (th.hbFirstClock-rec.clock)*1000) or "?",
 				th and th.hbOverlapClock and string.format("%.0f", (th.hbOverlapClock-rec.clock)*1000) or "?",
@@ -8492,7 +8518,11 @@ local function onOutcome(attacker, result, kind, eventClock)
 				tostring(th and th.recognitionSource or "none"),
 				rec.pressLateBy and string.format("%+.0f", rec.pressLateBy*1000) or "?",
 				p1 and string.format("%.0f", p1*1000) or "?", ps and string.format("%.0f", ps*1000) or "?",
-				getPingRaw()*1000, getPing()*1000, uplink()*1000)
+				getPingRaw()*1000, getPing()*1000, uplink()*1000,
+				(V93.pbOn and eventClock - V93.pbOn < 1) and string.format("%+.0fms", (V93.pbOn - eventClock) * 1000) or "-",
+				(V93.pbOff and eventClock - V93.pbOff < 1) and string.format("%+.0fms", (V93.pbOff - eventClock) * 1000) or "-",
+				th and th.hbGap0 and string.format("%.1f", th.hbGap0) or "?",
+				(th and th.hbFirstClock) and string.format("%.0fms", (eventClock - th.hbFirstClock) * 1000) or "?")
 		end
 	end
 
