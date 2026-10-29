@@ -10,7 +10,7 @@ local _C = {}
 local _D = {}
 
 local Config = {
-	Version       = "A31",
+	Version       = "A32",
 	Enabled       = false,
 	Mode          = "Perfect",
 
@@ -8509,7 +8509,7 @@ _C.edgeApply = function(th, edge, how)
 	local d = edge - th.detectClock
 	th.edgeDelta = d
 	local thr = Config.AttrAnchorMs or 0.10
-	if Config.AttrAnchor == false or math.abs(d) < thr or math.abs(d) > 0.5 then
+	if Config.AttrAnchor ~= true or math.abs(d) < thr or math.abs(d) > 0.5 then
 		th.edgeApplied = true
 		if Config.DeepDiag then
 			diagPush("ATTR-EDGE t=%.2f %s %s edge−anim=%+.0fms (%s) → без сдвига", os.clock(), tostring(th.name), tostring(th.kind), d * 1000, how)
@@ -8540,6 +8540,15 @@ _C.hookAttrEdges = function(model)
 	V93.attrEdge[model] = rec
 	local function bind(attr, kind)
 		model:GetAttributeChangedSignal(attr):Connect(function()
+			if Config.DeepDiag and (kind == "M1" or kind == "M2") then
+				local ref
+				for i = #Threats, 1, -1 do
+					local t = Threats[i]
+					if t.attackerModel == model and t.kind == kind then ref = t; break end
+				end
+				diagPush("ATTR-SEQ t=%.3f %s %s=%s sinceDetect=%s", os.clock(), tostring(model.Name), attr, tostring(model:GetAttribute(attr)),
+					ref and string.format("%+.0fms", (os.clock() - ref.detectClock) * 1000) or "no-threat")
+			end
 			if model:GetAttribute(attr) ~= true then return end
 			local now = os.clock()
 			rec[kind] = now
