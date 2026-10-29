@@ -10,7 +10,7 @@ local _C = {}
 local _D = {}
 
 local Config = {
-	Version       = "A29",
+	Version       = "A31",
 	Enabled       = false,
 	Mode          = "Perfect",
 
@@ -1545,7 +1545,7 @@ local associatedHitbox = function(th)
 						diagPush("HB-RETIME t=%.2f %s %s контакт %+.0fms→%+.0fms (хитбокс РАНЬШЕ таблицы — пересчёт)",
 							os.clock(), tostring(th.name), tostring(th.kind),
 							(oldContact - os.clock()) * 1000, (hbContact - os.clock()) * 1000)
-					else
+					elseif not th.pressed then
 						diagPush("HB-RETIME t=%.2f %s %s контакт %+.0fms→%+.0fms (хитбокс раньше, rearm не успеет)%s",
 							os.clock(), tostring(th.name), tostring(th.kind),
 							(oldContact - os.clock()) * 1000, (hbContact - os.clock()) * 1000,
@@ -1561,8 +1561,10 @@ local associatedHitbox = function(th)
 		end
 
 		if Config.TraceDiag then
-			diagTrace("TRACE-HB t=%.3f %s %s s%d sid=%s first=%+.0fms toPred=%+.0fms pos=(%.1f,%.1f,%.1f) size=(%.1f,%.1f,%.1f)", os.clock(), th.name or "?", th.kind or "?", th.strike or 1, tostring(sid),
-				(th.hbFirstClock - th.detectClock)*1000, ((th.contactAbs or th.hbFirstClock)-th.hbFirstClock)*1000,
+			diagTrace("TRACE-HB t=%.3f %s %s s%d sid=%s first=%+.0fms edge→hb=%s tbl=%.0fms toPred=%+.0fms pos=(%.1f,%.1f,%.1f) size=(%.1f,%.1f,%.1f)", os.clock(), th.name or "?", th.kind or "?", th.strike or 1, tostring(sid),
+				(th.hbFirstClock - th.detectClock)*1000,
+				(function() local er = th.attackerModel and V93.attrEdge[th.attackerModel]; local e = er and er[th.kind]; return e and string.format("%+.0fms", (th.hbFirstClock - e)*1000) or "?" end)(),
+				(th.hitTLReal or th.hitTL or 0)*1000, ((th.contactAbs or th.hbFirstClock)-th.hbFirstClock)*1000,
 				best.Position.X, best.Position.Y, best.Position.Z, best.Size.X, best.Size.Y, best.Size.Z)
 		end
 	end
@@ -1818,18 +1820,7 @@ local willHitMe = function(th)
 	local velToMeEarly = planarClosing(aHRP, myHRP, th)
 	local maxYd = Config.MaxHeightDiff or 8
 	local yOk = math.abs(myPos.Y - aPos.Y) <= maxYd
-	-- A29: AOE-путь «любой M2 в Range = в меня» оставляем только для стилей, чей M2-хитбокс
-	-- (выучен по серверным хитбоксам) реально большой. Узкие M2 идут через геометрию ниже.
-	local m2Narrow = false
-	if th.kind == "M2" and V93.learn and Config.AoeFromHitbox ~= false then
-		local gS = V93.learn.geo[tostring(th.styleKey) .. "|M2"]
-		if gS and (gS.n or 0) >= (Config.LearnGeoMinSamples or 2)
-			and math.max(gS.sx or 0, gS.sz or 0) < (Config.AoeM2MinSize or 12) then
-			m2Narrow = true
-			th.m2Narrow = true
-		end
-	end
-	if th.kind == "M2" and yOk and not m2Narrow then
+	if th.kind == "M2" and yOk then
 		local cap = Config.Range or 18
 		if th.styleKey == "cqc" then cap = math.max(cap, 30) end
 		if dist2dEarly <= cap then
@@ -1914,16 +1905,6 @@ local willHitMe = function(th)
 		+ localTorsoHalf()
 	local halfH = (sz and sz.Y * 0.5 or 3) * hbMul + 2.5 + localHeightYBudget()
 	local halfD = (sz and sz.Z * 0.5 or (Config.HitboxDepth or 4)) * hbMul
-	-- A29: размер/оффсет, выученные с реальных серверных хитбоксов этого стиля (уже с ростом атакующего).
-	local lg = _C.learnGeo and _C.learnGeo(th.styleKey, th.kind)
-	if lg then
-		halfW = lg.sx * 0.5 + (Config.HighSlack or 0.35) + localTorsoHalf()
-		halfH = lg.sy * 0.5 + 2.5 + localHeightYBudget()
-		halfD = lg.sz * 0.5
-		local fL = -(lg.oz or 0)
-		if fL > 0 then forward = fL + (th.geomStep or 0) end
-		th.geomLearned = true
-	end
 	if math.abs(myAt.Y - origin.Y) > halfH then
 		th.recognitionSource = "y-diff"
 		return whmSet(th, false)
@@ -2063,7 +2044,7 @@ local willHitMe = function(th)
 		end
 	end
 
-	if not hit and th.kind == "M2" and not th.m2Narrow then
+	if not hit and th.kind == "M2" then
 		local d2 = th.geomDist2d
 		if type(d2) ~= "number" then
 			d2 = math.sqrt(ox * ox + oz * oz)
@@ -6038,22 +6019,6 @@ local onAttack = function(attackerHRP, info, model, id, track, origin, hbPart)
 	if origin ~= "hitbox" then
 		remaining0 = math.max(0, hitTLReal - already / tpSpeed(track))
 	end
-	-- A29: таблица CombatConfig + выученный по серверным хитбоксам остаток (стиль/тип/комбо).
-	-- Запоминаем старт анимации, чтобы хитбокс этого свинга дал сэмпл (см. _C.hbLearn).
-	if origin ~= "hitbox" and not fromTable and (info.t == "M1" or info.t == "M2") then
-		local ckL = styleKey(info.s)
-		local animStart = os.clock() - already / tpSpeed(track)
-		V93.learn.last[name] = { clock = animStart, base = hitTLReal, mult = aMult, ck = ckL,
-			combo = combo, kind = info.t, hrp = model and model:FindFirstChild("HumanoidRootPart"), used = false }
-		local cal = _C.calTiming(ckL, info.t, combo, aMult)
-		if cal ~= 0 then
-			hitTL, hitTLReal = hitTL + cal, hitTLReal + cal
-			remaining0 = math.max(0, remaining0 + cal)
-			if Config.DeepDiag then
-				diagPush("LEARN-APPLY %s %s(%s c%d) table %+.0fms (выучено по хитбоксам)", name, info.t, tostring(ckL), combo or 0, cal * 1000)
-			end
-		end
-	end
 	if origin ~= "hitbox" and info.t == "M1" and combo == 3 and dist <= (Config.CloseM1EarlyStuds or 4.5) then
 		local sk = styleKey(info.s)
 		if sk == "ali" then
@@ -6188,6 +6153,16 @@ local onAttack = function(attackerHRP, info, model, id, track, origin, hbPart)
 							(nowClock - old.detectClock) * 1000,
 							(old.contactAbs - nowClock) * 1000)
 				end
+			end
+		end
+	end
+	do
+		local er = model and V93.attrEdge[model]
+		local e = er and er[info.t]
+		if e and origin ~= "hitbox" and (nowClock - e) < 0.6 and (nowClock - e) >= 0 then
+			local prev = V93.lastSwingAt[name] and V93.lastSwingAt[name][info.t]
+			if not prev or e > prev + 0.05 then
+				_C.edgeApply(th, e, "до анимации")
 			end
 		end
 	end
@@ -6331,196 +6306,28 @@ local function ingestHitboxPart(part)
 end
 State.ingestHitbox = ingestHitboxPart
 
--- ===================== A29: рантайм-обучение по серверным хитбоксам =====================
--- Хитбокс создаёт сервер в момент удара (Ts) и реплицирует всем. Анимация атакующего и хитбокс
--- идут к нам одним путём (через сервер), поэтому  (хитбокс увиден) − (анимация увидена)  =
--- реальная серверная задержка удара, БЕЗ пинга. Учим по каждому стилю/комбо остаток к таблице
--- CombatConfig и геометрию хитбокса (размер + оффсет в кадре атакующего). Сохраняется в файл,
--- сбрасывается при смене game.PlaceVersion → баланс-патчи подхватываются сами.
-V93.learn   = { geo = {}, tim = {}, last = {}, dirty = false }
+-- A29: пассивный учёт появления серверных хитбоксов (только таймстемпы для HB-RETIME/диагностики,
+-- ничего не калибрует). Хитбокс реплицируется тем же путём, что и анимация.
 V93.hbEvt   = setmetatable({}, { __mode = "k" })
 V93.hbConn  = setmetatable({}, { __mode = "k" })
-V93.hbBySid = {}
-V93.pb      = { rise = nil, fall = nil, lat = nil, latN = 0, adj = 0, n = 0, winObs = nil }
-_C.learnFile = "gakuran_ap_learn.json"
-
-_C.learnKey = function(ck, kind, combo)
-	return tostring(ck) .. "|" .. tostring(kind) .. "|" .. tostring(kind == "M1" and (combo or 1) or 0)
-end
-
-_C.calTiming = function(ck, kind, combo, mult)
-	LPH_ATTRIBUTES(VM(NONE))
-	if Config.LearnTiming == false then return 0 end
-	local r = V93.learn.tim[_C.learnKey(ck, kind, combo)]
-	if not r or (r.n or 0) < (Config.LearnMinSamples or 3) then return 0 end
-	local cap = Config.LearnMaxShift or 0.12
-	local v = math.clamp(r.e or 0, -cap, cap)
-	local m = (type(mult) == "number" and mult > 0.05) and mult or 1
-	return v / m
-end
-
-_C.learnGeo = function(ck, kind)
-	LPH_ATTRIBUTES(VM(NONE))
-	local g = V93.learn.geo[tostring(ck) .. "|" .. tostring(kind)]
-	if g and (g.n or 0) >= (Config.LearnGeoMinSamples or 2) then return g end
-	g = V93.learn.geo["*|" .. tostring(kind)]
-	if g and (g.n or 0) >= (Config.LearnGeoMinSamples or 2) then return g end
-	return nil
-end
-
-_C.geoUpdate = function(gk, sz, off)
-	local L = V93.learn
-	local g = L.geo[gk]
-	if not g then
-		g = { sx = sz.X, sy = sz.Y, sz = sz.Z, ox = off.X, oy = off.Y, oz = off.Z, n = 0 }
-		L.geo[gk] = g
-	end
-	local b = (g.n < 4) and (1 / (g.n + 1)) or 0.2
-	g.sx = g.sx + (sz.X - g.sx) * b
-	g.sy = g.sy + (sz.Y - g.sy) * b
-	g.sz = g.sz + (sz.Z - g.sz) * b
-	g.ox = g.ox + (off.X - g.ox) * b
-	g.oy = g.oy + (off.Y - g.oy) * b
-	g.oz = g.oz + (off.Z - g.oz) * b
-	g.n = g.n + 1
-	return g
-end
-
-_C.hbLearn = function(part, tSeen)
-	LPH_ATTRIBUTES(VM(NONE))
-	if not (part and part.Parent) then return end
-	local owner, kind = _C.hbMeta(part)
-	if not (owner and (kind == "M1" or kind == "M2")) then return end
-	local sid = part:GetAttribute("VictimSwingId")
-	if typeof(sid) == "string" and sid ~= "" then
-		V93.hbBySidN = (V93.hbBySidN or 0) + 1
-		if V93.hbBySidN > 400 then V93.hbBySid, V93.hbBySidN = {}, 0 end
-		V93.hbBySid[sid] = { t = tSeen, owner = owner, kind = kind }
-	end
-	V93.hbLastByOwner = V93.hbLastByOwner or {}
-	V93.hbLastByOwner[owner] = { t = tSeen, kind = kind }
-	local L = V93.learn
-	local last = L.last[owner]
-	if not last or last.used or last.kind ~= kind then return end
-	local meas = tSeen - last.clock
-	if meas < 0.04 or meas > 1.8 then return end
-	last.used = true
-	local m = last.mult or 1
-	local residN = (meas - last.base) * m
-	if math.abs(residN) > (Config.LearnRejectAbs or 0.25) then
-		diagPush("LEARN-REJECT t=%.2f %s %s(%s c%d) meas=%.0fms table=%.0fms resid=%+.0fms (вне допуска — чужой хитбокс/отмена)",
-			tSeen, owner, kind, tostring(last.ck), last.combo or 0, meas * 1000, last.base * 1000, residN * 1000)
-		return
-	end
-	local key = _C.learnKey(last.ck, kind, last.combo)
-	local r = L.tim[key]
-	if not r then r = { e = residN, n = 0 }; L.tim[key] = r end
-	local a = (r.n < 4) and (1 / (r.n + 1)) or (Config.LearnAlpha or 0.2)
-	r.e = r.e + (residN - r.e) * a
-	r.n = r.n + 1
-	local g
-	local hrp = last.hrp
-	if hrp and hrp.Parent then
-		local off = hrp.CFrame:PointToObjectSpace(part.Position)
-		if off.Magnitude < 40 then
-			g = _C.geoUpdate(tostring(last.ck) .. "|" .. kind, part.Size, off)
-			_C.geoUpdate("*|" .. kind, part.Size, off)
-		end
-	end
-	L.dirty = true
-	diagPush("LEARN t=%.2f %s %s(%s c%d) meas=%.0fms table=%.0fms resid=%+.0fms → ema=%+.0fms n=%d | size=(%.1f,%.1f,%.1f) off=(%.1f,%.1f,%.1f)",
-		tSeen, owner, kind, tostring(last.ck), last.combo or 0, meas * 1000, last.base * 1000, residN * 1000,
-		r.e * 1000, r.n, part.Size.X, part.Size.Y, part.Size.Z,
-		g and g.ox or 0, g and g.oy or 0, g and g.oz or 0)
-end
 
 State.hbWatchPart = function(part)
 	if not (part and part:IsA("BasePart")) then return end
 	if V93.hbConn[part] then return end
 	local function onSid()
-		local now = os.clock()
-		V93.hbEvt[part] = { sid = part:GetAttribute("VictimSwingId"), t = now }
-		task.defer(_C.hbLearn, part, now)
+		V93.hbEvt[part] = { sid = part:GetAttribute("VictimSwingId"), t = os.clock() }
 	end
 	V93.hbConn[part] = part:GetAttributeChangedSignal("VictimSwingId"):Connect(onSid)
 	onSid()
 end
 _C.watchHB = watchHitboxFolder
 
-_C.learnLoad = function()
-	if type(readfile) ~= "function" or type(isfile) ~= "function" then return end
-	local ok, raw = pcall(function() return isfile(_C.learnFile) and readfile(_C.learnFile) or nil end)
-	if not ok or type(raw) ~= "string" or raw == "" then return end
-	local Http = game:GetService("HttpService")
-	local ok2, data = pcall(Http.JSONDecode, Http, raw)
-	if not ok2 or type(data) ~= "table" then return end
-	if data.pv ~= game.PlaceVersion then
-		dbg(string.format("learn: PlaceVersion %s → %s, таблица сброшена (новый билд игры)", tostring(data.pv), tostring(game.PlaceVersion)))
-		return
-	end
-	if type(data.tim) == "table" then V93.learn.tim = data.tim end
-	if type(data.geo) == "table" then V93.learn.geo = data.geo end
-	if type(data.pbAdj) == "number" then V93.pb.adj = math.clamp(data.pbAdj, -0.04, 0.04); V93.pb.n = data.pbN or 0 end
-	if type(data.pbLat) == "number" then V93.pb.lat = data.pbLat; V93.pb.latN = 4 end
-end
-
-_C.learnSave = function()
-	if not V93.learn.dirty or type(writefile) ~= "function" then return end
-	V93.learn.dirty = false
-	local Http = game:GetService("HttpService")
-	local ok, s = pcall(Http.JSONEncode, Http, {
-		pv = game.PlaceVersion, tim = V93.learn.tim, geo = V93.learn.geo,
-		pbAdj = V93.pb.adj, pbN = V93.pb.n, pbLat = V93.pb.lat,
-	})
-	if ok then pcall(writefile, _C.learnFile, s) end
-end
-
 task.spawn(function()
-	pcall(_C.learnLoad)
 	local f = Workspace:WaitForChild("Hitboxes", 60)
 	if f then
 		V93.hbFolder = f
 		_C.watchHB(f)
 	end
-	while true do
-		task.wait(15)
-		pcall(_C.learnSave)
-	end
-end)
-
--- ===================== A29: PB-loop (замкнутый контур тайминга) =====================
--- PerfectBlocking ставит СЕРВЕР при приёме Activated; хитбокс создаёт СЕРВЕР в момент удара.
--- Оба приходят к нам одним downlink'ом, значит  t(хитбокс) − t(PB↑)  = Ts − Tact  на сервере,
--- без оценки пинга. Это ровно та величина, по которой сервер решает perfect. Подстраиваем
--- момент нажатия так, чтобы она сидела в aimGap. Триггер — наш собственный VictimHitConfirm.
-_C.pbBind = function(char)
-	if not char then return end
-	if V93.pbConnChar == char then return end
-	V93.pbConnChar = char
-	if V93.pbConn then pcall(function() V93.pbConn:Disconnect() end) end
-	V93.pbConn = char:GetAttributeChangedSignal("PerfectBlocking"):Connect(function()
-		local now = os.clock()
-		local P = V93.pb
-		if char:GetAttribute("PerfectBlocking") == true then
-			P.rise = now
-			local la = State.lastAct
-			if type(la) == "number" and now - la > 0 and now - la < 0.6 then
-				local lat = now - la
-				P.lat = P.lat and (P.lat + (lat - P.lat) * 0.25) or lat
-				P.latN = (P.latN or 0) + 1
-			end
-		else
-			if P.rise and now - P.rise < 0.5 then
-				local w = now - P.rise
-				P.winObs = P.winObs and (P.winObs + (w - P.winObs) * 0.25) or w
-			end
-			P.fall = now
-		end
-	end)
-end
-task.spawn(function()
-	_C.pbBind(LocalPlayer.Character)
-	LocalPlayer.CharacterAdded:Connect(function(c) task.defer(_C.pbBind, c) end)
 end)
 
 -- A29: GrabSlamDefend — сервер даёт жертве ответить на слэм (perfectcopy, M2GrabSlamAnswerable).
@@ -6549,60 +6356,6 @@ task.spawn(function()
 	_C.gsdBind(LocalPlayer.Character)
 	LocalPlayer.CharacterAdded:Connect(function(c) task.defer(_C.gsdBind, c) end)
 end)
-
-_C.onVictimConfirm = function(attacker, attack, sid, blk, pb)
-	LPH_ATTRIBUTES(VM(NONE))
-	local now = os.clock()
-	local P = V93.pb
-	local ev = (typeof(sid) == "string") and V93.hbBySid[sid] or nil
-	if not ev then
-		local lo = V93.hbLastByOwner and V93.hbLastByOwner[tostring(attacker)]
-		if lo and (lo.kind == attack) and now - lo.t < 0.45 then ev = lo end
-	end
-	local tHB = ev and ev.t or nil
-	if not tHB then
-		diagPush("VHC    t=%.2f %s %s res=%s | хитбокса этого свинга не видели → PB-loop без сэмпла", now, tostring(attacker), tostring(attack), tostring(pb))
-		return
-	end
-	local la = State.lastAct
-	V93.vhcLast = V93.vhcLast or {}
-	local rec = { t = now, tHB = tHB, blk = blk, pb = pb, gap = nil }
-	V93.vhcLast[tostring(attacker)] = rec
-	local pwin = GameData.perfectWindow or Config.PerfectWindow or 0.125
-	local aim = math.min(pwin * 0.72, pwin - 0.006)
-	local gap, why
-	if type(la) == "number" and tHB - la > 0 and tHB - la < 0.6 then
-		if P.rise and P.rise >= la and P.rise <= tHB + 0.02 then
-			gap, why = tHB - P.rise, "pb-rise"
-		elseif P.lat and (P.latN or 0) >= 2 then
-			gap, why = tHB - (la + P.lat), "est"
-		end
-	end
-	rec.gap = gap
-	local sample = nil
-	if gap and Config.PBLoop ~= false then
-		local e = gap - aim
-		if math.abs(e) <= 0.2 then
-			sample = e
-			P.n = (P.n or 0) + 1
-			local a = (P.n < 5) and 0.35 or 0.18
-			local lim = Config.PBLoopMax or 0.04
-			P.adj = math.clamp((P.adj or 0) + e * a, -lim, lim)
-			V93.learn.dirty = true
-		end
-	end
-	diagPush("VHC    t=%.2f %s %s sid=%s flags blk=%s pb=%s | hb→pb gap=%s (%s) aim=%.0fms e=%s adj=%+.0fms n=%d pbLat=%s win=%s",
-		now, tostring(attacker), tostring(attack), tostring(sid), tostring(blk), tostring(pb),
-		gap and string.format("%.0fms", gap * 1000) or "?", tostring(why or "no-press"), aim * 1000,
-		sample and string.format("%+.0fms", sample * 1000) or "-", (P.adj or 0) * 1000, P.n or 0,
-		P.lat and string.format("%.0fms", P.lat * 1000) or "?",
-		P.winObs and string.format("%.0fms", P.winObs * 1000) or "?")
-end
-_C.pbAdjNow = function()
-	local P = V93.pb
-	if Config.PBLoop == false or (P.n or 0) < (Config.PBLoopMinSamples or 4) then return 0 end
-	return P.adj or 0
-end
 
 local function dirIsClear(origin, dir, allowedModel)
 	if not Config.DodgeWallCheck then return true end
@@ -7343,7 +7096,7 @@ local schedulerStep = function(now)
 					th.aimGap = gap
 					local pkt = timingOneWay()
 					th.pktLead = pkt
-					local pressAt = th.contactAbs - gap - pkt + _C.pbAdjNow()
+					local pressAt = th.contactAbs - gap - pkt
 					local holdEnd = th.contactAbs + hold
 					local pressAtQ = pressAt
 					do
@@ -8563,9 +8316,6 @@ local function onOutcome(attacker, result, kind, eventClock)
 
 	rec.matched = true
 	if rec.th then rec.th.resolved = true end
-	if rec.pressDt and _C.onVictimConfirm then
-		pcall(_C.onVictimConfirm, attacker, kind, rec.th and rec.th.serverSwingId, nil, result)
-	end
 
 	if result == "GUARDBREAK" then
 		State.blocking, State.holdUntil = false, 0
@@ -8747,9 +8497,73 @@ local function cachedOwner(animator)
 	return rec
 end
 
+-- A30: рост серверных атрибутов M1/M2 на атакующем. Их ставит СЕРВЕР при приёме ServerCheck
+-- (клиент атакующего шлёт ServerCheck в момент свинга; в дампе нигде нет клиентского SetAttribute("M1"/"M2")).
+-- Анимация — косметика атакующего и реплицируется отдельно, атрибут — состояние сервера. Расхождение
+-- между ними = задержанный/опережающий пакет (спуф) или лаг репликации анимации.
+V93.attrEdge = setmetatable({}, { __mode = "k" })
+V93.attrConn = setmetatable({}, { __mode = "k" })
+_C.edgeApply = function(th, edge, how)
+	LPH_ATTRIBUTES(VM(NONE))
+	if th.edgeApplied or th.resolved or not th.contactAbs then return end
+	local d = edge - th.detectClock
+	th.edgeDelta = d
+	local thr = Config.AttrAnchorMs or 0.10
+	if Config.AttrAnchor == false or math.abs(d) < thr or math.abs(d) > 0.5 then
+		th.edgeApplied = true
+		if Config.DeepDiag then
+			diagPush("ATTR-EDGE t=%.2f %s %s edge−anim=%+.0fms (%s) → без сдвига", os.clock(), tostring(th.name), tostring(th.kind), d * 1000, how)
+		end
+		return
+	end
+	th.edgeApplied = true
+	local old = th.contactAbs
+	th.contactAbs = old + d
+	th.contactEdge = true
+	if th.group then th.group.contactAbs = th.contactAbs end
+	if d > 0 and th.pressed and not th.resolved and (th.contactAbs - os.clock()) > (uplink() + (Config.PerfectMin or 0.05) + 0.02) then
+		-- пакет ушёл по старому контакту, а сервер стартовал позже: окно ещё можно переоткрыть
+		th.pressed = nil
+		th.didPressClock = nil
+		if th.rec then th.rec.pressServer, th.rec.pressDt = nil, nil end
+		State.allowRearmUntil = os.clock() + 0.14
+	end
+	diagPush("ATTR-EDGE t=%.2f %s %s edge−anim=%+.0fms (%s) → контакт %+.0f→%+.0fms (сервер стартовал не там, где показывает анимация)",
+		os.clock(), tostring(th.name), tostring(th.kind), d * 1000, how,
+		(old - os.clock()) * 1000, (th.contactAbs - os.clock()) * 1000)
+end
+
+_C.hookAttrEdges = function(model)
+	if not model or V93.attrConn[model] then return end
+	V93.attrConn[model] = true
+	local rec = {}
+	V93.attrEdge[model] = rec
+	local function bind(attr, kind)
+		model:GetAttributeChangedSignal(attr):Connect(function()
+			if model:GetAttribute(attr) ~= true then return end
+			local now = os.clock()
+			rec[kind] = now
+			if kind ~= "M1" and kind ~= "M2" then return end
+			for i = #Threats, 1, -1 do
+				local th = Threats[i]
+				if th.attackerModel == model and th.kind == kind and not th.resolved and not th.edgeApplied
+					and (now - th.detectClock) < 0.6 and not th.hbFirstClock then
+					_C.edgeApply(th, now, "после анимации")
+					break
+				end
+			end
+		end)
+	end
+	bind("M1", "M1"); bind("M2", "M2"); bind("CombatAttacking", "CA")
+end
+
 local function hookAnimator(animator)
 	if _C.hooked[animator] then return end
 	_C.hooked[animator] = true
+	do
+		local mdl = animator:FindFirstAncestorOfClass("Model")
+		if mdl then _C.hookAttrEdges(mdl) end
+	end
 	animator.AnimationPlayed:Connect(function(track)
 		LPH_ATTRIBUTES(VM(NONE))
 		local anim = track and track.Animation
