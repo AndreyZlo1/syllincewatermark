@@ -10,7 +10,7 @@ local _C = {}
 local _D = {}
 
 local Config = {
-	Version       = "A33",
+	Version       = "A34",
 	Enabled       = false,
 	Mode          = "Perfect",
 
@@ -1576,6 +1576,40 @@ local associatedHitbox = function(th)
 				(function() local er = th.attackerModel and V93.attrEdge[th.attackerModel]; local e = er and er[th.kind]; return e and string.format("%+.0fms", (th.hbFirstClock - e)*1000) or "?" end)(),
 				(th.hitTLReal or th.hitTL or 0)*1000, ((th.contactAbs or th.hbFirstClock)-th.hbFirstClock)*1000,
 				best.Position.X, best.Position.Y, best.Position.Z, best.Size.X, best.Size.Y, best.Size.Z)
+			V93.lastHbClock = th.hbFirstClock
+			local am, ah = th.attackerModel, th.attackerHRP
+			if am and am.Parent then
+				local near = {}
+				for _, pp in ipairs(am:GetChildren()) do
+					if pp:IsA("BasePart") then near[#near + 1] = { pp, (pp.Position - best.Position).Magnitude } end
+				end
+				table.sort(near, function(a, b) return a[2] < b[2] end)
+				local rel = ah and ah.Parent and ah.CFrame:PointToObjectSpace(best.Position)
+				local kids = {}
+				for _, ch in ipairs(best:GetChildren()) do kids[#kids + 1] = ch.ClassName .. ":" .. ch.Name end
+				local nJ = -1
+				pcall(function() nJ = #best:GetJoints() end)
+				local root = best.AssemblyRootPart
+				diagTrace("TRACE-HBATT t=%.3f %s %s s%d nearest=%s:%.2f,%s:%.2f,%s:%.2f hbInHRP=(%s) anchored=%s joints=%d root=%s kids=[%s]", os.clock(), th.name or "?", th.kind or "?", th.strike or 1,
+					near[1] and near[1][1].Name or "?", near[1] and near[1][2] or -1,
+					near[2] and near[2][1].Name or "?", near[2] and near[2][2] or -1,
+					near[3] and near[3][1].Name or "?", near[3] and near[3][2] or -1,
+					rel and string.format("%.1f,%.1f,%.1f", rel.X, rel.Y, rel.Z) or "?",
+					tostring(best.Anchored), nJ, root and root.Name or "nil", table.concat(kids, ","))
+				local p0, h0 = best.Position, ah and ah.Parent and ah.Position
+				local n1 = near[1] and near[1][1]
+				local n1p = n1 and n1.Position
+				task.delay(0.08, function()
+					if not best.Parent then
+						diagTrace("TRACE-HBMOVE %s %s s%d hb уже удалён через 80мс", th.name or "?", th.kind or "?", th.strike or 1)
+						return
+					end
+					diagTrace("TRACE-HBMOVE %s %s s%d за 80мс: hb=%.2f HRP=%.2f %s=%.2f", th.name or "?", th.kind or "?", th.strike or 1,
+						(best.Position - p0).Magnitude,
+						(h0 and ah.Parent) and (ah.Position - h0).Magnitude or -1,
+						n1 and n1.Name or "?", (n1 and n1.Parent and n1p) and (n1.Position - n1p).Magnitude or -1)
+				end)
+			end
 		end
 	end
 	return best
@@ -5475,7 +5509,8 @@ _C.planDual = function(cluster, now, ifLat, ifDur)
 		th.plannedDodge = nil
 		th.plannedParry = (th == earliest) or nil
 	end
-	if Config.TraceDiag then
+	if Config.TraceDiag and (not V93.planLogAt or now - V93.planLogAt > 0.3) then
+		V93.planLogAt = now
 		diagPush("PLAN t=%.2f PARRY-EARLIEST (%d угроз): парри %s %s(+%.0fms), второй не в одном окне spread=%.0fms dodge=%s",
 			now, n,
 			earliest and tostring(earliest.name) or "?",
@@ -6362,6 +6397,25 @@ _C.gsdBind = function(char)
 		end)
 	end)
 end
+-- A34: PerfectBlocking ставит только сервер. Момент появления относительно нашего нажатия и первого
+-- виденного хитбокса = серверное окно без оценки пинга (чистая диагностика, ничего не подстраивает).
+_C.pbBind = function(char)
+	if not char or V93.pbChar == char then return end
+	V93.pbChar = char
+	for _, a in ipairs({ "PerfectBlocking", "Blocking" }) do
+		char:GetAttributeChangedSignal(a):Connect(function()
+			if not Config.TraceDiag then return end
+			local now = os.clock()
+			diagTrace("PB-SEEN t=%.3f %s=%s sincePress=%s sinceHb=%s", now, a, tostring(char:GetAttribute(a)),
+				type(State.lastPress) == "number" and string.format("%+.0fms", (now - State.lastPress) * 1000) or "?",
+				V93.lastHbClock and string.format("%+.0fms", (now - V93.lastHbClock) * 1000) or "?")
+		end)
+	end
+end
+task.spawn(function()
+	_C.pbBind(LocalPlayer.Character)
+	LocalPlayer.CharacterAdded:Connect(function(c) task.defer(_C.pbBind, c) end)
+end)
 task.spawn(function()
 	_C.gsdBind(LocalPlayer.Character)
 	LocalPlayer.CharacterAdded:Connect(function(c) task.defer(_C.gsdBind, c) end)
@@ -8556,8 +8610,10 @@ _C.hookAttrEdges = function(model)
 					local t = Threats[i]
 					if t.attackerModel == model and t.kind == kind then ref = t; break end
 				end
-				diagPush("ATTR-SEQ t=%.3f %s %s=%s sinceDetect=%s", os.clock(), tostring(model.Name), attr, tostring(model:GetAttribute(attr)),
-					ref and string.format("%+.0fms", (os.clock() - ref.detectClock) * 1000) or "no-threat")
+				if ref then
+					diagPush("ATTR-SEQ t=%.3f %s %s=%s sinceDetect=%s", os.clock(), tostring(model.Name), attr, tostring(model:GetAttribute(attr)),
+						string.format("%+.0fms", (os.clock() - ref.detectClock) * 1000))
+				end
 			end
 			if model:GetAttribute(attr) ~= true then return end
 			local now = os.clock()
