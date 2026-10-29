@@ -10,7 +10,7 @@ local _C = {}
 local _D = {}
 
 local Config = {
-	Version       = "A42",
+	Version       = "A43",
 	Enabled       = false,
 	Mode          = "Perfect",
 
@@ -8277,8 +8277,14 @@ local function onOutcome(attacker, result, kind, eventClock)
 		State.lastPressEarly = false
 	end
 	if result == "PERFECT" and rec.th and rec.th.group then
-		if (rec.th.strike or 1) >= 2 then
-			rec.th.group.cancelled = true
+		-- A43: PERFECT на ЛЮБОМ ударе связки = атакующий в Parried, остальные удары не наступят (лог A42: Boxing M2 s1 PERFECT ->
+		-- s2 ни разу не пришёл, но скрипт жал CD-PRESS и тратил додж). Раньше отменяли только при strike>=2.
+		local grp = rec.th.group
+		grp.cancelled = true
+		local nxt = grp.second
+		if nxt and nxt ~= rec.th then
+			nxt.resolved = true
+			if nxt.rec then nxt.rec.matched = true end
 		end
 	elseif result == "EARLY" and rec.th and rec.th.group then
 		if (rec.th.strike or 1) >= 2 and not m2BreaksHeldGuard(rec.th) then
