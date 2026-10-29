@@ -10,11 +10,13 @@ local _C = {}
 local _D = {}
 
 local Config = {
-	Version       = "A35",
+	Version       = "A36",
 	Enabled       = false,
 	Mode          = "Perfect",
 
 	Range         = 18,
+	M2Range       = 14,
+	AimShift      = 0.045,
 	ReachCloseCap = 8,
 	RequireFacing = false,
 	IncludeNPCs   = true,
@@ -1888,7 +1890,7 @@ local willHitMe = function(th)
 	local maxYd = Config.MaxHeightDiff or 8
 	local yOk = math.abs(myPos.Y - aPos.Y) <= maxYd
 	if th.kind == "M2" and yOk then
-		local cap = Config.Range or 18
+		local cap = Config.M2Range or Config.Range or 18
 		if th.styleKey == "cqc" then cap = math.max(cap, 30) end
 		if dist2dEarly <= cap then
 			if dist2dEarly > 9 then
@@ -2116,7 +2118,7 @@ local willHitMe = function(th)
 		if type(d2) ~= "number" then
 			d2 = math.sqrt(ox * ox + oz * oz)
 		end
-		local cap = Config.Range or 18
+		local cap = Config.M2Range or Config.Range or 18
 		if th.styleKey == "cqc" then cap = math.max(cap, 30) end
 		if type(d2) == "number" and d2 <= cap then
 			if d2 > 9 and th.geomFaceToMe ~= nil and th.geomFaceToMe < -0.34
@@ -6422,6 +6424,18 @@ _C.gsdBind = function(char)
 end
 -- A34: PerfectBlocking ставит только сервер. Момент появления относительно нашего нажатия и первого
 -- виденного хитбокса = серверное окно без оценки пинга (чистая диагностика, ничего не подстраивает).
+_C.pressGeom = function(wb, now)
+	local mh, ah2 = localHRP(), wb.attackerHRP
+	if not (mh and ah2 and ah2.Parent) then return end
+	local dx, dz = mh.Position.X - ah2.Position.X, mh.Position.Z - ah2.Position.Z
+	local dd = math.sqrt(dx * dx + dz * dz)
+	local lk = ah2.CFrame.LookVector
+	local f2m = dd > 0.05 and (lk.X * dx + lk.Z * dz) / dd or 1
+	local av, mv = ah2.AssemblyLinearVelocity, mh.AssemblyLinearVelocity
+	diagTrace("PRESS-GEOM t=%.3f %s %s s%d dist=%.1f face=%.2f close=%.1f aSpeed=%.1f mySpeed=%.1f toContact=%+.0fms", now,
+		wb.name or "?", wb.kind or "?", wb.strike or 1, dd, f2m, wb.closeVel or 0,
+		math.sqrt(av.X * av.X + av.Z * av.Z), math.sqrt(mv.X * mv.X + mv.Z * mv.Z), ((wb.contactAbs or now) - now) * 1000)
+end
 _C.pbBind = function(char)
 	if not char or V93.pbChar == char then return end
 	V93.pbChar = char
@@ -7182,6 +7196,9 @@ local schedulerStep = function(now)
 					if gap < pmin0 then gap = pmin0 end
 					local wall = pwin - ((Config.GapEdgeMs or 6) / 1000)
 					if gap > wall then gap = wall end
+					-- A36: измерено по логам A34/A35 (n=71 PERFECT, 27 BLOCK): PB-флаг живёт ~190мс, все BLOCK пришли
+					-- >=204мс после его включения, медиана PERFECT = 149мс (центр окна ~95). Прицел был на дальнем краю.
+					gap = math.max(gap - (Config.AimShift or 0.045), 0.02)
 					lead = gap
 					th.aimGap = gap
 					local pkt = timingOneWay()
@@ -8154,6 +8171,7 @@ local schedulerStep = function(now)
 						p1 and string.format("%.0f", p1*1000) or "?", ps and string.format("%.0f", ps*1000) or "?",
 						getPingRaw()*1000, getPing()*1000, up*1000,
 						(V93.gnpEma or 0)*1000, (V93.gnpJit or 0)*1000)
+					_C.pressGeom(wantBlock, now)
 				end
 			elseif State.blockedReason then
 				if wantBlock.rec then wantBlock.rec.blockedReason = State.blockedReason end
@@ -8649,6 +8667,19 @@ _C.hookAttrEdges = function(model)
 			local now = os.clock()
 			rec[kind] = now
 			if kind ~= "M1" and kind ~= "M2" then return end
+			-- A36: сервер начал удар (атрибут), а активной угрозы нет = анимацию не поймали / дедуп съел свинг.
+			if Config.TraceDiag then
+				local known = false
+				for i = #Threats, 1, -1 do
+					local t = Threats[i]
+					if t.attackerModel == model and t.kind == kind and (now - t.detectClock) < 0.9 then known = true; break end
+				end
+				if not known then
+					local mh, ah2 = localHRP(), model:FindFirstChild("HumanoidRootPart")
+					diagTrace("ATTR-ORPHAN t=%.3f %s %s=true без угрозы (анимация не поймана) dist=%s", now, tostring(model.Name), attr,
+						(mh and ah2) and string.format("%.1f", (mh.Position - ah2.Position).Magnitude) or "?")
+				end
+			end
 			for i = #Threats, 1, -1 do
 				local th = Threats[i]
 				if th.attackerModel == model and th.kind == kind and not th.resolved and not th.edgeApplied
