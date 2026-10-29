@@ -10,13 +10,17 @@ local _C = {}
 local _D = {}
 
 local Config = {
-	Version       = "A36",
+	Version       = "A37",
 	Enabled       = false,
 	Mode          = "Perfect",
 
 	Range         = 18,
 	M2Range       = 14,
 	AimShift      = 0.045,
+	PressMaxDist  = 9.0,
+	MergeAfterContact = 0.20,
+	PbAim         = 0.103,
+	PbLatAim      = true,
 	ReachCloseCap = 8,
 	RequireFacing = false,
 	IncludeNPCs   = true,
@@ -5963,7 +5967,13 @@ local onAttack = function(attackerHRP, info, model, id, track, origin, hbPart)
 			if old and old.name == name and old.kind == info.t
 				and not old.resolved and not old.dodged then
 				local ttl = math.max(0.4, (old.hitTL or 0) + 0.25)
-				if (nowMerge - old.detectClock) < ttl then
+				-- A37: старый свинг уже прошёл контакт + жизнь хитбокса = это НОВЫЙ удар комбо, а не дубль анимации.
+				local pastC = old.contactAbs and nowMerge > old.contactAbs + (Config.MergeAfterContact or 0.20)
+				if pastC and Config.TraceDiag and not old.mergeSkipLogged then
+					old.mergeSkipLogged = true
+					diagTrace("MERGE-SKIP t=%.3f %s %s старый свинг прошёл контакт %+.0fms назад → новый удар, не дубль", nowMerge, name, tostring(info.t), (nowMerge - old.contactAbs) * 1000)
+				end
+				if not pastC and (nowMerge - old.detectClock) < ttl then
 					if track then
 						old.track = track
 						State.seenAnimTrack = State.seenAnimTrack or setmetatable({}, { __mode = "k" })
@@ -6443,7 +6453,25 @@ _C.pbBind = function(char)
 		char:GetAttributeChangedSignal(a):Connect(function()
 			local now = os.clock()
 			if a == "PerfectBlocking" then
-				if char:GetAttribute(a) == true then V93.pbOn = now else V93.pbOff = now end
+				if char:GetAttribute(a) == true then
+					V93.pbOn = now
+					-- A37: реальная задержка «нажал -> сервер включил PerfectBlocking». Не зависит от показаний пинга Roblox.
+					local lp = State.lastPress
+					if type(lp) == "number" and (now - lp) > 0.06 and (now - lp) < 0.30 then
+						local r = V93.pbLatRing
+						if not r then r = {}; V93.pbLatRing = r end
+						r[#r + 1] = now - lp
+						if #r > 5 then table.remove(r, 1) end
+						local c = table.clone(r)
+						table.sort(c)
+						V93.pbLat, V93.pbLatN = c[(#c + 1) // 2], #r
+						if Config.TraceDiag then
+							diagTrace("PB-LAT t=%.3f sample=%.0fms med=%.0fms n=%d rawPing=%.0f", now, (now - lp) * 1000, V93.pbLat * 1000, #r, getPingRaw() * 1000)
+						end
+					end
+				else
+					V93.pbOff = now
+				end
 			end
 			if not Config.TraceDiag then return end
 			diagTrace("PB-SEEN t=%.3f %s=%s sincePress=%s sinceHb=%s", now, a, tostring(char:GetAttribute(a)),
@@ -7199,6 +7227,12 @@ local schedulerStep = function(now)
 					-- A36: измерено по логам A34/A35 (n=71 PERFECT, 27 BLOCK): PB-флаг живёт ~190мс, все BLOCK пришли
 					-- >=204мс после его включения, медиана PERFECT = 149мс (центр окна ~95). Прицел был на дальнем краю.
 					gap = math.max(gap - (Config.AimShift or 0.045), 0.02)
+					if Config.PbLatAim ~= false and V93.pbLat and (V93.pbLatN or 0) >= 3 then
+						-- лидирование от измеренной задержки сервера: press = trueContact - (pbLat + PbAim),
+						-- trueContact = contactAbs + replicaAge (хитбокс приходит через hitTL после детекта, пинг тут не нужен)
+						gap = math.clamp(V93.pbLat + (Config.PbAim or 0.103) - (th.replicaAge or 0) - timingOneWay(), 0.02, 0.30)
+						th.pbLatAimed = true
+					end
 					lead = gap
 					th.aimGap = gap
 					local pkt = timingOneWay()
@@ -7375,6 +7409,24 @@ local schedulerStep = function(now)
 				local reachPhantom = (th.recognitionSource == "geom-sticky/OUT-OF-REACH")
 					or (th.geomLatched and not th.trustedHit
 						and (now - (th.geomLatchSince or now)) > (Config.LatchClusterGrace or 0.25))
+				if not reachPhantom and Config.PressMaxDist and th.kind == "M1" and dt <= 0.26 and not th.hbOverlapClock
+					and th.attackerHRP and th.attackerHRP.Parent then
+					-- A37: на подходе к нажатию (горизонт ~200мс) линейный прогноз дистанции работает: на логе A36
+					-- порог 9 ст. = 0 потерянных попаданий из 57, отсекает 4 из 11 пустых нажатий.
+					local mh2 = localHRP()
+					if mh2 then
+						local ap2, mp2 = th.attackerHRP.Position, mh2.Position
+						local ddx, ddz = mp2.X - ap2.X, mp2.Z - ap2.Z
+						local dpred = math.sqrt(ddx * ddx + ddz * ddz) - (th.closeVel or 0) * (dt + (th.replicaAge or 0.085))
+						if dpred > Config.PressMaxDist then
+							reachPhantom = true
+							if Config.TraceDiag and not th.pressGateLogged then
+								th.pressGateLogged = true
+								diagTrace("PRESS-GATE t=%.3f %s %s dpred=%.1f > %.1f (close=%.1f toContact=%+.0fms) → не жмём", now, tostring(th.name), tostring(th.kind), dpred, Config.PressMaxDist, th.closeVel or 0, dt * 1000)
+							end
+						end
+					end
+				end
 				local hz = Config.DodgeHorizon
 			if isMustDodge(th) then hz = math.max(hz, 0.70) end
 			if dt <= hz and dt > 0.05 and not th.staleTrack
