@@ -250,7 +250,6 @@ local CFG = {
 	GkReactSeconds = 0.15, -- keeper reaction after release; he sees GoalCrossingPreview (not from dump)
 	ShotReachMargin = 0.05,
 	Draw = true,
-	Debug = true,
 }
 
 local COL = {
@@ -317,9 +316,6 @@ local function dbg(...)
 	end
 	local line = string.format("%.3f s=%.3f %s", os.clock(), Workspace:GetServerTimeNow(), table.concat(bits, " "))
 	ringPush(line)
-	if CFG.Debug then
-		print("[IS]", ...)
-	end
 	return line
 end
 
@@ -705,9 +701,6 @@ local function hideWorld()
 	end
 	if Mark.lockRing then
 		hideLines(Mark.lockRing)
-	end
-	if Mark.hideGallery then
-		Mark.hideGallery()
 	end
 end
 
@@ -2504,7 +2497,7 @@ end
 -- along his FLAT aim. He may release any time after KickCore.GetMinimumReleaseSeconds. A dribble (Dodge
 -- ActiveSeconds 1 iframe) started once that window opens covers every release up to a second later and earns
 -- SuccessfulDodgeSpeedMultiplier when the kick lands on the iframe.
--- Enemy kick box art. One renderer for the live overlay and the gallery station, so what is tuned on the board is
+-- Enemy kick box art. One renderer for the live overlay, so what is tuned here is
 -- what shows in a match. Concept: the box is BUILT by his charge. Edges draw themselves in construction order
 -- (floor -> posts -> roof) as the charge climbs to KickCore minimum release; a sweep bar crosses the floor at the
 -- same rate. At release-ready the floor takes three hatch strokes that land staggered (fast attack, small overshoot,
@@ -5764,7 +5757,7 @@ else
 
 	local now = os.clock()
 	local gap = (tackleWhy == "no owner" or tackleWhy == "off") and 6 or 2
-	if CFG.Debug and now - lastTally >= gap then
+	if now - lastTally >= gap then
 		lastTally = now
 		local player = enemyCarrier(oid)
 		dbg(
@@ -5803,556 +5796,6 @@ end
 
 local function cdLeft(lastAt, dur)
 	return math.max(0, dur - (os.clock() - lastAt))
-end
-
-Mark.galleryOn = false
-
-Mark.hideGallery = function()
-	local tris = Mark.galleryTris
-	local lines = Mark.galleryLines
-	if tris then
-		for i = 1, #tris do
-			tris[i].Visible = false
-		end
-	end
-	if lines then
-		for i = 1, #lines do
-			lines[i].Visible = false
-		end
-	end
-	if Mark.engineLabel then
-		Mark.engineLabel.Visible = false
-	end
-end
-
-Mark.placeGallery = function(root)
-	local gy = root.Position.Y - 3.15
-	local look = flat(root.CFrame.LookVector)
-	look = (look and look.Magnitude > 0.2) and look.Unit or Vector3.new(0, 0, 1)
-	local right = xzRight(look)
-	local origin = Vector3.new(root.Position.X, gy, root.Position.Z) + right * 46
-	local frame = CFrame.fromMatrix(origin, right, Vector3.yAxis, look)
-	local oldGallery = Workspace:FindFirstChild("Gallery")
-	if oldGallery then
-		oldGallery:Destroy()
-	end
-	local folder = Instance.new("Folder")
-	folder.Name = "Gallery"
-	folder.Parent = Workspace
-	local function box(parent, cf, size, color, mat, trans, ghost, query, collide)
-		local part = Instance.new("Part")
-		part.Name = "g"
-		part.Anchored = true
-		part.CanCollide = collide == true
-		part.CanTouch = false
-		part.CanQuery = query == true
-		part.CastShadow = false
-		part.Material = mat
-		part.Color = color
-		part.Transparency = trans
-		part.Size = size
-		part.CFrame = cf
-		if ghost then
-			part:SetAttribute("ghost", true)
-		else
-			part:SetAttribute("t0", trans)
-		end
-		part.Parent = parent
-		return part
-	end
-	local function sign(cf, title)
-		local pad = box(folder, cf * CFrame.new(0, 0.08, 0), Vector3.new(3.2, 0.12, 3.2), COL.Chalk, Enum.Material.SmoothPlastic, 0, false, false, false)
-		local gui = Instance.new("BillboardGui")
-		gui.Size = UDim2.fromOffset(160, 42)
-		gui.StudsOffset = Vector3.new(0, 6.4, 0)
-		gui.AlwaysOnTop = false
-		gui.Parent = pad
-		local label = Instance.new("TextLabel")
-		label.BackgroundTransparency = 1
-		label.Size = UDim2.fromScale(1, 1)
-		label.Font = Enum.Font.GothamMedium
-		label.TextSize = 13
-		label.TextColor3 = COL.Paper
-		label.Text = title
-		label.Parent = gui
-		return pad
-	end
-	local limbs = {
-		{ Vector3.new(0, 3.15, 0), Vector3.new(1.7, 1.9, 0.85) },
-		{ Vector3.new(0, 4.7, 0), Vector3.new(1.15, 1.15, 1.15) },
-		{ Vector3.new(-1.25, 3.2, 0), Vector3.new(0.55, 1.7, 0.55) },
-		{ Vector3.new(1.25, 3.2, 0), Vector3.new(0.55, 1.7, 0.55) },
-		{ Vector3.new(-0.42, 1.05, 0), Vector3.new(0.62, 1.9, 0.62) },
-		{ Vector3.new(0.42, 1.05, 0), Vector3.new(0.62, 1.9, 0.62) },
-	}
-	local function mannequin(cf, mode)
-		local parts = {}
-		for i = 1, #limbs do
-			local off, size = limbs[i][1], limbs[i][2]
-			local lcf = cf * CFrame.new(off)
-			if mode == "ghost" then
-				parts[i] = box(folder, lcf, size, COL.Ink, Enum.Material.SmoothPlastic, 1, true, false, false)
-			elseif mode == "field" then
-				box(folder, lcf, size, COL.Tackle, Enum.Material.ForceField, 0.08, false, false, false)
-			elseif mode == "shell" then
-				box(folder, lcf, size, COL.Line, Enum.Material.Neon, 0, false, false, false)
-				box(folder, lcf, size + Vector3.new(0.3, 0.3, 0.3), COL.Dodge, Enum.Material.ForceField, 0.4, false, false, false)
-			elseif mode == "lip" then
-				box(folder, lcf, size + Vector3.new(0.18, 0.18, 0.18), COL.Ink, Enum.Material.SmoothPlastic, 0, false, false, false)
-				box(folder, lcf, size, COL.Paper, Enum.Material.SmoothPlastic, 0, false, false, false)
-			elseif mode == "cage" then
-				local hx, hy, hz = size.X * 0.5, size.Y * 0.5, size.Z * 0.5
-				local t = 0.07
-				local xs, zs, ys = { -hx, hx }, { -hz, hz }, { -hy, hy }
-				for _, x in xs do
-					for _, z in zs do
-						box(folder, lcf * CFrame.new(x, 0, z), Vector3.new(t, size.Y, t), COL.Line, Enum.Material.Neon, 0, false, false, false)
-					end
-				end
-				for _, y in ys do
-					for _, z in zs do
-						box(folder, lcf * CFrame.new(0, y, z), Vector3.new(size.X, t, t), COL.Line, Enum.Material.Neon, 0, false, false, false)
-					end
-					for _, x in xs do
-						box(folder, lcf * CFrame.new(x, y, 0), Vector3.new(t, t, size.Z), COL.Line, Enum.Material.Neon, 0, false, false, false)
-					end
-				end
-			end
-		end
-		return parts
-	end
-	local stations = {}
-	local function station(col, row, title, mode)
-		local cf = frame * CFrame.new(row * 16, 0, (col - 1.5) * 12)
-		sign(cf, title)
-		if mode == "lip" or mode == "glow" then
-			mannequin(cf, "ghost")
-		end
-		stations[#stations + 1] = { kind = mode, cf = cf }
-		return cf
-	end
-	station(0, 0, "LIP\nчернила под мелом", "lip")
-	station(1, 0, "GLOW\nтри кромки", "glow")
-	station(0, 1, "TACKLE\nпредикт, lip", "tackle-lip")
-	station(1, 1, "TACKLE\nпредикт, glow", "tackle-glow")
-	station(2, 1, "TRAJ\naurora: траектория удара", "traj")
-	station(6, 0, "POS\nлайв → сервер: поле / вратарь", "pos")
-	station(6, 1, "SIGHT\nприцел AutoTackle: reticle", "sight")
-	station(3, 1, "LAG\nlive → server, lip", "lag-lip")
-	station(2, 0, "AIM\nскрипт, glow", "aim-glow")
-	station(3, 0, "PATH\nагент, lip", "aim-lip")
-	station(4, 0, "KICK\nзаряд врага → дриббл", "kick")
-	station(4, 1, "SILENT\nцель сайлент аима", "silent")
-	station(5, 0, "SPOT\ncorners / ripple / kick", "spot")
-	station(5, 1, "AGENT\nпуть + точка: flow / classic", "agent")
-	local deck = box(folder, frame * CFrame.new(16, 0.02, 6), Vector3.new(44, 0.06, 62), COL.Ink, Enum.Material.SmoothPlastic, 0.35, false, false, false)
-	deck.Name = "deck"
-	Mark.galleryFolder = folder
-	Mark.galleryOrigin = origin
-	Mark.galleryStations = stations
-	Mark.galleryParams = RaycastParams.new()
-	Mark.galleryParams.FilterType = Enum.RaycastFilterType.Exclude
-	local tris = {}
-	for i = 1, 1100 do
-		tris[i] = newTri(36)
-	end
-	local glines = {}
-	for i = 1, 1300 do
-		local ln = newDraw("Line", 40)
-		ln.Thickness = 1.4
-		glines[i] = ln
-	end
-	Mark.galleryTris = tris
-	Mark.galleryLines = glines
-	logFile("gallery", "place", string.format("%.0f,%.0f", origin.X, origin.Z))
-end
-
-Mark.toggleGallery = function()
-	local character = LocalPlayer.Character
-	local root = character and ActorTargeting.GetActorRoot(LocalPlayer)
-	if not root then
-		return
-	end
-	if not Mark.galleryFolder then
-		Mark.placeGallery(root)
-	end
-	Mark.galleryOn = not Mark.galleryOn
-	local folder = Mark.galleryFolder
-	for _, obj in folder:GetDescendants() do
-		if obj:IsA("BasePart") and not obj:GetAttribute("ghost") then
-			obj.Transparency = Mark.galleryOn and (obj:GetAttribute("t0") or 0) or 1
-		elseif obj:IsA("BillboardGui") then
-			obj.Enabled = Mark.galleryOn
-		end
-	end
-	if not Mark.galleryOn then
-		Mark.hideGallery()
-	end
-	logFile("gallery", Mark.galleryOn and "on" or "off")
-end
-
-Mark.paintBoards = function()
-	if not Mark.galleryOn or not Mark.galleryStations then
-		return
-	end
-	Camera = Workspace.CurrentCamera
-	if not Camera then
-		return
-	end
-	local origin = Mark.galleryOrigin
-	if origin and (Camera.CFrame.Position - origin).Magnitude > 140 then
-		Mark.hideGallery()
-		return
-	end
-	Mark.hideGallery()
-	if Mark.engineLabel then
-		Mark.engineLabel.Visible = false
-	end
-	local lines = Mark.galleryLines
-	if not lines then
-		return
-	end
-	local li = 1
-	local cam = Camera.CFrame.Position
-	local look = Camera.CFrame.LookVector
-	local near = 0.15
-	local boxes = {
-		{ Vector3.new(0, 3.15, 0), Vector3.new(1.7, 1.9, 0.85) },
-		{ Vector3.new(0, 4.7, 0), Vector3.new(1.15, 1.15, 1.15) },
-		{ Vector3.new(-1.25, 3.2, 0), Vector3.new(0.55, 1.7, 0.55) },
-		{ Vector3.new(1.25, 3.2, 0), Vector3.new(0.55, 1.7, 0.55) },
-		{ Vector3.new(-0.42, 1.05, 0), Vector3.new(0.62, 1.9, 0.62) },
-		{ Vector3.new(0.42, 1.05, 0), Vector3.new(0.62, 1.9, 0.62) },
-	}
-	local edgeIx = {
-		{ 1, 2 }, { 2, 3 }, { 3, 4 }, { 4, 1 },
-		{ 5, 6 }, { 6, 7 }, { 7, 8 }, { 8, 5 },
-		{ 1, 5 }, { 2, 6 }, { 3, 7 }, { 4, 8 },
-	}
-	local function depthOf(p)
-		return (p - cam):Dot(look)
-	end
-	local function seg(a, b, col, alpha, thick, z)
-		local ln = lines[li]
-		li = li + 1
-		if not ln then
-			-- the fixed pool (1300) ran out once the ripple / agent stations were added: grow on demand
-			if li > 4200 then
-				return
-			end
-			ln = newDraw("Line", 40)
-			ln.Thickness = 1.4
-			lines[li - 1] = ln
-		end
-		local da, db = depthOf(a), depthOf(b)
-		if da < near and db < near then
-			ln.Visible = false
-			return
-		end
-		if da < near or db < near then
-			local t = (near - da) / (db - da)
-			local p = a:Lerp(b, t)
-			if da < near then
-				a = p
-			else
-				b = p
-			end
-		end
-		local sa, _, za = worldTo(a)
-		local sb, _, zb = worldTo(b)
-		if za > 0 and zb > 0 then
-			ln.From = sa
-			ln.To = sb
-			ln.Color = col
-			ln.Transparency = alpha
-			ln.Thickness = thick
-			ln.ZIndex = z
-			ln.Visible = true
-		else
-			ln.Visible = false
-		end
-	end
-	local function lip(a, b)
-		seg(a, b, COL.Ink, 1, 4.2, 40)
-		seg(a, b, COL.Paper, 1, 1.4, 44)
-	end
-	local function glow(a, b)
-		seg(a, b, COL.Tackle, 0.2, 8, 39)
-		seg(a, b, COL.Tackle, 0.45, 3.6, 41)
-		seg(a, b, COL.Paper, 1, 1.3, 44)
-	end
-	local function stroke(a, b, mode)
-		if mode == "glow" then
-			glow(a, b)
-		else
-			lip(a, b)
-		end
-	end
-	local function cornersOf(cf, size)
-		local h = size * 0.5
-		local o = cf.Position
-		local x = cf.RightVector * h.X
-		local y = cf.UpVector * h.Y
-		local z = cf.LookVector * h.Z
-		return {
-			o + x + y + z, o - x + y + z, o - x - y + z, o + x - y + z,
-			o + x + y - z, o - x + y - z, o - x - y - z, o + x - y - z,
-		}
-	end
-	local function boxStroke(cf, size, mode)
-		local c = cornersOf(cf, size)
-		for e = 1, #edgeIx do
-			stroke(c[edgeIx[e][1]], c[edgeIx[e][2]], mode)
-		end
-	end
-	local function poly(pts, mode)
-		for i = 1, #pts - 1 do
-			stroke(pts[i], pts[i + 1], mode)
-		end
-	end
-	local function body(cf, mode)
-		for b = 1, #boxes do
-			boxStroke(cf * CFrame.new(boxes[b][1]), boxes[b][2], mode)
-		end
-	end
-	local function tackle(cf, mode)
-		boxStroke(cf * CFrame.new(0, 0.9, 0), Vector3.new(0.7, 1.6, 0.45), mode)
-		local pts = {}
-		for i = 0, 8 do
-			local u = i / 8
-			pts[i + 1] = cf:PointToWorldSpace(Vector3.new(math.sin(u * math.pi) * 1.3, 0.06, 1.4 + u * 8.2))
-		end
-		poly(pts, mode)
-		local endP = pts[#pts]
-		local right = cf.RightVector
-		local fwd = cf.LookVector
-		local h = 2.5
-		local a = endP - right * h - fwd * h
-		local b = endP + right * h - fwd * h
-		local c = endP + right * h + fwd * h
-		local d = endP - right * h + fwd * h
-		poly({ a, b, c, d, a }, mode)
-	end
-	local function lag(cf)
-		local live = cf:PointToWorldSpace(Vector3.new(-0.8, 0.08, 1.2))
-		local srv = cf:PointToWorldSpace(Vector3.new(1.1, 0.08, 6.4))
-		local up = Vector3.new(0, 1.15, 0)
-		lip(live, live + up)
-		lip(srv, srv + up * 0.72)
-		lip(live + up * 0.15, srv + up * 0.15)
-	end
-	local gtriN = 1000
-	local gpen = Mark.makePen(function()
-		local ln = lines[li]
-		if not ln then
-			if li > 4200 then
-				return nil
-			end
-			ln = newDraw("Line", 40)
-			ln.Thickness = 1.4
-			lines[li] = ln
-		end
-		li = li + 1
-		return ln
-	end, function()
-		gtriN += 1
-		return Mark.galleryTris and Mark.galleryTris[gtriN]
-	end)
-	for s = 1, #Mark.galleryStations do
-		local st = Mark.galleryStations[s]
-		local kind = st.kind
-		if kind == "lip" or kind == "glow" then
-			body(st.cf, kind)
-		elseif kind == "tackle-lip" then
-			tackle(st.cf, "lip")
-		elseif kind == "tackle-glow" then
-			tackle(st.cf, "glow")
-		elseif kind == "lag-lip" then
-			lag(st.cf)
-		elseif kind == "kick" then
-			-- loop 3.6 s: charge 0-1.0 (box builds), ready 1.0-2.8 (hatch, chevrons; we walk in from outside),
-			-- strike 2.8-3.6 (box folds onto its front face)
-			local T = os.clock() % 3.6
-			body(st.cf, "lip")
-			local fwd = st.cf.RightVector
-			local aimed = CFrame.lookAt(st.cf.Position + Vector3.new(0, 3.15, 0), st.cf.Position + Vector3.new(0, 3.15, 0) + fwd)
-			local outside = st.cf.Position + fwd * 5 + st.cf.LookVector * 7
-			local inside = st.cf.Position + fwd * 4.5
-			local walk = easeOut((T - 1.2) / 1.1)
-			local us = outside:Lerp(inside, walk)
-			local k = HitboxSettings.Kick
-			local local_ = (aimed * k.CFrameOffset):PointToObjectSpace(us + Vector3.new(0, 3.15, 0))
-			local isIn = math.abs(local_.X) <= k.Size.X * 0.5 and math.abs(local_.Z) <= k.Size.Z * 0.5
-			local P = Mark.kickPalette
-			local key = (isIn and T >= 1.0) and "live" or (isIn and "armed" or "safe")
-			local c = (aimed * k.CFrameOffset).Position
-			local maxR = math.sqrt((k.Size.X * 0.5) ^ 2 + (k.Size.Z * 0.5) ^ 2)
-			Mark.kickRipple(seg, Vector3.new(c.X, st.cf.Position.Y + 0.06, c.Z), maxR, P[key], Mark.rippleStep("gallery", Mark.rippleRates[key]), os.clock())
-			body(CFrame.new(us) * CFrame.Angles(0, math.atan2(-fwd.X, -fwd.Z), 0), "lip")
-		elseif kind == "agent" then
-			-- two lanes: the new flow path and the old chalk route, both ending in the default spot; modes cycle
-			local T = os.clock()
-			local keys = { "route", "dodge", "dribble" }
-			local key = keys[math.floor(T / 2.5) % 3 + 1]
-			local col = key == "dodge" and COL.Dodge or (key == "dribble" and COL.Tackle or COL.Line)
-			local y0 = st.cf.Position.Y + 0.06
-			for lane = 1, 2 do
-				local z = lane == 1 and -3.2 or 3.2
-				local k = lane == 1 and 1 or -1
-				local pts = {}
-				for n, xz in ipairs({ { -6, 0 }, { -2, 0.9 * k }, { 2, -0.7 * k }, { 6.2, 0.4 * k } }) do
-					pts[n] = st.cf:PointToWorldSpace(Vector3.new(xz[1], 0, z + xz[2]))
-				end
-				Mark.agentPath(seg, pts, y0, lane == 1 and "flow" or "classic", key, T, col)
-				Mark.agentSpot(seg, Vector3.new(pts[4].X, y0, pts[4].Z), CFG.AgentSpotStyle, key, T)
-				body(CFrame.new(pts[1]) * CFrame.Angles(0, math.atan2(pts[2].X - pts[1].X, pts[2].Z - pts[1].Z) + math.pi, 0), "lip")
-			end
-		elseif kind == "traj" then
-			-- a shot over 11 studs into a goal frame; the three shot families cycle every 3 s
-			local T = os.clock()
-			local kinds = { "hi", "lo", "curl", "lime" }
-			local kind2 = kinds[math.floor(T / 3) % 4 + 1]
-			local pts, times = {}, {}
-			local lift = kind2 == "lo" and 0.7 or (kind2 == "hi" and 3.4 or (kind2 == "lime" and 6.2 or 2.4))
-			local bend = kind2 == "curl" and 2.2 or 0
-			for i = 0, 20 do
-				local u = i / 20
-				pts[i + 1] = st.cf:PointToWorldSpace(Vector3.new(bend * math.sin(u * math.pi * 0.9), 0.4 + math.sin(u * math.pi) * lift + u * 0.8, -5 + u * 12))
-				times[i + 1] = u * 1.1
-			end
-			local goalZ = 7
-			local gh, gw = 3.6, 3.8
-			local function G(x, y)
-				return st.cf:PointToWorldSpace(Vector3.new(x, y, goalZ))
-			end
-			local gc = Mark.artPal[kind2][1]
-			seg(G(-gw, 0.05), G(-gw, gh), gc, 0.55, 2.4, 41)
-			seg(G(gw, 0.05), G(gw, gh), gc, 0.55, 2.4, 41)
-			seg(G(-gw, gh), G(gw, gh), gc, 0.55, 2.4, 41)
-			Mark.trajArt(gpen, pts, times, pts[#pts], st.cf.RightVector, st.cf.Position.Y + 0.02, kind2, T)
-		elseif kind == "pos" then
-			-- live runs along the row axis, the server position lags behind it; left a field player, right a keeper
-			local T = os.clock()
-			for lane = 1, 2 do
-				local z = lane == 1 and -3.5 or 3.5
-				local ph = math.sin(T * 0.9 + lane)
-				local vel = math.cos(T * 0.9 + lane)
-				local liveP = st.cf:PointToWorldSpace(Vector3.new(ph * 3.4, 0, z))
-				local fwd = st.cf.RightVector * (vel >= 0 and 1 or -1)
-				local ghostP = liveP - st.cf.RightVector * (vel * 1.7)
-				body(CFrame.new(liveP) * CFrame.Angles(0, math.atan2(-fwd.X, -fwd.Z), 0), "lip")
-				Mark.posArt(gpen, liveP, ghostP, fwd, st.cf.Position.Y, lane == 2, T)
-			end
-		elseif kind == "sight" then
-			-- target jogs a small figure of eight; the lock re-acquires every 3.6 s, armed (coral) every other cycle
-			local T = os.clock()
-			local tp = st.cf:PointToWorldSpace(Vector3.new(math.sin(T * 0.8) * 2.2, 0, math.sin(T * 1.6) * 1.2))
-			body(CFrame.new(tp), "lip")
-			local cycle = math.floor(T / 3.6)
-			Mark.sightArt(gpen, tp, st.cf.Position.Y, cycle % 2 == 1, st.cf.LookVector * -1, T, cycle * 3.6)
-		elseif kind == "spot" then
-			-- three agent-spot looks side by side, the mode cycles route -> dodge -> dribble every 2.5 s
-			local T = os.clock()
-			local keys = { "route", "dodge", "dribble" }
-			local key = keys[math.floor(T / 2.5) % 3 + 1]
-			local styles = { "corners", "ripple", "kick" }
-			for n = 1, 3 do
-				local c = (st.cf * CFrame.new((n - 2) * 5, 0, 0)).Position + Vector3.new(0, 0.06, 0)
-				Mark.agentSpot(seg, c, styles[n], key, T)
-			end
-		elseif kind == "silent" then
-			-- shooter at the station, target strafing 9 studs ahead; carrier colour every other 2.4 s cycle
-			local T = os.clock()
-			body(st.cf, "lip")
-			local fwd = st.cf.RightVector
-			local hand = st.cf.Position + Vector3.new(0, 3.2, 0) + fwd * 1.1 + st.cf.LookVector * 0.6
-			local tgt = st.cf.Position + fwd * 9 + st.cf.LookVector * (math.sin(T * 1.3) * 3)
-			body(CFrame.new(tgt) * CFrame.Angles(0, math.atan2(fwd.X, fwd.Z), 0), "lip")
-			local carrier = math.floor(T / 2.4) % 2 == 1
-			local col = carrier and Color3.fromRGB(255, 150, 50) or Color3.fromRGB(90, 220, 255)
-			Mark.silentArt(seg, hand, tgt + Vector3.new(0, 3.5, 0), tgt + Vector3.new(0, 0.06, 0), col, T)
-		elseif kind == "aim-glow" then
-			local reel = Mark.stepReel()
-			local ang0 = reel.drumAng
-			local origin = st.cf.Position + Vector3.new(0, 0.08, 0)
-			for i = 1, 4 do
-				local ang = ang0 + (i - 1) * math.pi * 0.5
-				local outward = Vector3.new(math.cos(ang), 0, math.sin(ang))
-				local right = Vector3.new(-outward.Z, 0, outward.X)
-				local apex = origin + outward * 0.5
-				local base = apex + outward * 1.52
-				local halfW = 0.21
-				stroke(apex, base + right * halfW, "glow")
-				stroke(base + right * halfW, base - right * halfW, "glow")
-				stroke(base - right * halfW, apex, "glow")
-			end
-		elseif kind == "aim-lip" then
-			local reel = Mark.stepReel()
-			local y = st.cf.Position.Y + 0.06
-			local function ground(p)
-				return Vector3.new(p.X, y, p.Z)
-			end
-			local chain = {
-				ground(st.cf.Position - st.cf.LookVector * 6 - st.cf.RightVector * 1.2),
-				ground(st.cf.Position - st.cf.LookVector * 2.4 + st.cf.RightVector * 0.6),
-				ground(st.cf.Position),
-			}
-			for i = 1, #chain - 1 do
-				seg(chain[i], chain[i + 1], COL.Ink, 1, 3.2, 40)
-				seg(chain[i], chain[i + 1], COL.Line, 1, 1.45, 44)
-			end
-			local total = flat(chain[3] - chain[1]).Magnitude
-			for k = 1, 3 do
-				local p = chain[1]:Lerp(chain[3], 0.22 + (k - 1) * 0.28)
-				local dir = flat(chain[3] - chain[1])
-				if dir.Magnitude > 0.05 then
-					dir = dir.Unit
-					local r = Vector3.new(-dir.Z, 0, dir.X)
-					local tip = p + dir * 0.65
-					local base = p - dir * 0.18
-					seg(tip, base + r * 0.4, COL.Paper, 1, 1.85, 44)
-					seg(tip, base - r * 0.4, COL.Paper, 1, 1.85, 44)
-				end
-			end
-			local destP = chain[3]
-			local ring = 0.95
-			local prev = destP + Vector3.new(ring, 0, 0)
-			for i = 1, 4 do
-				local ang = i / 4 * math.pi * 2
-				local nxt = destP + Vector3.new(math.cos(ang) * ring, 0, math.sin(ang) * ring)
-				seg(prev, nxt, COL.Paper, 1, 1.5, 44)
-				prev = nxt
-			end
-			local gtris = Mark.galleryTris
-			local origin = Vector3.new(destP.X + reel.fastRoll * 0.22, y, destP.Z)
-			local ang0 = reel.fastAng
-			local scale = 1
-			for i = 1, 4 do
-				local ang = ang0 + (i - 1) * math.pi * 0.5
-				local warp = 1 + reel.fastRoll * math.cos(ang) * 0.05
-				local outward = Vector3.new(math.cos(ang), 0, math.sin(ang))
-				local right = Vector3.new(-outward.Z, 0, outward.X)
-				local apex = origin + outward * (0.5 * scale * warp)
-				local base = apex + outward * (1.52 * scale)
-				local halfW = 0.21 * scale
-				local tri = gtris and gtris[i]
-				if tri then
-					tri.Filled = true
-					Mark.fillTri(tri, apex, base + right * halfW, base - right * halfW, COL.Paper)
-				end
-				seg(apex, base + right * halfW, COL.Ink, 1, 3.2, 40)
-				seg(apex, base + right * halfW, COL.Line, 1, 1.45, 44)
-				seg(base + right * halfW, base - right * halfW, COL.Ink, 1, 3.2, 40)
-				seg(base + right * halfW, base - right * halfW, COL.Line, 1, 1.45, 44)
-				seg(base - right * halfW, apex, COL.Ink, 1, 3.2, 40)
-				seg(base - right * halfW, apex, COL.Line, 1, 1.45, 44)
-			end
-		end
-	end
-	if li - 1 > (Mark.galleryPeak or 0) then
-		Mark.galleryPeak = li - 1
-		logFile("gallery", "lines", li - 1, "pool", #lines)
-	end
 end
 
 local function paintWorld()
@@ -6568,9 +6011,6 @@ local function paintWorld()
 	end
 	if Mark.drawRoute then
 		Mark.drawRoute(root, gy)
-	end
-	if Mark.paintBoards then
-		Mark.paintBoards(root, gy, gdir)
 	end
 	Mark.artFinish()
 end
@@ -7303,7 +6743,7 @@ Mark.saDraw = function()
 	end
 end
 
--- SilentAim target art (live + gallery): beam muzzle -> chest (ink under-stroke + colour), 4 bright pulses running
+-- SilentAim target art: beam muzzle -> chest (ink under-stroke + colour), 4 bright pulses running
 -- toward the target (period 0.6 s, white fading into the beam colour), 3 spinning arcs at his feet.
 Mark.silentArt = function(seg, muzzle, chest, feet, col, t)
 	local hot = Color3.fromRGB(255, 255, 255)
@@ -9993,7 +9433,6 @@ local function dumpLog()
 		end
 	end
 	writefile("illegalsoccerlog.txt", table.concat(lines, "\n") .. "\n")
-	print("[IS] dumped", #lines, "lines -> illegalsoccerlog.txt")
 end
 
 Mark.holdJump = function()
@@ -16679,12 +16118,12 @@ Mark.drawRoute = function(root, gy)
 	Mark.agentPool.finish()
 end
 
--- ===== new-look art (live + gallery) ======================================================================
+-- ===== new-look art ======================================================================
 -- Rendering model (rewritten for cost): every shape projects its vertices ONCE (pen.P = one WorldToViewportPoint),
 -- then every layer (glow / core / fill) is written from those 2D points through pen.L / pen.T. Lines go straight
 -- to the Drawing object with per-property change checks, gradient colours come from a 48-step LUT (no Color3:Lerp
 -- per segment), alpha is quantised to 1/24 so unchanged segments cost nothing. Ring / arc resolution follows the
--- on-screen radius (LOD). The same functions draw live and in the gallery: only the pen differs.
+-- on-screen radius (LOD). Live drawing goes through the pen.
 Mark.artInit = function()
 	local floor, clamp, cos, sin, abs, pi = math.floor, math.clamp, math.cos, math.sin, math.abs, math.pi
 	local V2 = Vector2.new
@@ -17133,7 +16572,7 @@ Mark.artInit = function()
 	-- slide point was the flicker.
 	Mark.sightArt = function(pen, p, gy, hot, aim, t, bornOverride)
 		-- fade only on a real retarget. Resetting on a 1.8-stud jitter of the slide point dropped alpha to 0
-		-- every few frames (the flicker). Live stays full; the gallery still fades via bornOverride.
+		-- every few frames (the flicker). Live stays full.
 		local st = Mark.sightState
 		if not st or (st.pos - p).Magnitude > 14 then
 			st = { born = t, pos = p, last = t, ang = 0, vel = 5.6, dir = 1, flipAt = t + 1.2, n = 0 }
@@ -17306,7 +16745,7 @@ Mark.agentPath = function(seg, pts, y, style, key, t, classicCol)
 	end
 end
 
--- One entry for every agent-spot look (live route + gallery).
+-- One entry for every agent-spot look (live route).
 -- corners: 4 corner arcs of a squircle (superellipse n = 4: a rounded square that almost reads as a circle), each
 -- arc a gradient across the palette, ink under-stroke, slow spin, the radius breathes (+-8 %, 1.2 s) and snaps in a
 -- little when the destination is fresh. ripple / kick: the water-drop rings, squircle or round.
@@ -17375,7 +16814,7 @@ pcall(Mark.paInstall)
 dbg("boot", "drawing.new", true, "reach", CFG.TackleReach, "track", CFG.TrackStuds, "dribble", "slide-predict", "speed", CFG.TackleSpeed, "dump", "H", "corner", CFG.PreferCornerCurl, "trick", CFG.OnlyTrick)
 
 -- perf probe wrappers: installed last, after every Mark.* function exists
-for _, name in { "tickGk", "tickSkill", "tickHazard", "tickVolley", "tickBlock", "tickBall", "tickBike", "tickAerial", "tickKickDodge", "moveTick", "drawRoute", "paintBoards", "drawOil", "drawKickBox", "kickThreat", "saDraw", "homeSlide", "ballPath", "gkOwnDive", "gkDiveSearch", "volleyPlan", "drawFlight", "drawShadow", "drawScar", "dodgeSteer", "silentArt", "trajArt", "posArt", "sightArt", "passTick", "paDraw" } do
+for _, name in { "tickGk", "tickSkill", "tickHazard", "tickVolley", "tickBlock", "tickBall", "tickBike", "tickAerial", "tickKickDodge", "moveTick", "drawRoute", "drawOil", "drawKickBox", "kickThreat", "saDraw", "homeSlide", "ballPath", "gkOwnDive", "gkDiveSearch", "volleyPlan", "drawFlight", "drawShadow", "drawScar", "dodgeSteer", "silentArt", "trajArt", "posArt", "sightArt", "passTick", "paDraw" } do
 	Mark.perfWrap(name)
 end
 
@@ -17384,6 +16823,7 @@ end
 -- (Lib, Core), then M.start() and M.buildUI(ctx). The UI only READS / WRITES CFG, COL and Mark.artPal (all read
 -- live by the script) and calls a few Mark.* actions. No new top-level locals: the chunk sits at Luau's limit.
 -- No key is bound by default: every keybind below is created empty.
+-- Layout: every function is one card: Enabled + the settings you touch, the rest behind its own "Show Advanced".
 -- ============================================================================================================
 return function(_Lib, _Core)
 	local M = {}
@@ -17404,6 +16844,8 @@ return function(_Lib, _Core)
 	function M.buildUI(ctx)
 		local uiReady = false
 		local T = ctx.tabs
+		-- while set, every element the helpers create is also collected here (one "Show Advanced" group)
+		local cap = nil
 
 		local function notify(title, body)
 			if uiReady then
@@ -17417,22 +16859,28 @@ return function(_Lib, _Core)
 			local m = 10 ^ (p or 0)
 			return math.floor(v * m + 0.5) / m
 		end
+		local function keep(el)
+			if cap and el then
+				cap[#cap + 1] = el
+			end
+			return el
+		end
 		local function card(tab, s)
 			return tab:Section({ Side = s })
 		end
 		local function head(sec, name, divider)
 			if divider then
-				sec:Divider()
+				keep(sec:Divider())
 			end
-			sec:Header({ Name = name })
+			return keep(sec:Header({ Name = name }))
 		end
 		local function note(sec, text)
-			sec:SubLabel({ Text = text })
+			return keep(sec:SubLabel({ Text = text }))
 		end
 
 		-- Enabled switch of a function. Notifies like AutoParry does.
 		local function feature(sec, title, key, set)
-			sec:Toggle({
+			return sec:Toggle({
 				Name = "Enabled",
 				Default = CFG[key] == true,
 				Callback = function(v)
@@ -17446,7 +16894,7 @@ return function(_Lib, _Core)
 		end
 
 		local function tog(sec, name, key, text, set)
-			sec:Toggle({
+			local el = keep(sec:Toggle({
 				Name = name,
 				Default = CFG[key] == true,
 				Callback = function(v)
@@ -17455,10 +16903,11 @@ return function(_Lib, _Core)
 						set(CFG[key])
 					end
 				end,
-			}, fl(key))
+			}, fl(key)))
 			if text then
 				note(sec, text)
 			end
+			return el
 		end
 
 		-- o.scale: the slider shows CFG * scale (percent / ms); o.prec decimals; o.text = one short hint
@@ -17469,7 +16918,7 @@ return function(_Lib, _Core)
 			if cur == nil then
 				cur = mn / sc
 			end
-			sec:Slider({
+			local el = keep(sec:Slider({
 				Name = name,
 				Default = math.clamp(round(cur * sc, o.prec or 0), mn, mx),
 				Minimum = mn,
@@ -17482,14 +16931,15 @@ return function(_Lib, _Core)
 						o.set(CFG[key])
 					end
 				end,
-			}, fl(key))
+			}, fl(key)))
 			if o.text then
 				note(sec, o.text)
 			end
+			return el
 		end
 
 		local function drop(sec, name, key, opts, text)
-			sec:Dropdown({
+			local el = keep(sec:Dropdown({
 				Name = name,
 				Options = opts,
 				Default = CFG[key],
@@ -17498,16 +16948,22 @@ return function(_Lib, _Core)
 						CFG[key] = v
 					end
 				end,
-			}, fl(key))
+			}, fl(key)))
 			if text then
 				note(sec, text)
 			end
+			return el
 		end
 
-		-- dropdown with a label per value: list = { { label, value }, ... }
-		local function pick(sec, name, key, list, text)
+		-- dropdown with a label per value: list = { { label, value }, ... }; onChange(value) for dependent controls
+		local function pick(sec, name, key, list, text, onChange, current)
 			local opts, byLabel, def = {}, {}, list[1][1]
-			local cur = CFG[key]
+			-- `current` given = the control is virtual (no CFG key of its own): onChange does the writing
+			local virtual = current ~= nil
+			local cur = current
+			if cur == nil then
+				cur = CFG[key]
+			end
 			if cur == nil then
 				cur = true
 			end
@@ -17518,34 +16974,81 @@ return function(_Lib, _Core)
 					def = e[1]
 				end
 			end
-			sec:Dropdown({
+			local el = keep(sec:Dropdown({
 				Name = name,
 				Options = opts,
 				Default = def,
 				Callback = function(v)
 					if byLabel[v] ~= nil then
-						CFG[key] = byLabel[v]
+						if not virtual then
+							CFG[key] = byLabel[v]
+						end
+						if onChange then
+							onChange(byLabel[v])
+						end
 					end
 				end,
-			}, fl(key))
+			}, fl(key)))
 			if text then
 				note(sec, text)
 			end
+			return el
+		end
+
+		-- multi dropdown over { { key, label }, ... } writing { [key] = true } of the UNCHECKED ones into CFG[banKey]
+		local function typeList(sec, name, banKey, flag, items, text)
+			local keyOf, opts, def = {}, {}, {}
+			for _, t in ipairs(items) do
+				keyOf[t[2]] = t[1]
+				opts[#opts + 1] = t[2]
+				if not (CFG[banKey] and CFG[banKey][t[1]]) then
+					def[#def + 1] = t[2]
+				end
+			end
+			local el = keep(sec:Dropdown({
+				Name = name,
+				Options = opts,
+				Multi = true,
+				Default = def,
+				Callback = function(sel)
+					local allowed = {}
+					if type(sel) == "table" then
+						for k, v in pairs(sel) do
+							if v == true and keyOf[k] then
+								allowed[keyOf[k]] = true
+							elseif type(v) == "string" and keyOf[v] then
+								allowed[keyOf[v]] = true
+							end
+						end
+					end
+					local ban = {}
+					for _, t in ipairs(items) do
+						if not allowed[t[1]] then
+							ban[t[1]] = true
+						end
+					end
+					CFG[banKey] = ban
+				end,
+			}, fl(flag)))
+			if text then
+				note(sec, text)
+			end
+			return el
 		end
 
 		-- keybinds are created empty (ctx.keybind passes no Default): nothing is bound until the user does it
 		local function bind(sec, name, key, fn)
-			ctx.keybind(sec, { Name = name, Flag = fl(key), Toggle = fn })
+			return keep(ctx.keybind(sec, { Name = name, Flag = fl(key), Toggle = fn }))
 		end
 
 		local function color(sec, name, role)
-			sec:Colorpicker({
+			return keep(sec:Colorpicker({
 				Name = name,
 				Default = COL[role],
 				Callback = function(c)
 					COL[role] = c
 				end,
-			}, fl("COL_" .. role))
+			}, fl("COL_" .. role)))
 		end
 
 		-- art palettes: a 48-step LUT is cached per palette TABLE, so a colour change swaps in a new table
@@ -17555,7 +17058,7 @@ return function(_Lib, _Core)
 				return
 			end
 			for i = 1, 3 do
-				sec:Colorpicker({
+				keep(sec:Colorpicker({
 					Name = names[i],
 					Default = pal[i],
 					Callback = function(c)
@@ -17564,14 +17067,44 @@ return function(_Lib, _Core)
 						new[i] = c
 						Mark.artPal[kind] = new
 					end,
-				}, fl("PAL_" .. kind .. i))
+				}, fl("PAL_" .. kind .. i)))
 			end
+		end
+
+		-- Everything built inside fn() sits behind one toggle at the bottom of the card. Hidden controls keep
+		-- their value and stay in the config; the toggle itself is saved too, so the card opens as you left it.
+		local function advanced(sec, key, fn, label)
+			local els, shown = {}, false
+			local function apply()
+				for _, e in ipairs(els) do
+					pcall(function()
+						e:SetVisibility(shown)
+					end)
+				end
+			end
+			keep(sec:Divider())
+			sec:Toggle({
+				Name = label or "Show Advanced",
+				Default = false,
+				Callback = function(v)
+					shown = v and true or false
+					apply()
+				end,
+			}, fl("ADV_" .. key))
+			local outer = cap
+			cap = els
+			local ok, err = pcall(fn)
+			cap = outer
+			if not ok then
+				logFile("ui advanced", key, tostring(err))
+			end
+			apply()
 		end
 
 		local function block(name, fn)
 			local ok, err = pcall(fn)
 			if not ok then
-				warn(("[IllegalSoccer] UI block '%s' failed: %s"):format(name, tostring(err)))
+				logFile("ui block failed", name, tostring(err))
 			end
 		end
 
@@ -17596,84 +17129,43 @@ return function(_Lib, _Core)
 		block("AutoShoot", function()
 			local tab = T.AutoShoot
 
+			-- left column ------------------------------------------------------------------------------------
 			local s = card(tab, "Left")
 			head(s, "AutoShoot")
 			feature(s, "AutoShoot", "AutoShoot")
 			sld(s, "Max Distance", "ShootMaxDist", 20, 160, { suffix = " st" })
 			sld(s, "Keeper Margin", "ShotReachMargin", -0.2, 0.5, { prec = 2, suffix = " s", text = "How late the keeper must be for a shot to count." })
 
-			local ty = card(tab, "Right")
-			head(ty, "Shot Types")
-			do
-				local keyOf, opts, def = {}, {}, {}
-				for _, t in ipairs(SHOT_TYPES) do
-					keyOf[t[2]] = t[1]
-					opts[#opts + 1] = t[2]
-					if not (CFG.ShotBan and CFG.ShotBan[t[1]]) then
-						def[#def + 1] = t[2]
-					end
-				end
-				ty:Dropdown({
-					Name = "Allowed Types",
-					Options = opts,
-					Multi = true,
-					Default = def,
-					Callback = function(sel)
-						local allowed = {}
-						if type(sel) == "table" then
-							for k, v in pairs(sel) do
-								if v == true and keyOf[k] then
-									allowed[keyOf[k]] = true
-								elseif type(v) == "string" and keyOf[v] then
-									allowed[keyOf[v]] = true
-								end
-							end
-						end
-						local ban = {}
-						for _, t in ipairs(SHOT_TYPES) do
-							if not allowed[t[1]] then
-								ban[t[1]] = true
-							end
-						end
-						CFG.ShotBan = ban
-					end,
-				}, fl("ShotTypes"))
-				note(ty, "Unchecked types are never used.")
-			end
-			tog(ty, "Prefer Corner Curl", "PreferCornerCurl")
-			tog(ty, "Only Trick / Dip", "OnlyTrick")
-
 			local pr = card(tab, "Left")
 			head(pr, "Priority")
-			do
-				local ORDER = { "FAKE", "Normal Shot", "Bounce FAKE" }
-				local cur = (CFG.PriorityBounceFAKE and "Bounce FAKE") or (CFG.PriorityFAKE and "FAKE") or "Normal Shot"
-				pr:Dropdown({
-					Name = "Try First",
-					Options = ORDER,
-					Default = cur,
-					Callback = function(v)
-						if v == "FAKE" then
-							CFG.PriorityFAKE, CFG.PriorityBounceFAKE = true, false
-						elseif v == "Bounce FAKE" then
-							CFG.PriorityFAKE, CFG.PriorityBounceFAKE = false, true
-						elseif v == "Normal Shot" then
-							CFG.PriorityFAKE, CFG.PriorityBounceFAKE = false, false
-						end
-					end,
-				}, fl("TryFirst"))
-				note(pr, "The rest are tried after it, then the normal shot.")
-			end
-			sld(pr, "FAKE Chance", "FakeFirstChance", 0, 100, { scale = 100, suffix = "%", text = "When a mate is open and FAKE is tried first." })
+			pick(pr, "Try First", "TryFirst", { { "FAKE", "FAKE" }, { "Normal Shot", "NORMAL" }, { "Bounce FAKE", "BOUNCE" } }, "The rest follow it, the normal shot comes last.", function(v)
+				CFG.PriorityFAKE = v == "FAKE"
+				CFG.PriorityBounceFAKE = v == "BOUNCE"
+			end, (CFG.PriorityBounceFAKE and "BOUNCE") or (CFG.PriorityFAKE and "FAKE") or "NORMAL")
+			sld(pr, "FAKE Chance", "FakeFirstChance", 0, 100, { scale = 100, suffix = "%", text = "When a teammate is open and FAKE is tried first." })
 			tog(pr, "Wait For Keeper Dive", "FakeAfterDiveBan", "No FAKE while the enemy keeper's dive is on cooldown.")
-			tog(pr, "Shoot After Bounce FAKE", "FakeOnceThenShoot", "After one worked, no more fakes until the ball is lost.")
+			tog(pr, "Shoot After Bounce FAKE", "FakeOnceThenShoot", "After one worked, no fakes until the ball is lost.")
 
+			-- Feint: the controls that do not apply to the chosen mode are hidden
 			local fe = card(tab, "Left")
 			head(fe, "Feint")
-			pick(fe, "Mode", "FeintMode", { { "Off", "Off" }, { "Chance", "Chance" }, { "Count", "Count" } }, "Chance: rolled per charge. Count: N feints, then a real shot.")
-			sld(fe, "Chance", "FeintChance", 0, 100, { scale = 100, suffix = "%" })
-			sld(fe, "Feints In A Row", "FeintCount", 1, 5)
-			sld(fe, "Cancel At", "FeintAt", 0.2, 0.38, { prec = 2, suffix = " s", text = "Charge time at which the feint cancels." })
+			local chanceEl, countEl, atEl, skipEl
+			local function feintVis(mode)
+				mode = mode or CFG.FeintMode or "Off"
+				local rows = { { chanceEl, mode == "Chance" }, { countEl, mode == "Count" }, { atEl, mode ~= "Off" }, { skipEl, mode ~= "Off" } }
+				for i = 1, 4 do
+					local el, on = rows[i][1], rows[i][2]
+					if el then
+						pcall(function()
+							el:SetVisibility(on)
+						end)
+					end
+				end
+			end
+			pick(fe, "Mode", "FeintMode", { { "Off", "Off" }, { "Chance", "Chance" }, { "Count", "Count" } }, "Chance: rolled per charge. Count: N feints, then a real shot.", feintVis)
+			chanceEl = sld(fe, "Chance", "FeintChance", 0, 100, { scale = 100, suffix = "%" })
+			countEl = sld(fe, "Feints In A Row", "FeintCount", 1, 5)
+			atEl = sld(fe, "Cancel At", "FeintAt", 0.2, 0.38, { prec = 2, suffix = " s" })
 			do
 				local def = {}
 				if CFG.FeintSkipFake ~= false then
@@ -17682,7 +17174,7 @@ return function(_Lib, _Core)
 				if CFG.FeintSkipBounce ~= false then
 					def[#def + 1] = "Bounce FAKE"
 				end
-				fe:Dropdown({
+				skipEl = fe:Dropdown({
 					Name = "Never Feint On",
 					Options = { "FAKE", "Bounce FAKE" },
 					Multi = true,
@@ -17703,6 +17195,59 @@ return function(_Lib, _Core)
 					end,
 				}, fl("FeintSkip"))
 			end
+			feintVis()
+
+			local b = card(tab, "Left")
+			head(b, "Bounce FAKE")
+			tog(b, "Enabled", "BounceFAKE", "A shot that bounces off a wall and comes back to you.")
+			sld(b, "Chance", "BounceFakeChance", 0, 100, { scale = 100, suffix = "%" })
+			sld(b, "Extra Height", "BounceFakeHeight", 0, 10, { prec = 1, suffix = " st", text = "Raises the aim points, out of the keeper's jump." })
+			sld(b, "Max Distance To Goal", "BounceFakeRange", 30, 160, { suffix = " st" })
+			advanced(b, "BounceFake", function()
+				sld(b, "Run Allowance", "BounceFakeRun", 4, 24, { suffix = " st", text = "How far you may run for the returning ball." })
+				sld(b, "Return Slack", "BounceFakeSlack", 0.5, 8, { prec = 1, suffix = " st" })
+				sld(b, "Walls Tried", "BounceFakeMaxSim", 2, 20, { text = "Higher finds more, delays the preview." })
+				sld(b, "Flight Steps", "BounceFakeSteps", 20, 90)
+			end)
+
+			local v = card(tab, "Left")
+			head(v, "Shot Preview")
+			tog(v, "Show Preview", "DrawShot")
+			drop(v, "Style", "ShotStyle", { "aurora", "classic" }, "Classic uses the colors from Visuals.")
+			if Mark.artPal then
+				advanced(v, "ShotColors", function()
+					head(v, "High Shots")
+					palette(v, "hi", { "Color 1", "Color 2", "Color 3" })
+					head(v, "Low Shots", true)
+					palette(v, "lo", { "Color 1", "Color 2", "Color 3" })
+					head(v, "Curled Shots", true)
+					palette(v, "curl", { "Color 1", "Color 2", "Color 3" })
+				end, "Edit Colors")
+			end
+
+			-- right column -----------------------------------------------------------------------------------
+			local ty = card(tab, "Right")
+			head(ty, "Shot Types")
+			typeList(ty, "Allowed Types", "ShotBan", "ShotTypes", SHOT_TYPES, "Unchecked types are never used.")
+			tog(ty, "Prefer Corner Curl", "PreferCornerCurl")
+			tog(ty, "Only Trick / Dip", "OnlyTrick")
+			advanced(ty, "Weights", function()
+				note(ty, "100% = default mix. 0% = never, 200% = twice as often.")
+				for _, t in ipairs(SHOT_TYPES) do
+					keep(ty:Slider({
+						Name = t[2],
+						Default = math.clamp(round(((CFG.ShotWeight and CFG.ShotWeight[t[1]]) or 1) * 100, 0), 0, 300),
+						Minimum = 0,
+						Maximum = 300,
+						Precision = 0,
+						Suffix = "%",
+						Callback = function(x)
+							CFG.ShotWeight = CFG.ShotWeight or {}
+							CFG.ShotWeight[t[1]] = x / 100
+						end,
+					}, fl("W_" .. t[1])))
+				end
+			end, "Edit Weights")
 
 			local f = card(tab, "Right")
 			head(f, "FAKE")
@@ -17710,105 +17255,31 @@ return function(_Lib, _Core)
 			tog(f, "Friends First", "PrioritizeFriends")
 			tog(f, "Curved FAKE", "FakeCurve")
 			tog(f, "Corner Name", "FakeCorner", "Labels it FAKE CORNER when it lands in a corner.")
-			head(f, "Teammate Rules", true)
-			sld(f, "Max Distance To Goal", "FakeMaxDepth", 30, 160, { suffix = " st" })
-			sld(f, "Defender Clearance", "FakeFoeRadius", 2, 14, { suffix = " st", text = "An enemy this close to him takes the ball." })
-			sld(f, "Side Tolerance", "FakeLatMul", 1, 3, { prec = 1, suffix = "x", text = "How far off the goal his line may be. Curves bend it back." })
-			sld(f, "Slack", "FakeSlop", 1, 12, { suffix = " st" })
-			sld(f, "Fallback Chance", "FakeChance", 0, 100, { scale = 100, suffix = "%", text = "Used when FAKE is not tried first." })
+			advanced(f, "Fake", function()
+				head(f, "Teammate Rules")
+				sld(f, "Max Distance To Goal", "FakeMaxDepth", 30, 160, { suffix = " st" })
+				sld(f, "Defender Clearance", "FakeFoeRadius", 2, 14, { suffix = " st", text = "An enemy this close to him takes the ball." })
+				sld(f, "Side Tolerance", "FakeLatMul", 1, 3, { prec = 1, suffix = "x", text = "How far off the goal his line may be. Curves bend it back." })
+				sld(f, "Slack", "FakeSlop", 1, 12, { suffix = " st" })
+				sld(f, "Fallback Chance", "FakeChance", 0, 100, { scale = 100, suffix = "%", text = "Used when FAKE is not tried first." })
+			end)
 
 			local fk = card(tab, "Right")
 			head(fk, "Flick")
 			tog(fk, "Auto Flick", "AutoFlick", "The flick key runs flick, jump and volley for you.")
 			tog(fk, "Auto Jump", "FlickAutoJump")
-			sld(fk, "Jump Timing", "AerialJumpLead", 0.1, 0.5, { prec = 2, suffix = " s", text = "Jumps this long before the ball arrives." })
 			tog(fk, "Auto Kick", "FlickAutoKick", "Off: you kick, the aim stays locked.")
-			do
-				local keyOf, opts, def = {}, {}, {}
-				for _, t in ipairs(SHOT_TYPES) do
-					keyOf[t[2]] = t[1]
-					opts[#opts + 1] = t[2]
-					if not (CFG.FlickBan and CFG.FlickBan[t[1]]) then
-						def[#def + 1] = t[2]
-					end
-				end
-				fk:Dropdown({
-					Name = "Flick Shot Types",
-					Options = opts,
-					Multi = true,
-					Default = def,
-					Callback = function(sel)
-						local allowed = {}
-						if type(sel) == "table" then
-							for k, v in pairs(sel) do
-								if v == true and keyOf[k] then
-									allowed[keyOf[k]] = true
-								elseif type(v) == "string" and keyOf[v] then
-									allowed[keyOf[v]] = true
-								end
-							end
-						end
-						local ban = {}
-						for _, t in ipairs(SHOT_TYPES) do
-							if not allowed[t[1]] then
-								ban[t[1]] = true
-							end
-						end
-						CFG.FlickBan = ban
-					end,
-				}, fl("FlickTypes"))
-				note(fk, "Used while a flick or volley is aimed. Unchecked are never used.")
-			end
-
-			local b = card(tab, "Left")
-			head(b, "Bounce FAKE")
-			tog(b, "Enabled", "BounceFAKE", "A shot that bounces off a wall and comes back to you.")
-			sld(b, "Chance", "BounceFakeChance", 0, 100, { scale = 100, suffix = "%" })
-			sld(b, "Max Distance To Goal", "BounceFakeRange", 30, 160, { suffix = " st" })
-			sld(b, "Extra Height", "BounceFakeHeight", 0, 10, { prec = 1, suffix = " st", text = "Raises the wall aim points, out of the keeper's jump." })
-			sld(b, "Run Allowance", "BounceFakeRun", 4, 24, { suffix = " st", text = "How far you may run for the returning ball." })
-			sld(b, "Return Slack", "BounceFakeSlack", 0.5, 8, { prec = 1, suffix = " st" })
-			head(b, "Search", true)
-			sld(b, "Walls Tried", "BounceFakeMaxSim", 2, 20, { text = "Higher finds more, delays the preview." })
-			sld(b, "Flight Steps", "BounceFakeSteps", 20, 90)
-
-			local w = card(tab, "Right")
-			head(w, "Type Weights")
-			note(w, "100% = default mix. 0% = never, 200% = twice as often.")
-			for _, t in ipairs(SHOT_TYPES) do
-				w:Slider({
-					Name = t[2],
-					Default = math.clamp(round(((CFG.ShotWeight and CFG.ShotWeight[t[1]]) or 1) * 100, 0), 0, 300),
-					Minimum = 0,
-					Maximum = 300,
-					Precision = 0,
-					Suffix = "%",
-					Callback = function(v)
-						CFG.ShotWeight = CFG.ShotWeight or {}
-						CFG.ShotWeight[t[1]] = v / 100
-					end,
-				}, fl("W_" .. t[1]))
-			end
-
-			local v = card(tab, "Left")
-			head(v, "Shot Preview")
-			tog(v, "Show Preview", "DrawShot")
-			drop(v, "Style", "ShotStyle", { "aurora", "classic" }, "Classic uses the colors from Visuals.")
-			if Mark.artPal then
-				head(v, "High Shots", true)
-				palette(v, "hi", { "Color 1", "Color 2", "Color 3" })
-				head(v, "Low Shots", true)
-				palette(v, "lo", { "Color 1", "Color 2", "Color 3" })
-				head(v, "Curled Shots", true)
-				palette(v, "curl", { "Color 1", "Color 2", "Color 3" })
-			end
+			typeList(fk, "Flick Shot Types", "FlickBan", "FlickTypes", SHOT_TYPES, "Used while a flick or volley is aimed.")
+			advanced(fk, "Flick", function()
+				sld(fk, "Jump Timing", "AerialJumpLead", 0.1, 0.5, { prec = 2, suffix = " s", text = "Jumps this long before the ball arrives." })
+			end)
 		end)
 
 		-- ==================================================================================================
-		-- MAIN
+		-- DEFENSE
 		-- ==================================================================================================
-		block("Main", function()
-			local tab = T.Main
+		block("Defense", function()
+			local tab = T.Defense
 
 			-- AutoTackle -----------------------------------------------------------------------------------
 			local s = card(tab, "Left")
@@ -17818,44 +17289,78 @@ return function(_Lib, _Core)
 			sld(s, "Reach", "TackleReach", 8, 30, { suffix = " st" })
 			sld(s, "Slide Power", "TackleSpeed", 0.8, 1.6, {
 				prec = 2, suffix = "x",
-				set = function(v)
-					pcall(SlideTackle.SetSpeedMultiplier, v)
+				set = function(x)
+					pcall(SlideTackle.SetSpeedMultiplier, x)
 				end,
 			})
-			head(s, "Waiting", true)
-			sld(s, "Goal Zone", "TackleGoalZone", 0, 80, { suffix = " st", text = "Inside it near our goal, never wait for AutoBlock." })
-			tog(s, "Strict Kick Wait", "TackleGateStrict", "Wait for AutoBlock even when its kick cannot fire.")
-			tog(s, "Yield To Teammate", "TackleCompetitor", "Skips a carrier a teammate is already on.")
-			sld(s, "Teammate Radius", "TackleCompetitorRadius", 3, 25, { suffix = " st" })
+			tog(s, "Competitor Check", "TackleCompetitor", "Skips a carrier a teammate is already on.")
+			sld(s, "Competitor Radius", "TackleCompetitorRadius", 3, 25, { suffix = " st" })
 			head(s, "Charging Carrier", true)
 			tog(s, "Charge Guard", "ChargeTackleGuard", "Slide only if it lands before his release.")
 			tog(s, "Slide Across The Shot", "ChargeSlideBlock")
-			sld(s, "Charge Range", "ChargeTackleRange", 4, 20, { suffix = " st" })
 			head(s, "Lofting Carrier", true)
 			tog(s, "Jump Slide", "JumpSlide", "Jump first, then slide from the air.")
-			sld(s, "Jump Delay", "JumpSlideDelay", 50, 400, { scale = 1000, suffix = " ms" })
 			head(s, "Manual Tackle", true)
 			tog(s, "Manual Tackle", "ManualTackle", "Your own tackle press is aimed at the carrier.")
-			sld(s, "Manual Radius", "ManualRadius", 8, 50, { suffix = " st" })
 			bind(s, "Manual Tackle Key", "KB_ManualTackle", function()
 				pcall(Mark.manualFire)
 			end)
 			head(s, "Visual", true)
 			tog(s, "Show Prediction", "DrawTackle")
 			drop(s, "Sight Style", "SightStyle", { "reticle", "classic" })
-			head(s, "Advanced", true)
-			sld(s, "Track Radius", "TrackStuds", 30, 160, { suffix = " st" })
-			sld(s, "Min Slide Power", "TackleMinSpeed", 0.3, 1.2, { prec = 2, suffix = "x" })
+			advanced(s, "Tackle", function()
+				sld(s, "Goal Zone", "TackleGoalZone", 0, 80, { suffix = " st", text = "Inside it near our goal, never wait for AutoBlock." })
+				tog(s, "Strict Kick Wait", "TackleGateStrict", "Wait for AutoBlock even when its kick cannot fire.")
+				sld(s, "Track Radius", "TrackStuds", 30, 160, { suffix = " st" })
+				sld(s, "Min Slide Power", "TackleMinSpeed", 0.3, 1.2, { prec = 2, suffix = "x" })
+				sld(s, "Charge Range", "ChargeTackleRange", 4, 20, { suffix = " st" })
+				sld(s, "Jump Delay", "JumpSlideDelay", 50, 400, { scale = 1000, suffix = " ms" })
+				sld(s, "Manual Radius", "ManualRadius", 8, 50, { suffix = " st" })
+			end)
+
+			-- AutoBlock ------------------------------------------------------------------------------------
+			local b = card(tab, "Left")
+			head(b, "AutoBlock")
+			feature(b, "AutoBlock", "AutoBlock")
+			sld(b, "Range", "BlockRange", 15, 80, { suffix = " st" })
+			tog(b, "Competitor Check", "BlockCompetitor", "Stops when a teammate is already on the carrier.")
+			sld(b, "Competitor Radius", "CompetitorRadius", 4, 30, { suffix = " st" })
+			head(b, "High Shots", true)
+			tog(b, "Pre-Release Jump", "BlockPreJump", "Jumps before the release, timed to his charge.")
+			tog(b, "Slide Block", "BlockSlide")
+			tog(b, "Jump + Air Slide", "BlockSlideJump")
+			advanced(b, "Block", function()
+				sld(b, "Behind Limit", "BlockBehind", 8, 40, { suffix = " st", text = "How far behind the carrier it may still start." })
+				sld(b, "Stand Closer By", "BlockCloser", -1, 3, { prec = 1, suffix = " st" })
+				sld(b, "Min Gap", "BlockGapMin", 1, 6, { prec = 1, suffix = " st" })
+			end)
+
+			-- AutoKick -------------------------------------------------------------------------------------
+			local k = card(tab, "Left")
+			head(k, "AutoKick")
+			feature(k, "AutoKick", "AutoKick")
+			note(k, "Works inside AutoBlock and CounterJump.")
+			tog(k, "Always Full Charge", "AutoKickFull", "Never releases early: a miss instead of a weak kick.")
+			sld(k, "Range", "AutoKickRange", 1, 12, { prec = 1, suffix = " st" })
+			advanced(k, "Kick", function()
+				sld(k, "Cooldown", "AutoKickCooldown", 0.2, 2, { prec = 2, suffix = " s" })
+				sld(k, "Min Charge", "AutoKickRelease", 0.2, 0.4, { prec = 2, suffix = " s", text = "Only when Always Full Charge is off." })
+				tog(k, "Eager Press", "AutoKickEager")
+				sld(k, "Flee Limit", "AutoKickFlee", 3, 20, { suffix = " st/s", text = "No kick if he pulls away faster than this." })
+				sld(k, "Flee Margin", "AutoKickPadPerSpeed", 0, 0.3, { prec = 2 })
+			end)
 
 			-- AutoDribble ----------------------------------------------------------------------------------
 			local d = card(tab, "Right")
 			head(d, "AutoDribble")
 			feature(d, "AutoDribble", "AutoDribble")
 			tog(d, "Agent Addon", "AgentAddon", "Walks into the tackler's box inside the iframe.")
-			sld(d, "React Range", "DribbleReact", 10, 40, { suffix = " st" })
-			sld(d, "Close Range", "DribbleClose", 5, 25, { suffix = " st" })
-			sld(d, "Margin", "DribbleSlop", 1, 8, { prec = 1, suffix = " st" })
 			tog(d, "Show Threat", "DrawDanger")
+			advanced(d, "Dribble", function()
+				sld(d, "React Range", "DribbleReact", 10, 40, { suffix = " st" })
+				sld(d, "Close Range", "DribbleClose", 5, 25, { suffix = " st" })
+				sld(d, "Margin", "DribbleSlop", 1, 8, { prec = 1, suffix = " st" })
+			end)
 
 			-- AutoDodge ------------------------------------------------------------------------------------
 			local dg = card(tab, "Right")
@@ -17864,166 +17369,138 @@ return function(_Lib, _Core)
 			note(dg, "Last resort when the dribble is on cooldown.")
 			pick(dg, "Dodge Mode", "DodgeTeleport", { { "Teleport + Movement", true }, { "Movement Only", false } }, "Movement Only never moves the character by CFrame.")
 			tog(dg, "Pass Instead", "PassAssistSync", "Lobs to the safest teammate when a dodge is unsure.")
-			tog(dg, "Barricade Addon", "BarricadeAddon", "Blocks a projectile with a wall.")
-			head(dg, "Projectiles", true)
-			sld(dg, "Safe Margin", "ProjSafeMargin", 0, 4, { prec = 1, suffix = " st" })
-			sld(dg, "Punch Radius", "ProjHitRadius", 2, 10, { prec = 1, suffix = " st" })
-			head(dg, "Hazards", true)
-			sld(dg, "Blast Margin", "BlastMargin", 0, 5, { prec = 1, suffix = " st" })
-			sld(dg, "Mine Margin", "MineMargin", 0, 6, { prec = 1, suffix = " st" })
-
-			-- AutoBlock ------------------------------------------------------------------------------------
-			local b = card(tab, "Left")
-			head(b, "AutoBlock")
-			feature(b, "AutoBlock", "AutoBlock")
-			sld(b, "Range", "BlockRange", 15, 80, { suffix = " st" })
-			sld(b, "Behind Limit", "BlockBehind", 8, 40, { suffix = " st", text = "How far behind the carrier it may still start." })
-			sld(b, "Stand Closer By", "BlockCloser", -1, 3, { prec = 1, suffix = " st" })
-			sld(b, "Min Gap", "BlockGapMin", 1, 6, { prec = 1, suffix = " st" })
-			tog(b, "Yield To Teammate", "BlockCompetitor", "Skips a carrier a teammate is already on.")
-			sld(b, "Teammate Radius", "CompetitorRadius", 4, 30, { suffix = " st" })
-			head(b, "High Shots", true)
-			tog(b, "Pre-Release Jump", "BlockPreJump", "Jumps before the release, timed to his charge.")
-			tog(b, "Slide Block", "BlockSlide")
-			tog(b, "Jump + Air Slide", "BlockSlideJump")
-
-			-- AutoKick -------------------------------------------------------------------------------------
-			local k = card(tab, "Left")
-			head(k, "AutoKick")
-			feature(k, "AutoKick", "AutoKick")
-			note(k, "Works inside AutoBlock and CounterJump.")
-			sld(k, "Range", "AutoKickRange", 1, 12, { prec = 1, suffix = " st" })
-			sld(k, "Cooldown", "AutoKickCooldown", 0.2, 2, { prec = 2, suffix = " s" })
-			tog(k, "Always Full Charge", "AutoKickFull", "Never releases early: a miss instead of a weak kick.")
-			sld(k, "Min Charge", "AutoKickRelease", 0.2, 0.4, { prec = 2, suffix = " s", text = "Only when Always Full Charge is off." })
-			tog(k, "Eager Press", "AutoKickEager")
-			head(k, "Fleeing Carrier", true)
-			sld(k, "Flee Limit", "AutoKickFlee", 3, 20, { suffix = " st/s", text = "No kick if he pulls away faster than this." })
-			sld(k, "Flee Margin", "AutoKickPadPerSpeed", 0, 0.3, { prec = 2 })
+			advanced(dg, "Dodge", function()
+				head(dg, "Projectiles")
+				sld(dg, "Safe Margin", "ProjSafeMargin", 0, 4, { prec = 1, suffix = " st" })
+				sld(dg, "Punch Radius", "ProjHitRadius", 2, 10, { prec = 1, suffix = " st" })
+				head(dg, "Hazards", true)
+				sld(dg, "Blast Margin", "BlastMargin", 0, 5, { prec = 1, suffix = " st" })
+				sld(dg, "Mine Margin", "MineMargin", 0, 6, { prec = 1, suffix = " st" })
+			end)
 
 			-- CounterJump ----------------------------------------------------------------------------------
 			local c = card(tab, "Right")
 			head(c, "CounterJump")
 			feature(c, "CounterJump", "CounterJump")
 			note(c, "Jumps when an enemy goes airborne with the ball.")
-			sld(c, "Range", "CounterJumpRange", 4, 20, { suffix = " st" })
 			tog(c, "Counter Tackle", "CounterTackle", "Slides at the ball during a flick wind-up.")
-			head(c, "Combo", true)
-			sld(c, "Combo Chance", "CounterComboChance", 0, 100, { scale = 100, suffix = "%" })
-			sld(c, "Kick Share", "CounterKickChance", 0, 100, { scale = 100, suffix = "%" })
-			sld(c, "Kick Delay", "CounterKickDelay", 0, 0.4, { prec = 2, suffix = " s" })
-			head(c, "Teammates", true)
-			tog(c, "Yield To Teammate", "CounterCompetitor")
-			sld(c, "Teammate Radius", "CounterCompetitorRadius", 4, 30, { suffix = " st" })
+			tog(c, "Competitor Check", "CounterCompetitor", "Stops when a teammate is already on him.")
+			sld(c, "Competitor Radius", "CounterCompetitorRadius", 4, 30, { suffix = " st" })
+			advanced(c, "Counter", function()
+				sld(c, "Range", "CounterJumpRange", 4, 20, { suffix = " st" })
+				sld(c, "Combo Chance", "CounterComboChance", 0, 100, { scale = 100, suffix = "%" })
+				sld(c, "Kick Share", "CounterKickChance", 0, 100, { scale = 100, suffix = "%" })
+				sld(c, "Kick Delay", "CounterKickDelay", 0, 0.4, { prec = 2, suffix = " s" })
+			end)
+		end)
 
-			-- AutoBall -------------------------------------------------------------------------------------
-			local ba = card(tab, "Left")
-			head(ba, "AutoBall")
-			feature(ba, "AutoBall", "AutoBall")
-			sld(ba, "Slide Gain", "RouteSlideGain", 0, 1.5, { prec = 2, suffix = " s", text = "A slide replaces the run if it gets there this much sooner." })
-			tog(ba, "Yield To Teammate", "BallCompetitor", "Lets a teammate who is clearly closer take the ball.")
-			sld(ba, "Yield Gap", "BallYieldGap", 2, 20, { suffix = " st", text = "How much closer he must be." })
-			head(ba, "Candidate Killer", true)
-			tog(ba, "Candidate Killer", "CandidateKiller", "Slides an enemy who runs for the same ball.")
-			sld(ba, "Ball Radius", "KillerRadius", 8, 40, { suffix = " st" })
-			sld(ba, "Our Reach", "KillerReach", 10, 50, { suffix = " st" })
-			sld(ba, "Threat Margin", "KillerMargin", 0, 1.5, { prec = 2, suffix = " s" })
-			sld(ba, "Max Turn", "KillerAngle", 10, 90, { suffix = "°" })
-			sld(ba, "Intent Radius", "IntentTackleRadius", 20, 120, { suffix = " st" })
-			head(ba, "Killer Guard", true)
-			tog(ba, "Killer Guard", "KillerGuard", "Ball near our goal: slide the closest enemy first.")
-			sld(ba, "Goal Distance", "KillerGuardGoal", 20, 100, { suffix = " st" })
-			sld(ba, "Ball Distance", "KillerGuardNear", 8, 40, { suffix = " st" })
-			sld(ba, "Enemy Distance", "KillerGuardFoe", 10, 80, { suffix = " st" })
+		-- ==================================================================================================
+		-- GOALKEEPER
+		-- ==================================================================================================
+		block("Goalkeeper", function()
+			local tab = T.Goalkeeper
 
-			-- AutoGK ---------------------------------------------------------------------------------------
-			local g = card(tab, "Right")
+			local g = card(tab, "Left")
 			head(g, "AutoGK")
 			feature(g, "AutoGK", "AutoGK")
+			note(g, "Reactions only: intercept, dive, press, return.")
 			tog(g, "Jump + Dive", "GkJumpDive", "For shots no ground dive reaches.")
 			tog(g, "Lost-Path Stand", "GkLostPath")
 			tog(g, "Auto Clear", "GkAutoClear")
-			sld(g, "Reaction", "GkReactSeconds", 0.05, 0.4, { prec = 2, suffix = " s" })
-			sld(g, "Walk Slack", "GkWalkSlack", 0, 0.3, { prec = 2, suffix = " s" })
-			sld(g, "Intercept Radius", "GkInterceptEnemy", 4, 30, { suffix = " st", text = "Free ball with an enemy this close: no run." })
-			sld(g, "Bait Inset", "GkBaitInset", 0, 2, { prec = 1, suffix = " st" })
-			sld(g, "Bait Ray", "GkBaitRay", 0.5, 6, { prec = 1, suffix = " st" })
-			head(g, "Press", true)
-			tog(g, "Press", "GkPress", "Forward dive into a carrier coming at goal.")
-			tog(g, "Press Jump", "GkPressJump")
-			sld(g, "Press Distance", "PressGoalDist", 10, 60, { suffix = " st" })
-			sld(g, "Wait For Contact", "PressMaxT", 0.1, 1, { prec = 2, suffix = " s" })
-			sld(g, "Desperate Window", "GkPressDesperate", 0.2, 1.5, { prec = 2, suffix = " s" })
-			head(g, "Return", true)
-			tog(g, "Return After Push", "GkReturn", "Back to the spot after a shotgun or dash push.")
-			sld(g, "Dive Back From", "GkReturnDive", 5, 30, { suffix = " st" })
-			sld(g, "Lost-Path Share", "GkLostDiveFrac", 0.3, 1, { prec = 2 })
+			advanced(g, "Gk", function()
+				sld(g, "Reaction", "GkReactSeconds", 0.05, 0.4, { prec = 2, suffix = " s" })
+				sld(g, "Walk Slack", "GkWalkSlack", 0, 0.3, { prec = 2, suffix = " s" })
+				sld(g, "Intercept Radius", "GkInterceptEnemy", 4, 30, { suffix = " st", text = "Free ball with an enemy this close: no run." })
+				sld(g, "Bait Inset", "GkBaitInset", 0, 2, { prec = 1, suffix = " st" })
+				sld(g, "Bait Ray", "GkBaitRay", 0.5, 6, { prec = 1, suffix = " st" })
+				sld(g, "Lost-Path Share", "GkLostDiveFrac", 0.3, 1, { prec = 2 })
+			end)
 
-			-- AutoWall -------------------------------------------------------------------------------------
-			local w = card(tab, "Left")
-			head(w, "AutoWall")
-			feature(w, "AutoWall", "AutoWall")
-			tog(w, "Auto Use", "WallEquip", "Takes the barricades out by itself. Off: only when already in hand.")
-			pick(w, "Aim Ahead", "WallLead", { { "Never", "never" }, { "Only When He Runs Away", "away" }, { "Always", "always" } })
-			sld(w, "Equip Distance", "WallEquipDist", 8, 50, { suffix = " st" })
-			sld(w, "Put Away After", "WallEquipHold", 1, 10, { prec = 1, suffix = " s" })
-			sld(w, "Cooldown", "WallCooldown", 0.2, 3, { prec = 1, suffix = " s" })
-			head(w, "Ambush", true)
-			tog(w, "Ambush", "WallAmbush", "Places early on an enemy running into the spot.")
-			sld(w, "Reach", "WallReach", 8, 50, { suffix = " st" })
-			sld(w, "Min Closing Speed", "WallAmbushV", 1, 12, { prec = 1, suffix = " st/s" })
-			sld(w, "Time Window", "WallAmbushT", 0.2, 2, { prec = 2, suffix = " s" })
-			head(w, "Shots", true)
-			tog(w, "Wall On Shot Path", "WallShot")
+			local p = card(tab, "Right")
+			head(p, "Press")
+			tog(p, "Press", "GkPress", "Forward dive into a carrier coming at goal.")
+			tog(p, "Press Jump", "GkPressJump")
+			advanced(p, "GkPress", function()
+				sld(p, "Press Distance", "PressGoalDist", 10, 60, { suffix = " st" })
+				sld(p, "Wait For Contact", "PressMaxT", 0.1, 1, { prec = 2, suffix = " s" })
+				sld(p, "Desperate Window", "GkPressDesperate", 0.2, 1.5, { prec = 2, suffix = " s" })
+			end)
 
-			-- SilentAim ------------------------------------------------------------------------------------
-			local sa = card(tab, "Right")
+			local r = card(tab, "Right")
+			head(r, "Return")
+			tog(r, "Return After Push", "GkReturn", "Back to the spot after a shotgun or dash push.")
+			advanced(r, "GkReturn", function()
+				sld(r, "Dive Back From", "GkReturnDive", 5, 30, { suffix = " st" })
+			end)
+		end)
+
+		-- ==================================================================================================
+		-- SKILLS (items)
+		-- ==================================================================================================
+		block("Skills", function()
+			local tab = T.Skills
+
+			local sa = card(tab, "Left")
 			head(sa, "SilentAim")
 			feature(sa, "SilentAim", "SilentAim")
 			note(sa, "Item aim: leads the target, arcs the freeze gun.")
 			sld(sa, "FOV", "SilentFov", 30, 400, { suffix = " px" })
-			sld(sa, "Freeze Gun Tolerance", "ArcMaxErr", 0.5, 6, { prec = 1, suffix = " st", text = "Arc error accepted. Beyond it, aims at the feet." })
-			head(sa, "Visual", true)
 			tog(sa, "Show FOV Circle", "DrawSilentFov")
 			tog(sa, "Show Tracer", "DrawSilent")
-
-			-- Pass Assist ----------------------------------------------------------------------------------
-			local p = card(tab, "Right")
-			head(p, "Pass Assist")
-			feature(p, "Pass Assist", "PassAssist")
-			note(p, "A pass press on a teammate becomes a solved lob.")
-			sld(p, "Lock Angle", "PassFov", 3, 25, { suffix = "°" })
-			sld(p, "Min Distance", "PassMinDist", 3, 30, { suffix = " st" })
-			sld(p, "Max Distance", "PassMaxDist", 40, 200, { suffix = " st" })
-			tog(p, "Pass To Keeper", "PassToKeeper")
-			head(p, "Landing", true)
-			sld(p, "Goal Lead", "PassGoalLead", 10, 60, { suffix = " st", text = "Receive point stays this far from their goal." })
-			sld(p, "Keeper Radius", "PassKeeperRadius", 4, 30, { suffix = " st" })
-			sld(p, "Goal Angle", "PassGoalSep", 2, 25, { suffix = "°" })
-			sld(p, "Goal Zone", "PassGoalZone", 10, 70, { suffix = " st" })
-			head(p, "Manual Pass", true)
-			tog(p, "Manual Pass", "PassManual", "One key passes to the best teammate.")
-			sld(p, "Near Limit", "PassManualNear", 4, 40, { suffix = " st" })
-			bind(p, "Manual Pass Key", "KB_ManualPass", function()
-				if CFG.PassManual then
-					local ok, err = pcall(Mark.paManual)
-					if not ok then
-						logFile("pass manual", "err", tostring(err))
-					end
-				end
+			advanced(sa, "Silent", function()
+				sld(sa, "Freeze Gun Tolerance", "ArcMaxErr", 0.5, 6, { prec = 1, suffix = " st", text = "Arc error accepted. Beyond it, aims at the feet." })
 			end)
-			head(p, "Visual", true)
-			tog(p, "Show Marks", "PassShow")
-			palette(p, "lime", { "Mark 1", "Mark 2", "Mark 3" })
+
+			local w = card(tab, "Right")
+			head(w, "AutoWall")
+			feature(w, "AutoWall", "AutoWall")
+			tog(w, "Auto Use", "WallEquip", "Takes the barricades out by itself. Off: only when already in hand.")
+			pick(w, "Aim Ahead", "WallLead", { { "Never", "never" }, { "Only When He Runs Away", "away" }, { "Always", "always" } })
+			tog(w, "Block Projectiles", "BarricadeAddon", "Puts a wall on a projectile's path.")
+			tog(w, "Wall On Shot Path", "WallShot", "Walls a charged shot.")
+			tog(w, "Ambush", "WallAmbush", "Places early on an enemy running into the spot.")
+			advanced(w, "Wall", function()
+				sld(w, "Equip Distance", "WallEquipDist", 8, 50, { suffix = " st" })
+				sld(w, "Put Away After", "WallEquipHold", 1, 10, { prec = 1, suffix = " s" })
+				sld(w, "Cooldown", "WallCooldown", 0.2, 3, { prec = 1, suffix = " s" })
+				sld(w, "Ambush Reach", "WallReach", 8, 50, { suffix = " st" })
+				sld(w, "Min Closing Speed", "WallAmbushV", 1, 12, { prec = 1, suffix = " st/s" })
+				sld(w, "Ambush Time", "WallAmbushT", 0.2, 2, { prec = 2, suffix = " s" })
+			end)
 		end)
 
 		-- ==================================================================================================
 		-- MOVEMENT
 		-- ==================================================================================================
 		block("Movement", function()
-			local s = card(T.Movement, "Left")
-			head(s, "Jump")
-			s:Keybind({
+			local tab = T.Movement
+
+			local ba = card(tab, "Left")
+			head(ba, "AutoBall")
+			feature(ba, "AutoBall", "AutoBall")
+			tog(ba, "Competitor Check", "BallCompetitor", "Stops when a teammate is clearly closer to the ball.")
+			sld(ba, "Competitor Gap", "BallYieldGap", 2, 20, { suffix = " st", text = "How much closer he must be." })
+			head(ba, "Rival Slide", true)
+			tog(ba, "Enabled", "CandidateKiller", "Slides an enemy who runs for the same ball.")
+			head(ba, "Goal Guard", true)
+			tog(ba, "Enabled", "KillerGuard", "Ball near our goal: slide the closest enemy first.")
+			advanced(ba, "Ball", function()
+				sld(ba, "Slide Gain", "RouteSlideGain", 0, 1.5, { prec = 2, suffix = " s", text = "A slide replaces the run if it gets there this much sooner." })
+				head(ba, "Rival Slide")
+				sld(ba, "Ball Radius", "KillerRadius", 8, 40, { suffix = " st" })
+				sld(ba, "Our Reach", "KillerReach", 10, 50, { suffix = " st" })
+				sld(ba, "Threat Margin", "KillerMargin", 0, 1.5, { prec = 2, suffix = " s" })
+				sld(ba, "Max Turn", "KillerAngle", 10, 90, { suffix = "°" })
+				sld(ba, "Intent Radius", "IntentTackleRadius", 20, 120, { suffix = " st" })
+				head(ba, "Goal Guard", true)
+				sld(ba, "Goal Distance", "KillerGuardGoal", 20, 100, { suffix = " st" })
+				sld(ba, "Ball Distance", "KillerGuardNear", 8, 40, { suffix = " st" })
+				sld(ba, "Enemy Distance", "KillerGuardFoe", 10, 80, { suffix = " st" })
+			end)
+
+			local j = card(tab, "Right")
+			head(j, "Free Jump")
+			j:Keybind({
 				Name = "Free Jump Key",
 				Callback = function()
 					if UserInputService:GetFocusedTextBox() then
@@ -18037,7 +17514,17 @@ return function(_Lib, _Core)
 					end
 				end,
 			}, fl("KB_Jump"))
-			note(s, "A jump that costs no stamina.")
+			note(j, "A jump that costs no stamina.")
+
+			local fb = card(tab, "Right")
+			head(fb, "Force Bicycle")
+			bind(fb, "Force Bicycle Key", "KB_Bike", function()
+				local ok, err = pcall(Mark.startBike)
+				if not ok then
+					logFile("ui bike", "err", tostring(err))
+				end
+			end)
+			note(fb, "Jumps and bicycle-kicks the ball. Needs the ball.")
 		end)
 
 		-- ==================================================================================================
@@ -18049,7 +17536,6 @@ return function(_Lib, _Core)
 			local s = card(tab, "Left")
 			head(s, "Overlay")
 			tog(s, "Draw Overlay", "Draw")
-			sld(s, "Paint Rate", "PaintHz", 0, 240, { suffix = " Hz", text = "Only at 100+ fps. 0 = every frame." })
 			head(s, "Show", true)
 			tog(s, "Positions", "DrawPos")
 			tog(s, "Goal Frame", "DrawGoal")
@@ -18057,57 +17543,74 @@ return function(_Lib, _Core)
 			tog(s, "Agent Route", "DrawRoute")
 			tog(s, "Oil Puddles", "DrawHazards")
 			tog(s, "Kick Box", "DrawKickBox")
-			note(s, "Shot preview, tackle, threat and pass marks are in their own functions.")
+			note(s, "Shot preview, tackle and threat marks, silent aim and pass marks sit in their own functions.")
+			advanced(s, "Overlay", function()
+				sld(s, "Paint Rate", "PaintHz", 0, 240, { suffix = " Hz", text = "Only at 100+ fps. 0 = every frame." })
+			end)
 
 			local st = card(tab, "Right")
 			head(st, "Styles")
 			drop(st, "Positions", "PosStyle", { "phantom", "classic" })
 			drop(st, "Route Destination", "AgentSpotStyle", { "corners", "ripple", "kick" })
 			drop(st, "Route Line", "AgentPathStyle", { "flow", "classic" })
-			head(st, "Gallery", true)
-			bind(st, "Style Gallery Key", "KB_Gallery", function()
-				pcall(Mark.toggleGallery)
-			end)
-			note(st, "Shows every style on boards in the world.")
 
-			if Mark.artPal then
-				local pc = card(tab, "Left")
-				head(pc, "Position Colors")
-				head(pc, "You", true)
-				palette(pc, "live", { "Color 1", "Color 2", "Color 3" })
-				head(pc, "Server Position", true)
-				palette(pc, "srv", { "Color 1", "Color 2", "Color 3" })
-
-				local al = card(tab, "Right")
-				head(al, "Alert Colors")
-				palette(al, "hot", { "Color 1", "Color 2", "Color 3" })
-				note(al, "Shot start and warnings.")
-			end
-
-			local r = card(tab, "Left")
-			head(r, "Classic Colors")
-			color(r, "Route / Ball Path", "Line")
-			color(r, "Tackle", "Tackle")
-			color(r, "Shadows", "Chalk")
-			color(r, "Highlights", "Paper")
-			color(r, "Lob / Curl", "Lob")
-			color(r, "Flat Shots", "Flat")
-			color(r, "Dodge", "Dodge")
+			local r = card(tab, "Right")
+			head(r, "Colors")
+			note(r, "Shot preview and pass mark colors sit in their own functions.")
+			advanced(r, "Colors", function()
+				if Mark.artPal then
+					head(r, "You")
+					palette(r, "live", { "Color 1", "Color 2", "Color 3" })
+					head(r, "Server Position", true)
+					palette(r, "srv", { "Color 1", "Color 2", "Color 3" })
+					head(r, "Alerts", true)
+					palette(r, "hot", { "Color 1", "Color 2", "Color 3" })
+					head(r, "Classic Style", true)
+				else
+					head(r, "Classic Style")
+				end
+				color(r, "Route / Ball Path", "Line")
+				color(r, "Tackle", "Tackle")
+				color(r, "Shadows", "Chalk")
+				color(r, "Highlights", "Paper")
+				color(r, "Lob / Curl", "Lob")
+				color(r, "Flat Shots", "Flat")
+				color(r, "Dodge", "Dodge")
+			end, "Edit Colors")
 		end)
 
 		-- ==================================================================================================
 		-- MISC
 		-- ==================================================================================================
 		block("Misc", function()
-			local s = card(T.Misc, "Left")
-			head(s, "Actions")
-			bind(s, "Bicycle Kick Key", "KB_Bike", function()
-				local ok, err = pcall(Mark.startBike)
-				if not ok then
-					logFile("ui bike", "err", tostring(err))
+			local p = card(T.Misc, "Left")
+			head(p, "Pass Assist")
+			feature(p, "Pass Assist", "PassAssist")
+			note(p, "A pass press on a teammate becomes a solved lob.")
+			tog(p, "Manual Pass", "PassManual", "One key passes to the best teammate.")
+			bind(p, "Manual Pass Key", "KB_ManualPass", function()
+				if CFG.PassManual then
+					local ok, err = pcall(Mark.paManual)
+					if not ok then
+						logFile("pass manual", "err", tostring(err))
+					end
 				end
 			end)
-			note(s, "Needs the ball.")
+			tog(p, "Pass To Keeper", "PassToKeeper")
+			tog(p, "Show Marks", "PassShow")
+			advanced(p, "Pass", function()
+				sld(p, "Lock Angle", "PassFov", 3, 25, { suffix = "°" })
+				sld(p, "Min Distance", "PassMinDist", 3, 30, { suffix = " st" })
+				sld(p, "Max Distance", "PassMaxDist", 40, 200, { suffix = " st" })
+				sld(p, "Manual Near Limit", "PassManualNear", 4, 40, { suffix = " st" })
+				head(p, "Landing", true)
+				sld(p, "Goal Lead", "PassGoalLead", 10, 60, { suffix = " st", text = "Receive point stays this far from their goal." })
+				sld(p, "Keeper Radius", "PassKeeperRadius", 4, 30, { suffix = " st" })
+				sld(p, "Goal Angle", "PassGoalSep", 2, 25, { suffix = "°" })
+				sld(p, "Goal Zone", "PassGoalZone", 10, 70, { suffix = " st" })
+				head(p, "Mark Colors", true)
+				palette(p, "lime", { "Mark 1", "Mark 2", "Mark 3" })
+			end)
 		end)
 
 		-- ==================================================================================================
@@ -18124,8 +17627,7 @@ return function(_Lib, _Core)
 
 			local lg = card(tab, "Left")
 			head(lg, "Log")
-			tog(lg, "Console Output", "Debug")
-			tog(lg, "Perf Probe", "Perf", "Writes ms per section every 5 s.")
+			tog(lg, "Perf Probe", "Perf", "Writes ms per section into the log every 5 s.")
 			lg:Button({
 				Name = "Dump Log To File",
 				Callback = function()
