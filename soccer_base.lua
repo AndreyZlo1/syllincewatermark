@@ -65,7 +65,25 @@ local CFG = {
 	AutoDribble = true,
 	AutoShoot = true,
 	AutoKick = true, -- legit charged kick inside AutoBlock / CounterJump (Mark.akTry), released by the kick box
-	ShotFeint = false,
+	FeintMode = "Off", -- Off / Chance (roll per charge) / Count (FeintCount feints, then one real charge, repeat)
+	FeintChance = 0.6, -- Chance mode: share of charges that become a feint
+	FeintCount = 1, -- Count mode: feints in a row before the real shot
+	FeintAt = 0.32, -- the charge is cancelled when it has been held this long (s)
+	FeintSkipFake = true, -- never feint a FAKE shot
+	FeintSkipBounce = true, -- never feint a BOUNCE FAKE
+	AutoFlick = true, -- the flick key starts the scripted flick -> jump -> volley; off = the game's own flick, aim help only
+	FlickAutoJump = true, -- scripted jump into the ball after the flick
+	FlickAutoKick = true, -- scripted Kick press (volley) once the ball is in reach
+	FlickBan = {}, -- [band] = true: shot types never used while a flick / volley is being aimed
+	DodgeTeleport = true, -- dodges may step the character (CFrame); off = movement only
+	BounceFakeHeight = 2, -- BounceFAKE aim points are raised by this many studs (the keeper's jump reaches low ones)
+	AutoKickFull = true, -- AutoKick always charges to the FULL charge (no early release); it misses instead of a weak kick
+	BlockCompetitor = true, -- AutoBlock yields to a teammate already on the carrier (CompetitorRadius)
+	BallCompetitor = true, -- AutoBall yields to a teammate clearly closer to the ball
+	BallYieldGap = 6, -- ... closer by more than this many studs
+	TackleCompetitor = false, -- AutoTackle yields to a teammate already on the carrier
+	TackleCompetitorRadius = 8,
+	CounterCompetitorRadius = 12,
 	CounterCompetitor = false, -- CounterJump stands down when a teammate is already on the enemy (CompetitorRadius); off = jump regardless
 	CounterKickChance = 0.45, -- share of counter combos that use Kick instead of the slide when both are possible
 	CounterComboChance = 0.85, -- share of counter jumps that continue into a combo at all
@@ -88,7 +106,7 @@ local CFG = {
 	FakeLatMul = 1.5, -- prefilter: the straight line through the mate may miss the goal by post * this + FakeSlop (curves bend it back)
 	FakeMaxDepth = 100, -- a mate farther than this from the goal is not used
 	DrawPos = true, DrawTackle = true, DrawDanger = true, DrawGoal = true, DrawBall = true, DrawShot = true, DrawRoute = true,
-	DrawHazards = true, DrawKickBox = true, DrawSilent = true, DrawSilentFov = true, DrawHud = true, ShotDebug = true,
+	DrawHazards = true, DrawKickBox = true, DrawSilent = true, DrawSilentFov = true, DrawHud = false, ShotDebug = false,
 	AgentAddon = true,
 	AutoDodge = true,
 	AutoBlock = true,
@@ -147,13 +165,14 @@ local CFG = {
 	WallMin = 3.2, -- predicted distance window the wall can land on a target (it spawns 5 studs ahead: PlacementForwardDistance)
 	WallMax = 6.8,
 	WallAmbush = true, -- also place it early on an enemy running into the wall's spot
-	WallEquip = true, -- AutoWall takes the barricades out itself (item slot press) when a threat is coming
+	WallEquip = false, -- Auto Use: AutoWall takes the barricades out itself (item slot press) when a threat is coming; off = only when already in hand
+	WallLead = "away", -- where the wall is aimed: "never" = at his current spot, "away" = led only when he runs away from us, "always" = always led
 	WallEquipDelay = 0.3, -- extra time the equip needs before the wall can be placed
 	WallEquipDist = 26,
 	WallEquipHold = 3.5, -- put the unused barricades away after this long
-	WallReach = 28, -- ambush: an enemy this far away that closes on the wall's spot gets it placed early (was 18)
+	WallReach = 18, -- ambush: an enemy this far away that closes on the wall's spot gets it placed early
 	WallAmbushV = 4.5, -- closing speed from which an ambush wall is considered (was 6)
-	WallAmbushT = 1.0, -- ... and he reaches the spot within this many seconds (was 0.65)
+	WallAmbushT = 0.6, -- ... and he reaches the spot within this many seconds (was 1.0: the wall stood there long before he came and he turned)
 	WallShot = true, -- wall on the replicated shot path of a charging carrier (needs barricades in hand)
 	TackleGateStrict = false, -- true = the old gate (tackle waits for AutoBlock for every carrier farther than TackleGoalZone)
 	CounterKickDelay = 0.08, -- air combo: the Kick goes out this long after the jump when the slide has no legal pair
@@ -5597,19 +5616,7 @@ local function stepLogic()
 			end
 		end
 		Mark.rebaseAim()
-		if CFG.ShotFeint then
-			local inst = Mark.chargeInst()
-			if inst and inst.IsCharging() then
-				local held = inst.GetHeldSeconds()
-				if held and held >= 0.32 and not Shoot.feinted then
-					Shoot.feinted = true
-					ChargedKick.CancelCharge()
-					setShootWhy("feint")
-				end
-			else
-				Shoot.feinted = false
-			end
-		end
+		Mark.feintTick()
 	elseif not own and not Mark.flickStrike then
 		Shoot.preview = nil
 		Shoot.locked = nil
@@ -5665,6 +5672,8 @@ local function stepLogic()
 						Mark.confLogAt = os.clock()
 						logFile("tackle unsure", "conf", string.format("%.2f", solved.conf or 0), "need", string.format("%.2f", CFG.TackleConfidence or 0), "eta", string.format("%.2f", solved.eta or 0))
 					end
+				elseif CFG.TackleCompetitor and Mark.mateNear(croot.Position, CFG.TackleCompetitorRadius or 8) then
+					tackleWhy = "mate"
 				elseif Mark.kickCmd then
 					tackleWhy = "kick"
 				elseif Mark.move.mode == "dodge" and dribbleDanger and dribbleDanger.fire then
@@ -7107,8 +7116,7 @@ local function onProjectile(kind, proj)
 			sign = -sign
 		end
 		local step = right * sign * need
-		root.CFrame = root.CFrame + step
-		LocalMovementGuard.RegisterDisplacement(root, step)
+		Mark.stepAway(root, step, "proj")
 		Mark.projDodgeAt[tag] = os.clock()
 		logFile("proj dodge", tostring(tag), string.format("miss %.2f", miss), string.format("t %.2f", t), string.format("step %.1f", need))
 	end
@@ -7961,7 +7969,10 @@ Mark.wallTick = function(root, oid, own, use, ping)
 					if vel.Magnitude > 32 then
 						vel = vel.Unit * 32
 					end
-					local P = pos + vel * lat
+					local leadMode = CFG.WallLead or "away"
+					local rel0 = flat(pos - us)
+					local fleeing = rel0.Magnitude > 0.5 and (vel - ourV):Dot(rel0.Unit) > 0.5
+					local P = (leadMode == "always" or (leadMode == "away" and fleeing)) and (pos + vel * lat) or pos
 					local rel = flat(P - us)
 					local d = rel.Magnitude
 					if d > 0.5 then
@@ -10490,7 +10501,7 @@ Mark.tickCounterJump = function(character, root)
 						local a2 = Actors.GetFromCharacter(m2)
 						if a2 and a2 ~= LocalPlayer and sameTeam(a2) and not isGoalkeeper(a2) then
 							local r2 = ActorTargeting.GetActorRoot(a2)
-							if r2 and flat(r2.Position - r.Position).Magnitude <= CFG.CompetitorRadius then
+							if r2 and flat(r2.Position - r.Position).Magnitude <= (CFG.CounterCompetitorRadius or CFG.CompetitorRadius) then
 								logFile("counter jump", "skip", "competitor", actorName(a2))
 								why = nil
 								break
@@ -10671,7 +10682,7 @@ Mark.tickBlock = function(character, root)
 	end
 	for _, model in Actors.GetAllCharacterModels() do
 		local actor = Actors.GetFromCharacter(model)
-		if actor and actor ~= LocalPlayer and sameTeam(actor) and not isGoalkeeper(actor) and not Mark.mateDown(actor, model) then
+		if CFG.BlockCompetitor ~= false and actor and actor ~= LocalPlayer and sameTeam(actor) and not isGoalkeeper(actor) and not Mark.mateDown(actor, model) then
 			local ar = ActorTargeting.GetActorRoot(actor)
 			if ar then
 				-- CompetitorCheck: a teammate (keeper excluded above) already within CompetitorRadius of the carrier owns
@@ -11531,7 +11542,9 @@ end
 -- AutoShoot tab > Shot Types: drop candidates whose band the user excluded. The lob is keyed "chip". A flick strike needs
 -- the bounce bands, so those stay legal there. An emptied pool simply means "no auto shot" (same path as no candidates).
 Mark.shotFilter = function(pool)
-	local ban = CFG.ShotBan
+	-- while a flick / volley is being aimed its own list decides (FlickBan), the normal list does not apply
+	local flick = Mark.flickAim or Mark.aerial or Mark.flickStrike
+	local ban = flick and CFG.FlickBan or CFG.ShotBan
 	if type(ban) ~= "table" or next(ban) == nil then
 		return pool
 	end
@@ -11539,7 +11552,7 @@ Mark.shotFilter = function(pool)
 	for i = 1, #pool do
 		local p = pool[i]
 		local key = p.lob and "chip" or (p.band == "mid" and "high" or p.band)
-		if not ban[key] or (Mark.flickAim and (key == "bounceHigh" or key == "bounceLow")) then
+		if not ban[key] then
 			out[#out + 1] = p
 		end
 	end
@@ -11548,6 +11561,49 @@ Mark.shotFilter = function(pool)
 		logFile("shoot ban", "every candidate excluded", #pool)
 	end
 	return out
+end
+
+-- Feint: our own charge is cancelled at FeintAt instead of released. Decided ONCE per charge when it starts:
+-- Chance = roll FeintChance; Count = FeintCount feints in a row, then one real charge (the counter restarts).
+-- FAKE / BOUNCE FAKE shots are never feinted (their shot name is read from the solver).
+Mark.feintTick = function()
+	local mode = CFG.FeintMode or "Off"
+	local inst = mode ~= "Off" and Mark.chargeInst()
+	if not (inst and inst.IsCharging()) then
+		Shoot.feintOn, Shoot.feinted, Shoot.feintDo = false, false, nil
+		return
+	end
+	if not Shoot.feintOn then
+		Shoot.feintOn = true
+		if mode == "Chance" then
+			Shoot.feintDo = math.random() < (CFG.FeintChance or 0.6)
+		else
+			if (Mark.feintN or 0) < (CFG.FeintCount or 1) then
+				Shoot.feintDo = true
+			else
+				Mark.feintN = 0
+				Shoot.feintDo = false
+			end
+		end
+	end
+	if not Shoot.feintDo or Shoot.feinted then
+		return
+	end
+	local held = inst.GetHeldSeconds()
+	if not (held and held >= (CFG.FeintAt or 0.32)) then
+		return
+	end
+	local nm = Shoot.shotName
+	if (nm == "BOUNCE FAKE" and CFG.FeintSkipBounce ~= false) or ((nm == "FAKE" or nm == "FAKE CORNER") and CFG.FeintSkipFake ~= false) then
+		Shoot.feintDo = false
+		logFile("feint skip", nm)
+		return
+	end
+	Shoot.feinted = true
+	Mark.feintN = (Mark.feintN or 0) + 1
+	ChargedKick.CancelCharge()
+	setShootWhy("feint")
+	logFile("feint", mode, nm or "-", "held", string.format("%.2f", held), "n", Mark.feintN)
 end
 
 -- Why the FAKE family must not be used right now (nil = allowed).
@@ -11729,7 +11785,7 @@ Mark.bounceFakeRaw = function(c)
 	local best = nil
 	local t0 = Workspace:GetServerTimeNow()
 	for _, cand in plan do
-		local point = c.bottom + c.up * cand[2] + c.lateral * (cand[1] * c.post)
+		local point = c.bottom + c.up * (cand[2] + (CFG.BounceFakeHeight or 0)) + c.lateral * (cand[1] * c.post)
 		local look = point - c.camPos
 		if look.Magnitude < 1 then
 			continue
@@ -11739,7 +11795,7 @@ Mark.bounceFakeRaw = function(c)
 			continue
 		end
 		tried += 1
-		if math.abs(pack.side or 99) > c.post + 1.6 or (pack.land - c.bottom):Dot(c.up) > mh + 14 then
+		if math.abs(pack.side or 99) > c.post + 1.6 or (pack.land - c.bottom):Dot(c.up) > mh + 14 + (CFG.BounceFakeHeight or 0) then
 			continue
 		end
 		if not (pack.pts and (Mark.worldBlocked(pack.pts, c.world) or flightBlocked(pack.pts, c.goal))) then
@@ -12340,6 +12396,20 @@ Mark.mateDown = function(actor, model)
 	return down, left
 end
 
+-- A field teammate (not the keeper, not stunned / ragdolled / frozen) within `radius` of `pos`, or nil.
+Mark.mateNear = function(pos, radius)
+	for _, model in Actors.GetAllCharacterModels() do
+		local actor = Actors.GetFromCharacter(model)
+		if actor and actor ~= LocalPlayer and sameTeam(actor) and not isGoalkeeper(actor) and not Mark.mateDown(actor, model) then
+			local ar = ActorTargeting.GetActorRoot(actor)
+			if ar and flat(ar.Position - pos).Magnitude <= radius then
+				return actor
+			end
+		end
+	end
+	return nil
+end
+
 Mark.tackleGate = function(character, root, player, ch, solved)
 	if not CFG.AutoBlock then
 		return true, "noblock"
@@ -12705,6 +12775,13 @@ Mark.akTry = function(tag, model, r, urgent)
 	if not first or (not urgent and not bestSolid and not (CFG.AutoKickEager ~= false and opening <= 2 and first <= minRel + 0.07)) then
 		return false, "nohit"
 	end
+	if CFG.AutoKickFull ~= false then
+		-- the kick will be released at the full charge: he has to be inside the box THEN, not only at the earliest release
+		local fullT = (KickCore.GetFullChargeSeconds and KickCore.GetFullChargeSeconds()) or (maxC - 0.05)
+		if not Mark.akEval(ctx, fullT, pad) then
+			return false, "nohit full"
+		end
+	end
 	-- never kick through a teammate or toward our own goal with the ball at his feet
 	local aimDir = bestAim
 	for _, m in Actors.GetAllCharacterModels() do
@@ -12798,7 +12875,15 @@ Mark.akTick = function(character, root)
 			-- (a hit at 0.30 s is half the power: the log showed every release at held 0.30)
 			local toFull = math.max(fullAt - 0.008 - held, 0)
 			local inFull = toFull <= 0 or Mark.akEval(ctx, toFull)
-			if ak.urgent or held >= math.min(fullAt - 0.008, CFG.AutoKickRelease or 9) or not inFull or held >= maxC - 0.045 then
+			local releaseNow
+			if CFG.AutoKickFull ~= false then
+				-- always the FULL charge: no early release for an urgent kick or a carrier who would leave the box; if he
+				-- leaves it the charge is cancelled below (miss) instead of sending a weak kick
+				releaseNow = held >= fullAt + 0.002 or held >= maxC - 0.03
+			else
+				releaseNow = ak.urgent or held >= math.min(fullAt - 0.008, CFG.AutoKickRelease or 9) or not inFull or held >= maxC - 0.045
+			end
+			if releaseNow then
 				Mark.ak = nil
 				Mark.volleyAimUntil = now + 0.25
 				pcall(ChargedKick.HandleInputEnded, ak.input)
@@ -13919,7 +14004,7 @@ Mark.tickBall = function(character, root)
 	local ourNeed = math.max(0, gap - receiveHalf)
 	for _, model in Actors.GetAllCharacterModels() do
 		local actor = Actors.GetFromCharacter(model)
-		if actor and actor ~= LocalPlayer and sameTeam(actor) and not isGoalkeeper(actor) and not Mark.mateDown(actor, model) then
+		if CFG.BallCompetitor ~= false and actor and actor ~= LocalPlayer and sameTeam(actor) and not isGoalkeeper(actor) and not Mark.mateDown(actor, model) then
 			local ar = ActorTargeting.GetActorRoot(actor)
 			if ar then
 				-- CompetitorCheck (ball): yield only when a teammate is NOTICEABLY closer (e.g. 6 vs our 20 studs):
@@ -13928,7 +14013,7 @@ Mark.tickBall = function(character, root)
 				local their = Mark.mover.GetRunWalkSpeed(Mark.mover.GetBaseWalkSpeed(model), false)
 				local ourT = ourNeed / math.max(spd, 8)
 				local theirT = their > 1 and d / their or math.huge
-				if theirT < ourT * 0.6 and ourT - theirT > 0.25 and ourNeed - d > 6 then
+				if theirT < ourT * 0.6 and ourT - theirT > 0.25 and ourNeed - d > (CFG.BallYieldGap or 6) then
 					beaten = true
 					break
 				end
@@ -14450,7 +14535,7 @@ Mark.tickAerial = function(character, root)
 	-- else our contact time. Once pressed, BicycleKick.StartHover holds us up until the ball arrives.
 	Mark.volleyMod = Mark.volleyMod or require(Client.Gameplay.Actions.VolleyOpportunity)
 	local ev = Mark.volleyMod.GetEvaluation(character)
-	if landed and not a.jumped then
+	if landed and not a.jumped and CFG.FlickAutoJump ~= false then
 		local gameLeft = ev and ev.ApproachSeconds
 		if (gameLeft and gameLeft <= CFG.AerialJumpLead) or left <= CFG.AerialJumpLead then
 			a.jumped = Mark.doJump("aerial")
@@ -14471,6 +14556,9 @@ Mark.tickAerial = function(character, root)
 			logFile("aerial", "wait", "ev", tostring(ev ~= nil), "approach", ev and string.format("%.2f", ev.ApproachSeconds or -1) or "-", "miss", ev and string.format("%.1f", ev.MissAngleDegrees or -1) or "-", "rising", tostring(rising), "bike", tostring(bike), "left", string.format("%.2f", left))
 		end
 		return
+	end
+	if CFG.FlickAutoKick == false then
+		return -- the player kicks; the aim stays locked on the solved shot
 	end
 	local input = Controls.CreateInput("Kick")
 	local started = ChargedKick.HandleInputBegan(input, false) and ChargedKick.IsCharging()
@@ -14885,10 +14973,29 @@ Mark.userInputDir = function()
 end
 
 -- Instant sidestep used by the hazard dodges (same displacement path as the slide dodge: root CFrame + guard).
+-- One place for every sidestep. DodgeTeleport: the old instant step (CFrame + displacement guard). Off: no CFrame write,
+-- the agent walks that way for the time the step would have taken (moveSteer "dodge", stopped by moveTick).
+Mark.stepAway = function(root, step, why, stream)
+	if CFG.DodgeTeleport ~= false then
+		root.CFrame = root.CFrame + step
+		LocalMovementGuard.RegisterDisplacement(root, step)
+		if stream then
+			CharacterMotion.SetStreamVelocity(root.Parent, root.AssemblyLinearVelocity)
+		end
+		return true
+	end
+	local dir = unitOrNil(flat(step))
+	if not dir then
+		return false
+	end
+	Mark.walkOff = { untilT = os.clock() + math.clamp(step.Magnitude / 20, 0.2, 0.6) }
+	Mark.moveSteer(dir, "dodge")
+	logFile("step walk", why or "-", fmtV(step))
+	return false
+end
+
 Mark.hazardStep = function(root, step, why)
-	root.CFrame = root.CFrame + step
-	LocalMovementGuard.RegisterDisplacement(root, step)
-	CharacterMotion.SetStreamVelocity(root.Parent, root.AssemblyLinearVelocity)
+	Mark.stepAway(root, step, why, true)
 	logFile("hazard step", why, fmtV(step))
 end
 
@@ -15935,8 +16042,7 @@ Mark.projTick = function(character, root)
 				end
 			end
 			if bestOff then
-				root.CFrame = root.CFrame + bestOff
-				LocalMovementGuard.RegisterDisplacement(root, bestOff)
+				Mark.stepAway(root, bestOff, "proj")
 				st.lastDodge = os.clock()
 				logFile("proj dodge", st.item, sure and "sure" or "unsure", "stay", string.format("%.1f", stay), "step", string.format("%.1f", bestC), "rad", string.format("%.1f", rad), "tImp", string.format("%.2f", tImp))
 			end
@@ -16323,7 +16429,7 @@ Mark.dodgeSteer = function(root, threat)
 				if sv < 0 then
 					return live + v0 * sv
 				end
-				return live + d * 5 + d * (vB * sv)
+				return live + d * (CFG.DodgeTeleport ~= false and 5 or 0) + d * (vB * sv)
 			end
 			local okC, clear = pcall(Mark.slideClearance, lock, elapsed, posAt, assisted, ping)
 			if okC and type(clear) == "number" then
@@ -16355,11 +16461,15 @@ Mark.dodgeSteer = function(root, threat)
 		Mark.dodgeAt = os.clock()
 		lock.handled = true
 		Mark.dodgeFrom = root.Position
-		local step = dir.Unit * 5
-		root.CFrame = root.CFrame + step
-		LocalMovementGuard.RegisterDisplacement(root, step)
-		CharacterMotion.SetStreamVelocity(root.Parent, root.AssemblyLinearVelocity)
-		logFile("dodge tp", "5.00", fmtV(step))
+		if CFG.DodgeTeleport ~= false then
+			local step = dir.Unit * 5
+			root.CFrame = root.CFrame + step
+			LocalMovementGuard.RegisterDisplacement(root, step)
+			CharacterMotion.SetStreamVelocity(root.Parent, root.AssemblyLinearVelocity)
+			logFile("dodge tp", "5.00", fmtV(step))
+		else
+			logFile("dodge walk", fmtV(dir))
+		end
 	end
 	Mark.dodgeDest = root.Position + dir * 6
 	Mark.move.pts = { Mark.dodgeFrom or root.Position, Mark.dodgeDest }
@@ -16438,6 +16548,12 @@ Mark.dodgeSteer = function(root, threat)
 
 Mark.moveTick = function(character, root)
 	local m = Mark.move
+	if Mark.walkOff and os.clock() >= Mark.walkOff.untilT then
+		Mark.walkOff = nil
+		if m and m.mode == "dodge" and not Mark.dodgeAt then
+			Mark.moveStop("dodge")
+		end
+	end
 	-- watchdog: a dodge replaced by another mode (moveSteer overwrites m.mode) never ran moveStop("dodge"), leaving
 	-- the facing lock on -> stuck facing, backpedal speed, no sprint
 	if Mark.dodgeLockOn and (not m or m.mode ~= "dodge") then
@@ -17244,7 +17360,9 @@ UserInputService.InputBegan:Connect(function(input, gp)
 	end
 	if Controls.IsInput("RainbowFlick", input) then
 		Mark.armFlickWindow()
-		Mark.startAerial()
+		if CFG.AutoFlick ~= false then
+			Mark.startAerial()
+		end
 	end
 end)
 UserInputService.InputEnded:Connect(function(input)
@@ -17386,6 +17504,35 @@ return function(_Lib, _Core)
 			end
 		end
 
+		-- dropdown with a label per value: list = { { label, value }, ... }
+		local function pick(sec, name, key, list, text)
+			local opts, byLabel, def = {}, {}, list[1][1]
+			local cur = CFG[key]
+			if cur == nil then
+				cur = true
+			end
+			for _, e in ipairs(list) do
+				opts[#opts + 1] = e[1]
+				byLabel[e[1]] = e[2]
+				if e[2] == cur then
+					def = e[1]
+				end
+			end
+			sec:Dropdown({
+				Name = name,
+				Options = opts,
+				Default = def,
+				Callback = function(v)
+					if byLabel[v] ~= nil then
+						CFG[key] = byLabel[v]
+					end
+				end,
+			}, fl(key))
+			if text then
+				note(sec, text)
+			end
+		end
+
 		-- keybinds are created empty (ctx.keybind passes no Default): nothing is bound until the user does it
 		local function bind(sec, name, key, fn)
 			ctx.keybind(sec, { Name = name, Flag = fl(key), Toggle = fn })
@@ -17454,7 +17601,6 @@ return function(_Lib, _Core)
 			feature(s, "AutoShoot", "AutoShoot")
 			sld(s, "Max Distance", "ShootMaxDist", 20, 160, { suffix = " st" })
 			sld(s, "Keeper Margin", "ShotReachMargin", -0.2, 0.5, { prec = 2, suffix = " s", text = "How late the keeper must be for a shot to count." })
-			tog(s, "Feint At Full Charge", "ShotFeint")
 
 			local ty = card(tab, "Right")
 			head(ty, "Shot Types")
@@ -17522,6 +17668,42 @@ return function(_Lib, _Core)
 			tog(pr, "Wait For Keeper Dive", "FakeAfterDiveBan", "No FAKE while the enemy keeper's dive is on cooldown.")
 			tog(pr, "Shoot After Bounce FAKE", "FakeOnceThenShoot", "After one worked, no more fakes until the ball is lost.")
 
+			local fe = card(tab, "Left")
+			head(fe, "Feint")
+			pick(fe, "Mode", "FeintMode", { { "Off", "Off" }, { "Chance", "Chance" }, { "Count", "Count" } }, "Chance: rolled per charge. Count: N feints, then a real shot.")
+			sld(fe, "Chance", "FeintChance", 0, 100, { scale = 100, suffix = "%" })
+			sld(fe, "Feints In A Row", "FeintCount", 1, 5)
+			sld(fe, "Cancel At", "FeintAt", 0.2, 0.38, { prec = 2, suffix = " s", text = "Charge time at which the feint cancels." })
+			do
+				local def = {}
+				if CFG.FeintSkipFake ~= false then
+					def[#def + 1] = "FAKE"
+				end
+				if CFG.FeintSkipBounce ~= false then
+					def[#def + 1] = "Bounce FAKE"
+				end
+				fe:Dropdown({
+					Name = "Never Feint On",
+					Options = { "FAKE", "Bounce FAKE" },
+					Multi = true,
+					Default = def,
+					Callback = function(sel)
+						local on = {}
+						if type(sel) == "table" then
+							for k, v in pairs(sel) do
+								if v == true then
+									on[k] = true
+								elseif type(v) == "string" then
+									on[v] = true
+								end
+							end
+						end
+						CFG.FeintSkipFake = on["FAKE"] == true
+						CFG.FeintSkipBounce = on["Bounce FAKE"] == true
+					end,
+				}, fl("FeintSkip"))
+			end
+
 			local f = card(tab, "Right")
 			head(f, "FAKE")
 			tog(f, "Enabled", "FakeShot", "A shot through a teammate in front of goal.")
@@ -17535,11 +17717,55 @@ return function(_Lib, _Core)
 			sld(f, "Slack", "FakeSlop", 1, 12, { suffix = " st" })
 			sld(f, "Fallback Chance", "FakeChance", 0, 100, { scale = 100, suffix = "%", text = "Used when FAKE is not tried first." })
 
+			local fk = card(tab, "Right")
+			head(fk, "Flick")
+			tog(fk, "Auto Flick", "AutoFlick", "The flick key runs flick, jump and volley for you.")
+			tog(fk, "Auto Jump", "FlickAutoJump")
+			sld(fk, "Jump Timing", "AerialJumpLead", 0.1, 0.5, { prec = 2, suffix = " s", text = "Jumps this long before the ball arrives." })
+			tog(fk, "Auto Kick", "FlickAutoKick", "Off: you kick, the aim stays locked.")
+			do
+				local keyOf, opts, def = {}, {}, {}
+				for _, t in ipairs(SHOT_TYPES) do
+					keyOf[t[2]] = t[1]
+					opts[#opts + 1] = t[2]
+					if not (CFG.FlickBan and CFG.FlickBan[t[1]]) then
+						def[#def + 1] = t[2]
+					end
+				end
+				fk:Dropdown({
+					Name = "Flick Shot Types",
+					Options = opts,
+					Multi = true,
+					Default = def,
+					Callback = function(sel)
+						local allowed = {}
+						if type(sel) == "table" then
+							for k, v in pairs(sel) do
+								if v == true and keyOf[k] then
+									allowed[keyOf[k]] = true
+								elseif type(v) == "string" and keyOf[v] then
+									allowed[keyOf[v]] = true
+								end
+							end
+						end
+						local ban = {}
+						for _, t in ipairs(SHOT_TYPES) do
+							if not allowed[t[1]] then
+								ban[t[1]] = true
+							end
+						end
+						CFG.FlickBan = ban
+					end,
+				}, fl("FlickTypes"))
+				note(fk, "Used while a flick or volley is aimed. Unchecked are never used.")
+			end
+
 			local b = card(tab, "Left")
 			head(b, "Bounce FAKE")
 			tog(b, "Enabled", "BounceFAKE", "A shot that bounces off a wall and comes back to you.")
 			sld(b, "Chance", "BounceFakeChance", 0, 100, { scale = 100, suffix = "%" })
 			sld(b, "Max Distance To Goal", "BounceFakeRange", 30, 160, { suffix = " st" })
+			sld(b, "Extra Height", "BounceFakeHeight", 0, 10, { prec = 1, suffix = " st", text = "Raises the wall aim points, out of the keeper's jump." })
 			sld(b, "Run Allowance", "BounceFakeRun", 4, 24, { suffix = " st", text = "How far you may run for the returning ball." })
 			sld(b, "Return Slack", "BounceFakeSlack", 0.5, 8, { prec = 1, suffix = " st" })
 			head(b, "Search", true)
@@ -17599,6 +17825,8 @@ return function(_Lib, _Core)
 			head(s, "Waiting", true)
 			sld(s, "Goal Zone", "TackleGoalZone", 0, 80, { suffix = " st", text = "Inside it near our goal, never wait for AutoBlock." })
 			tog(s, "Strict Kick Wait", "TackleGateStrict", "Wait for AutoBlock even when its kick cannot fire.")
+			tog(s, "Yield To Teammate", "TackleCompetitor", "Skips a carrier a teammate is already on.")
+			sld(s, "Teammate Radius", "TackleCompetitorRadius", 3, 25, { suffix = " st" })
 			head(s, "Charging Carrier", true)
 			tog(s, "Charge Guard", "ChargeTackleGuard", "Slide only if it lands before his release.")
 			tog(s, "Slide Across The Shot", "ChargeSlideBlock")
@@ -17634,6 +17862,7 @@ return function(_Lib, _Core)
 			head(dg, "AutoDodge")
 			feature(dg, "AutoDodge", "AutoDodge")
 			note(dg, "Last resort when the dribble is on cooldown.")
+			pick(dg, "Dodge Mode", "DodgeTeleport", { { "Teleport + Movement", true }, { "Movement Only", false } }, "Movement Only never moves the character by CFrame.")
 			tog(dg, "Pass Instead", "PassAssistSync", "Lobs to the safest teammate when a dodge is unsure.")
 			tog(dg, "Barricade Addon", "BarricadeAddon", "Blocks a projectile with a wall.")
 			head(dg, "Projectiles", true)
@@ -17651,6 +17880,8 @@ return function(_Lib, _Core)
 			sld(b, "Behind Limit", "BlockBehind", 8, 40, { suffix = " st", text = "How far behind the carrier it may still start." })
 			sld(b, "Stand Closer By", "BlockCloser", -1, 3, { prec = 1, suffix = " st" })
 			sld(b, "Min Gap", "BlockGapMin", 1, 6, { prec = 1, suffix = " st" })
+			tog(b, "Yield To Teammate", "BlockCompetitor", "Skips a carrier a teammate is already on.")
+			sld(b, "Teammate Radius", "CompetitorRadius", 4, 30, { suffix = " st" })
 			head(b, "High Shots", true)
 			tog(b, "Pre-Release Jump", "BlockPreJump", "Jumps before the release, timed to his charge.")
 			tog(b, "Slide Block", "BlockSlide")
@@ -17663,7 +17894,8 @@ return function(_Lib, _Core)
 			note(k, "Works inside AutoBlock and CounterJump.")
 			sld(k, "Range", "AutoKickRange", 1, 12, { prec = 1, suffix = " st" })
 			sld(k, "Cooldown", "AutoKickCooldown", 0.2, 2, { prec = 2, suffix = " s" })
-			sld(k, "Min Charge", "AutoKickRelease", 0.2, 0.4, { prec = 2, suffix = " s", text = "0.4 = always the full charge." })
+			tog(k, "Always Full Charge", "AutoKickFull", "Never releases early: a miss instead of a weak kick.")
+			sld(k, "Min Charge", "AutoKickRelease", 0.2, 0.4, { prec = 2, suffix = " s", text = "Only when Always Full Charge is off." })
 			tog(k, "Eager Press", "AutoKickEager")
 			head(k, "Fleeing Carrier", true)
 			sld(k, "Flee Limit", "AutoKickFlee", 3, 20, { suffix = " st/s", text = "No kick if he pulls away faster than this." })
@@ -17682,13 +17914,15 @@ return function(_Lib, _Core)
 			sld(c, "Kick Delay", "CounterKickDelay", 0, 0.4, { prec = 2, suffix = " s" })
 			head(c, "Teammates", true)
 			tog(c, "Yield To Teammate", "CounterCompetitor")
-			sld(c, "Teammate Radius", "CompetitorRadius", 4, 30, { suffix = " st" })
+			sld(c, "Teammate Radius", "CounterCompetitorRadius", 4, 30, { suffix = " st" })
 
 			-- AutoBall -------------------------------------------------------------------------------------
 			local ba = card(tab, "Left")
 			head(ba, "AutoBall")
 			feature(ba, "AutoBall", "AutoBall")
 			sld(ba, "Slide Gain", "RouteSlideGain", 0, 1.5, { prec = 2, suffix = " s", text = "A slide replaces the run if it gets there this much sooner." })
+			tog(ba, "Yield To Teammate", "BallCompetitor", "Lets a teammate who is clearly closer take the ball.")
+			sld(ba, "Yield Gap", "BallYieldGap", 2, 20, { suffix = " st", text = "How much closer he must be." })
 			head(ba, "Candidate Killer", true)
 			tog(ba, "Candidate Killer", "CandidateKiller", "Slides an enemy who runs for the same ball.")
 			sld(ba, "Ball Radius", "KillerRadius", 8, 40, { suffix = " st" })
@@ -17729,7 +17963,8 @@ return function(_Lib, _Core)
 			local w = card(tab, "Left")
 			head(w, "AutoWall")
 			feature(w, "AutoWall", "AutoWall")
-			tog(w, "Auto Equip", "WallEquip")
+			tog(w, "Auto Use", "WallEquip", "Takes the barricades out by itself. Off: only when already in hand.")
+			pick(w, "Aim Ahead", "WallLead", { { "Never", "never" }, { "Only When He Runs Away", "away" }, { "Always", "always" } })
 			sld(w, "Equip Distance", "WallEquipDist", 8, 50, { suffix = " st" })
 			sld(w, "Put Away After", "WallEquipHold", 1, 10, { prec = 1, suffix = " s" })
 			sld(w, "Cooldown", "WallCooldown", 0.2, 3, { prec = 1, suffix = " s" })
