@@ -10,7 +10,7 @@ local _C = {}
 local _D = {}
 
 local Config = {
-	Version       = "A43",
+	Version       = "A44",
 	Enabled       = false,
 	Mode          = "Perfect",
 
@@ -10973,7 +10973,20 @@ return function(_Lib, _Core)
 		dbDiag:Button({
 			Name = "Save AutoParry diag",
 			Callback = function()
-				local body  = summary() .. "\n\n" .. table.concat(_D.DiagLog, "\n")
+				-- A44: вставка в чат режет файл (тестер прислал 492 из 2416 строк). Исходы идут ДО хронологии, чтобы выжили при обрезке.
+				local keep, nk = {}, 0
+				for _, src in ipairs({ _D.DiagLog, _D.TraceLog or {} }) do
+					for _, ln in ipairs(src) do
+						local h = ln:sub(1, 8)
+						if h:sub(1, 4) == "OUT " or h == "TRACE-OU" or h == "PB-LAT t" or h == "PRESS-GA"
+							or h == "GUARD-EX" or h == "MISS!  t" or h == "MULTI-KE" then
+							nk = nk + 1
+							keep[nk] = ln
+						end
+					end
+				end
+				local body  = summary() .. "\n\n===== OUTCOMES (" .. nk .. ") =====\n" .. table.concat(keep, "\n")
+					.. "\n\n===== FULL LOG =====\n" .. table.concat(_D.DiagLog, "\n")
 				if _D.TraceLog and #_D.TraceLog > 0 then
 					body = body .. "\n\n===== VERBOSE TRACE =====\n" .. table.concat(_D.TraceLog, "\n")
 				end
