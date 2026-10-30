@@ -71,7 +71,9 @@ local CFG = {
 	FeintAt = 0.32, -- the charge is cancelled when it has been held this long (s)
 	FeintSkipFake = true, -- never feint a FAKE shot
 	FeintSkipBounce = true, -- never feint a BOUNCE FAKE
-	FeintSmart = true, -- Smart Select: no feint once the enemy keeper has dived (his dive is on cooldown): the shot goes as it is
+	FeintSmart = true,
+	FeintCompetitor = true, -- an outfield enemy within FeintCompetitorRange of the ball: no feint, the shot goes
+	FeintCompetitorRange = 10, -- Smart Select: no feint once the enemy keeper has dived (his dive is on cooldown): the shot goes as it is
 	AutoFlick = true, -- the flick key starts the scripted flick -> jump -> volley; off = the game's own flick, aim help only
 	FlickAutoJump = true, -- scripted jump into the ball after the flick
 	FlickAutoKick = true, -- scripted Kick press (volley) once the ball is in reach
@@ -8040,10 +8042,31 @@ Mark.gkPress = function(character, root, c)
 		return Vector3.new(P.X + V.X * tt, y, P.Z + V.Z * tt)
 	end
 	-- an airborne man's vertical motion is not known for sure (rocket = ballistic, grapple / jetpack = no gravity): a dive
-	-- needs the contact under BOTH readings (ballistic and straight line), otherwise we dive under / at a man who is far higher
+	-- needs the contact under BOTH readings (ballistic and straight line), otherwise we dive under / at a man who is far higher.
+	-- Exception: a flier above our jump + dive reach whose ballistic reading brings him down (dropFrom) is read ballistically
+	-- only, and only past that time (the straight reading never comes down, so it would block the dive forever).
 	local function poseY2(t)
 		local tt = lead + t
 		return P.Y + vy * tt
+	end
+	-- A flier we cannot reach at his current height (rocket jump, a lob carrier): the ballistic reading says he comes down to
+	-- dive height, the straight reading says he stays up. Demanding both made the dive fire only once his displayed Y had
+	-- already fallen and the pose was a guess. Ballistic only, past the time he starts dropping, and only while his own height
+	-- is out of reach of a jump + dive right now.
+	local dropFrom = nil
+	if airborne and not jetOn and vy > -2 then
+		local apex = vy > 0 and vy / g or 0
+		local reachNow = root.Position.Y + (Mark.jumpH or 7.2) + 1.7 + (CFG.PressVert or 4)
+		if poseY2(0) > reachNow then
+			local t = apex
+			while t <= 2.4 do
+				if poseY2(t) <= reachNow then
+					dropFrom = t
+					break
+				end
+				t += 0.05
+			end
+		end
 	end
 	local fwd, side, mouth = c.fwd, c.side, c.mouth
 	local E0 = pose(0)
@@ -8096,11 +8119,12 @@ Mark.gkPress = function(character, root, c)
 					local E = pose(t)
 					local d = flat(K - E).Magnitude
 					local dy = math.abs(K.Y - E.Y)
+					local dropping = dropFrom ~= nil and t >= dropFrom
 					local eAlong = flat(E - mouth):Dot(fwd)
 					if eAlong < 0.5 or (K - mouth):Dot(fwd) < 0.3 then
 						break -- he is over the line (or we would be) before the contact
 					end
-					if d <= Rr and dy <= H + 1 and (not airborne or math.abs(K.Y - poseY2(t)) <= H + 1) then
+					if d <= Rr and dy <= H + 1 and (not airborne or dropping or math.abs(K.Y - poseY2(t)) <= H + 1) then
 						run += 1
 						minD = math.min(minD, d)
 						first = first or t
@@ -8145,6 +8169,10 @@ Mark.gkPress = function(character, root, c)
 		end
 	end
 	local pick = best or jumpBest
+	if pick and dropFrom and pick.t < dropFrom - 0.02 then
+		-- he is still climbing / hovering above anything we can reach: wait for the drop, re-plan next tick
+		return skip(string.format("wait drop %.2f his h %.1f", dropFrom, poseY2(0) - root.Position.Y))
+	end
 	if pick and pick.t - pick.td > maxT and tG > 0.9 then
 		-- the contact is further off than a dive is worth: he can still dodge, jump or shoot - wait, re-plan next tick
 		return skip(string.format("too early contact %.2f d %.1f tG %.2f", pick.t, flat(E0 - root.Position).Magnitude, tG == math.huge and -1 or tG))
@@ -11175,6 +11203,20 @@ Mark.feintNow = function(why)
 		skip = nm
 	elseif CFG.FeintSmart ~= false and Mark.foeDiveLeft() > 0 then
 		skip = "keeper dived"
+	elseif CFG.FeintCompetitor ~= false then
+		-- an outfield enemy close to the ball can just take it while the feint cancels and recharges: shoot instead
+		local root = ActorTargeting.GetActorRoot(LocalPlayer)
+		local ball = root and (Renderer.GetPosition() or root.Position)
+		if root and ball then
+			for _, model in Actors.GetAllCharacterModels() do
+				local a = Actors.GetFromCharacter(model)
+				local r = a and a ~= LocalPlayer and not sameTeam(a) and not isGoalkeeper(a) and ActorTargeting.GetActorRoot(a)
+				if r and flat(r.Position - ball).Magnitude <= (CFG.FeintCompetitorRange or 10) then
+					skip = "enemy close"
+					break
+				end
+			end
+		end
 	end
 	if skip then
 		if fd and not fd.skipLogged then
@@ -17404,11 +17446,11 @@ return function(_Lib, _Core)
 			-- Feint: the controls that do not apply to the chosen mode are hidden
 			local fe = card(tab, "Left")
 			head(fe, "Feint")
-			local chanceEl, countEl, atEl, atNote, skipEl, smartEl, smartNote
+			local chanceEl, countEl, atEl, atNote, skipEl, smartEl, smartNote, compEl
 			local function feintVis(mode)
 				mode = mode or CFG.FeintMode or "Off"
-				local rows = { { chanceEl, mode == "Chance" }, { countEl, mode == "Count" }, { atEl, mode ~= "Off" }, { skipEl, mode ~= "Off" }, { smartEl, mode ~= "Off" }, { atNote, mode ~= "Off" }, { smartNote, mode ~= "Off" } }
-				for i = 1, 7 do
+				local rows = { { chanceEl, mode == "Chance" }, { countEl, mode == "Count" }, { atEl, mode ~= "Off" }, { skipEl, mode ~= "Off" }, { smartEl, mode ~= "Off" }, { atNote, mode ~= "Off" }, { smartNote, mode ~= "Off" }, { compEl, mode ~= "Off" } }
+				for i = 1, 8 do
 					local el, on = rows[i][1], rows[i][2]
 					if el then
 						Mark.try(function()
@@ -17424,6 +17466,7 @@ return function(_Lib, _Core)
 			atNote = note(fe, "Or when you release, if that comes first.")
 			smartEl = tog(fe, "Smart Select", "FeintSmart")
 			smartNote = note(fe, "No feint once the keeper has dived: the shot goes.")
+			compEl = tog(fe, "Competitor", "FeintCompetitor", "No feint while an outfield enemy is within 10 studs of the ball.")
 			do
 				local def = {}
 				if CFG.FeintSkipFake ~= false then
