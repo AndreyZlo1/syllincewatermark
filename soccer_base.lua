@@ -2878,17 +2878,32 @@ CharacterControllers.GetMoveCommand = function(ch)
 	if ch == LocalPlayer.Character and ClientSlide.IsSlideTackling() then
 		return origGetMove(ch)
 	end
-	if ch == LocalPlayer.Character and Mark.hazEv and next(Mark.hazEv) ~= nil and not (Mark.move and Mark.move.mode) then
+	if ch == LocalPlayer.Character and Mark.hazEv and next(Mark.hazEv) ~= nil and not Mark.moveLive(Mark.move) then
 		local cc = Mark.blastClamp(ch, origGetMove(ch))
 		if typeof(cc) == "Vector3" then
 			return cc
 		end
 	end
 	local move = Mark.move
-	if move and move.dir and move.mode and ch == LocalPlayer.Character and move.dir.Magnitude > 0.2 then
+	if move and move.dir and move.mode and ch == LocalPlayer.Character and move.dir.Magnitude > 0.2 and Mark.moveLive(move) then
 		return move.dir
 	end
 	return origGetMove(ch)
+end
+-- A steer mode is owned by whoever calls moveSteer. If that caller stops (error, early return, state change, a branch
+-- of stepLogic that never reaches moveStop) the mode used to stay: GetMoveCommand kept returning move.dir and moveTick
+-- kept replaying it = the agent held a direction and walked you in it (tester). Path modes (m.pts) end at their last
+-- point; dodge has its own cap; everything else expires 0.5 s after its last real steer.
+Mark.moveLive = function(m)
+	if not (m and m.mode) then
+		return false
+	end
+	if m.mode == "dodge" then
+		return true
+	end
+	-- (m.pts is a drawn route for ball / block / dribble too, not proof that anybody is still driving the mode;
+	-- walk / take paths are driven by moveTick, which steers every frame and refreshes m.at)
+	return os.clock() - (m.at or 0) < 0.5
 end
 Mark.cutSlide = function(move)
 	local root = ActorTargeting.GetActorRoot(LocalPlayer)
@@ -2932,7 +2947,7 @@ CharacterControllers.SetMoveCommand = function(ch, move, look, rot)
 	if ch == LocalPlayer.Character and ClientSlide.IsSlideTackling() and not (slideAim and os.clock() < slideAimUntil) then
 		return origSetMove(ch, move, look, rot)
 	end
-	if Mark.move.dir and Mark.move.mode and ch == LocalPlayer.Character and Mark.move.dir.Magnitude > 0.2 then
+	if Mark.move.dir and Mark.move.mode and ch == LocalPlayer.Character and Mark.move.dir.Magnitude > 0.2 and Mark.moveLive(Mark.move) then
 		move = Mark.move.dir
 		if Mark.move.mode == "dodge" or Mark.move.mode == "block" then
 			look = Mark.move.look or Mark.move.dir
@@ -11209,6 +11224,10 @@ end
 -- (a charge pressed just before the ball arrives). Scripted charges (volley / bicycle / flick / AutoKick) never feint.
 Mark.feintEligible = function(own)
 	local now = os.clock()
+	-- a feint is part of AutoShoot: off with it, and only for a shot AutoShoot has actually solved (aim exists)
+	if not (CFG.AutoShoot and Shoot.aim) then
+		return false
+	end
 	if own then
 		Mark.ownSeenAt = now
 	end
@@ -11282,7 +11301,7 @@ end
 -- decided yet (the charge was too short to be seen, or the ball was not ours until the very end).
 Mark.feintRelease = function()
 	local mode = CFG.FeintMode or "Off"
-	if mode == "Off" then
+	if mode == "Off" or not CFG.AutoShoot then
 		return false
 	end
 	local fd = Mark.fd
@@ -11304,7 +11323,7 @@ Mark.feintTick = function(own)
 	if own then
 		Mark.ownSeenAt = os.clock()
 	end
-	local inst = mode ~= "Off" and Mark.chargeInst()
+	local inst = mode ~= "Off" and CFG.AutoShoot and Mark.chargeInst()
 	if not (inst and inst.IsCharging()) then
 		Shoot.feinted = false
 		return
@@ -15836,6 +15855,9 @@ Mark.moveSteer = function(dir, mode, replay)
 		m.want = dir
 	end
 	m.dir = dir
+	if not replay then
+		m.at = os.clock() -- the caller that owns this mode is alive: Mark.moveLive expires it when it stops calling
+	end
 	local ch = LocalPlayer.Character
 	if ch and dir then
 		local face = m.look or dir
@@ -16278,6 +16300,11 @@ Mark.moveTick = function(character, root)
 		logFile("dodge lock", "released-orphan")
 	end
 	if not (m and m.mode and root) then
+		return
+	end
+	if not Mark.moveLive(m) then
+		logFile("move watchdog", m.mode, "idle", string.format("%.2f", os.clock() - (m.at or 0)))
+		Mark.moveStop()
 		return
 	end
 	if m.mode == "dribble" or m.mode == "dodge" or m.mode == "block" or m.mode == "ball" or m.mode == "kick" or (m.mode == "steer" and not m.pts) then
