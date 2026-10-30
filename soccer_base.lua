@@ -201,6 +201,8 @@ local CFG = {
 	BlockPreJump = true, -- jump for a high shot BEFORE the release, timed to the replicated charge path
 	BlockSlide = true, -- AutoBlock: slide the flying shot when the body cannot reach it (ground slide, or jump + air slide)
 	BlockSlideJump = true,
+	BlockGoal = true, -- AutoBlock: a ball flying into OUR goal is run down / jumped / slid at, whether or not AutoBall is on
+	BlockGoalTime = 3, -- ... only when it crosses the line within this many seconds
 	BarricadeAddon = true, -- projectiles: a wall on their path instead of dodge / pass when the timing allows
 	WallMargin = 0.12, -- the path must reach the wall circle this much later than press + ping + WallLatency
 	WallHeight = 6, -- wall height estimate for the projectile-height test
@@ -215,6 +217,8 @@ local CFG = {
 	PassManualNear = 16, -- a teammate closer than this is only chosen when nobody farther is passable
 	PassShow = true, -- lime trajectory + brackets on the selected teammate
 	PassFov = 9, -- new lock: crosshair within this many degrees of his chest
+	PassNearGoal = 80, -- within this many studs of their goal (ball or target) the pass goes ON the teammate, not ahead of him (0 = off)
+	PassNearLead = 3, -- ... the lead is capped at this many studs there
 	PassGoalLead = 34, -- the predicted receive point never gets closer than this to the enemy goal (the keeper takes it there)
 	PassKeeperRadius = 14, -- keeper this close to the landing point -> contested
 	PassGoalSep = 9, -- a teammate within this many degrees of the goal (and near it) is a shooting target, not a pass target
@@ -223,6 +227,7 @@ local CFG = {
 	PassMaxDist = 130,
 	PassToKeeper = false,
 	PriorityFAKE = true, -- FAKE is tried FIRST (before BounceFAKE and the normal pool)
+	FakeMateSpeed = 38, -- FAKE: a mate running faster than this is not used (his pose at the pass is too uncertain)
 	FakeFirstChance = 0.95, -- ...and taken without its own roll in this share of solves; the rest fall back to FakeChance, so it is not every time
 	BounceFAKE = true, -- FAKE family member: a flight that looks like a shot on goal, hits a wall and comes back to us (<= 60 studs)
 	PriorityBounceFAKE = false, -- BounceFAKE goes first and is used whenever it exists (then PriorityFAKE)
@@ -5237,6 +5242,12 @@ solveShotRaw = function(root, forced)
 				end
 			end
 			Mark.fakeWhy = table.concat(notes, " ; ")
+			-- a FAKE that was meant to be found and was not: say why (throttled). A rolled-away attempt is not a failure.
+			local found = picked and (picked.fake or picked.bfake)
+			if not found and Mark.fakeWhy ~= "" and not Mark.fakeWhy:find("roll ", 1, true) and (not Mark.fakeFailAt or os.clock() - Mark.fakeFailAt > 1.5) then
+				Mark.fakeFailAt = os.clock()
+				logFile("shoot fake none", Mark.fakeWhy)
+			end
 		end
 		Shoot.reachM = picked and picked.reach
 		Shoot.keeperS = keeper
@@ -7993,8 +8004,19 @@ Mark.gkPress = function(character, root, c)
 		return skip("down")
 	end
 	local crec = Mark.charges and Mark.charges[pl.UserId]
-	if crec and crec.live and c.now - (crec.seen or 0) < 0.6 then
+	local charging = crec and crec.live and c.now - (crec.seen or 0) < 0.6
+	-- A flier already inside the mouth and inside the dive (20 studs) is committed: waiting for his shot loses, the release
+	-- comes at the line (log: "charging" skip while he covered along 39 -> 4.7, crossed dead centre). His steered velocity
+	-- also wobbles (vIn 32, -8, 3, -17) so the velocity gate below misses him. Position decides, not the velocity sample.
+	local relC = flat(er.Position - c.mouth)
+	local alongC, latC = relC:Dot(c.fwd), relC:Dot(c.side)
+	local committed = not CharacterControllers.IsLanded(model, hum) and alongC > -1 and alongC <= c.diveMod.GetDistance(LocalPlayer) and math.abs(latC) <= c.half + 2.5
+	if charging and not committed then
 		return skip("charging")
+	end
+	if committed and (not Mark.gkCommitLog or c.now - Mark.gkCommitLog > 0.6) then
+		Mark.gkCommitLog = c.now
+		logFile("gk press commit", actorName(pl), "along", string.format("%.1f", alongC), "lat", string.format("%.1f", latC), "charging", tostring(charging == true))
 	end
 	local P, V, W = Mark.carrierPose(er, model)
 	local vf = flat(W)
@@ -8081,8 +8103,12 @@ Mark.gkPress = function(character, root, c)
 	local runIn = tG <= 1.8 and math.abs(latG) <= c.half + 2.5
 	-- an airborne attacker cannot change course: any line that ends in the mouth counts, a ground carrier only if he is close
 	local near = rel.Magnitude <= (CFG.PressGoalDist or 30)
-	if not (runIn or (near and vIn > 4)) then
+	if not (committed or runIn or (near and vIn > 4)) then
 		return skip(string.format("no need tG %.2f lat %.1f vIn %.1f", tG == math.huge and -1 or tG, latG, vIn))
+	end
+	if committed and vIn <= 4 then
+		-- the velocity sample says he is leaving or drifting, but he is already in the mouth: dive at where he IS
+		V = Vector3.zero
 	end
 	local D = c.diveMod
 	local dist = D.GetDistance(LocalPlayer)
@@ -8173,7 +8199,7 @@ Mark.gkPress = function(character, root, c)
 		-- he is still climbing / hovering above anything we can reach: wait for the drop, re-plan next tick
 		return skip(string.format("wait drop %.2f his h %.1f", dropFrom, poseY2(0) - root.Position.Y))
 	end
-	if pick and pick.t - pick.td > maxT and tG > 0.9 then
+	if pick and not committed and pick.t - pick.td > maxT and tG > 0.9 then
 		-- the contact is further off than a dive is worth: he can still dodge, jump or shoot - wait, re-plan next tick
 		return skip(string.format("too early contact %.2f d %.1f tG %.2f", pick.t, flat(E0 - root.Position).Magnitude, tG == math.huge and -1 or tG))
 	end
@@ -10625,8 +10651,16 @@ Mark.paSolve = function(sel, fixed)
 	local goalP = enemyGoalPart()
 	goalP = goalP and goalP.Position
 	local leadMin = CFG.PassGoalLead or 34
+	-- Near their goal a pass is a pass to HIM: the usual receive point is where he will be when the ball arrives (a through ball),
+	-- which up there sails past or in front of him into the keeper's hands. Within PassNearGoal of the goal (ball or target)
+	-- the lead is capped at PassNearLead studs (0 = exactly on him) and the ball is solved to that point.
+	local nearGoal = goalP ~= nil and CFG.PassNearGoal ~= 0 and math.min(flat(ballPos - goalP).Magnitude, flat(sel.pos - goalP).Magnitude) <= (CFG.PassNearGoal or 80)
+	local leadCap = CFG.PassNearLead or 3
 	local function targetAt(tt)
 		local lead = sel.vel * (tt + ping * 0.5)
+		if nearGoal and lead.Magnitude > leadCap then
+			lead = lead.Magnitude > 1e-3 and lead.Unit * leadCap or Vector3.zero
+		end
 		local T = sel.pos + lead
 		if goalP then
 			-- never predict a receive point close to their goal: shorten the lead until it is outside the zone (or drop it
@@ -11789,7 +11823,7 @@ Mark.fakeShot = function(c)
 					-- Moving mates are fine: his pose is projected to the moment the ball gets there (first guess from the
 					-- distance, refined from the simulated flight time below). Only a sprint across the line is too uncertain.
 					local v = flat(r.AssemblyLinearVelocity)
-					if v.Magnitude > 30 then
+					if v.Magnitude > (CFG.FakeMateSpeed or 38) then
 						dg.fast += 1
 					else
 						local tFly = flat(r.Position - c.start).Magnitude / 95
@@ -11831,11 +11865,17 @@ Mark.fakeShot = function(c)
 		return nil, string.format("no mate (team %d down %d fast %d depth %d lat %d foe %d D %.0f..%.0f of Ds %.0f)", dg.team, dg.down, dg.fast, dg.depth, dg.lat, dg.foe, dg.dMin, dg.dMax, Ds)
 	end
 	local prio = CFG.PrioritizeFriends ~= false
+	-- Friends first, then the mates a line through him ends inside the posts for (small |sg|), a mate close to the goal last
+	-- among equals: the old order was "nearest to the goal first", the steepest shot with the keeper on top of it.
 	table.sort(mates, function(a, b)
 		if prio and a.tier ~= b.tier then
 			return a.tier > b.tier
 		end
-		return a.Dm < b.Dm
+		if a.off ~= b.off then
+			return not a.off
+		end
+		local sa, sb = math.abs(a.sg) + math.max(0, 14 - a.Dm) * 0.4, math.abs(b.sg) + math.max(0, 14 - b.Dm) * 0.4
+		return sa < sb
 	end)
 	local chance = CFG.FakeChance or 0.12
 	if prio and mates[1].tier > 0 then
@@ -11847,10 +11887,10 @@ Mark.fakeShot = function(c)
 	local slop = CFG.FakeSlop or 3.5
 	local latLim = math.max(bodyR - 0.5, 1.1) + slop * 0.4
 	local saved = Shoot.simCap
-	Shoot.simCap = (Shoot.sims or 0) + 40
+	Shoot.simCap = (Shoot.sims or 0) + ((Mark.dtAvg or 0) > 0.028 and 30 or 60)
 	local result, info = nil, "none"
 	local function crossOf(pack, mate)
-		if not (pack and pack.inside and pack.pts) then
+		if not (pack and pack.pts) then
 			return nil
 		end
 		local Q, tQ = nil, nil
@@ -11876,6 +11916,20 @@ Mark.fakeShot = function(c)
 			corner = math.abs(side) >= c.post * 0.5,
 		}
 	end
+	-- The mate's pose at the moment the ball reaches him. The first guess (distance / 95) is off by the real flight time (arc,
+	-- curve, drag): a mate running at 20 studs/s is 2-4 studs away from it, which is the whole lateral window. After each
+	-- simulation his pose is recomputed for the simulated time tQ and the same flight is re-read at his new depth.
+	local function retime(mate, tQ)
+		local M = mate.root.Position + mate.v * (ping + tQ)
+		local moved = (M - mate.M).Magnitude
+		if moved > 1e-3 then
+			local Dm = depthOf(M)
+			mate.M, mate.Dm, mate.sM = M, Dm, sideOf(M)
+			mate.f = Ds / math.max(Ds - Dm, 1)
+			mate.sg = sS + (mate.sM - sS) * mate.f
+		end
+		return moved
+	end
 	local function aimAt(mate, aimSide, aimH, curve)
 		local point = c.bottom + c.up * math.clamp(aimH, 0.4, c.mouthH - 2.2) + c.lateral * aimSide
 		local look = point - c.camPos
@@ -11886,6 +11940,18 @@ Mark.fakeShot = function(c)
 		local hit = crossOf(pack, mate)
 		if not hit then
 			return nil
+		end
+		if mate.spd > 1 then
+			for _ = 1, 2 do
+				if retime(mate, hit.tQ) < 0.4 then
+					break
+				end
+				local again = crossOf(pack, mate)
+				if not again then
+					break
+				end
+				hit = again
+			end
 		end
 		hit.point, hit.curve, hit.aimSide, hit.aimH = point, curve, aimSide, aimH
 		hit.latOk = math.abs(hit.latErr) <= latLim
@@ -11948,37 +12014,54 @@ Mark.fakeShot = function(c)
 		end
 	end
 	local yLoT, yHiT = lo + 1.0, hi - 0.8
+	-- Damped Newton on (aim side, aim height) against (lateral, vertical) error at his depth, always stepping from the BEST
+	-- aim so far: a step that did not improve is halved instead of being followed (the old 3 blind steps diverged on a curve and
+	-- stopped), and a step that misses the goal plane is also halved instead of ending the search.
 	local function solveCurve(mate, curve, yT, latWant)
 		local aSide = mate.sg + latWant * mate.f
 		local aH = 2.4
-		local bestH, bestS = nil, math.huge
-		for it = 1, 3 do
+		local bestH, bestS, bestAS, bestAH = nil, math.huge, aSide, aH
+		local step = 0.85
+		for it = 1, 5 do
 			local h = aimAt(mate, aSide, aH, curve or nil)
-			if not h then
-				if it == 1 then
-					aSide = math.clamp(aSide, -(c.post - 1.5), c.post - 1.5)
-					h = aimAt(mate, aSide, aH, curve or nil)
-				end
-				if not h then
-					break
-				end
+			if not h and it == 1 then
+				aSide = math.clamp(aSide, -(c.post - 1.5), c.post - 1.5)
+				bestAS = aSide
+				h = aimAt(mate, aSide, aH, curve or nil)
 			end
-			local eLat = h.latErr + latWant
-			local eY = yT - h.yRel
-			local s = math.abs(eLat) + 0.5 * math.abs(eY)
-			if s < bestS then
-				bestH, bestS = h, s
-			end
-			if math.abs(eLat) <= 0.6 and math.abs(eY) <= 0.9 then
+			if h then
+				local eLat = h.latErr + latWant
+				local eY = yT - h.yRel
+				local s = math.abs(eLat) + 0.5 * math.abs(eY)
+				if s < bestS then
+					bestH, bestS, bestAS, bestAH = h, s, aSide, aH
+					if math.abs(eLat) <= 0.6 and math.abs(eY) <= 0.9 then
+						break
+					end
+				else
+					step *= 0.5
+				end
+			elseif bestH then
+				step *= 0.5
+			else
 				break
 			end
-			aSide += eLat * mate.f * 0.85
-			aH = math.clamp(aH + eY * mate.f * 0.85, 0.5, c.mouthH - 2.2)
+			if not bestH then
+				break
+			end
+			local eL = bestH.latErr + latWant
+			local eV = yT - bestH.yRel
+			aSide = bestAS + eL * mate.f * step
+			aH = math.clamp(bestAH + eV * mate.f * step, 0.5, c.mouthH - 2.2)
+		end
+		if bestH then
+			bestH.res = bestS
 		end
 		return bestH
 	end
 	local pool, tried, blocked = {}, 0, 0
-	for mi = 1, math.min(#mates, 2) do
+	local worst = nil -- the closest miss, for the log
+	for mi = 1, math.min(#mates, 3) do
 		local mate = mates[mi]
 		-- a different spot of his body for each mate (the roll is reused with an offset)
 		local yT = yLoT + (yHiT - yLoT) * frac(u1 + mi * 0.37)
@@ -11989,7 +12072,10 @@ Mark.fakeShot = function(c)
 			end
 			tried += 1
 			local h = solveCurve(mate, curve, yT, latWant)
-			if h and h.inMouth and h.latOk and h.yOk then
+			if h and (not worst or (h.res or 99) < (worst.res or 99)) then
+				worst = h
+			end
+			if h and h.pack.inside and h.inMouth and h.latOk and h.yOk then
 				if foeBlocks(h, mate) then
 					blocked += 1
 				else
@@ -12019,6 +12105,9 @@ Mark.fakeShot = function(c)
 		info = info .. string.format(" pool %d/%d", #pool, tried)
 	else
 		info = blocked > 0 and "foe on pass" or string.format("miss (%d solves)", tried)
+		if worst then
+			info = info .. string.format(" best lat %.1f/%.1f y %.1f in %s mouth %s", worst.latErr, latLim, worst.yRel, tostring(worst.pack.inside == true), tostring(worst.inMouth == true))
+		end
 	end
 	Shoot.simCap = math.max(saved or 0, Shoot.sims or 0)
 	return result, info
@@ -13561,8 +13650,47 @@ Mark.killerSlide = function(root, routeDir, foes, ballNow, ourT, mLo, mHi, guard
 	return best, table.concat(why, "; ")
 end
 
+-- GOAL GUARD (AutoBlock): a free ball whose predicted path crosses OUR mouth within BlockGoalTime s. Returns the crossing
+-- ({ i = first sample past the line, t, p, lat }) or nil. goalMouthCorners' last value is the face normal pointing into the
+-- field, so "along" is the distance in front of the line.
+Mark.goalThreat = function(samples, ts)
+	local g = Mark.defendGoal()
+	if not (g and samples and #samples >= 3) then
+		return nil
+	end
+	local lb, lt, rb, _, _, n = goalMouthCorners(g)
+	local fwd = n and unitOrNil(flat(n))
+	if not (lb and rb and lt and fwd) then
+		return nil
+	end
+	local mc = (lb + rb) * 0.5
+	local side = Vector3.new(-fwd.Z, 0, fwd.X)
+	local half = flat(rb - lb).Magnitude * 0.5
+	local bottomY, topY = math.min(lb.Y, rb.Y), math.max(lt.Y, math.min(lb.Y, rb.Y) + 4)
+	local prev = flat(samples[1] - mc):Dot(fwd)
+	for i = 2, #samples do
+		local a = flat(samples[i] - mc):Dot(fwd)
+		if a <= 0.5 then
+			if prev <= a then
+				return nil -- not moving towards the line
+			end
+			local k = math.clamp((prev - 0.5) / (prev - a), 0, 1)
+			local p = samples[i - 1]:Lerp(samples[i], k)
+			local t = ts[i - 1] + (ts[i] - ts[i - 1]) * k
+			local lat = flat(p - mc):Dot(side)
+			if t <= (CFG.BlockGoalTime or 3) and math.abs(lat) <= half + 1.5 and p.Y >= bottomY - 1.5 and p.Y <= topY + 1.5 then
+				return { i = i, t = t, p = p, lat = lat }
+			end
+			return nil
+		end
+		prev = a
+	end
+	return nil
+end
+
 Mark.tickBall = function(character, root)
-	if not CFG.AutoBall then
+	local guardOn = CFG.AutoBlock and CFG.BlockGoal ~= false
+	if not CFG.AutoBall and not guardOn then
 		return
 	end
 	if not Mark.playLive() then
@@ -13620,6 +13748,28 @@ Mark.tickBall = function(character, root)
 		Mark.ballStop("no ball")
 		return
 	end
+	-- Goal guard: the path is cut at our goal line (a contact point behind it / in the net is worthless), the enemy field
+	-- players are no racers for a ball that is going in, and AutoBall may be off - the guard needs no other switch.
+	local threat = nil
+	if guardOn and not MatchSettings.IsGoalkeeperCharacter(character) then
+		threat = Mark.goalThreat(samples, ts)
+		if threat then
+			local cs, ct = {}, {}
+			for i = 1, threat.i - 1 do
+				cs[i], ct[i] = samples[i], ts[i]
+			end
+			cs[#cs + 1], ct[#ct + 1] = threat.p, threat.t
+			samples, ts, rest = cs, ct, false
+			if not Mark.guardLog or os.clock() - Mark.guardLog > 0.8 then
+				Mark.guardLog = os.clock()
+				logFile("block goal", "threat", "t", string.format("%.2f", threat.t), "lat", string.format("%.1f", threat.lat), "h", string.format("%.1f", threat.p.Y - root.Position.Y), "speed", string.format("%.0f", vel.Magnitude))
+			end
+		end
+	end
+	if not CFG.AutoBall and not threat then
+		Mark.ballStop("guard idle")
+		return
+	end
 	do
 		local sp = vel.Magnitude
 		if sp > 4 then
@@ -13651,7 +13801,7 @@ Mark.tickBall = function(character, root)
 		local actor = Actors.GetFromCharacter(model)
 		if actor and actor ~= LocalPlayer and not sameTeam(actor) and not isGoalkeeper(actor) then
 			local fr = ActorTargeting.GetActorRoot(actor)
-			if fr and flat(fr.Position - pos).Magnitude < 60 then
+			if fr and not threat and flat(fr.Position - pos).Magnitude < 60 then
 				-- delay = seconds until he can move again (stun / ragdoll / freeze ice / WalkSpeed 0): a downed enemy is not a
 				-- racer for that long (it was: killer slides and "foe near" boosts at men who could not walk)
 				local down, left = Mark.mateDown(actor, model)
@@ -13755,7 +13905,7 @@ Mark.tickBall = function(character, root)
 	-- Enemy keeper gets to our contact point first (run, or a GoalkeeperDive whose curve time beats us): the chase is
 	-- pointless, he claims it.
 	local keeperFirst = false
-	if not beaten then
+	if not beaten and not threat then
 		local diveMod = Mark.gkDiveMod or require(Modules.Actions.GoalkeeperDive)
 		Mark.gkDiveMod = diveMod
 		local ourT = ourNeed / math.max(spd, 8)
@@ -17628,12 +17778,14 @@ return function(_Lib, _Core)
 			head(b, "High Shots")
 			tog(b, "Pre-Release Jump", "BlockPreJump", "Jumps before the release, timed to his charge.")
 			tog(b, "Slide Block", "BlockSlide")
+			tog(b, "Defend Goal", "BlockGoal", "Blocks a ball flying into our goal with the body: run, jump or slide into its path.")
 			tog(b, "Jump + Air Slide", "BlockSlideJump")
 			advanced(b, "Block", function()
 				sld(b, "Behind Limit", "BlockBehind", 8, 40, { suffix = " st", text = "How far behind the carrier it may still start." })
 				sld(b, "Stand Closer By", "BlockCloser", -1, 3, { prec = 1, suffix = " st" })
 				sld(b, "Min Gap", "BlockGapMin", 1, 6, { prec = 1, suffix = " st" })
 				sld(b, "Close In To", "BlockMaxDepth", 3, 26, { suffix = " st" })
+				sld(b, "Goal Threat Window", "BlockGoalTime", 1, 5, { prec = 1, suffix = " s", text = "Defend Goal reacts to a ball that crosses our line within this time." })
 			end)
 
 			-- AutoKick -------------------------------------------------------------------------------------
@@ -17898,6 +18050,8 @@ return function(_Lib, _Core)
 				sld(p, "Max Distance", "PassMaxDist", 40, 200, { suffix = " st" })
 				sld(p, "Manual Near Limit", "PassManualNear", 4, 40, { suffix = " st" })
 				head(p, "Landing")
+				sld(p, "Exact Pass Zone", "PassNearGoal", 0, 130, { suffix = " st", text = "Within this distance of their goal the pass lands on the teammate, not ahead of him (0 = off)." })
+				sld(p, "Exact Pass Lead", "PassNearLead", 0, 10, { suffix = " st" })
 				sld(p, "Goal Lead", "PassGoalLead", 10, 60, { suffix = " st", text = "Receive point stays this far from their goal." })
 				sld(p, "Keeper Radius", "PassKeeperRadius", 4, 30, { suffix = " st" })
 				sld(p, "Goal Angle", "PassGoalSep", 2, 25, { suffix = "°" })
