@@ -187,6 +187,7 @@ local CFG = {
 	PressMaxT = 0.4, -- keeper forward dive waits until the contact is this close
 	AutoKickRange = 5.5, -- AutoBlock presses the kick when the carrier is within kick reach + this (was +2.5)
 	AutoKickCooldown = 0.5,
+	AutoKickAway = 3, -- no kick when HE moves away from us faster than this (urgent air/counter kicks: twice)
 	AutoKickFlee = 9, -- no kick when the gap would open faster than this (he runs away, we are slowed to ~8 by the charge)
 	AutoKickPadPerSpeed = 0.1, -- extra solid-hit margin (studs) per stud/s of opening speed
 	AutoKickEager = true, -- press when he is inside the box at the earliest release, solid or not
@@ -12071,6 +12072,16 @@ Mark.tackleGate = function(character, root, player, ch, solved)
 	if mode == "tackle" then
 		return true, "free"
 	end
+	-- The block / AutoKick only hold the tackle for a carrier they can actually kick: one who moves away from us (or just
+	-- dribbled off) is not waited for - the tackle goes now (the kick would not be pressed for him either: akTry "leaving").
+	do
+		local hr = ch and ch:FindFirstChild("HumanoidRootPart")
+		local awayDir = unitOrNil(-rel)
+		local away = hr and awayDir and flat(hr.AssemblyLinearVelocity):Dot(awayDir) or 0
+		if away > (CFG.AutoKickAway or 3) or (ch and now - ((Mark.akDrib or {})[ch] or -9) < 0.9 and away > -1) then
+			return true, "leaving"
+		end
+	end
 	if mode == "smart" then
 		local d = rel.Magnitude
 		local kickLive = CFG.AutoKick ~= false and holding and not Mark.ak and now - (Mark.akAt or 0) >= (CFG.AutoKickCooldown or 0.5)
@@ -12376,7 +12387,9 @@ Mark.akTry = function(tag, model, r, urgent)
 	if slideAim or ClientSlide.IsSlideTackling() or ClientDodge.IsDribbling() or Ragdoll.IsActorRagdolled(LocalPlayer) or Mark.aerial then
 		return false, "busy2"
 	end
+	Mark.akDrib = Mark.akDrib or {}
 	if Dodge.IsDribbling(model) then
+		Mark.akDrib[model] = now
 		return false, "iframe"
 	end
 	local down = Mark.mateDown(Actors.GetFromCharacter(model), model)
@@ -12396,6 +12409,20 @@ Mark.akTry = function(tag, model, r, urgent)
 		vHim = flat(ctx.vel)
 	end
 	local opening = toHim and (vHim:Dot(toHim) - ctx.vUs:Dot(toHim)) or 0
+	-- Being inside the radius says nothing. What counts is where HE goes: his own velocity along the line from us to him
+	-- (not relative to us, and not against the charging speed we get clamped to). Leaving -> no kick, the tackle / dribble
+	-- answer / block take him. Same after his dribble: the iframe ends with him already dashing off (log: the kick was
+	-- pressed again right after "cancel iframe"). Applies to every tag; the urgent (air / counter) ones get a looser limit.
+	local away = toHim and math.max(flat(r.AssemblyLinearVelocity):Dot(toHim), flat(ctx.vel):Dot(toHim)) or 0
+	local awayLim = (CFG.AutoKickAway or 3) * (urgent and 2 or 1)
+	local dribbled = now - (Mark.akDrib[model] or -9) < 0.9
+	if away > awayLim or (dribbled and away > -1) then
+		if not Mark.akFleeLog or now - Mark.akFleeLog > 0.8 then
+			Mark.akFleeLog = now
+			logFile("autokick skip leaving", tag, actorName(Actors.GetFromCharacter(model)), "away", string.format("%.1f", away), "lim", string.format("%.1f", awayLim), "dribbled", tostring(dribbled), "dist", string.format("%.1f", flat(r.Position - root.Position).Magnitude))
+		end
+		return false, "leaving"
+	end
 	if not urgent and opening > (CFG.AutoKickFlee or 9) then
 		if not Mark.akFleeLog or now - Mark.akFleeLog > 0.8 then
 			Mark.akFleeLog = now
@@ -12497,6 +12524,8 @@ Mark.akTick = function(character, root)
 	-- he dribbled: the iframe eats the kick. Cancel it, remember his Dodge (carrierDribbleWait) so the tackle gate
 	-- ("naked": slide right after his iframe while his cooldown runs) takes over.
 	if Dodge.IsDribbling(ak.model) then
+		Mark.akDrib = Mark.akDrib or {}
+		Mark.akDrib[ak.model] = now
 		carrierDribbleWait(Actors.GetFromCharacter(ak.model), 0)
 		TurnControl.ReleaseAutoRotate("AimCharge")
 		return finish("cancel iframe", true)
@@ -12507,6 +12536,15 @@ Mark.akTick = function(character, root)
 	local maxC = KickCore.Constants.MaximumChargeSeconds or 0.4
 	local fullAt = KickCore.GetFullChargeSeconds and KickCore.GetFullChargeSeconds() or (maxC - 0.05)
 	local ctx = Mark.akClampUs(Mark.akCtx(root, ak.model, ak.root), character)
+	do
+		local toHim = unitOrNil(flat(ak.root.Position - root.Position))
+		local away = toHim and math.max(flat(ak.root.AssemblyLinearVelocity):Dot(toHim), flat(ctx.vel):Dot(toHim)) or 0
+		if away > (CFG.AutoKickAway or 3) * 2 + 2 and held < minRel + 0.05 then
+			logFile("autokick", "cancel leaving", ak.tag, "away", string.format("%.1f", away))
+			TurnControl.ReleaseAutoRotate("AimCharge")
+			return finish("cancel", true)
+		end
+	end
 	local r0 = math.max(minRel - held, 0)
 	local inNow, solidNow, aimNow = Mark.akEval(ctx, r0)
 	-- keep the override on the aim of the best upcoming moment
@@ -17566,7 +17604,8 @@ return function(_Lib, _Core)
 				sld(k, "Cooldown", "AutoKickCooldown", 0.2, 2, { prec = 2, suffix = " s" })
 				sld(k, "Min Charge", "AutoKickRelease", 0.2, 0.4, { prec = 2, suffix = " s", text = "Only when Always Full Charge is off." })
 				tog(k, "Eager Press", "AutoKickEager")
-				sld(k, "Flee Limit", "AutoKickFlee", 3, 20, { suffix = " st/s", text = "No kick if he pulls away faster than this." })
+				sld(k, "Leaving Limit", "AutoKickAway", 0, 12, { suffix = " st/s", text = "No kick if he moves away from you faster than this (also right after his dribble)." })
+				sld(k, "Flee Limit", "AutoKickFlee", 3, 20, { suffix = " st/s", text = "No kick if the gap opens faster than this at charging speed." })
 				sld(k, "Flee Margin", "AutoKickPadPerSpeed", 0, 0.3, { prec = 2 })
 			end)
 
