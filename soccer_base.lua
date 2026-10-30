@@ -132,8 +132,6 @@ local CFG = {
 	PosStyle = "phantom",
 	SightStyle = "reticle",
 	CounterJumpRange = 10,
-	CounterContest = true, -- ball contested (we and an enemy both within CounterContestRange of it): jump + charged Kick at a teammate
-	CounterContestRange = 10,
 	PassAssistSync = true, -- AutoDodge x Pass Assist: a legit Lob to the safest teammate instead of the blind ball dump (homing rocket punch, or a projectile we are not sure to dodge)
 	ProjHitRadius = 5, -- homing punch -> ball contact distance (not in the client dump; 3 judged real hits as misses)
 	ProjSafeMargin = 1.0, -- dodge clearance above the item radius that counts as a sure dodge
@@ -193,6 +191,8 @@ local CFG = {
 	AutoKickPadPerSpeed = 0.1, -- extra solid-hit margin (studs) per stud/s of opening speed
 	AutoKickEager = true, -- press when he is inside the box at the earliest release, solid or not
 	AutoKickRelease = 0.4, -- earliest release charge (while he is in the box); >= the full charge (0.35) = always wait for full unless he would leave the box
+	SlideCenterWindow = 0.2, -- AutoBall slide: keep scanning this long after the first press that holds the ball, take the one with the most box hits
+	SlideGoodHits = 7, -- hits (of 11) that count as centred
 	SlideLag = 0.03, -- extra seconds the ball is taken ahead when a slide is planned (on top of ping/2)
 	SlideMinHits = 3, -- of 11 samples of the live window the box must hold the ball (was 2)
 	BlockPreJump = true, -- jump for a high shot BEFORE the release, timed to the replicated charge path
@@ -2905,6 +2905,24 @@ Mark.moveLive = function(m)
 	-- walk / take paths are driven by moveTick, which steers every frame and refreshes m.at)
 	return os.clock() - (m.at or 0) < 0.5
 end
+-- Dive input. origSetMove writes the controller's MoveCommand directly and the game does not rewrite it while the
+-- player holds no stick, so every keeper dive left the dive direction in the controller: the keeper kept walking that
+-- way after landing (tester: "the script holds a direction and leads me", always keeper-related). The command is cleared
+-- 0.15 s after the dive unless something else (the player, a live agent mode) has written a different one since.
+Mark.diveSet = function(character, wd, fwd)
+	origSetMove(character, wd, fwd, true)
+end
+Mark.diveRestore = function(character, wd)
+	task.delay(0.15, function()
+		if not (character and character.Parent) or Mark.moveLive(Mark.move) then
+			return
+		end
+		local cur = origGetMove(character)
+		if typeof(cur) == "Vector3" and typeof(wd) == "Vector3" and (cur - wd).Magnitude < 0.05 then
+			origSetMove(character, Vector3.zero, Vector3.zero, false)
+		end
+	end)
+end
 Mark.cutSlide = function(move)
 	local root = ActorTargeting.GetActorRoot(LocalPlayer)
 	local mv = unitOrNil(flat(move))
@@ -3761,8 +3779,8 @@ local function solveShot(root, forced, ...)
 	end
 	if os.clock() - (Shoot.costLog or 0) > 3 and (Shoot.costN or 0) > 0 then
 		Shoot.costLog = os.clock()
-		logFile("shoot cost", string.format("n %d avg %.1fms max %.1fms memo %d", Shoot.costN, Shoot.costSum / Shoot.costN, Shoot.costMax, Shoot.memoHit or 0))
-		Shoot.costN, Shoot.costSum, Shoot.costMax, Shoot.memoHit = 0, 0, 0, 0
+		logFile("shoot cost", string.format("n %d avg %.1fms max %.1fms memo %d warm %d full %.1f", Shoot.costN, Shoot.costSum / Shoot.costN, Shoot.costMax, Shoot.memoHit or 0, Shoot.warmHit or 0, Shoot.fullCost or 0))
+		Shoot.costN, Shoot.costSum, Shoot.costMax, Shoot.memoHit, Shoot.warmHit = 0, 0, 0, 0, 0
 	end
 	return a, b, c, d
 end
@@ -3827,7 +3845,8 @@ solveShotRaw = function(root, forced)
 	if not forced and Shoot.aim and Shoot.preview and moved < 0.2 and math.abs((Shoot.solveKeeper or 0) - keeper) < 2 then
 		return Shoot.aim, Shoot.kickDir, Shoot.curve, nil
 	end
-	if not forced and Shoot.aim and Shoot.preview and moved < 1.2 and os.clock() - (Shoot.solveT or 0) < 0.12 then
+	local slowF = (Mark.dtAvg or 0) > 0.025
+	if not forced and Shoot.aim and Shoot.preview and moved < (slowF and 2.5 or 1.2) and os.clock() - (Shoot.solveT or 0) < (slowF and 0.3 or 0.12) then
 		return Shoot.aim, Shoot.kickDir, Shoot.curve, nil
 	end
 	-- Throttle. A failed solve left Shoot.aim nil, which bypassed both caches above: with a moving player keeper
@@ -4307,7 +4326,13 @@ solveShotRaw = function(root, forced)
 	end
 	local aimAndPackRaw
 	local function aimAndPack(h, side, curve, band, fromBall)
-		if (Shoot.sims or 0) >= 70 then
+		-- slow frame rate (< ~36 fps / < ~50 fps): a smaller total sim budget and an early stop once the pool is big
+		-- enough to pick from; a late, complete answer beats the perfect one that never arrives (tester: AutoShoot dead at 30 fps)
+		local dtA = Mark.dtAvg or 0
+		if (Shoot.sims or 0) >= (dtA > 0.028 and 36 or (dtA > 0.02 and 52 or 70)) then
+			return false
+		end
+		if not forced and #pool >= (dtA > 0.028 and 5 or (dtA > 0.02 and 8 or 1e9)) then
 			return false
 		end
 		-- bicycle launch: a curled floor shot breaks (curl + bounce), floor shots go straight there
@@ -4342,6 +4367,17 @@ solveShotRaw = function(root, forced)
 		end
 		local ceilH = mouthH + 14 + lift * 1.5
 		local aimH = h + lift
+		-- Warm start. Every candidate converges its aim point by 3-5 full simulations; between two solves the ball moved a
+		-- few studs and the converged correction is nearly the same, so it is the starting point now (usually one
+		-- simulation instead of 3-5). Key: band, side, height, curl. Stale after 4 s or 12 studs of distance change.
+		Shoot.warm = Shoot.warm or {}
+		local wkey = string.format("%s|%s|%.0f|%.0f|%.2f|%s", band or "-", side >= 0 and "+" or "-", h, side, curve or 0, fromBall and "b" or "c")
+		local warm = Shoot.warm[wkey]
+		if warm and os.clock() - warm.at < 4 and math.abs(dist - warm.dist) < 12 then
+			aimH = math.clamp(aimH + warm.dH, -16, ceilH)
+			aimSide = side + warm.dS
+			Shoot.warmHit = (Shoot.warmHit or 0) + 1
+		end
 		local last = nil
 		local prevAim, prevLand = nil, nil
 		local tight = math.abs(side) >= post * 0.8
@@ -4463,6 +4499,7 @@ solveShotRaw = function(root, forced)
 			end
 			last = pack
 			if take(pack) then
+				Shoot.warm[wkey] = { dH = aimH - (h + lift), dS = aimSide - side, dist = dist, at = os.clock() }
 				return true
 			end
 			local y = (pack.land - bottom):Dot(up)
@@ -5414,6 +5451,10 @@ local function stepLogic()
 		local mm = Mark.move and Mark.move.mode
 		if mm and mm ~= "gk" and mm ~= "dodge" then
 			logFile("gk drop mode", mm)
+			Mark.moveStop()
+		elseif mm and not Mark.moveLive(Mark.move) then
+			-- the keeper half of stepLogic never reaches moveTick: a stale keeper / dodge order was cleared nowhere
+			logFile("move watchdog", mm, "keeper idle")
 			Mark.moveStop()
 		end
 		Mark.dodgeTend(root)
@@ -8078,9 +8119,10 @@ Mark.gkPress = function(character, root, c)
 	end
 	local function fireDive(best, tag)
 		TurnControl.LockAutoRotate("Goalkeeper", fwd)
-		origSetMove(character, best.wd, fwd, true)
+		Mark.diveSet(character, best.wd, fwd)
 		Mark.gkDive = c.now
 		local ok = c.role.Dive()
+		Mark.diveRestore(character, best.wd)
 		TurnControl.ReleaseAutoRotate("Goalkeeper")
 		Mark.gkPressRec = { at = c.now, pl = pl, model = model, minD = math.huge, name = actorName(pl) }
 		logFile("gk press", tag, ok and "ok" or "no", actorName(pl), "choice", best.name, "hit t", string.format("%.2f", best.t), "margin", string.format("%.1f", R - best.minD), "d", string.format("%.1f", flat(E0 - root.Position).Magnitude), "v", string.format("%.1f", V.Magnitude), "vy", string.format("%.1f", vy), "dyNow", string.format("%.1f", E0.Y - root.Position.Y), "air", tostring(airborne), "tG", tG == math.huge and "-" or string.format("%.2f", tG), "latG", string.format("%.1f", latG))
@@ -8221,9 +8263,10 @@ Mark.gkReturnTick = function(character, root, c)
 		if bestW then
 			Mark.gkReturnDived = true
 			TurnControl.LockAutoRotate("Goalkeeper", c.fwd)
-			origSetMove(character, bestW, c.fwd, true)
+			Mark.diveSet(character, bestW, c.fwd)
 			Mark.gkDive = c.now
 			local ok = c.role.Dive()
+			Mark.diveRestore(character, bestW)
 			TurnControl.ReleaseAutoRotate("Goalkeeper")
 			logFile("gk return", "dive", ok and "ok" or "no", "choice", bestName, "disp", string.format("%.1f", disp))
 			return nil
@@ -8262,9 +8305,10 @@ Mark.gkComboTick = function(character, root)
 		return
 	end
 	TurnControl.LockAutoRotate("Goalkeeper", cb.fwd)
-	origSetMove(character, wd, cb.fwd, true)
+	Mark.diveSet(character, wd, cb.fwd)
 	Mark.gkDive = now
 	local ok = cb.role.Dive()
+	Mark.diveRestore(character, wd)
 	TurnControl.ReleaseAutoRotate("Goalkeeper")
 	logFile("gk press", "air dive", ok and "ok" or "no", cb.name, "airborne", tostring(not CharacterControllers.IsLanded(character, character:FindFirstChildOfClass("Humanoid"))))
 end
@@ -8775,9 +8819,10 @@ Mark.tickGk = function(character, root)
 		end
 		if hit then
 			TurnControl.LockAutoRotate("Goalkeeper", fwd)
-			origSetMove(character, hit.wd, fwd, true)
+			Mark.diveSet(character, hit.wd, fwd)
 			Mark.gkDive = now
 			local ok = role.Dive()
+			Mark.diveRestore(character, hit.wd)
 			TurnControl.ReleaseAutoRotate("Goalkeeper")
 			logFile("gk dive", ok and "ok" or "no", "model", hit.own and "own" or "assist", "choice", hit.name, "miss", string.format("%.2f", hit.miss), "t", string.format("%.2f", hit.t or -1), "assist", tostring(hit.assisted), "eta", string.format("%.2f", crossT or -1), "dir", fmtV(hit.wd))
 		elseif not Mark.gkNoDiveLog or now - Mark.gkNoDiveLog > 0.3 then
@@ -9880,7 +9925,7 @@ Mark.airSeen = {}
 -- Both in the air without our own counter jump (the player jumped, or he is mid bicycle kick): an enemy within the kick
 -- reach of our airborne body gets the charged Kick at once (urgent: first legal release), when the box reaches him.
 Mark.counterAirKick = function(character, root)
-	if CFG.AutoKick == false or Mark.ak or Mark.contest or os.clock() - (Mark.airKickAt or 0) < 0.5 then
+	if CFG.AutoKick == false or Mark.ak or os.clock() - (Mark.airKickAt or 0) < 0.5 then
 		return
 	end
 	local hum = character:FindFirstChildOfClass("Humanoid")
@@ -9906,159 +9951,11 @@ Mark.counterAirKick = function(character, root)
 	end
 end
 
--- Contested ball: we and an enemy are both within CounterContestRange of the ball and nobody on our side owns it. Jump,
--- then a charged Kick at the best outfield teammate (clearance / pass with the kick hitbox, like the bicycle kick, never
--- at the keeper and never back at our own goal). Everything legal: the same Kick input path as AutoKick.
-Mark.contestTarget = function(root, ball)
-	local own = Mark.defendGoal()
-	local ownDir = own and unitOrNil(flat(own.Position - ball)) or nil
-	local best, bestScore = nil, -1e9
-	local foes = {}
-	for _, model in Actors.GetAllCharacterModels() do
-		local a = Actors.GetFromCharacter(model)
-		local r = a and ActorTargeting.GetActorRoot(a)
-		if r and a ~= LocalPlayer and not sameTeam(a) then
-			foes[#foes + 1] = r.Position
-		end
-	end
-	for _, model in Actors.GetAllCharacterModels() do
-		local a = Actors.GetFromCharacter(model)
-		if a and a ~= LocalPlayer and sameTeam(a) and not isGoalkeeper(a) and not Mark.mateDown(a, model) then
-			local r = ActorTargeting.GetActorRoot(a)
-			if r then
-				local to = flat(r.Position - ball)
-				local d = to.Magnitude
-				local u = unitOrNil(to)
-				if u and d >= 12 and d <= 90 and not (ownDir and ownDir:Dot(u) > 0.5) then
-					local score = d * 0.2
-					if own then
-						score += flat(r.Position - own.Position).Magnitude * 0.5
-					end
-					for _, fp in foes do
-						local rel = flat(fp - ball)
-						local along = rel:Dot(u)
-						if along > 3 and along < d then
-							local lat = (rel - u * along).Magnitude
-							if lat < 5 then
-								score -= 60
-							end
-						end
-						if flat(fp - r.Position).Magnitude < 8 then
-							score -= 35
-						end
-					end
-					if score > bestScore then
-						best, bestScore = { actor = a, root = r, dist = d }, score
-					end
-				end
-			end
-		end
-	end
-	return best
-end
-
-Mark.contestTry = function(character, root, ball)
-	if CFG.CounterContest == false or Mark.contest or Mark.ak or Mark.aerial or Mark.bike or CFG.AutoKick == false then
-		return false
-	end
-	local now = os.clock()
-	if now - (Mark.contestAt or 0) < 1.5 or (ChargedKick.IsCharging and ChargedKick.IsCharging()) then
-		return false
-	end
-	if MatchSettings.IsGoalkeeperCharacter(character) or slideAim or ClientSlide.IsSlideTackling() or ClientDodge.IsDribbling() then
-		return false
-	end
-	local range = CFG.CounterContestRange or 10
-	if flat(ball - root.Position).Magnitude > range then
-		return false
-	end
-	local oid = liveOwnerId()
-	local owner = type(oid) == "number" and oid ~= 0 and playerOf(oid) or nil
-	if owner and sameTeam(owner) then
-		return false
-	end
-	local foe = nil
-	for _, model in Actors.GetAllCharacterModels() do
-		local a = Actors.GetFromCharacter(model)
-		local r = a and a ~= LocalPlayer and not sameTeam(a) and ActorTargeting.GetActorRoot(a)
-		if r and flat(r.Position - ball).Magnitude <= range and not Mark.mateDown(a, model) then
-			foe = a
-			break
-		end
-	end
-	if not foe then
-		return false
-	end
-	local tgt = Mark.contestTarget(root, ball)
-	if not tgt then
-		return false
-	end
-	if not Mark.doJump("contest") then
-		return false
-	end
-	Mark.contestAt = now
-	Mark.contest = { at = now, target = tgt.actor, troot = tgt.root, hold = math.clamp(0.2 + tgt.dist / 100 * 0.2, 0.2, 0.4) }
-	logFile("contest", "jump", actorName(foe), "mate", actorName(tgt.actor), "d", string.format("%.0f", tgt.dist), "hold", string.format("%.2f", Mark.contest.hold))
-	return true
-end
-
-Mark.contestEnd = function(why)
-	local c = Mark.contest
-	if c and c.input then
-		ChargedKick.HandleInputEnded(c.input)
-	end
-	Mark.contest = nil
-	Mark.volleyAim, Mark.volleyAimUntil = nil, nil
-	logFile("contest", "end", why)
-end
-
-Mark.contestTick = function(character, root)
-	local c = Mark.contest
-	if not c then
-		return
-	end
-	local now = os.clock()
-	local ball = Renderer.GetPosition() or Renderer.GetMainMatchPosition()
-	if now - c.at > 1.3 or typeof(ball) ~= "Vector3" or not c.troot.Parent or liveOwnerId() == LocalPlayer.UserId then
-		Mark.contestEnd("timeout")
-		return
-	end
-	local to = unitOrNil(flat(c.troot.Position + c.troot.AssemblyLinearVelocity * 0.3 - ball))
-	if not to then
-		Mark.contestEnd("no aim")
-		return
-	end
-	local aim = Vector3.new(to.X, 0.12, to.Z).Unit
-	if not c.input then
-		if now - c.at < (CFG.CounterKickDelay or 0.08) or flat(ball - root.Position).Magnitude > Mark.kickReach() + 2.5 then
-			return
-		end
-		Mark.volleyAim, Mark.volleyAimUntil = aim, now + 0.4
-		local input = Controls.CreateInput("Kick")
-		if not (ChargedKick.HandleInputBegan(input, false) and ChargedKick.IsCharging()) then
-			Mark.contestEnd("refused")
-			return
-		end
-		Mark.scriptChargeAt, Mark.volleyAt, Mark.userVolleyAt = now, now, now
-		c.input, c.pressAt = input, now
-		logFile("contest", "press", actorName(c.target), "aim", fmtV(aim))
-		return
-	end
-	Mark.volleyAim, Mark.volleyAimUntil = aim, now + 0.4
-	if not (ChargedKick.IsCharging and ChargedKick.IsCharging()) then
-		c.input = nil
-		Mark.contestEnd("charge gone")
-	elseif now - c.pressAt >= c.hold then
-		Mark.contestEnd("release")
-	end
-end
-
 Mark.tickCounterJump = function(character, root)
 	if not CFG.CounterJump then
 		return
 	end
 	Mark.counterComboTick(character, root)
-	Mark.contestTick(character, root)
 	Mark.counterAirKick(character, root)
 	local hum = character:FindFirstChildOfClass("Humanoid")
 	if not (hum and CharacterControllers.IsLanded(character, hum)) or liveOwnerId() == LocalPlayer.UserId then
@@ -10069,9 +9966,6 @@ Mark.tickCounterJump = function(character, root)
 	end
 	local ball = Renderer.GetPosition() or Renderer.GetMainMatchPosition()
 	if typeof(ball) ~= "Vector3" then
-		return
-	end
-	if Mark.contestTry(character, root, ball) then
 		return
 	end
 	local range = CFG.CounterJumpRange
@@ -10155,6 +10049,13 @@ Mark.tickCounterJump = function(character, root)
 						why = "flick"
 						Mark.flickStart[actor.UserId] = nil
 					end
+				end
+				-- Enemy HIGH: he is up in the air (a header, a jump to the ball, a flick he already started) and the ball is with him
+				-- or within reach of him: the jump above only fires on the take-off edge of the first 0.4 s, which an enemy that rose
+				-- before we were in range never gave us. Once per air episode.
+				if not why and air and ep and not ep.high and r.Position.Y - root.Position.Y >= 3 and (isOwner or flat(ball - r.Position).Magnitude <= 9) then
+					why = "high"
+					ep.high = true
 				end
 				if why and CFG.CounterCompetitor then
 					-- optional: a teammate already on him owns the duel (CompetitorRadius), as in AutoBlock
@@ -13385,8 +13286,15 @@ Mark.routePlan = function(c)
 		local rots = { 0, math.rad(35), -math.rad(35), math.rad(70), -math.rad(70) }
 		local limit = math.min(run and run.t or math.huge, 3)
 		local tp = 0
+		-- Centre the ball in the live box. The scan used to stop at the FIRST press time that held the ball in 3 of 11 box
+		-- samples: that is the tail of the window (log: tc 0.51-0.56 of a 0.27-0.57 box, ball closest at 0.58-0.59 = a hair
+		-- after the box closed; the slide itself travels 0.4-0.9 studs short of the model, ping and frame time add more).
+		-- Now it keeps scanning SlideCenterWindow s past the first hit and takes the press with the most box samples
+		-- (capped at SlideGoodHits), earliest on a tie.
+		local slideTp0 = nil
+		local goodHits = CFG.SlideGoodHits or 7
 		while tp <= 1.5 + 1e-6 do
-			if tp + t0 >= (slide and slide.tc or limit) then
+			if tp + t0 >= limit or (slideTp0 and tp > slideTp0 + (CFG.SlideCenterWindow or 0.2)) then
 				break
 			end
 			local Cc, r = reach(tp)
@@ -13411,7 +13319,9 @@ Mark.routePlan = function(c)
 								local first, hits = sweep(W, ur, m, tp)
 								if first and hits >= (CFG.SlideMinHits or 3) then
 									local tc = tp + first
-									if not slide or tc < slide.tc - 0.02 or (tc <= slide.tc + 0.02 and hits > slide.hits) then
+									local sc, scOld = math.min(hits, goodHits), slide and math.min(slide.hits, goodHits) or -1
+									if not slide or sc > scOld or (sc == scOld and tc < slide.tc - 0.02) then
+										slideTp0 = slideTp0 or tp
 										local heading = off > 0.3 and unitOrNil(flat(W - Cc)) or nil
 										slide = { kind = "slide", p = B, tc = tc, t = tc, tp = tp, W = W, phi = ur, mult = m, hits = hits, rot = math.deg(a), heading = heading, way = W }
 									end
@@ -17694,12 +17604,10 @@ return function(_Lib, _Core)
 			feature(c, "CounterJump", "CounterJump")
 			note(c, "Jumps when an enemy goes airborne with the ball.")
 			tog(c, "Counter Tackle", "CounterTackle", "Slides at the ball during a flick wind-up.")
-			tog(c, "Contest Ball", "CounterContest", "Both near the ball: jump + kick it to a teammate.")
 			tog(c, "Competitor Check", "CounterCompetitor", "Stops when a teammate is already on him.")
 			sld(c, "Competitor Radius", "CounterCompetitorRadius", 4, 30, { suffix = " st" })
 			advanced(c, "Counter", function()
 				sld(c, "Range", "CounterJumpRange", 4, 20, { suffix = " st" })
-				sld(c, "Contest Range", "CounterContestRange", 5, 20, { suffix = " st" })
 				sld(c, "Combo Chance", "CounterComboChance", 0, 100, { scale = 100, suffix = "%" })
 				sld(c, "Kick Share", "CounterKickChance", 0, 100, { scale = 100, suffix = "%" })
 				sld(c, "Kick Delay", "CounterKickDelay", 0, 0.4, { prec = 2, suffix = " s" })
