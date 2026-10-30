@@ -71,6 +71,7 @@ local CFG = {
 	FeintAt = 0.32, -- the charge is cancelled when it has been held this long (s)
 	FeintSkipFake = true, -- never feint a FAKE shot
 	FeintSkipBounce = true, -- never feint a BOUNCE FAKE
+	FeintSmart = true, -- Smart Select: no feint once the enemy keeper has dived (his dive is on cooldown): the shot goes as it is
 	AutoFlick = true, -- the flick key starts the scripted flick -> jump -> volley; off = the game's own flick, aim help only
 	FlickAutoJump = true, -- scripted jump into the ball after the flick
 	FlickAutoKick = true, -- scripted Kick press (volley) once the ball is in reach
@@ -6304,6 +6305,19 @@ if ChargedKick.HandleInputBegan then
 	end
 end
 
+if ChargedKick.HandleInputEnded then
+	local oldShootEnded = ChargedKick.HandleInputEnded
+	ChargedKick.HandleInputEnded = function(input, ...)
+		-- only the player's own release (a real input object); our scripted charges pass tables and go straight through
+		if typeof(input) == "Instance" and Shoot.feintDo and not Shoot.feinted and Mark.feintRelease and Controls.IsInput("Kick", input) then
+			if Mark.feintRelease() then
+				return
+			end
+		end
+		return oldShootEnded(input, ...)
+	end
+end
+
 Mark.wallParts = function()
 	local now = os.clock()
 	if Mark.wallCache and now - (Mark.wallAt or 0) < 0.25 then
@@ -11002,15 +11016,60 @@ Mark.shotFilter = function(pool)
 	return out
 end
 
--- Feint: our own charge is cancelled at FeintAt instead of released. Decided ONCE per charge when it starts:
+-- Feint: our own charge is cancelled instead of released. Decided ONCE per charge when it starts:
 -- Chance = roll FeintChance; Count = FeintCount feints in a row, then one real charge (the counter restarts).
--- FAKE / BOUNCE FAKE shots are never feinted (their shot name is read from the solver).
+-- The cancel happens at FeintAt, or at the moment YOU release if that comes first (the release is swallowed and becomes
+-- the cancel: a timer alone lost the race against a human who lets go at the full charge, 0.35 s).
+-- Never on FAKE / BOUNCE FAKE (shot name read from the solver); Smart Select: never once the enemy keeper has dived
+-- (his dive is on cooldown: the feint has nothing left to bait and only burns the chance).
+Mark.feintReset = function()
+	Shoot.feintOn, Shoot.feinted, Shoot.feintDo = false, false, nil
+end
+
+-- true = the charge was cancelled as a feint; false = no feint (the caller lets the shot go)
+Mark.feintNow = function(why)
+	local nm = Shoot.shotName
+	local skip = nil
+	if (nm == "BOUNCE FAKE" and CFG.FeintSkipBounce ~= false) or ((nm == "FAKE" or nm == "FAKE CORNER") and CFG.FeintSkipFake ~= false) then
+		skip = nm
+	elseif CFG.FeintSmart ~= false and Mark.foeDiveLeft() > 0 then
+		skip = "keeper dived"
+	end
+	if skip then
+		Shoot.feintDo = false
+		logFile("feint skip", skip, why)
+		return false
+	end
+	local inst = Mark.chargeInst()
+	local held = inst and inst.GetHeldSeconds and inst.GetHeldSeconds() or 0
+	Shoot.feinted = true
+	Mark.feintN = (Mark.feintN or 0) + 1
+	ChargedKick.CancelCharge()
+	setShootWhy("feint")
+	logFile("feint", CFG.FeintMode or "Off", nm or "-", why, "held", string.format("%.2f", held), "n", Mark.feintN)
+	return true
+end
+
+-- called from the ChargedKick.HandleInputEnded hook for the player's own release
+Mark.feintRelease = function()
+	if not Shoot.feintDo or Shoot.feinted or (CFG.FeintMode or "Off") == "Off" then
+		return false
+	end
+	return Mark.feintNow("release")
+end
+
 Mark.feintTick = function()
 	local mode = CFG.FeintMode or "Off"
+	local now = os.clock()
+	local gap = now - (Mark.feintTickAt or 0)
+	Mark.feintTickAt = now
 	local inst = mode ~= "Off" and Mark.chargeInst()
 	if not (inst and inst.IsCharging()) then
-		Shoot.feintOn, Shoot.feinted, Shoot.feintDo = false, false, nil
+		Mark.feintReset()
 		return
+	end
+	if gap > 0.25 then
+		Mark.feintReset() -- the tick did not run for a while (ball not ours): whatever is stored belongs to another charge
 	end
 	if not Shoot.feintOn then
 		Shoot.feintOn = true
@@ -11029,20 +11088,9 @@ Mark.feintTick = function()
 		return
 	end
 	local held = inst.GetHeldSeconds()
-	if not (held and held >= (CFG.FeintAt or 0.32)) then
-		return
+	if held and held >= (CFG.FeintAt or 0.32) then
+		Mark.feintNow("timer")
 	end
-	local nm = Shoot.shotName
-	if (nm == "BOUNCE FAKE" and CFG.FeintSkipBounce ~= false) or ((nm == "FAKE" or nm == "FAKE CORNER") and CFG.FeintSkipFake ~= false) then
-		Shoot.feintDo = false
-		logFile("feint skip", nm)
-		return
-	end
-	Shoot.feinted = true
-	Mark.feintN = (Mark.feintN or 0) + 1
-	ChargedKick.CancelCharge()
-	setShootWhy("feint")
-	logFile("feint", mode, nm or "-", "held", string.format("%.2f", held), "n", Mark.feintN)
 end
 
 -- Why the FAKE family must not be used right now (nil = allowed).
@@ -17154,11 +17202,11 @@ return function(_Lib, _Core)
 			-- Feint: the controls that do not apply to the chosen mode are hidden
 			local fe = card(tab, "Left")
 			head(fe, "Feint")
-			local chanceEl, countEl, atEl, skipEl
+			local chanceEl, countEl, atEl, atNote, skipEl, smartEl, smartNote
 			local function feintVis(mode)
 				mode = mode or CFG.FeintMode or "Off"
-				local rows = { { chanceEl, mode == "Chance" }, { countEl, mode == "Count" }, { atEl, mode ~= "Off" }, { skipEl, mode ~= "Off" } }
-				for i = 1, 4 do
+				local rows = { { chanceEl, mode == "Chance" }, { countEl, mode == "Count" }, { atEl, mode ~= "Off" }, { skipEl, mode ~= "Off" }, { smartEl, mode ~= "Off" }, { atNote, mode ~= "Off" }, { smartNote, mode ~= "Off" } }
+				for i = 1, 7 do
 					local el, on = rows[i][1], rows[i][2]
 					if el then
 						pcall(function()
@@ -17171,6 +17219,9 @@ return function(_Lib, _Core)
 			chanceEl = sld(fe, "Chance", "FeintChance", 0, 100, { scale = 100, suffix = "%" })
 			countEl = sld(fe, "Feints In A Row", "FeintCount", 1, 5)
 			atEl = sld(fe, "Cancel At", "FeintAt", 0.2, 0.38, { prec = 2, suffix = " s" })
+			atNote = note(fe, "Or when you release, if that comes first.")
+			smartEl = tog(fe, "Smart Select", "FeintSmart")
+			smartNote = note(fe, "No feint once the keeper has dived: the shot goes.")
 			do
 				local def = {}
 				if CFG.FeintSkipFake ~= false then
