@@ -132,6 +132,8 @@ local CFG = {
 	PosStyle = "phantom",
 	SightStyle = "reticle",
 	CounterJumpRange = 10,
+	CounterContest = true, -- ball contested (we and an enemy both within CounterContestRange of it): jump + charged Kick at a teammate
+	CounterContestRange = 10,
 	PassAssistSync = true, -- AutoDodge x Pass Assist: a legit Lob to the safest teammate instead of the blind ball dump (homing rocket punch, or a projectile we are not sure to dodge)
 	ProjHitRadius = 5, -- homing punch -> ball contact distance (not in the client dump; 3 judged real hits as misses)
 	ProjSafeMargin = 1.0, -- dodge clearance above the item radius that counts as a sure dodge
@@ -178,8 +180,9 @@ local CFG = {
 	TackleVsBlock = "block", -- block = AutoBlock first (tackle waits while it is on him) / smart = wait only for a firing kick / tackle = never wait
 	TackleHoldMax = 0.8, -- block first: the tackle waits at most this long for the block
 	CounterKickDelay = 0.08, -- air combo: the Kick goes out this long after the jump when the slide has no legal pair
-	BlockCloser = 1.0, -- AutoBlock shadow gap = kick reach - 1 - this (was 4.0 studs, now 3.0)
-	BlockGapMin = 2.2,
+	BlockCloser = 1.6, -- AutoBlock shadow gap = kick reach - 1 - this (was 4.0 studs, now 3.0)
+	BlockGapMin = 2.0,
+	BlockMaxDepth = 9, -- AutoBlock in front of him: closes in to at most this depth (was a fixed 26: kept whatever distance we had)
 	ArcMaxErr = 2.5, -- FreezeGun: accepted height error of the scanned landing point (studs)
 	JumpSlide = true, -- a lofting carrier: jump first, slide from the air
 	JumpSlideDelay = 0.16,
@@ -321,11 +324,30 @@ local function dbg(...)
 	return line
 end
 
-local function persist(line)
-	if isfile(Log.file) then
-		appendfile(Log.file, line .. "\n")
+-- One file write per ~2 s instead of isfile + appendfile for every line: each call is a synchronous disk round trip
+-- that blocks the whole Lua thread (tester log: single tickBlock / paintWorld calls of 1.2 s that only log lines can
+-- explain). A script error line flushes at once.
+Log.wbuf, Log.wn, Log.wAt, Log.started = {}, 0, os.clock(), false
+Log.flush = function()
+	if Log.wn == 0 then
+		return
+	end
+	local text = table.concat(Log.wbuf, "\n", 1, Log.wn) .. "\n"
+	table.clear(Log.wbuf)
+	Log.wn, Log.wAt = 0, os.clock()
+	if Log.started and isfile(Log.file) then
+		appendfile(Log.file, text)
 	else
-		writefile(Log.file, line .. "\n")
+		Log.started = true
+		writefile(Log.file, text)
+	end
+end
+
+local function persist(line)
+	Log.wn += 1
+	Log.wbuf[Log.wn] = line
+	if Log.wn >= 200 or os.clock() - Log.wAt > 2 or line:find("SCRIPT ERROR", 1, true) then
+		Log.flush()
 	end
 end
 
@@ -4173,6 +4195,31 @@ solveShotRaw = function(root, forced)
 		if not pack or not pack.inside then
 			return false
 		end
+		-- Closed corner: a ball that crosses the plane at an angle and is moving back towards the centre came from OUTSIDE
+		-- the post line, so its centre passes the post axis at (mouthHalf - |side|) * cos(angle), not at the plane distance
+		-- the post inset (radius + 0.3) assumed. Log: side 16.0-16.3 (the inset limit) at 22-37 degrees hit the frame.
+		if pack.pts and pack.land then
+			local pts, k = pack.pts, #pack.pts
+			for idx = 1, #pts do
+				if pts[idx] == pack.land then
+					k = idx
+					break
+				end
+			end
+			local d = pack.land - pts[math.max(k - 1, 1)]
+			local dd = math.abs(d:Dot(face))
+			local s = (pack.land - bottom):Dot(lateral)
+			local dl = d:Dot(lateral)
+			if dd > 0.05 and dl * s < 0 then
+				local cosA = dd / math.sqrt(dd * dd + dl * dl)
+				local c = (mouthHalf - math.abs(s)) * cosA
+				if c < radius + 0.6 then
+					Mark.cornerWhy = string.format("corner s %.1f ang %.0f clr %.2f", s, math.deg(math.acos(cosA)), c)
+					fail.corner = (fail.corner or 0) + 1
+					return false
+				end
+			end
+		end
 		local blocked
 		local m = pack.memo
 		if m and m.blockStamp == Mark.wallSig then
@@ -7526,7 +7573,7 @@ Mark.tickSkill = function(character, root)
 	-- AbsolutePosition centre sat one top-bar inset too high. Projecting the real ray removes the mismatch.
 	local center
 	do
-		local ray = Mark.oldCamRay or Reticle.GetCameraRay()
+		local ray = (Mark.oldCamRay or Reticle.GetCameraRay)()
 		if ray then
 			local sp = cam:WorldToViewportPoint(ray.Origin + ray.Direction.Unit * 60)
 			center = Vector2.new(sp.X, sp.Y)
@@ -8788,6 +8835,9 @@ end
 
 RunService.Heartbeat:Connect(function(dt)
 	Mark.dt = dt
+	if Log.wn > 0 and os.clock() - Log.wAt > 2 then
+		Log.flush()
+	end
 	Mark.dtAvg = (Mark.dtAvg or dt) * 0.95 + dt * 0.05
 	if not CFG.Perf then
 		return stepLogic()
@@ -8807,6 +8857,14 @@ RunService.RenderStepped:Connect(function()
 			return
 		end
 		Mark.paintAt = nowP
+	end
+	-- Slow machine (< ~28 fps): paint every second frame. Drawing objects persist, a skipped paint keeps the last picture
+	-- (tester log: 12 fps median, paintWorld + paintHud ~ 5 % of every frame).
+	if (Mark.dtAvg or 0) > 1 / 28 then
+		Mark.paintSkip = not Mark.paintSkip
+		if Mark.paintSkip then
+			return
+		end
 	end
 	local t0 = os.clock()
 	local cam = Workspace.CurrentCamera
@@ -9411,7 +9469,9 @@ local function dumpLog()
 			add(Log.ring[(Log.head + i - 1) % Log.N + 1])
 		end
 	end
+	Log.wbuf, Log.wn = {}, 0
 	writefile("illegalsoccerlog.txt", table.concat(lines, "\n") .. "\n")
+	Log.started = true
 end
 
 Mark.holdJump = function()
@@ -9786,7 +9846,7 @@ Mark.airSeen = {}
 -- Both in the air without our own counter jump (the player jumped, or he is mid bicycle kick): an enemy within the kick
 -- reach of our airborne body gets the charged Kick at once (urgent: first legal release), when the box reaches him.
 Mark.counterAirKick = function(character, root)
-	if CFG.AutoKick == false or Mark.ak or os.clock() - (Mark.airKickAt or 0) < 0.5 then
+	if CFG.AutoKick == false or Mark.ak or Mark.contest or os.clock() - (Mark.airKickAt or 0) < 0.5 then
 		return
 	end
 	local hum = character:FindFirstChildOfClass("Humanoid")
@@ -9812,11 +9872,159 @@ Mark.counterAirKick = function(character, root)
 	end
 end
 
+-- Contested ball: we and an enemy are both within CounterContestRange of the ball and nobody on our side owns it. Jump,
+-- then a charged Kick at the best outfield teammate (clearance / pass with the kick hitbox, like the bicycle kick, never
+-- at the keeper and never back at our own goal). Everything legal: the same Kick input path as AutoKick.
+Mark.contestTarget = function(root, ball)
+	local own = Mark.defendGoal()
+	local ownDir = own and unitOrNil(flat(own.Position - ball)) or nil
+	local best, bestScore = nil, -1e9
+	local foes = {}
+	for _, model in Actors.GetAllCharacterModels() do
+		local a = Actors.GetFromCharacter(model)
+		local r = a and ActorTargeting.GetActorRoot(a)
+		if r and a ~= LocalPlayer and not sameTeam(a) then
+			foes[#foes + 1] = r.Position
+		end
+	end
+	for _, model in Actors.GetAllCharacterModels() do
+		local a = Actors.GetFromCharacter(model)
+		if a and a ~= LocalPlayer and sameTeam(a) and not isGoalkeeper(a) and not Mark.mateDown(a, model) then
+			local r = ActorTargeting.GetActorRoot(a)
+			if r then
+				local to = flat(r.Position - ball)
+				local d = to.Magnitude
+				local u = unitOrNil(to)
+				if u and d >= 12 and d <= 90 and not (ownDir and ownDir:Dot(u) > 0.5) then
+					local score = d * 0.2
+					if own then
+						score += flat(r.Position - own.Position).Magnitude * 0.5
+					end
+					for _, fp in foes do
+						local rel = flat(fp - ball)
+						local along = rel:Dot(u)
+						if along > 3 and along < d then
+							local lat = (rel - u * along).Magnitude
+							if lat < 5 then
+								score -= 60
+							end
+						end
+						if flat(fp - r.Position).Magnitude < 8 then
+							score -= 35
+						end
+					end
+					if score > bestScore then
+						best, bestScore = { actor = a, root = r, dist = d }, score
+					end
+				end
+			end
+		end
+	end
+	return best
+end
+
+Mark.contestTry = function(character, root, ball)
+	if CFG.CounterContest == false or Mark.contest or Mark.ak or Mark.aerial or Mark.bike or CFG.AutoKick == false then
+		return false
+	end
+	local now = os.clock()
+	if now - (Mark.contestAt or 0) < 1.5 or (ChargedKick.IsCharging and ChargedKick.IsCharging()) then
+		return false
+	end
+	if MatchSettings.IsGoalkeeperCharacter(character) or slideAim or ClientSlide.IsSlideTackling() or ClientDodge.IsDribbling() then
+		return false
+	end
+	local range = CFG.CounterContestRange or 10
+	if flat(ball - root.Position).Magnitude > range then
+		return false
+	end
+	local oid = liveOwnerId()
+	local owner = type(oid) == "number" and oid ~= 0 and playerOf(oid) or nil
+	if owner and sameTeam(owner) then
+		return false
+	end
+	local foe = nil
+	for _, model in Actors.GetAllCharacterModels() do
+		local a = Actors.GetFromCharacter(model)
+		local r = a and a ~= LocalPlayer and not sameTeam(a) and ActorTargeting.GetActorRoot(a)
+		if r and flat(r.Position - ball).Magnitude <= range and not Mark.mateDown(a, model) then
+			foe = a
+			break
+		end
+	end
+	if not foe then
+		return false
+	end
+	local tgt = Mark.contestTarget(root, ball)
+	if not tgt then
+		return false
+	end
+	if not Mark.doJump("contest") then
+		return false
+	end
+	Mark.contestAt = now
+	Mark.contest = { at = now, target = tgt.actor, troot = tgt.root, hold = math.clamp(0.2 + tgt.dist / 100 * 0.2, 0.2, 0.4) }
+	logFile("contest", "jump", actorName(foe), "mate", actorName(tgt.actor), "d", string.format("%.0f", tgt.dist), "hold", string.format("%.2f", Mark.contest.hold))
+	return true
+end
+
+Mark.contestEnd = function(why)
+	local c = Mark.contest
+	if c and c.input then
+		ChargedKick.HandleInputEnded(c.input)
+	end
+	Mark.contest = nil
+	Mark.volleyAim, Mark.volleyAimUntil = nil, nil
+	logFile("contest", "end", why)
+end
+
+Mark.contestTick = function(character, root)
+	local c = Mark.contest
+	if not c then
+		return
+	end
+	local now = os.clock()
+	local ball = Renderer.GetPosition() or Renderer.GetMainMatchPosition()
+	if now - c.at > 1.3 or typeof(ball) ~= "Vector3" or not c.troot.Parent or liveOwnerId() == LocalPlayer.UserId then
+		Mark.contestEnd("timeout")
+		return
+	end
+	local to = unitOrNil(flat(c.troot.Position + c.troot.AssemblyLinearVelocity * 0.3 - ball))
+	if not to then
+		Mark.contestEnd("no aim")
+		return
+	end
+	local aim = Vector3.new(to.X, 0.12, to.Z).Unit
+	if not c.input then
+		if now - c.at < (CFG.CounterKickDelay or 0.08) or flat(ball - root.Position).Magnitude > Mark.kickReach() + 2.5 then
+			return
+		end
+		Mark.volleyAim, Mark.volleyAimUntil = aim, now + 0.4
+		local input = Controls.CreateInput("Kick")
+		if not (ChargedKick.HandleInputBegan(input, false) and ChargedKick.IsCharging()) then
+			Mark.contestEnd("refused")
+			return
+		end
+		Mark.scriptChargeAt, Mark.volleyAt, Mark.userVolleyAt = now, now, now
+		c.input, c.pressAt = input, now
+		logFile("contest", "press", actorName(c.target), "aim", fmtV(aim))
+		return
+	end
+	Mark.volleyAim, Mark.volleyAimUntil = aim, now + 0.4
+	if not (ChargedKick.IsCharging and ChargedKick.IsCharging()) then
+		c.input = nil
+		Mark.contestEnd("charge gone")
+	elseif now - c.pressAt >= c.hold then
+		Mark.contestEnd("release")
+	end
+end
+
 Mark.tickCounterJump = function(character, root)
 	if not CFG.CounterJump then
 		return
 	end
 	Mark.counterComboTick(character, root)
+	Mark.contestTick(character, root)
 	Mark.counterAirKick(character, root)
 	local hum = character:FindFirstChildOfClass("Humanoid")
 	if not (hum and CharacterControllers.IsLanded(character, hum)) or liveOwnerId() == LocalPlayer.UserId then
@@ -9827,6 +10035,9 @@ Mark.tickCounterJump = function(character, root)
 	end
 	local ball = Renderer.GetPosition() or Renderer.GetMainMatchPosition()
 	if typeof(ball) ~= "Vector3" then
+		return
+	end
+	if Mark.contestTry(character, root, ball) then
 		return
 	end
 	local range = CFG.CounterJumpRange
@@ -10210,7 +10421,7 @@ Mark.tickBlock = function(character, root)
 		local dAlong = relL:Dot(uf)
 		if dAlong >= gap * 0.5 then
 			ahead = true
-			dest = Pf + uf * math.clamp(dAlong, gap, 26)
+			dest = Pf + uf * math.clamp(dAlong, gap, math.max(gap, CFG.BlockMaxDepth or 9))
 			target = dest
 		end
 	end
@@ -13855,6 +14066,10 @@ Mark.bandStat = function(stat)
 		out[#out + 1] = "bar:" .. Mark.barWhy
 		Mark.barWhy = nil
 	end
+	if Mark.cornerWhy then
+		out[#out + 1] = "cor:" .. Mark.cornerWhy
+		Mark.cornerWhy = nil
+	end
 	local f = Mark.shotFail
 	if f then
 		out[#out + 1] = string.format("f:v%d,c%d,b%d,fr%d,k%d,bar%d,foe%d", f.vel or 0, f.cross or 0, f.block or 0, f.frame or 0, f.keeper or 0, f.bar or 0, f.foe or 0)
@@ -17368,6 +17583,7 @@ return function(_Lib, _Core)
 				sld(b, "Behind Limit", "BlockBehind", 8, 40, { suffix = " st", text = "How far behind the carrier it may still start." })
 				sld(b, "Stand Closer By", "BlockCloser", -1, 3, { prec = 1, suffix = " st" })
 				sld(b, "Min Gap", "BlockGapMin", 1, 6, { prec = 1, suffix = " st" })
+				sld(b, "Close In To", "BlockMaxDepth", 3, 26, { suffix = " st" })
 			end)
 
 			-- AutoKick -------------------------------------------------------------------------------------
@@ -17419,10 +17635,12 @@ return function(_Lib, _Core)
 			feature(c, "CounterJump", "CounterJump")
 			note(c, "Jumps when an enemy goes airborne with the ball.")
 			tog(c, "Counter Tackle", "CounterTackle", "Slides at the ball during a flick wind-up.")
+			tog(c, "Contest Ball", "CounterContest", "Both near the ball: jump + kick it to a teammate.")
 			tog(c, "Competitor Check", "CounterCompetitor", "Stops when a teammate is already on him.")
 			sld(c, "Competitor Radius", "CounterCompetitorRadius", 4, 30, { suffix = " st" })
 			advanced(c, "Counter", function()
 				sld(c, "Range", "CounterJumpRange", 4, 20, { suffix = " st" })
+				sld(c, "Contest Range", "CounterContestRange", 5, 20, { suffix = " st" })
 				sld(c, "Combo Chance", "CounterComboChance", 0, 100, { scale = 100, suffix = "%" })
 				sld(c, "Kick Share", "CounterKickChance", 0, 100, { scale = 100, suffix = "%" })
 				sld(c, "Kick Delay", "CounterKickDelay", 0, 0.4, { prec = 2, suffix = " s" })
