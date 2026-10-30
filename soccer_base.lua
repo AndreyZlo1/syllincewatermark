@@ -175,7 +175,8 @@ local CFG = {
 	WallAmbushV = 4.5, -- closing speed from which an ambush wall is considered (was 6)
 	WallAmbushT = 0.6, -- ... and he reaches the spot within this many seconds (was 1.0: the wall stood there long before he came and he turned)
 	WallShot = true, -- wall on the replicated shot path of a charging carrier (needs barricades in hand)
-	TackleGateStrict = false, -- true = the old gate (tackle waits for AutoBlock for every carrier farther than TackleGoalZone)
+	TackleVsBlock = "block", -- block = AutoBlock first (tackle waits while it is on him) / smart = wait only for a firing kick / tackle = never wait
+	TackleHoldMax = 0.8, -- block first: the tackle waits at most this long for the block
 	CounterKickDelay = 0.08, -- air combo: the Kick goes out this long after the jump when the slide has no legal pair
 	BlockCloser = 1.0, -- AutoBlock shadow gap = kick reach - 1 - this (was 4.0 studs, now 3.0)
 	BlockGapMin = 2.2,
@@ -5559,6 +5560,7 @@ local function stepLogic()
 		Mark.flickStrike = nil
 	end
 
+	Mark.feintTick(own)
 	if Mark.shotLockUntil and os.clock() < Mark.shotLockUntil then
 		-- aerial / bicycle strike in flight: the aim solved at the press is the one the release sends; any re-solve
 		-- from the moved ball (or the ownership flicker at contact) wiped Shoot.aim and the preview at the strike
@@ -5610,7 +5612,6 @@ local function stepLogic()
 			end
 		end
 		Mark.rebaseAim()
-		Mark.feintTick()
 	elseif not own and not Mark.flickStrike then
 		Shoot.preview = nil
 		Shoot.locked = nil
@@ -6309,7 +6310,7 @@ if ChargedKick.HandleInputEnded then
 	local oldShootEnded = ChargedKick.HandleInputEnded
 	ChargedKick.HandleInputEnded = function(input, ...)
 		-- only the player's own release (a real input object); our scripted charges pass tables and go straight through
-		if typeof(input) == "Instance" and Shoot.feintDo and not Shoot.feinted and Mark.feintRelease and Controls.IsInput("Kick", input) then
+		if typeof(input) == "Instance" and Mark.feintRelease and Controls.IsInput("Kick", input) then
 			if Mark.feintRelease() then
 				return
 			end
@@ -11026,6 +11027,35 @@ Mark.feintReset = function()
 	Shoot.feintOn, Shoot.feinted, Shoot.feintDo = false, false, nil
 end
 
+-- A feint applies to the PLAYER's own Kick charge (real input object) while we own the ball or owned it a moment ago
+-- (a charge pressed just before the ball arrives). Scripted charges (volley / bicycle / flick / AutoKick) never feint.
+Mark.feintEligible = function(own)
+	local now = os.clock()
+	if own then
+		Mark.ownSeenAt = now
+	end
+	if Mark.aerial or Mark.forceBike or Mark.flickStrike or Mark.bike then
+		return false
+	end
+	if (Mark.realChargeAt or 0) < (Mark.scriptChargeAt or 0) then
+		return false
+	end
+	return own or now - (Mark.ownSeenAt or -100) < 1.0
+end
+
+-- the once-per-charge decision
+Mark.feintBegin = function(mode)
+	Shoot.feintOn = true
+	if mode == "Chance" then
+		Shoot.feintDo = math.random() < (CFG.FeintChance or 0.6)
+	elseif (Mark.feintN or 0) < (CFG.FeintCount or 1) then
+		Shoot.feintDo = true
+	else
+		Mark.feintN = 0
+		Shoot.feintDo = false
+	end
+end
+
 -- true = the charge was cancelled as a feint; false = no feint (the caller lets the shot go)
 Mark.feintNow = function(why)
 	local nm = Shoot.shotName
@@ -11050,39 +11080,47 @@ Mark.feintNow = function(why)
 	return true
 end
 
--- called from the ChargedKick.HandleInputEnded hook for the player's own release
+-- called from the ChargedKick.HandleInputEnded hook for the player's own release. Also decides here when no tick had
+-- decided yet (the charge was too short to be seen, or the ball was not ours until the very end).
 Mark.feintRelease = function()
-	if not Shoot.feintDo or Shoot.feinted or (CFG.FeintMode or "Off") == "Off" then
+	local mode = CFG.FeintMode or "Off"
+	if mode == "Off" or Shoot.feinted then
+		return false
+	end
+	if not Shoot.feintOn then
+		if not Mark.feintEligible(Mark.weOwn()) then
+			return false
+		end
+		Mark.feintBegin(mode)
+	end
+	if not Shoot.feintDo then
 		return false
 	end
 	return Mark.feintNow("release")
 end
 
-Mark.feintTick = function()
+-- every logic step, whether or not we own the ball right now
+Mark.feintTick = function(own)
 	local mode = CFG.FeintMode or "Off"
 	local now = os.clock()
 	local gap = now - (Mark.feintTickAt or 0)
 	Mark.feintTickAt = now
+	if own then
+		Mark.ownSeenAt = now
+	end
 	local inst = mode ~= "Off" and Mark.chargeInst()
 	if not (inst and inst.IsCharging()) then
 		Mark.feintReset()
 		return
 	end
 	if gap > 0.25 then
-		Mark.feintReset() -- the tick did not run for a while (ball not ours): whatever is stored belongs to another charge
+		Mark.feintReset() -- the tick did not run for a while: whatever is stored belongs to another charge
+	end
+	if not Mark.feintEligible(own) then
+		return
 	end
 	if not Shoot.feintOn then
-		Shoot.feintOn = true
-		if mode == "Chance" then
-			Shoot.feintDo = math.random() < (CFG.FeintChance or 0.6)
-		else
-			if (Mark.feintN or 0) < (CFG.FeintCount or 1) then
-				Shoot.feintDo = true
-			else
-				Mark.feintN = 0
-				Shoot.feintDo = false
-			end
-		end
+		Mark.feintBegin(mode)
 	end
 	if not Shoot.feintDo or Shoot.feinted then
 		return
@@ -11920,11 +11958,17 @@ Mark.tackleGate = function(character, root, player, ch, solved)
 	local rel = flat(root.Position - P)
 	local along = u and rel:Dot(u) or 0
 	local holding = along > 0 and rel.Magnitude <= Mark.kickReach() + 1.5
-	-- The old gate waited for AutoBlock / AutoKick ("block" / "hold") for EVERY carrier farther than TackleGoalZone from our goal
-	-- - the tackle did nothing even when no kick could ever fire (log: tackle held right after our own kick). A tackle is held
-	-- only when the kick really is about to go: AutoKick on, off cooldown, not already charging, he is inside the kick reach
-	-- and not running away from us faster than a charging body can follow.
-	if CFG.TackleGateStrict ~= true then
+	-- Priority between the tackle and AutoBlock (CFG.TackleVsBlock):
+	--   "block"  - AutoBlock first: the tackle waits while the block is actually on him (it is moving us, or we already
+	--              stand in kick reach), for at most TackleHoldMax s, and never when the block cannot act (far, mate, sliding).
+	--   "smart"  - the tackle waits only when the AutoKick is about to fire (the v89 behaviour: almost always free).
+	--   "tackle" - never waits.
+	-- The pre-v89 gate waited for EVERY carrier whether or not the block / kick could act: the tackle did nothing.
+	local mode = CFG.TackleVsBlock or "block"
+	if mode == "tackle" then
+		return true, "free"
+	end
+	if mode == "smart" then
 		local d = rel.Magnitude
 		local kickLive = CFG.AutoKick ~= false and holding and not Mark.ak and now - (Mark.akAt or 0) >= (CFG.AutoKickCooldown or 0.5)
 		if kickLive then
@@ -11946,6 +11990,19 @@ Mark.tackleGate = function(character, root, player, ch, solved)
 	end
 	if not holding and flat(g.Position - P).Magnitude <= (CFG.TackleGoalZone or 40) then
 		return true, "goal"
+	end
+	if not (holding or Mark.move.mode == "block") then
+		return true, "free"
+	end
+	local who = key or ch
+	local h = Mark.tackleHold
+	if not h or h.who ~= who or now - h.last > 0.5 then
+		h = { who = who, since = now, last = now }
+		Mark.tackleHold = h
+	end
+	h.last = now
+	if now - h.since > (CFG.TackleHoldMax or 0.8) then
+		return true, "timeout"
 	end
 	return false, holding and "hold" or "block"
 end
@@ -15635,7 +15692,7 @@ Mark.moveSteer = function(dir, mode, replay)
 				local fd = unitOrNil(flat(dir))
 				if fd then
 					root.CFrame = CFrame.lookAt(root.Position, root.Position + fd)
-					TurnControl.LockAutoRotate("Dodge", fd)
+					TurnControl.LockAutoRotate("Dribble", fd)
 					Mark.dodgeLockOn = true
 				end
 				Mark.dodgeFaced = true
@@ -15686,7 +15743,7 @@ Mark.moveStop = function(only)
 		Mark.dodgeFaced = nil
 		Mark.dodgeDone = true
 		Mark.dodgeBoosted = nil
-		TurnControl.ReleaseAutoRotate("Dodge")
+		TurnControl.ReleaseAutoRotate("Dribble")
 		Mark.dodgeLockOn = nil
 		Mark.dodgeDirFixed = nil
 		TurnControl.SetTurnSpeedFactor(1)
@@ -15701,7 +15758,7 @@ end
 Mark.dodgeTend = function(root)
 	local m = Mark.move
 	if Mark.dodgeLockOn and (not m or m.mode ~= "dodge") then
-		TurnControl.ReleaseAutoRotate("Dodge")
+		TurnControl.ReleaseAutoRotate("Dribble")
 		TurnControl.SetTurnSpeedFactor(1)
 		Mark.dodgeLockOn = nil
 		Mark.dodgeFaced = nil
@@ -16044,7 +16101,7 @@ Mark.moveTick = function(character, root)
 	-- watchdog: a dodge replaced by another mode (moveSteer overwrites m.mode) never ran moveStop("dodge"), leaving
 	-- the facing lock on -> stuck facing, backpedal speed, no sprint
 	if Mark.dodgeLockOn and (not m or m.mode ~= "dodge") then
-		TurnControl.ReleaseAutoRotate("Dodge")
+		TurnControl.ReleaseAutoRotate("Dribble")
 		TurnControl.SetTurnSpeedFactor(1)
 		Mark.dodgeLockOn = nil
 		Mark.dodgeFaced = nil
@@ -17347,6 +17404,7 @@ return function(_Lib, _Core)
 					pcall(SlideTackle.SetSpeedMultiplier, x)
 				end,
 			})
+			pick(s, "Priority", "TackleVsBlock", { { "Block First", "block" }, { "Smart", "smart" }, { "Tackle First", "tackle" } }, "Block First: waits for AutoBlock while it is on him.")
 			tog(s, "Competitor Check", "TackleCompetitor", "Skips a carrier a teammate is already on.")
 			sld(s, "Competitor Radius", "TackleCompetitorRadius", 3, 25, { suffix = " st" })
 			head(s, "Charging Carrier")
@@ -17364,7 +17422,7 @@ return function(_Lib, _Core)
 			drop(s, "Sight Style", "SightStyle", { "reticle", "classic" })
 			advanced(s, "Tackle", function()
 				sld(s, "Goal Zone", "TackleGoalZone", 0, 80, { suffix = " st", text = "Inside it near our goal, never wait for AutoBlock." })
-				tog(s, "Strict Kick Wait", "TackleGateStrict", "Wait for AutoBlock even when its kick cannot fire.")
+				sld(s, "Max Block Wait", "TackleHoldMax", 0.2, 2, { prec = 1, suffix = " s", text = "Block First: longest the tackle waits for the block." })
 				sld(s, "Track Radius", "TrackStuds", 30, 160, { suffix = " st" })
 				sld(s, "Min Slide Power", "TackleMinSpeed", 0.3, 1.2, { prec = 2, suffix = "x" })
 				sld(s, "Charge Range", "ChargeTackleRange", 4, 20, { suffix = " st" })
