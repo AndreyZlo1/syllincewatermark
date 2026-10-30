@@ -3665,8 +3665,16 @@ local solveShotRaw
 -- (charge / release / G / flick) drop any running job and run synchronously: they need the exact current origin.
 Shoot.slice = function()
 	-- budget per frame; halved when the frame is already slow (Heartbeat dt > 12.5 ms = under 80 fps)
-	if Shoot.inJob and os.clock() - Shoot.sliceAt > (CFG.ShootSliceMs or 0.9) * (Shoot.sliceBoost or 1) * ((Mark.dt or 0) > 0.0125 and 0.5 or 1) / 1000 then
-		coroutine.yield()
+	if Shoot.inJob then
+		-- A full solve costs ~15-20 ms. The per-frame slice (halved under 80 fps) is fine at 100+ fps, but at 30 fps
+		-- 10 frames x 0.45 ms never add up: the job went stale at 0.35 s and restarted forever (tester log: "shoot solving"
+		-- all session, no "shoot start", AutoShoot dead). The budget now grows so the job lands in ~0.25 s at any fps.
+		local base = (CFG.ShootSliceMs or 0.9) * (Shoot.sliceBoost or 1) * ((Mark.dt or 0) > 0.0125 and 0.5 or 1)
+		local framesLeft = math.max(0.25 / math.max(Mark.dtAvg or 0.017, 0.004), 1)
+		local need = (Shoot.fullCost or 15) / framesLeft
+		if os.clock() - Shoot.sliceAt > math.clamp(math.max(base, need), base, 6) / 1000 then
+			coroutine.yield()
+		end
 	end
 end
 local function solveSliced(root, forced)
@@ -3684,8 +3692,13 @@ local function solveSliced(root, forced)
 	else
 		Shoot.jobForced = Shoot.jobForced and Shoot.job ~= nil
 	end
-	if Shoot.job and (os.clock() - Shoot.jobAt > 0.35 or (Shoot.jobArgs and Shoot.jobArgs ~= root)) then
+	if Shoot.job and (os.clock() - Shoot.jobAt > ((Mark.dtAvg or 0) > 0.025 and 0.6 or 0.35) or (Shoot.jobArgs and Shoot.jobArgs ~= root)) then
+		if os.clock() - (Shoot.staleLog or 0) > 3 then
+			Shoot.staleLog = os.clock()
+			logFile("shoot", "job stale", string.format("%.2f", os.clock() - Shoot.jobAt), "cost", string.format("%.1f", Shoot.jobMs or 0), "full", string.format("%.1f", Shoot.fullCost or 15))
+		end
 		Shoot.job = nil -- origin went stale before the job finished: start over from the current pose
+		Shoot.jobMs = 0
 	end
 	if not Shoot.job then
 		Shoot.job = coroutine.create(solveShotRaw)
@@ -3698,6 +3711,7 @@ local function solveSliced(root, forced)
 	Shoot.sliceBoost = boost
 	local ok, a, b, c, d = coroutine.resume(Shoot.job, Shoot.jobArgs, Shoot.jobForced == true)
 	Shoot.inJob = false
+	Shoot.jobMs = (Shoot.jobMs or 0) + (os.clock() - Shoot.sliceAt) * 1000
 	if not ok then
 		Shoot.job = nil
 		Shoot.jobForced = false
@@ -3705,6 +3719,8 @@ local function solveSliced(root, forced)
 		return nil, nil, nil, "err"
 	end
 	if coroutine.status(Shoot.job) == "dead" then
+		Shoot.fullCost = (Shoot.fullCost or 15) * 0.6 + math.clamp(Shoot.jobMs or 15, 2, 60) * 0.4
+		Shoot.jobMs = 0
 		Shoot.job = nil
 		Shoot.jobFrames = 0
 		Shoot.jobForced = false
@@ -6337,6 +6353,9 @@ if ChargedKick.HandleInputBegan then
 			local src0 = debug.info(2, "s")
 			local line0 = debug.info(2, "l")
 			logFile("kick input", "own", "type", typeof(input) == "Instance" and tostring(input.UserInputType) or typeof(input), "key", typeof(input) == "Instance" and tostring(input.KeyCode) or "-", "processed", tostring(processed), "caller", tostring(src0), tostring(line0))
+		end
+		if CFG.AutoShoot and not Shoot.aim and typeof(input) == "Instance" and Controls.IsInput("Kick", input) and liveOwnerId() == LocalPlayer.UserId then
+			logFile("shoot", "press without aim", tostring(Shoot.why), "job", tostring(Shoot.job ~= nil), "full", string.format("%.1f", Shoot.fullCost or 0), "dt", string.format("%.1f", (Mark.dtAvg or 0) * 1000))
 		end
 		if CFG.AutoShoot and Shoot.lob and Shoot.aim and not processed and Controls.IsInput("Kick", input) then
 			local passIn = Mark.passIn or require(Client.Gameplay.Actions.Pass)
@@ -11183,7 +11202,7 @@ end
 -- Never on FAKE / BOUNCE FAKE (shot name read from the solver); Smart Select: never once the enemy keeper has dived
 -- (his dive is on cooldown: the feint has nothing left to bait and only burns the chance).
 Mark.feintReset = function()
-	Shoot.feintOn, Shoot.feinted, Shoot.feintDo = false, false, nil
+	Shoot.feinted = false
 end
 
 -- A feint applies to the PLAYER's own Kick charge (real input object) while we own the ball or owned it a moment ago
@@ -11202,21 +11221,33 @@ Mark.feintEligible = function(own)
 	return own or now - (Mark.ownSeenAt or -100) < 1.0
 end
 
--- the once-per-charge decision
+-- The once-per-press decision. It is keyed by the press (Mark.realChargeAt is set by every real Kick press), NOT by
+-- per-charge flags: resetting those mid-charge (the tick skipped for a while, the charge flickering) made the same press
+-- decide again, the counter restarted and every press fired a feint (log: "feint Count ... n 1" on 5 presses in a row).
 Mark.feintBegin = function(mode)
-	Shoot.feintOn = true
+	local id = Mark.realChargeAt or 0
+	local fd = Mark.fd
+	if fd and fd.id == id then
+		return fd
+	end
+	local doIt
 	if mode == "Chance" then
-		Shoot.feintDo = math.random() < (CFG.FeintChance or 0.6)
+		doIt = math.random() < (CFG.FeintChance or 0.6)
 	elseif (Mark.feintN or 0) < (CFG.FeintCount or 1) then
-		Shoot.feintDo = true
+		doIt = true
 	else
 		Mark.feintN = 0
-		Shoot.feintDo = false
+		doIt = false
 	end
+	fd = { id = id, doIt = doIt, done = false }
+	Mark.fd = fd
+	logFile("feint decide", mode, doIt and "feint" or "real", "n", Mark.feintN or 0, "of", CFG.FeintCount or 1)
+	return fd
 end
 
 -- true = the charge was cancelled as a feint; false = no feint (the caller lets the shot go)
 Mark.feintNow = function(why)
+	local fd = Mark.fd
 	local nm = Shoot.shotName
 	local skip = nil
 	if (nm == "BOUNCE FAKE" and CFG.FeintSkipBounce ~= false) or ((nm == "FAKE" or nm == "FAKE CORNER") and CFG.FeintSkipFake ~= false) then
@@ -11225,12 +11256,20 @@ Mark.feintNow = function(why)
 		skip = "keeper dived"
 	end
 	if skip then
-		Shoot.feintDo = false
-		logFile("feint skip", skip, why)
+		if fd and not fd.skipLogged then
+			fd.skipLogged = true
+			logFile("feint skip", skip, why)
+		end
+		if fd then
+			fd.doIt = false
+		end
 		return false
 	end
 	local inst = Mark.chargeInst()
 	local held = inst and inst.GetHeldSeconds and inst.GetHeldSeconds() or 0
+	if fd then
+		fd.done = true
+	end
 	Shoot.feinted = true
 	Mark.feintN = (Mark.feintN or 0) + 1
 	ChargedKick.CancelCharge()
@@ -11243,16 +11282,17 @@ end
 -- decided yet (the charge was too short to be seen, or the ball was not ours until the very end).
 Mark.feintRelease = function()
 	local mode = CFG.FeintMode or "Off"
-	if mode == "Off" or Shoot.feinted then
+	if mode == "Off" then
 		return false
 	end
-	if not Shoot.feintOn then
+	local fd = Mark.fd
+	if not (fd and fd.id == (Mark.realChargeAt or 0)) then
 		if not Mark.feintEligible(Mark.weOwn()) then
 			return false
 		end
-		Mark.feintBegin(mode)
+		fd = Mark.feintBegin(mode)
 	end
-	if not Shoot.feintDo then
+	if fd.done or not fd.doIt then
 		return false
 	end
 	return Mark.feintNow("release")
@@ -11261,27 +11301,19 @@ end
 -- every logic step, whether or not we own the ball right now
 Mark.feintTick = function(own)
 	local mode = CFG.FeintMode or "Off"
-	local now = os.clock()
-	local gap = now - (Mark.feintTickAt or 0)
-	Mark.feintTickAt = now
 	if own then
-		Mark.ownSeenAt = now
+		Mark.ownSeenAt = os.clock()
 	end
 	local inst = mode ~= "Off" and Mark.chargeInst()
 	if not (inst and inst.IsCharging()) then
-		Mark.feintReset()
+		Shoot.feinted = false
 		return
-	end
-	if gap > 0.25 then
-		Mark.feintReset() -- the tick did not run for a while: whatever is stored belongs to another charge
 	end
 	if not Mark.feintEligible(own) then
 		return
 	end
-	if not Shoot.feintOn then
-		Mark.feintBegin(mode)
-	end
-	if not Shoot.feintDo or Shoot.feinted then
+	local fd = Mark.feintBegin(mode)
+	if fd.done or not fd.doIt then
 		return
 	end
 	local held = inst.GetHeldSeconds()
