@@ -118,6 +118,7 @@ local CFG = {
 	BlockBehind = 22,
 	TackleGoalZone = 40,
 	CompetitorRadius = 12,
+	CompetitorGoalZone = 45, -- AutoBlock / AutoBall: ball and we both this close to OUR goal -> Competitor Check is ignored (0 = always apply)
 	CounterJump = true,
 	ShootMaxDist = 160,
 	Perf = true,
@@ -255,6 +256,7 @@ local CFG = {
 	ManualTackle = true, -- redirect the player's own Tackle press onto the solved hit (works with AutoTackle off)
 	HammerRadius = 9, -- estimate: slam radius is server-side; 'skill hammer slam ... dist' logs calibrate it
 	OilRadius = 4, -- fallback when the Puddle template gives no part size (server zone not in the client dump)
+	ShootQuick = true, -- AutoShoot: solve candidates one by one in weighted order and stop at the first open shot (weak devices); false = the old full enumeration
 	ShootSliceMs = 0.9,
 	SilentAim = true,
 	SilentFov = 140, -- px radius around the gun reticle
@@ -3704,6 +3706,99 @@ local solveShotRaw
 -- frame hitch 8 times a second. Preview solves now run as a coroutine that yields inside packShot once the frame
 -- slice (CFG.ShootSliceMs) is spent and resumes next frame; the old aim stays on screen meanwhile. Forced solves
 -- (charge / release / G / flick) drop any running job and run synchronously: they need the exact current origin.
+-- QUICK SOLVE. The full solve builds EVERY candidate (15-20 aimAndPack calls, 3-5 flight sims each, then validation and keeper
+-- reach for all of them) and only then picks one by a weighted roll. On a weak device (10x the CPU time of a PC: 150-300 ms of
+-- work) that is seconds before the first aim. The roll decides almost everything, so the roll goes FIRST: the enumeration runs
+-- once in COLLECT mode (aimAndPack only records { h, side, curve, band } - zero simulations), the specs are put in a weighted
+-- random order (Efraimidis-Spirakis keys, seeded by Shoot.roll so the same spot gives the same order), and they are solved one
+-- by one until the first OPEN shot (the keeper cannot reach it in time). Weighted order + first feasible = weighted pick among
+-- the feasible ones, the same distribution as the old pick, for 1-3 candidates instead of all.
+Mark.quickPrior = function(sp, c)
+	local band = sp.band or ""
+	local w = c.typeW[band] or 0.6
+	local sw = CFG.ShotWeight and CFG.ShotWeight[(band == "mid" and "high") or band]
+	if type(sw) == "number" then
+		w *= sw
+	end
+	local s = sp.side
+	local ap = c.approach
+	if math.abs(ap) > 6 then
+		local tight = math.clamp((math.abs(ap) - 6) / 10, 0, 1)
+		w *= (s * ap > 0) and (1 - 0.75 * tight) or (1 + 0.8 * tight)
+	end
+	if math.abs(c.keeper) > 1.5 then
+		w *= (s * c.keeper > 0) and 0.45 or 1.4
+	end
+	if s * c.openSign > 1.5 then
+		w *= 1.6
+	elseif s * c.openSign < -1.5 then
+		w *= 0.7
+	end
+	if sp.curve then
+		if math.abs(s) >= 2 then
+			local onRight = s * c.rightDot >= 0
+			if (onRight and sp.curve > 0) or (not onRight and sp.curve < 0) then
+				return 0.001 -- the curl would bend away from the aim side (the old weigh() veto)
+			end
+		end
+		w *= 4 + c.farW * 4
+	elseif c.haveCurves and band ~= "flat" then
+		w *= 0.08
+	end
+	local hist = Mark.shotHist
+	if hist then
+		local ps = s >= 0 and 1 or -1
+		for hi = 1, #hist do
+			local hh = hist[hi]
+			if hi > #hist - 3 and hh.band == sp.band then
+				w *= 0.55
+				if hh.side == ps then
+					w *= 0.8
+				end
+			end
+		end
+	end
+	if sp.tier == 2 then
+		w *= 0.12 -- the old "only when the pool is empty" families
+	end
+	return w
+end
+
+Mark.quickShot = function(c)
+	local items = {}
+	for i = 1, #c.specs do
+		local sp = c.specs[i]
+		local u = math.clamp((c.roll * (11.17 + i * 7.31) + i * 0.6180339) % 1, 1e-3, 1 - 1e-3)
+		items[i] = { sp = sp, key = u ^ (1 / math.max(Mark.quickPrior(sp, c), 1e-3)) }
+	end
+	table.sort(items, function(a, b)
+		return a.key > b.key
+	end)
+	local slow = (Mark.dtAvg or 0) > 0.028
+	local maxTry, simMax = slow and 4 or 6, slow and 10 or 16
+	local tried, openN = 0, 0
+	Shoot.sims = 0
+	for k = 1, #items do
+		if tried >= maxTry or (Shoot.sims or 0) >= simMax then
+			break
+		end
+		local sp = items[k].sp
+		local n0 = #c.pool
+		c.aimAndPack(sp.h, sp.side, sp.curve, sp.band, sp.fromBall)
+		tried += 1
+		for j = n0 + 1, #c.pool do
+			local p = c.pool[j]
+			if c.reachMargin(p) >= CFG.ShotReachMargin and c.weigh(p) > 0 then
+				openN += 1
+			end
+		end
+		if openN >= 1 then
+			break
+		end
+	end
+	return tried, openN
+end
+
 Shoot.slice = function()
 	-- budget per frame; halved when the frame is already slow (Heartbeat dt > 12.5 ms = under 80 fps)
 	if Shoot.inJob then
@@ -3742,6 +3837,7 @@ local function solveSliced(root, forced)
 		Shoot.jobMs = 0
 	end
 	if not Shoot.job then
+		Shoot.fullPass, Shoot.collect = nil, nil
 		Shoot.job = coroutine.create(solveShotRaw)
 		Shoot.jobArgs = root
 		Shoot.jobAt = os.clock()
@@ -3787,8 +3883,8 @@ local function solveShot(root, forced, ...)
 	end
 	if os.clock() - (Shoot.costLog or 0) > 3 and (Shoot.costN or 0) > 0 then
 		Shoot.costLog = os.clock()
-		logFile("shoot cost", string.format("n %d avg %.1fms max %.1fms memo %d warm %d full %.1f", Shoot.costN, Shoot.costSum / Shoot.costN, Shoot.costMax, Shoot.memoHit or 0, Shoot.warmHit or 0, Shoot.fullCost or 0))
-		Shoot.costN, Shoot.costSum, Shoot.costMax, Shoot.memoHit, Shoot.warmHit = 0, 0, 0, 0, 0
+		logFile("shoot cost", string.format("n %d avg %.1fms max %.1fms memo %d warm %d full %.1f quick %d", Shoot.costN, Shoot.costSum / Shoot.costN, Shoot.costMax, Shoot.memoHit or 0, Shoot.warmHit or 0, Shoot.fullCost or 0, Shoot.quickN or 0))
+		Shoot.costN, Shoot.costSum, Shoot.costMax, Shoot.memoHit, Shoot.warmHit, Shoot.quickN = 0, 0, 0, 0, 0, 0
 	end
 	return a, b, c, d
 end
@@ -3850,11 +3946,11 @@ solveShotRaw = function(root, forced)
 	local wantBand = "high"
 	Shoot.wantBand = wantBand
 	local moved = Shoot.solveAt and (origin - Shoot.solveAt).Magnitude or 99
-	if not forced and Shoot.aim and Shoot.preview and moved < 0.2 and math.abs((Shoot.solveKeeper or 0) - keeper) < 2 then
+	if not forced and not Shoot.fullPass and Shoot.aim and Shoot.preview and moved < 0.2 and math.abs((Shoot.solveKeeper or 0) - keeper) < 2 then
 		return Shoot.aim, Shoot.kickDir, Shoot.curve, nil
 	end
 	local slowF = (Mark.dtAvg or 0) > 0.025
-	if not forced and Shoot.aim and Shoot.preview and moved < (slowF and 2.5 or 1.2) and os.clock() - (Shoot.solveT or 0) < (slowF and 0.3 or 0.12) then
+	if not forced and not Shoot.fullPass and Shoot.aim and Shoot.preview and moved < (slowF and 2.5 or 1.2) and os.clock() - (Shoot.solveT or 0) < (slowF and 0.3 or 0.12) then
 		return Shoot.aim, Shoot.kickDir, Shoot.curve, nil
 	end
 	-- Throttle. A failed solve left Shoot.aim nil, which bypassed both caches above: with a moving player keeper
@@ -3864,7 +3960,7 @@ solveShotRaw = function(root, forced)
 		local nowS = os.clock()
 		local oneShot = Mark.forceBike or Mark.aerialContact
 		local gapS = forced and 0.08 or (Shoot.aim and 0.2 or 0.3)
-		if not oneShot and nowS - (Shoot.lastSolveAt or 0) < gapS then
+		if not oneShot and not Shoot.fullPass and nowS - (Shoot.lastSolveAt or 0) < gapS then
 			if Shoot.aim then
 				return Shoot.aim, Shoot.kickDir, Shoot.curve, nil
 			end
@@ -4334,6 +4430,12 @@ solveShotRaw = function(root, forced)
 	end
 	local aimAndPackRaw
 	local function aimAndPack(h, side, curve, band, fromBall)
+		if Shoot.collect then
+			-- collect pass of the quick solve: record the spec, simulate nothing (see Mark.quickShot)
+			local sc = Shoot.collect
+			sc[#sc + 1] = { h = h, side = side, curve = curve, band = band, fromBall = fromBall, tier = Shoot.collectTier or 1 }
+			return false
+		end
 		-- slow frame rate (< ~36 fps / < ~50 fps): a smaller total sim budget and an early stop once the pool is big
 		-- enough to pick from; a late, complete answer beats the perfect one that never arrives (tester: AutoShoot dead at 30 fps)
 		local dtA = Mark.dtAvg or 0
@@ -4576,6 +4678,15 @@ solveShotRaw = function(root, forced)
 		local far = dist >= 80
 		Shoot.sims = 0
 		Shoot.simCap = 8
+		-- quick solve (see Mark.quickShot): collect the specs first. A full pass (after a quick miss, or when the last quick result
+		-- was not an open shot) enumerates and simulates everything, exactly as before.
+		Shoot.collect = nil
+		if Shoot.fullPass then
+			Shoot.fullPass = nil
+		elseif CFG.ShootQuick ~= false and not Shoot.wantFull and not air and not Mark.flickStrike and not Mark.forceBike then
+			Shoot.collect, Shoot.collectTier = {}, nil
+		end
+		Shoot.wantFull = nil
 		local roll = Shoot.roll or 0
 		local sign = roll > 0.72 and -openSign or openSign
 		if air then
@@ -4634,6 +4745,7 @@ solveShotRaw = function(root, forced)
 				aimAndPack(dipH, -sign * dipS, 0.85 * curveFor(-sign * post), "trickLow", false)
 			end
 			if #pool == 0 and (Shoot.sims or 0) < 5 then
+				Shoot.collectTier = 2
 				local alt = (band == "trickLow" or band == "corner") and "high" or "trickLow"
 				aimAndPack(alt == "trickLow" and dipH or topH, -sign * (alt == "trickLow" and dipS or post * 0.92), amounts and (0.85 * curveFor(-sign * post)) or nil, alt, false)
 			end
@@ -4683,6 +4795,7 @@ solveShotRaw = function(root, forced)
 				end
 			end
 			if #pool == 0 then
+					Shoot.collectTier = 2
 					if not amounts then -- the trickLow pass above only ran with amounts
 						for s = 1, #sides do
 							local sign = sides[s] >= 0 and 1 or -1
@@ -4709,6 +4822,7 @@ solveShotRaw = function(root, forced)
 				end
 			end
 		end
+		Shoot.collectTier = nil
 		if Mark.flickAim or Mark.aerial or Mark.forceBike then
 			local fwd = unitOrNil(flat(bottom - start))
 			-- floor-bounce shots get their own sims (they were starved by the shared cap)
@@ -4759,7 +4873,7 @@ solveShotRaw = function(root, forced)
 				end
 			end
 		end
-		if not air and dist <= 50 and #pool == 0 then
+		if not air and dist <= 50 and #pool == 0 and not Shoot.collect then
 		Mark.passMod = Mark.passMod or require(Modules.Actions.Pass)
 		local lobTimes = { 0.22 }
 		local lobSide = openSign * post
@@ -4996,6 +5110,35 @@ solveShotRaw = function(root, forced)
 				w = w * 0.15
 			end
 			return math.max(w, 0.05)
+		end
+		if Shoot.collect then
+			local specs = Shoot.collect
+			Shoot.collect = nil
+			local tried, openN = Mark.quickShot({
+				specs = specs, pool = pool, aimAndPack = aimAndPack, reachMargin = reachMargin, weigh = weigh, roll = Shoot.roll or 0,
+				approach = approach, keeper = keeper, openSign = openSign, rightDot = rightDot, farW = farW, haveCurves = amounts ~= nil,
+				typeW = { high = 1, airHigh = 1, dipCorner = 0.6, trickLow = 0.45, trick = 0.8, bounceHigh = 0.9, bounceLow = 0.9, corner = 0.65, airLow = 0.8 },
+			})
+			Shoot.quickN = (Shoot.quickN or 0) + 1
+			if os.clock() - (Shoot.quickLog or 0) > 2 then
+				Shoot.quickLog = os.clock()
+				logFile("shoot quick", "specs", #specs, "tried", tried, "open", openN, "pool", #pool, "sims", Shoot.sims or 0, "ms", string.format("%.1f", (os.clock() - (Shoot.solveStart or os.clock())) * 1000))
+			end
+			if #pool == 0 then
+				-- nothing valid among the first few: the full pass (every family, the chip lob, all the old fallbacks)
+				logFile("shoot quick", "miss", "specs", #specs, "tried", tried, "sims", Shoot.sims or 0)
+				Shoot.fullPass = true
+				Shoot.lastSolveAt = 0
+				return solveShotRaw(root, forced)
+			end
+			Shoot.wantFull = openN == 0 -- valid but not open: the next solve looks at everything
+			hasCurve = false
+			for i = 1, #pool do
+				if pool[i].curve then
+					hasCurve = true
+					break
+				end
+			end
 		end
 		pool = Mark.shotFilter(pool)
 		local weights = {}
@@ -10163,6 +10306,14 @@ Mark.blockSkip = function(why, extra)
 	Mark.blockSkipWhy, Mark.blockSkipAt = why, os.clock()
 	logFile("block skip", why, extra or "")
 end
+-- Competitor Check does not apply at our own goal: with the ball (carrier) AND us both within CompetitorGoalZone of it, a
+-- teammate being nearer is no reason to stand aside - the next miss is a goal.
+Mark.atHomeGoal = function(root, ballPos)
+	local g = Mark.defendGoal()
+	local z = CFG.CompetitorGoalZone or 45
+	return z > 0 and g ~= nil and flat(ballPos - g.Position).Magnitude <= z and flat(root.Position - g.Position).Magnitude <= z
+end
+
 Mark.tickBlock = function(character, root)
 	Mark.blockCharge(root)
 	Mark.tickCounterJump(character, root)
@@ -10293,7 +10444,7 @@ Mark.tickBlock = function(character, root)
 	end
 	for _, model in Actors.GetAllCharacterModels() do
 		local actor = Actors.GetFromCharacter(model)
-		if CFG.BlockCompetitor ~= false and actor and actor ~= LocalPlayer and sameTeam(actor) and not isGoalkeeper(actor) and not Mark.mateDown(actor, model) then
+		if CFG.BlockCompetitor ~= false and not Mark.atHomeGoal(root, P) and actor and actor ~= LocalPlayer and sameTeam(actor) and not isGoalkeeper(actor) and not Mark.mateDown(actor, model) then
 			local ar = ActorTargeting.GetActorRoot(actor)
 			if ar then
 				-- CompetitorCheck: a teammate (keeper excluded above) already within CompetitorRadius of the carrier owns
@@ -13883,10 +14034,11 @@ Mark.tickBall = function(character, root)
 	end
 	local gap = flat(aimP - root.Position).Magnitude
 	local beaten = false
+	local homeDef = Mark.atHomeGoal(root, pos)
 	local ourNeed = math.max(0, gap - receiveHalf)
 	for _, model in Actors.GetAllCharacterModels() do
 		local actor = Actors.GetFromCharacter(model)
-		if CFG.BallCompetitor ~= false and actor and actor ~= LocalPlayer and sameTeam(actor) and not isGoalkeeper(actor) and not Mark.mateDown(actor, model) then
+		if CFG.BallCompetitor ~= false and not homeDef and actor and actor ~= LocalPlayer and sameTeam(actor) and not isGoalkeeper(actor) and not Mark.mateDown(actor, model) then
 			local ar = ActorTargeting.GetActorRoot(actor)
 			if ar then
 				-- CompetitorCheck (ball): yield only when a teammate is NOTICEABLY closer (e.g. 6 vs our 20 studs):
@@ -13934,7 +14086,7 @@ Mark.tickBall = function(character, root)
 	-- competitor test sits on a threshold. Once we yielded, stay yielded for 0.6 s.
 	if beaten then
 		Mark.ballYieldUntil = os.clock() + 0.6
-	elseif Mark.ballYieldUntil and os.clock() < Mark.ballYieldUntil and not keeperFirst then
+	elseif Mark.ballYieldUntil and os.clock() < Mark.ballYieldUntil and not keeperFirst and not homeDef then
 		beaten = true
 	end
 	do
@@ -17580,6 +17732,7 @@ return function(_Lib, _Core)
 			local s = card(tab, "Left")
 			head(s, "AutoShoot")
 			feature(s, "AutoShoot", "AutoShoot")
+			tog(s, "Quick Solve", "ShootQuick", "Finds a shot in a few candidates instead of all. For weak PCs and phones. Off = full search.")
 			sld(s, "Max Distance", "ShootMaxDist", 20, 160, { suffix = " st" })
 			sld(s, "Keeper Margin", "ShotReachMargin", -0.2, 0.5, { prec = 2, suffix = " s", text = "How late the keeper must be for a shot to count." })
 
@@ -17775,6 +17928,7 @@ return function(_Lib, _Core)
 			sld(b, "Range", "BlockRange", 15, 80, { suffix = " st" })
 			tog(b, "Competitor Check", "BlockCompetitor", "Stops when a teammate is already on the carrier.")
 			sld(b, "Competitor Radius", "CompetitorRadius", 4, 30, { suffix = " st" })
+			sld(b, "Ignore Near Our Goal", "CompetitorGoalZone", 0, 90, { suffix = " st", text = "No Competitor Check (Block and Ball) when the ball and you are this close to our goal. 0 = off." })
 			head(b, "High Shots")
 			tog(b, "Pre-Release Jump", "BlockPreJump", "Jumps before the release, timed to his charge.")
 			tog(b, "Slide Block", "BlockSlide")
