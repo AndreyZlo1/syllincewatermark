@@ -10,7 +10,7 @@ local _C = {}
 local _D = {}
 
 local Config = {
-	Version       = "A46",
+	Version       = "A49",
 	Enabled       = false,
 	Mode          = "Perfect",
 	SpecConsumeWindow = 0.45, -- A46: баф скорости (Jin ElectricWind/Zanshin) снимается на старте удара; помним снятое значение столько секунд
@@ -23,7 +23,7 @@ local Config = {
 	PressPadM1    = 3.3,   -- A42: запас над (вынос + полуразмер бокса): A36/A37 M1 = 0 потерь из 60 попаданий на пороге ~9 ст.
 	PressPadM2    = 4.3,   -- M2 несут рывок: попадания до 8.0 ст. (13 шт.), запас шире
 	MergeAfterContact = 0.20,
-	PbAim         = 0.103,
+	PbAim         = 0.072, -- A49: было 0.103. 192 исхода A46: медиана pbOn 118мс при окне ~[0,155] (центр ~77); цель медианы ~85
 	PbLatAim      = true,
 	ReachCloseCap = 8,
 	IncludeNPCs   = true,
@@ -281,6 +281,7 @@ local Config = {
 	AP_MaxPerSec      = 8,
 	AP_MinSendGap     = 0.08,
 	AP_PunishFastGap  = 0.08,
+	AP_PunishHoldLive = 1,    -- A49: не бить в punish, пока в окне 1.2с есть живая угроза от другого атакующего (было 2)
 	AP_M2Stun         = 1.0,
 	AP_M1Stun         = 0.5,
 	AP_FaceHold       = 0.35,
@@ -2986,7 +2987,10 @@ _C.applyGrabSwingSpeed = function(info, track, hitTL)
 	if not info or info.t ~= "M2" or type(hitTL) ~= "number" then return hitTL end
 	local cfg = GameData.cfg
 	if not (cfg and cfg.GetStyleNumber) then return hitTL end
-	local gsp = cfg.GetStyleNumber(info.s, "M2GrabSwingAnimSpeed", 1)
+	-- A47: логи A46 (Wrestling M2, 5 свингов): ATTR-edge +449 при таблице 342 (/0.75 = 456), +366/384/399 при 292 (/0.75 = 389);
+	-- StyleCritWindup шлёт mult*0.75. Сервер делит контакт на M2GrabSwingAnimSpeed. Раньше стояло raw info.s (BoxingAnims-проблема)
+	-- и функция возвращала hitTL без изменений.
+	local gsp = cfg.GetStyleNumber(info.cfgKey or styleKey(info.s), "M2GrabSwingAnimSpeed", 1)
 	if type(gsp) ~= "number" or gsp <= 0.05 or gsp >= 0.97 then return hitTL end
 	local live = 1
 	if track then
@@ -2994,7 +2998,7 @@ _C.applyGrabSwingSpeed = function(info, track, hitTL)
 		if type(sp) == "number" and sp > 0.05 then live = sp end
 	end
 	if math.abs(live - 1) >= 0.08 then return hitTL end
-	return hitTL
+	return hitTL / gsp
 end
 styleForward = function(style, kind)
 	LPH_ATTRIBUTES(VM(NONE))
@@ -5234,7 +5238,7 @@ function State.ap.step(now)
 			end
 		end
 	end
-	if liveN >= 2 then
+	if liveN >= (Config.AP_PunishHoldLive or 1) then -- A49: был 2; наш punish-удар даёт CantAnything и режет пресс по второму атакующему
 		if Config.DeepDiag and (now - (ap.multiHoldLog or 0)) > 0.40 then
 			ap.multiHoldLog = now
 			diagPush("AUTOPLAY-HOLD t=%.2f attackers=%d no new swing", now, liveN)
@@ -6231,6 +6235,7 @@ local onAttack = function(attackerHRP, info, model, id, track, origin, hbPart)
 				info.contacts[1]*1000, info.contacts[2]*1000, speed)
 	end
 	while #q > 10 do table.remove(q, 1) end
+	_C.consumeWindup(th, name, nowClock)
 
 	if State.status ~= "PARRY" then State.status = "THREAT" end
 	State.parryCount = State.parryCount + 1
@@ -6337,15 +6342,24 @@ _C.pressGeom = function(wb, now)
 	local lk = ah2.CFrame.LookVector
 	local f2m = dd > 0.05 and (lk.X * dx + lk.Z * dz) / dd or 1
 	local av, mv = ah2.AssemblyLinearVelocity, mh.AssemblyLinearVelocity
-	diagTrace("PRESS-GEOM t=%.3f %s %s s%d dist=%.1f face=%.2f close=%.1f aSpeed=%.1f mySpeed=%.1f toContact=%+.0fms rec=%s box=%s", now,
+	diagTrace("PRESS-GEOM t=%.3f %s %s s%d dist=%.1f face=%.2f close=%.1f aSpeed=%.1f mySpeed=%.1f toContact=%+.0fms rec=%s box=%s self=%s", now,
 		wb.name or "?", wb.kind or "?", wb.strike or 1, dd, f2m, wb.closeVel or 0,
 		math.sqrt(av.X * av.X + av.Z * av.Z), math.sqrt(mv.X * mv.X + mv.Z * mv.Z), ((wb.contactAbs or now) - now) * 1000,
-		tostring(wb.recognitionSource), tostring(wb.geomSizeSrc))
+		tostring(wb.recognitionSource), tostring(wb.geomSizeSrc),
+		(function()
+			local c = localChar()
+			if not c then return "nochar" end
+			local f = {}
+			for _, a in ipairs({ "CombatAttacking", "M1", "M2", "M1Cooldown", "BlockCooldown", "Stunned", "CantAnything", "Parried", "ParryBuffered" }) do
+				if c:GetAttribute(a) then f[#f + 1] = a end
+			end
+			return #f > 0 and table.concat(f, "+") or "-"
+		end)())
 end
 _C.pbBind = function(char)
 	if not char or V93.pbChar == char then return end
 	V93.pbChar = char
-	for _, a in ipairs({ "PerfectBlocking", "Blocking" }) do
+	for _, a in ipairs({ "PerfectBlocking", "Blocking", "CombatAttacking", "M1", "M2", "M1Cooldown", "BlockCooldown", "Stunned", "CantAnything", "ParryBuffered" }) do
 		char:GetAttributeChangedSignal(a):Connect(function()
 			local now = os.clock()
 			if a == "PerfectBlocking" then
@@ -6357,7 +6371,7 @@ _C.pbBind = function(char)
 						local r = V93.pbLatRing
 						if not r then r = {}; V93.pbLatRing = r end
 						r[#r + 1] = now - lp
-						if #r > 5 then table.remove(r, 1) end
+						if #r > 7 then table.remove(r, 1) end -- A49: 7 вместо 5, PB-флаг квантован кадром 16.6мс, медиана из 5 прыгала 114<->131
 						local c = table.clone(r)
 						table.sort(c)
 						V93.pbLat, V93.pbLatN = c[(#c + 1) // 2], #r
@@ -8768,34 +8782,76 @@ end)
 -- A46: игра шлёт StyleCritWindup(attacker, mult) на старте крит-свинга; клиент игры считает контакт как
 -- (M2HitboxDelay[cfgKey] + HitboxWindupExtra) / mult (CritCinematicFx.contactTime). Это серверный мульт именно этого удара.
 _C.evSeen = {}
-_C.onCritWindup = function(ev, attackerName, arg)
-	if type(attackerName) ~= "string" then return end
-	local now = os.clock()
-	local th
-	for i = #Threats, 1, -1 do
-		local t = Threats[i]
-		if t.name == attackerName and t.kind == "M2" and not t.resolved and (now - (t.detectClock or now)) < 0.5 then th = t; break end
-	end
-	diagPush("CRIT-EVT t=%.3f %s %s arg=%s threat=%s sinceDetect=%s aMult=%s", now, ev, attackerName, tostring(arg), th and "yes" or "no",
-		th and string.format("%+.0fms", (now - th.detectClock) * 1000) or "-", th and string.format("%.3f", th.attackMult or 0) or "-")
-	if ev ~= "StyleCritWindup" or Config.CritWindupRetime == false then return end
-	if not th or th.windupMult or th.contacts then return end
-	local m = arg
-	if type(m) ~= "number" or m ~= m or m < 0.4 or m > 3 then return end
-	local old = th.attackMult or 1
-	if math.abs(m / old - 1) < 0.04 then return end
+_C.WindupPending = {}
+-- A47: StyleCritWindup(attacker, mult) приходит в пределах +-4мс от детекта анимации (логи A46: Jin 0.9138 / 1.2336 = x1.35 ElectricWind,
+-- 1.02 / 1.377; Wrestling 0.7558 = mult*0.75; Giovanna 0.9538 = aMult). SpecAttackSpeedMultiplier при этом не менялся (spec=nil, SPEC-ATTR=0):
+-- бафа в атрибутах клиента нет, единственный источник — это событие. Оно бывает раньше создания угрозы -> буфер WindupPending.
+_C.retimeStrike = function(th, m, now)
 	local prevTL = th.hitTL
-	local newTL = hitTimeline({ t = "M2", s = th.style, cfgKey = th.cfgKey, mom = th.mom, id = th.id, variant = th.variant,
-		name = th.animName, sprint = th.sprintLocked }, th.combo, m)
-	if type(newTL) ~= "number" or newTL < 0.15 or newTL > 2.5 then return end
+	local cfg = GameData.cfg
+	local key = th.cfgKey or th.style
+	local newTL
+	if (th.group and th.group.second ~= nil) or th.strike == 2 then
+		local d = cfg and cfg.GetStyleM2MultiHitDelays and cfg.GetStyleM2MultiHitDelays(key)
+		local di = type(d) == "table" and d[th.strike or 1] or nil
+		if type(di) == "number" then
+			local mc = m
+			if cfg.CapStyleM2HeightSpeed then
+				local ok, v = pcall(cfg.CapStyleM2HeightSpeed, key, m)
+				if ok and type(v) == "number" and v > 0.05 then mc = v end
+			end
+			newTL = cfg.GetScaledHitboxDelay and cfg.GetScaledHitboxDelay(di, mc) or ((di + 0.012) / mc)
+		end
+	end
+	if not newTL then
+		newTL = hitTimeline({ t = "M2", s = th.style, cfgKey = th.cfgKey, mom = th.mom, id = th.id, variant = th.variant,
+			name = th.animName, sprint = th.sprintLocked }, th.combo, m)
+	end
+	if type(newTL) ~= "number" or newTL < 0.15 or newTL > 2.5 then return false end
+	local old = th.attackMult or 1
 	th.windupMult = m
 	th.attackMult = m
 	th.hitTL, th.hitTLReal = newTL, newTL
 	th.contact0 = math.max(0, (th.contact0 or 0) + animToWall(newTL - (prevTL or newTL), th.track, m, newTL))
 	th.contactAbs = th.detectClock + th.contact0
-	th.pressed = nil
-	diagPush("CRIT-RETIME t=%.3f %s M2 mult %.3f→%.3f hitTL %.0f→%.0fms contactIn=%+.0fms", now, attackerName, old, m,
+	if th.rec then th.rec.hitTL = newTL; th.rec.contact = th.contact0 end
+	if math.abs(newTL - (prevTL or newTL)) > 0.025 then th.pressed = nil end
+	diagPush("CRIT-RETIME t=%.3f %s M2 s%d mult %.3f→%.3f hitTL %.0f→%.0fms contactIn=%+.0fms", now, tostring(th.name), th.strike or 1, old, m,
 		(prevTL or 0) * 1000, newTL * 1000, (th.contactAbs - now) * 1000)
+	return true
+end
+_C.onCritWindup = function(ev, attackerName, arg)
+	if type(attackerName) ~= "string" then return end
+	local now = os.clock()
+	local okArg = type(arg) == "number" and arg == arg and arg >= 0.4 and arg <= 3
+	local seen, applied = false, 0
+	for i = #Threats, 1, -1 do
+		local t = Threats[i]
+		if t.name == attackerName and t.kind == "M2" and not t.resolved and (now - (t.detectClock or now)) < 0.5 then
+			seen = true
+			if ev == "StyleCritWindup" and okArg and Config.CritWindupRetime ~= false and not t.windupMult then
+				local multi = (t.group and t.group.second ~= nil) or t.strike == 2
+				if multi or math.abs(arg / (t.attackMult or 1) - 1) >= 0.04 then
+					if _C.retimeStrike(t, arg, now) then applied = applied + 1 end
+				end
+			end
+		end
+	end
+	if ev == "StyleCritWindup" and okArg then
+		_C.WindupPending[attackerName] = (not seen) and { m = arg, t = now } or nil
+	end
+	diagPush("CRIT-EVT t=%.3f %s %s arg=%s threat=%s applied=%d", now, ev, attackerName, tostring(arg), seen and "yes" or "no", applied)
+end
+_C.consumeWindup = function(th, name, now)
+	local p = _C.WindupPending[name]
+	if not p or th.kind ~= "M2" then return end
+	_C.WindupPending[name] = nil
+	if now - p.t > 0.30 or Config.CritWindupRetime == false then return end
+	local second = th.group and th.group.second
+	if second or math.abs(p.m / (th.attackMult or 1) - 1) >= 0.04 then
+		_C.retimeStrike(th, p.m, now)
+		if second then _C.retimeStrike(second, p.m, now) end
+	end
 end
 
 task.spawn(function()
