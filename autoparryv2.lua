@@ -10,9 +10,11 @@ local _C = {}
 local _D = {}
 
 local Config = {
-	Version       = "A44",
+	Version       = "A46",
 	Enabled       = false,
 	Mode          = "Perfect",
+	SpecConsumeWindow = 0.45, -- A46: баф скорости (Jin ElectricWind/Zanshin) снимается на старте удара; помним снятое значение столько секунд
+	CritWindupRetime  = true, -- A46: StyleCritWindup(attacker, mult) — серверный мульт этого свинга
 
 	Range         = 18,
 	M2Range       = 14,
@@ -675,7 +677,7 @@ local V93 = {
 	pingCacheVal   = 0.08,
 	pingMedTmp = {},
 	hbFolder = nil,
-	sizes = {},
+	sizeByOwner = {},
 	hbParams = nil,
 	hbChar = nil,
 	hbFrame = -1,
@@ -1360,7 +1362,7 @@ local hitboxIndex = function()
 				local sid = sidNow
 				if typeof(sid) == "string" and sid ~= "" then
 					liveSid[sid] = true
-					if aType == "M1" or aType == "M2" then V93.sizes[aType] = child.Size end
+					if aType == "M1" or aType == "M2" then _C.noteHitboxSize(ownerNm, aType, child) end
 					local nm  = ownerNm
 					local lst = byOwner[nm]
 					if not lst then lst = {}; byOwner[nm] = lst end
@@ -1568,6 +1570,22 @@ local realHitboxHitsMe = function(ownerName, th)
 	end
 	if V93.hbChar ~= char then params.FilterDescendantsInstances = { char }; V93.hbChar = char end
 
+	if Config.TraceDiag and not th.hbGeomLogged then
+		th.hbGeomLogged = true
+		local aH = th.attackerHRP
+		if aH and aH.Parent then
+			local lk = aH.CFrame.LookVector
+			local rel = part.Position - aH.Position
+			local fwdR = rel.X * lk.X + rel.Z * lk.Z
+			local latR = rel.X * (-lk.Z) + rel.Z * lk.X
+			local pl = part.CFrame.LookVector
+			local yawD = math.deg(math.acos(math.clamp(pl.X * lk.X + pl.Z * lk.Z, -1, 1)))
+			local ps = part.Size
+			diagTrace("TRACE-HBGEOM t=%.3f %s %s s%d style=%s size=(%.2f,%.2f,%.2f) src=%s fwdReal=%.2f fwdPred=%s lat=%.2f dy=%+.2f yawDiff=%.0f sprint=%s hbMul=%.2f", os.clock(), th.name or "?", th.kind or "?", th.strike or 1,
+				tostring(th.styleKey or th.style), ps.X, ps.Y, ps.Z, tostring(th.geomSizeSrc), fwdR,
+				th.geomForward and string.format("%.2f", th.geomForward) or "nil", latR, rel.Y, yawD, tostring(th.geomSprint == true), hitboxSizeMult(th.attackerModel))
+		end
+	end
 	if Config.PerfProbe then V93.probeGPBB = (V93.probeGPBB or 0) + 1 end
 	local realHit = #Workspace:GetPartBoundsInBox(part.CFrame, part.Size, params) > 0
 	if realHit and not th.hbOverlapClock then
@@ -1575,11 +1593,11 @@ local realHitboxHitsMe = function(ownerName, th)
 		local my = localHRP()
 		local av = th.attackerHRP and th.attackerHRP.AssemblyLinearVelocity or Vector3.zero
 		local mv = my and my.AssemblyLinearVelocity or Vector3.zero
-		diagTrace("TRACE-OV t=%.3f %s %s s%d sid=%s detect=%+.0fms predErr=%+.0fms av=(%.1f,%.1f) mv=(%.1f,%.1f)", th.hbOverlapClock, th.name or "?", th.kind or "?", th.strike or 1,
+		diagTrace("TRACE-OV t=%.3f %s %s s%d sid=%s detect=%+.0fms predErr=%+.0fms av=(%.1f,%.1f) mv=(%.1f,%.1f) rec=%s d2=%.1f reach=%.1f", th.hbOverlapClock, th.name or "?", th.kind or "?", th.strike or 1,
 				tostring(th.serverSwingId or (th.group and th.group.serverSwingId) or "none"),
 				(th.hbOverlapClock-th.detectClock)*1000,
 				(th.hbOverlapClock-(th.contactAbs or th.hbOverlapClock))*1000,
-				av.X, av.Z, mv.X, mv.Z)
+				av.X, av.Z, mv.X, mv.Z, tostring(th.recognitionSource), th.geomDist2d or -1, th.geomReachEff or -1)
 	end
 
 	local hit = realHit
@@ -1726,6 +1744,12 @@ local hitboxGeom = function(th)
 		if ok and type(go) == "number" and go > 0 then
 			forward = forward + go
 		end
+		-- A45: спринт-M2 — отдельный бокс (M2SprintHitboxSize/ForwardOffset). Считаю смещение абсолютным (как
+		-- M2HitboxForwardOffset в GetStyleHitboxForwardOffset); сервера в дампе нет — сверять по TRACE-HBGEOM.
+		if th.sprintLocked then
+			local sf = _C.sprintForward(skG)
+			if sf then forward = sf; th.geomSprint = true end
+		end
 	end
 
 	local prevPos, prevT = attackerPrevPos(aHRP)
@@ -1866,7 +1890,8 @@ local willHitMe = function(th)
 	local look, origin = rawLook, aPos
 	local mode = "High"
 	origin = Vector3.new(predA.X, aPos.Y, predA.Z)
-	local sz = V93.sizes[th.kind]
+	local bsz, bsrc = _C.boxSize(th.name, th.kind, th.styleKey or string.lower(tostring(th.style or "")), th.sprintLocked, th.attackerModel)
+	th.geomSizeSrc = bsrc
 	local myAt = myPos
 	-- A29: сервер проверяет хитбокс против НАШЕЙ позиции в момент удара, а наша позиция на сервере
 	-- отстаёт на uplink. До удара (в серверном кадре) = remain; значит видна позиция через remain−uplink.
@@ -1878,12 +1903,11 @@ local willHitMe = function(th)
 			myAt = Vector3.new(myPos.X + myV.X * hz, myPos.Y, myPos.Z + myV.Z * hz)
 		end
 	end
-	local hbMul = hitboxSizeMult(th.attackerModel)
-	local halfW = (sz and sz.X * 0.5 or Config.HitHalfWidth or 3) * hbMul
+	local halfW = bsz.X * 0.5
 		+ (Config.HighSlack or 0.35)
 		+ localTorsoHalf()
-	local halfH = (sz and sz.Y * 0.5 or 3) * hbMul + 2.5 + localHeightYBudget()
-	local halfD = (sz and sz.Z * 0.5 or (Config.HitboxDepth or 4)) * hbMul
+	local halfH = bsz.Y * 0.5 + 2.5 + localHeightYBudget()
+	local halfD = bsz.Z * 0.5
 	if math.abs(myAt.Y - origin.Y) > halfH then
 		th.recognitionSource = "y-diff"
 		return whmSet(th, false)
@@ -2213,12 +2237,21 @@ local resolveCharHeight = function(model)
 end
 
 _C.AttackMultCache = setmetatable({}, { __mode = "k" })
+_C.SpecHist = setmetatable({}, { __mode = "k" })
+-- A46: SpecAttackSpeedMultiplier (Jin ElectricWind x1.35 / Zanshin x1.4) выставляет сервер и снимает на старте удара.
+-- Кэш на 8с держал aMult=0.95 весь баф; на детекте атрибут уже может быть снят -> помним снятое значение.
+_C.specRecent = function(model)
+	local h = _C.SpecHist[model]
+	if h and (os.clock() - h.t) < (Config.SpecConsumeWindow or 0.45) then return h.v end
+	return nil
+end
 _C.HeightSrcLogged = setmetatable({}, { __mode = "k" })
 local attackSpeedMult = function(model)
 	LPH_ATTRIBUTES(VM(NONE))
 	if not model then return 1 end
+	local specNow = model:GetAttribute("SpecAttackSpeedMultiplier")
 	local c = _C.AttackMultCache[model]
-	if c and (os.clock() - c.t) < 8.0 then return c.m end
+	if c and c.spec == specNow and (os.clock() - c.t) < 8.0 then return c.m end
 	if not GameData.resolved then loadGameModules() end
 	if not GameData.cu and os.clock() - (GameData.cuTry or -9) > 2 then
 		GameData.cuTry = os.clock()
@@ -2259,7 +2292,9 @@ local attackSpeedMult = function(model)
 			end
 		end
 	end
-	if src == "cu-char" then
+	local specHv = ((type(specNow) ~= "number" or specNow <= 0) and _C.specRecent(model)) or nil
+	if specHv then mult = mult * specHv; src = (src or "none") .. "+spec-hist" end
+	if src and src:sub(1, 7) == "cu-char" then
 		mult = math.clamp(mult, 0.40, 2.50)
 	else
 		mult = math.clamp(mult, 0.80, 1.20)
@@ -2268,7 +2303,7 @@ local attackSpeedMult = function(model)
 		_C.HeightSrcLogged[model] = true
 		diagPush("HEIGHT-SRC %s → aMult=%.3f src=%s", tostring(model and model.Name), mult, tostring(src or "none(=1.0)"))
 	end
-	_C.AttackMultCache[model] = { m = mult, t = os.clock(), src = src }
+	_C.AttackMultCache[model] = { m = mult, t = specHv and -1e9 or os.clock(), src = src, spec = specNow }
 	return mult
 end
 
@@ -2295,6 +2330,74 @@ hitboxSizeMult = function(model)
 	end
 	_C.HbSizeCache[model] = { m = m, t = os.clock() }
 	return m
+end
+
+-- A45: размер серверного бокса по владельцу, а не одна ячейка на тип удара (последний увиденный
+-- хитбокс любого игрока перетирал размер для всех; спринт-M2 дракона 5x7x5 раздувал чужие M2).
+-- Источники по убыванию достоверности: Part.Size хитбокса этого владельца -> M2SprintHitboxSize из конфига
+-- -> дефолт (M1 3.4^3, M2 3.4x6x3.4 — только наблюдения, не конфиг).
+-- A46: по 14 атакующим (TRACE-HB) size = база * hbMul(рост) для всех: M1 4.0^3, M2 4.0x7.0x4.0.
+-- 3.4 из старых заметок = hbMul 0.85 (самые низкие игроки), не база.
+_C.hbDefault = { M1 = Vector3.new(4, 4, 4), M2 = Vector3.new(4, 7, 4) }
+_C.knownSprintSizes = function()
+	local l = _C.sprintSizeList
+	if l then return l end
+	loadGameModules()
+	local cfg = GameData.cfg
+	if not (GameData.resolved and cfg and type(cfg.Styles) == "table") then return {} end
+	l = {}
+	for _, sc in pairs(cfg.Styles) do
+		if type(sc) == "table" and typeof(sc.M2SprintHitboxSize) == "Vector3" then l[#l + 1] = sc.M2SprintHitboxSize end
+	end
+	_C.sprintSizeList = l
+	return l
+end
+_C.sprintCfg = function(sk)
+	loadGameModules()
+	local cfg = GameData.cfg
+	if not (cfg and cfg.GetStyleConfig and sk) then return nil end
+	local ok, sc = pcall(cfg.GetStyleConfig, sk)
+	if ok and type(sc) == "table" then return sc end
+	return nil
+end
+_C.sprintForward = function(sk)
+	local sc = _C.sprintCfg(sk)
+	local f = sc and sc.M2SprintHitboxForwardOffset
+	if type(f) == "number" and f >= 0 then return f end
+	return nil
+end
+_C.noteHitboxSize = function(owner, kind, part)
+	local sz = part.Size
+	local slot = kind
+	for _, sp in ipairs(_C.knownSprintSizes()) do
+		if (sp - sz).Magnitude < 0.1 then slot = "M2S"; break end
+	end
+	local byO = V93.sizeByOwner[owner]
+	if not byO then byO = {}; V93.sizeByOwner[owner] = byO end
+	local rec = byO[slot]
+	if rec and (rec.size - sz).Magnitude < 0.01 then rec.t = os.clock(); return end
+	byO[slot] = { size = sz, t = os.clock() }
+	local plr = Players:FindFirstChild(owner)
+	local ch = plr and plr.Character
+	local mul = hitboxSizeMult(ch)
+	local base = _C.hbDefault[slot]
+	local ratio = base and (sz.X / base.X) or 0
+	diagTrace("HB-SIZE %s %s size=(%.2f,%.2f,%.2f) hbMul=%.2f ratio=%.2f dev=%+.2f", tostring(owner), slot,
+		sz.X, sz.Y, sz.Z, mul, ratio, ratio - mul)
+end
+_C.boxSize = function(owner, kind, sk, sprint, model)
+	if kind == "SKILL" then kind = "M2" end
+	local byO = owner and V93.sizeByOwner[owner]
+	if sprint and kind == "M2" then
+		local sc = _C.sprintCfg(sk)
+		if sc and typeof(sc.M2SprintHitboxSize) == "Vector3" then return sc.M2SprintHitboxSize * hitboxSizeMult(model), "cfg-sprint" end
+		local rs = byO and byO.M2S
+		if rs then return rs.size, "obs-sprint" end
+	end
+	local rec = byO and byO[kind]
+	if rec and (os.clock() - rec.t) < 60 then return rec.size, "obs" end
+	local base = _C.hbDefault[kind] or _C.hbDefault.M1
+	return base * hitboxSizeMult(model), "default"
 end
 
 local function heightDiag(model)
@@ -5736,16 +5839,12 @@ local serverAttackProof = function(model)
 	return false
 end
 
-local function reachLimit(kind, approaching)
-	local sz = V93.sizes and V93.sizes[kind]
-	local half = 4.5
-	if sz then
-		local flat = Vector3.new(sz.X, 0, sz.Z).Magnitude
-		if flat > 0 then half = flat / 2 end
-	end
-	local off = (kind == "M2") and 3 or 4
+local function reachLimit(kind, approaching, info, model, ownerName)
+	local ck = info and (info.cfgKey or styleKey(info.s)) or nil
+	local sz = _C.boxSize(ownerName, kind, ck, false, model)
+	local off = (ck and styleForward(ck, kind)) or ((kind == "M2") and 3 or 4)
 	local pad = 6
-	return off + half + pad + (Config.ReachSlack or 1) + localTorsoHalf()
+	return off + sz.Z * 0.5 + pad + (Config.ReachSlack or 1) + localTorsoHalf()
 end
 
 local onAttack = function(attackerHRP, info, model, id, track, origin, hbPart)
@@ -5767,7 +5866,9 @@ local onAttack = function(attackerHRP, info, model, id, track, origin, hbPart)
 	local kindGuess = (info and info.t) or "M1"
 	local closingSpeed = planarClosing(attackerHRP, myHRP, nil)
 	local approaching = closingSpeed > (Config.ApproachVelMin or 0.5)
-	local reachMax = math.min(reachLimit(kindGuess, approaching), Config.Range)
+	local plrR = model and Players:GetPlayerFromCharacter(model)
+	local ownerR = plrR and plrR.Name or (model and model.Name)
+	local reachMax = math.min(reachLimit(kindGuess, approaching, info, model, ownerR), Config.Range)
 	if kindGuess == "M2" then
 		loadGameModules()
 		local ringR
@@ -5993,7 +6094,7 @@ local onAttack = function(attackerHRP, info, model, id, track, origin, hbPart)
 	local th = {
 		name = name, kind = info.t, style = info.s, styleKey = styleKey(info.s), mom = info.mom, id = id,
 		combo = combo, variant = info.variant, animName = info.name,
-		sprintLocked = info.sprint == true,
+		sprintLocked = info.sprint == true, cfgKey = info.cfgKey,
 		track = track, hitTL = hitTL, hitTLReal = hitTLReal, initTP = already,
 		initSpeed = (track and speed) or effSpd, effSpd = effSpd, spdSrc = spdSrc,
 		detectClock = nowClock, detectServer = nowServer, contact0 = remaining0,
@@ -6159,12 +6260,13 @@ local onAttack = function(attackerHRP, info, model, id, track, origin, hbPart)
 				meSt = "block"
 			end
 		end
-		diagPush("SWING  t=%.2f  %s  %s(%s)  combo=%d  dist=%.0f  contact=%.0fms  spd=%.2f  aMult=%.2f  height=%s  bodyScale=%s  modelY=%s  pingMult=%.2f  hitTL=%.0fms  vlead=%.0fms  ping=%.0f  origin=%s tp=%.3f me=%s nT=%d nP=%d", os.clock(), name, info.t, info.s, combo, dist, remaining0*1000, speed, aMult,
+		diagPush("SWING  t=%.2f  %s  %s(%s)  combo=%d  dist=%.0f  contact=%.0fms  spd=%.2f  aMult=%.2f  height=%s  bodyScale=%s  modelY=%s  pingMult=%.2f  hitTL=%.0fms  vlead=%.0fms  ping=%.0f  origin=%s tp=%.3f me=%s nT=%d nP=%d spec=%s", os.clock(), name, info.t, info.s, combo, dist, remaining0*1000, speed, aMult,
 				heightAttr and string.format("%.3f", heightAttr) or "?",
 				bodyHeightScale and string.format("%.3f", bodyHeightScale) or "?",
 				modelHeight and string.format("%.2f", modelHeight) or "?",
 					pMult, hitTL*1000, (th.velLead or 0)*1000, pRaw*1000,
-					tostring(origin or "anim"), already, meSt, #Threats, q and #q or 0)
+					tostring(origin or "anim"), already, meSt, #Threats, q and #q or 0,
+					tostring(model and model:GetAttribute("SpecAttackSpeedMultiplier")))
 			if origin == "hitbox" and hbPart then
 				diagPush("SWING-HB t=%.2f %s %s(%s) sid=%s size=(%.1f,%.1f,%.1f) → контакт с серверного хитбокса (анимации нет)",
 					os.clock(), name, info.t, info.s, tostring(th.serverSwingId or "?"),
@@ -6235,9 +6337,10 @@ _C.pressGeom = function(wb, now)
 	local lk = ah2.CFrame.LookVector
 	local f2m = dd > 0.05 and (lk.X * dx + lk.Z * dz) / dd or 1
 	local av, mv = ah2.AssemblyLinearVelocity, mh.AssemblyLinearVelocity
-	diagTrace("PRESS-GEOM t=%.3f %s %s s%d dist=%.1f face=%.2f close=%.1f aSpeed=%.1f mySpeed=%.1f toContact=%+.0fms", now,
+	diagTrace("PRESS-GEOM t=%.3f %s %s s%d dist=%.1f face=%.2f close=%.1f aSpeed=%.1f mySpeed=%.1f toContact=%+.0fms rec=%s box=%s", now,
 		wb.name or "?", wb.kind or "?", wb.strike or 1, dd, f2m, wb.closeVel or 0,
-		math.sqrt(av.X * av.X + av.Z * av.Z), math.sqrt(mv.X * mv.X + mv.Z * mv.Z), ((wb.contactAbs or now) - now) * 1000)
+		math.sqrt(av.X * av.X + av.Z * av.Z), math.sqrt(mv.X * mv.X + mv.Z * mv.Z), ((wb.contactAbs or now) - now) * 1000,
+		tostring(wb.recognitionSource), tostring(wb.geomSizeSrc))
 end
 _C.pbBind = function(char)
 	if not char or V93.pbChar == char then return end
@@ -7241,7 +7344,7 @@ local schedulerStep = function(now)
 						local ddx, ddz = mp2.X - ap2.X, mp2.Z - ap2.Z
 						local dpred = math.sqrt(ddx * ddx + ddz * ddz) - (th.closeVel or 0) * (dt + (th.replicaAge or 0.085))
 						local fwdG = th.geomForward or styleForward(th.style or th.styleKey, th.kind) or 4
-						local limG = fwdG + (th.geomHalfD or 1.7) + (th.kind == "M2" and Config.PressPadM2 or Config.PressPadM1)
+						local limG = fwdG + (th.geomHalfD or (_C.boxSize(th.name, th.kind, th.styleKey, th.sprintLocked, th.attackerModel).Z * 0.5)) + (th.kind == "M2" and Config.PressPadM2 or Config.PressPadM1)
 						if dpred > limG then
 							reachPhantom = true
 							if Config.TraceDiag and not th.pressGateLogged then
@@ -8528,6 +8631,19 @@ _C.hookAttrEdges = function(model)
 		end)
 	end
 	bind("M1", "M1"); bind("M2", "M2"); bind("CombatAttacking", "CA")
+	rec.spec = model:GetAttribute("SpecAttackSpeedMultiplier")
+	model:GetAttributeChangedSignal("SpecAttackSpeedMultiplier"):Connect(function()
+		local nw = model:GetAttribute("SpecAttackSpeedMultiplier")
+		local old = rec.spec
+		rec.spec = nw
+		if type(old) == "number" and old > 0 and old ~= 1 and (type(nw) ~= "number" or nw ~= old) then
+			_C.SpecHist[model] = { v = old, t = os.clock() }
+		else
+			_C.SpecHist[model] = nil
+		end
+		_C.AttackMultCache[model] = nil
+		diagPush("SPEC-ATTR t=%.3f %s %s→%s", os.clock(), tostring(model.Name), tostring(old), tostring(nw))
+	end)
 end
 
 local function hookAnimator(animator)
@@ -8649,6 +8765,39 @@ Workspace.DescendantAdded:Connect(function(d)
 	if d.ClassName == "Animator" then hookAnimator(d) end
 end)
 
+-- A46: игра шлёт StyleCritWindup(attacker, mult) на старте крит-свинга; клиент игры считает контакт как
+-- (M2HitboxDelay[cfgKey] + HitboxWindupExtra) / mult (CritCinematicFx.contactTime). Это серверный мульт именно этого удара.
+_C.evSeen = {}
+_C.onCritWindup = function(ev, attackerName, arg)
+	if type(attackerName) ~= "string" then return end
+	local now = os.clock()
+	local th
+	for i = #Threats, 1, -1 do
+		local t = Threats[i]
+		if t.name == attackerName and t.kind == "M2" and not t.resolved and (now - (t.detectClock or now)) < 0.5 then th = t; break end
+	end
+	diagPush("CRIT-EVT t=%.3f %s %s arg=%s threat=%s sinceDetect=%s aMult=%s", now, ev, attackerName, tostring(arg), th and "yes" or "no",
+		th and string.format("%+.0fms", (now - th.detectClock) * 1000) or "-", th and string.format("%.3f", th.attackMult or 0) or "-")
+	if ev ~= "StyleCritWindup" or Config.CritWindupRetime == false then return end
+	if not th or th.windupMult or th.contacts then return end
+	local m = arg
+	if type(m) ~= "number" or m ~= m or m < 0.4 or m > 3 then return end
+	local old = th.attackMult or 1
+	if math.abs(m / old - 1) < 0.04 then return end
+	local prevTL = th.hitTL
+	local newTL = hitTimeline({ t = "M2", s = th.style, cfgKey = th.cfgKey, mom = th.mom, id = th.id, variant = th.variant,
+		name = th.animName, sprint = th.sprintLocked }, th.combo, m)
+	if type(newTL) ~= "number" or newTL < 0.15 or newTL > 2.5 then return end
+	th.windupMult = m
+	th.attackMult = m
+	th.hitTL, th.hitTLReal = newTL, newTL
+	th.contact0 = math.max(0, (th.contact0 or 0) + animToWall(newTL - (prevTL or newTL), th.track, m, newTL))
+	th.contactAbs = th.detectClock + th.contact0
+	th.pressed = nil
+	diagPush("CRIT-RETIME t=%.3f %s M2 mult %.3f→%.3f hitTL %.0f→%.0fms contactIn=%+.0fms", now, attackerName, old, m,
+		(prevTL or 0) * 1000, newTL * 1000, (th.contactAbs - now) * 1000)
+end
+
 task.spawn(function()
 	local Shared  = ReplicatedStorage:WaitForChild("Shared", 30)
 	local Network = Shared and Shared:WaitForChild("Network", 30)
@@ -8730,8 +8879,18 @@ task.spawn(function()
 			end
 			return
 		end
+		if eventName == "StyleCritWindup" or eventName == "MishimaCritCast" then
+			_C.onCritWindup(eventName, attacker, victim)
+			return
+		end
 		local kind, result = parseEvent(eventName)
-		if not kind then return end
+		if not kind then
+			if not _C.evSeen[eventName] then
+				_C.evSeen[eventName] = true
+				diagPush("EVT-NEW t=%.2f %s a=%s v=%s", os.clock(), eventName, tostring(attacker), tostring(victim))
+			end
+			return
+		end
 		if victim ~= myName then return end
 		onOutcome(attacker, result, kind, os.clock())
 	end)
