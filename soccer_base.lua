@@ -1533,6 +1533,10 @@ teamKey = function(name)
 end
 
 local function enemyGoalPart()
+	local c = Mark.goalCacheE
+	if c and os.clock() - c.at < 0.5 and c.g and c.g.Parent then
+		return c.g
+	end
 	local ours = teamKey(ActorTeams.GetActorTeamName(LocalPlayer))
 	local map = Workspace:FindFirstChild("Map")
 	local data = map and map:FindFirstChild("Data")
@@ -1541,6 +1545,7 @@ local function enemyGoalPart()
 		local folder = data and data:FindFirstChild(opp)
 		local g = folder and folder:FindFirstChild("Goal")
 		if g and g:IsA("BasePart") then
+			Mark.goalCacheE = { at = os.clock(), g = g }
 			return g
 		end
 	end
@@ -2506,7 +2511,7 @@ local function dribbleThreat(root)
 	end
 	local best
 	local maxReach = Mark.dumpTravel(C.HitboxDelaySeconds + C.HitboxSeconds) + 5.9
-	for _, model in Actors.GetAllCharacterModels() do
+	for _, model in Mark.models() do
 		local actor = Actors.GetFromCharacter(model)
 		if actor and actor ~= LocalPlayer and not sameTeam(actor) and not isGoalkeeper(actor) then
 			local r = ActorTargeting.GetActorRoot(actor)
@@ -3663,7 +3668,7 @@ local function keeperSide(mid, lateral, allowAlly)
 			Mark.gkRoot = r
 		end
 	end
-	for _, model in Actors.GetAllCharacterModels() do
+	for _, model in Mark.models() do
 		local r = model:FindFirstChild("HumanoidRootPart")
 		take(model, r)
 	end
@@ -4305,7 +4310,7 @@ solveShotRaw = function(root, forced)
 		if not dipFoes then
 			dipFoes = {}
 			Mark.mover = Mark.mover or require(Modules.Actions.ActionMovement)
-			for _, model in Actors.GetAllCharacterModels() do
+			for _, model in Mark.models() do
 				local actor = Actors.GetFromCharacter(model)
 				local r = actor and actor ~= LocalPlayer and not sameTeam(actor) and ActorTargeting.GetActorRoot(actor)
 				if r and r ~= Mark.gkRoot then
@@ -5586,6 +5591,7 @@ Mark.rebaseAim = function()
 end
 
 local function stepLogic()
+	Mark.logicId = (Mark.logicId or 0) + 1
 	Mark.volleyPending()
 	dribbleWhy = "off"
 	tackleWhy = "off"
@@ -7503,7 +7509,7 @@ Mark.wallEquipTick = function(root, oid, own)
 	if type(oid) ~= "number" or oid == 0 then
 		return
 	end
-	for _, model in Actors.GetAllCharacterModels() do
+	for _, model in Mark.models() do
 		local actor = Actors.GetFromCharacter(model)
 		if actor and actor ~= LocalPlayer and actor.UserId == oid and not sameTeam(actor) and not isGoalkeeper(actor) then
 			local r = ActorTargeting.GetActorRoot(actor)
@@ -7591,7 +7597,7 @@ Mark.wallVsPath = function(root, pathFn, tEnd, tag)
 		return false
 	end
 	local W = us + to * FWD
-	for _, model in Actors.GetAllCharacterModels() do
+	for _, model in Mark.models() do
 		local actor = Actors.GetFromCharacter(model)
 		if actor and actor ~= LocalPlayer and sameTeam(actor) then
 			local ar = ActorTargeting.GetActorRoot(actor)
@@ -7687,7 +7693,7 @@ Mark.wallTick = function(root, oid, own, use, ping)
 	local us = root.Position + ourV * lat
 	local half = Mark.wallHalfSeen or CFG.WallHalf or 4
 	local best = nil
-	for _, model in Actors.GetAllCharacterModels() do
+	for _, model in Mark.models() do
 		local actor = Actors.GetFromCharacter(model)
 		if actor and actor ~= LocalPlayer and not sameTeam(actor) and not isGoalkeeper(actor) then
 			local isOwner = type(oid) == "number" and actor.UserId == oid
@@ -7731,7 +7737,7 @@ Mark.wallTick = function(root, oid, own, use, ping)
 		return
 	end
 	local W = us + best.toward * FWD
-	for _, model in Actors.GetAllCharacterModels() do
+	for _, model in Mark.models() do
 		local actor = Actors.GetFromCharacter(model)
 		if actor and actor ~= LocalPlayer and sameTeam(actor) then
 			local ar = ActorTargeting.GetActorRoot(actor)
@@ -7822,7 +7828,7 @@ Mark.tickSkill = function(character, root)
 		return
 	end
 	local pick, pickD, pickOwner = nil, math.huge, false
-	for _, model in Actors.GetAllCharacterModels() do
+	for _, model in Mark.models() do
 		local actor = Actors.GetFromCharacter(model)
 		if actor and actor ~= LocalPlayer and not sameTeam(actor) then
 			local r = ActorTargeting.GetActorRoot(actor)
@@ -8065,7 +8071,7 @@ Mark.gkBait = function(samples, ts, limit)
 	local inset = CFG.GkBaitInset or 0.6
 	local rcv, air = HitboxSettings.Receive, HitboxSettings.AirReceive
 	local mates = {}
-	for _, model in Actors.GetAllCharacterModels() do
+	for _, model in Mark.models() do
 		local actor = Actors.GetFromCharacter(model)
 		if actor and actor ~= LocalPlayer and not sameTeam(actor) then
 			local r = ActorTargeting.GetActorRoot(actor)
@@ -8585,19 +8591,27 @@ Mark.tickGk = function(character, root)
 	local ballVel = (state and state.Velocity) or Renderer.GetTargetVelocity(nil, root.Position) or Vector3.zero
 	local crossP, crossT, crossWhy = nil, nil, state and "plane" or "no-state"
 	if state then
-		-- Physics.GetFirstBoxEntry returns an ABSOLUTE time (GoalCrossingPreview compares it with UpdatedAt).
-		local t0 = Workspace:GetServerTimeNow()
-		local p, t = pred.GetGoalCrossing(state, gkWorld, ours, t0, pred.Constants.GoalCrossingMaximumPredictionSeconds, false)
-		if typeof(p) == "Vector3" and type(t) == "number" then
-			crossP, crossT, crossWhy = p, (t > 1e6) and (t - t0) or t, "cross"
-		end
-		if not crossP then
-			local planeT = pred.GetPlaneTime(state, defend, fwd, 0)
-			if planeT and planeT > 0 and planeT <= 5 then
-				crossT = planeT
-				crossP = pred.GetBallPositionAtTime(state, planeT)
-				crossWhy = "plane"
+		-- GetGoalCrossing integrates the whole flight. Same state and the cross is not imminent: reuse, shifting the
+		-- ETA by the time since the solve. A new shot (no cross yet, or under 0.45 s) is always recomputed.
+		local gc = Mark.gkCross
+		local nowG = os.clock()
+		if gc and gc.state == state and gc.crossT and gc.crossT > 0.45 and nowG - gc.at < 0.08 then
+			crossP, crossT, crossWhy = gc.crossP, gc.crossT - (nowG - gc.at), gc.crossWhy
+		else
+			local t0 = Workspace:GetServerTimeNow()
+			local p, t = pred.GetGoalCrossing(state, gkWorld, ours, t0, pred.Constants.GoalCrossingMaximumPredictionSeconds, false)
+			if typeof(p) == "Vector3" and type(t) == "number" then
+				crossP, crossT, crossWhy = p, (t > 1e6) and (t - t0) or t, "cross"
 			end
+			if not crossP then
+				local planeT = pred.GetPlaneTime(state, defend, fwd, 0)
+				if planeT and planeT > 0 and planeT <= 5 then
+					crossT = planeT
+					crossP = pred.GetBallPositionAtTime(state, planeT)
+					crossWhy = "plane"
+				end
+			end
+			Mark.gkCross = { state = state, at = nowG, crossP = crossP, crossT = crossT, crossWhy = crossWhy }
 		end
 	end
 	-- Y window from the real mouth (goalMouthCorners), not the goal part centre: the part is the net VOLUME, its
@@ -8717,7 +8731,7 @@ Mark.tickGk = function(character, root)
 			local enemies = nil
 			if not shot then
 				enemies = {}
-				for _, model in Actors.GetAllCharacterModels() do
+				for _, model in Mark.models() do
 					local actor = Actors.GetFromCharacter(model)
 					if actor and actor ~= LocalPlayer and not sameTeam(actor) then
 						local r = ActorTargeting.GetActorRoot(actor)
@@ -8860,7 +8874,7 @@ Mark.tickGk = function(character, root)
 					if math.abs(s) <= half + 3 then
 						chargeS = s
 						-- a FAKE charge aims through his teammate: positioning on the ray's mouth point is the bait too
-						for _, model in Actors.GetAllCharacterModels() do
+						for _, model in Mark.models() do
 							local actor = Actors.GetFromCharacter(model)
 							if actor and actor ~= LocalPlayer and actor.UserId ~= ownerId and not sameTeam(actor) then
 								local r2 = ActorTargeting.GetActorRoot(actor)
@@ -9841,15 +9855,32 @@ Mark.doJump = function(why)
 	return true
 end
 
+Mark.models = function()
+	local id = Mark.logicId
+	local c = Mark.modelCache
+	if c and c.id == id then
+		return c.list
+	end
+	local list = Actors.GetAllCharacterModels()
+	Mark.modelCache = { id = id, list = list }
+	return list
+end
+
 Mark.defendGoal = function()
+	local c = Mark.defGoal
+	if c and os.clock() - c.at < 0.5 and (c.g == nil or (c.g and c.g.Parent)) then
+		return c.g
+	end
 	local ours = teamKey(ActorTeams.GetActorTeamName(LocalPlayer))
 	local map = Workspace:FindFirstChild("Map")
 	local data = map and map:FindFirstChild("Data")
 	local folder = data and ours and data:FindFirstChild(ours)
 	local g = folder and folder:FindFirstChild("Goal")
 	if g and g:IsA("BasePart") then
+		Mark.defGoal = { at = os.clock(), g = g }
 		return g
 	end
+	Mark.defGoal = { at = os.clock(), g = nil }
 	return nil
 end
 
@@ -9911,7 +9942,7 @@ Mark.blockIntercept = function(character, root)
 	local lo = rcv.CFrameOffset.Y - rcv.Size.Y * 0.5
 	local hi = rcv.CFrameOffset.Y + rcv.Size.Y * 0.5 + (Physics.BallRadius or 1)
 	local foes = {}
-	for _, model in Actors.GetAllCharacterModels() do
+	for _, model in Mark.models() do
 		local actor = Actors.GetFromCharacter(model)
 		if actor and actor ~= LocalPlayer and not sameTeam(actor) then
 			local r = ActorTargeting.GetActorRoot(actor)
@@ -9970,7 +10001,7 @@ Mark.counterTackle = function(character, root, actor, model, r, flickLeft)
 		return false, "iframe"
 	end
 	local myD = flat(root.Position - r.Position).Magnitude
-	for _, m in Actors.GetAllCharacterModels() do
+	for _, m in Mark.models() do
 		local a = Actors.GetFromCharacter(m)
 		if a and a ~= LocalPlayer and sameTeam(a) and not isGoalkeeper(a) and not Mark.mateDown(a, m) then
 			local ar = ActorTargeting.GetActorRoot(a)
@@ -9995,7 +10026,7 @@ Mark.counterTackle = function(character, root, actor, model, r, flickLeft)
 	end
 	-- a teammate on the slide line is knocked over by it
 	local line = solved.aim * math.min(solved.dist or 12, 20)
-	for _, m in Actors.GetAllCharacterModels() do
+	for _, m in Mark.models() do
 		local a = Actors.GetFromCharacter(m)
 		if a and a ~= LocalPlayer and sameTeam(a) then
 			local ar = ActorTargeting.GetActorRoot(a)
@@ -10134,7 +10165,7 @@ Mark.counterAirKick = function(character, root)
 		return
 	end
 	local reach = Mark.kickReach() + 3
-	for _, model in Actors.GetAllCharacterModels() do
+	for _, model in Mark.models() do
 		local actor = Actors.GetFromCharacter(model)
 		if actor and actor ~= LocalPlayer and not sameTeam(actor) then
 			local r = ActorTargeting.GetActorRoot(actor)
@@ -10172,7 +10203,7 @@ Mark.tickCounterJump = function(character, root)
 	end
 	Mark.flick = Mark.flick or require(Modules.Actions.RainbowFlick)
 	local oid = liveOwnerId()
-	for _, model in Actors.GetAllCharacterModels() do
+	for _, model in Mark.models() do
 		local actor = Actors.GetFromCharacter(model)
 		if actor and actor ~= LocalPlayer and not sameTeam(actor) then
 			local r = ActorTargeting.GetActorRoot(actor)
@@ -10257,7 +10288,7 @@ Mark.tickCounterJump = function(character, root)
 				end
 				if why and CFG.CounterCompetitor then
 					-- optional: a teammate already on him owns the duel (CompetitorRadius), as in AutoBlock
-					for _, m2 in Actors.GetAllCharacterModels() do
+					for _, m2 in Mark.models() do
 						local a2 = Actors.GetFromCharacter(m2)
 						if a2 and a2 ~= LocalPlayer and sameTeam(a2) and not isGoalkeeper(a2) then
 							local r2 = ActorTargeting.GetActorRoot(a2)
@@ -10442,7 +10473,7 @@ Mark.tickBlock = function(character, root)
 		Mark.blockSkip(goalSide and "far" or "behind", string.format("dist %.1f range %.1f along %.1f", dist, range, along))
 		return
 	end
-	for _, model in Actors.GetAllCharacterModels() do
+	for _, model in Mark.models() do
 		local actor = Actors.GetFromCharacter(model)
 		if CFG.BlockCompetitor ~= false and not Mark.atHomeGoal(root, P) and actor and actor ~= LocalPlayer and sameTeam(actor) and not isGoalkeeper(actor) and not Mark.mateDown(actor, model) then
 			local ar = ActorTargeting.GetActorRoot(actor)
@@ -10917,7 +10948,7 @@ Mark.paSolve = function(sel, fixed)
 	}
 	sol.along3 = Vector3.new(-best.dir.Z, 0, best.dir.X)
 	local contested = false
-	for _, model in Actors.GetAllCharacterModels() do
+	for _, model in Mark.models() do
 		local actor = Actors.GetFromCharacter(model)
 		local r = actor and actor ~= LocalPlayer and not sameTeam(actor) and ActorTargeting.GetActorRoot(actor)
 		if r and flat(r.Position - fl.land).Magnitude < (isGoalkeeper(actor) and (CFG.PassKeeperRadius or 14) or 5) then
@@ -10944,7 +10975,7 @@ Mark.paList = function(root)
 	local ballPos = Renderer.GetPosition() or root.Position
 	local goal = enemyGoalPart()
 	local zone = CFG.PassGoalZone or 36
-	for _, model in Actors.GetAllCharacterModels() do
+	for _, model in Mark.models() do
 		local actor = Actors.GetFromCharacter(model)
 		local r = actor and actor ~= LocalPlayer and sameTeam(actor) and ActorTargeting.GetActorRoot(actor)
 		if r and (CFG.PassToKeeper or not isGoalkeeper(actor)) and not Mark.mateDown(actor, model) then
@@ -10977,7 +11008,7 @@ Mark.paSelect = function(root)
 	local prev = Mark.pa.sel
 	local fov = CFG.PassFov or 12
 	local best, why = nil, nil
-	for _, model in Actors.GetAllCharacterModels() do
+	for _, model in Mark.models() do
 		local actor = Actors.GetFromCharacter(model)
 		local r = actor and actor ~= LocalPlayer and sameTeam(actor) and ActorTargeting.GetActorRoot(actor)
 		if r and (CFG.PassToKeeper or not isGoalkeeper(actor)) and not Mark.mateDown(actor, model) then
@@ -11011,7 +11042,7 @@ Mark.paSelect = function(root)
 	end
 	local held = nil
 	if prev then
-		for _, model in Actors.GetAllCharacterModels() do
+		for _, model in Mark.models() do
 			local actor = Actors.GetFromCharacter(model)
 			if actor == prev.actor then
 				local r = ActorTargeting.GetActorRoot(actor)
@@ -11185,7 +11216,7 @@ Mark.paManual = function()
 	local goal = enemyGoalPart()
 	local toGoal = goal and unitOrNil(flat(goal.Position - root.Position))
 	local foes = {}
-	for _, model in Actors.GetAllCharacterModels() do
+	for _, model in Mark.models() do
 		local actor = Actors.GetFromCharacter(model)
 		local r = actor and actor ~= LocalPlayer and not sameTeam(actor) and ActorTargeting.GetActorRoot(actor)
 		if r then
@@ -11393,7 +11424,7 @@ Mark.feintNow = function(why)
 		local root = ActorTargeting.GetActorRoot(LocalPlayer)
 		local ball = root and (Renderer.GetPosition() or root.Position)
 		if root and ball then
-			for _, model in Actors.GetAllCharacterModels() do
+			for _, model in Mark.models() do
 				local a = Actors.GetFromCharacter(model)
 				local r = a and a ~= LocalPlayer and not sameTeam(a) and not isGoalkeeper(a) and ActorTargeting.GetActorRoot(a)
 				if r and flat(r.Position - ball).Magnitude <= (CFG.FeintCompetitorRange or 10) then
@@ -11605,7 +11636,7 @@ Mark.bounceFakeRaw = function(c)
 	local rcv = HitboxSettings.Receive
 	local hiR = rcv.CFrameOffset.Y + rcv.Size.Y * 0.5 + c.radius
 	local foes = {}
-	for _, model in Actors.GetAllCharacterModels() do
+	for _, model in Mark.models() do
 		local actor = Actors.GetFromCharacter(model)
 		local r = actor and actor ~= LocalPlayer and not sameTeam(actor) and not isGoalkeeper(actor) and ActorTargeting.GetActorRoot(actor)
 		if r then
@@ -11962,7 +11993,7 @@ Mark.fakeShot = function(c)
 	local ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
 	local mates, foes = {}, {}
 	local dg = { team = 0, down = 0, fast = 0, depth = 0, lat = 0, foe = 0, dMin = 999, dMax = -999 }
-	for _, model in Actors.GetAllCharacterModels() do
+	for _, model in Mark.models() do
 		local actor = Actors.GetFromCharacter(model)
 		local r = actor and actor ~= LocalPlayer and ActorTargeting.GetActorRoot(actor)
 		if r and not isGoalkeeper(actor) then
@@ -12309,7 +12340,7 @@ end
 
 -- A field teammate (not the keeper, not stunned / ragdolled / frozen) within `radius` of `pos`, or nil.
 Mark.mateNear = function(pos, radius)
-	for _, model in Actors.GetAllCharacterModels() do
+	for _, model in Mark.models() do
 		local actor = Actors.GetFromCharacter(model)
 		if actor and actor ~= LocalPlayer and sameTeam(actor) and not isGoalkeeper(actor) and not Mark.mateDown(actor, model) then
 			local ar = ActorTargeting.GetActorRoot(actor)
@@ -12430,8 +12461,10 @@ Mark.ballPath = function(root)
 		state, world = Renderer.GetMovementState()
 	end
 	local memo = Mark.ballMemo
-	if state and memo and memo.state == state and os.clock() - memo.at < 0.04 then
-		-- callers only read the arrays: hand out the memo itself (the old copy of ~90 entries ran per caller per frame)
+	-- Callers only read the arrays. The old memo died at 40 ms, so below ~25 fps every frame re-ran the sim
+	-- (weak-pc log: ballPath p90 9 ms, one stall 386 ms). Same state and the ball has not moved: reuse.
+	local rough = Renderer.GetTargetVelocity(nil, root.Position)
+	if memo and os.clock() - memo.at < 0.09 and (pos - memo.samples[1]).Magnitude < 1.0 and (memo.state == state or (typeof(rough) == "Vector3" and (rough - memo.vel).Magnitude < 8)) then
 		return pos, memo.vel, memo.samples, memo.ts, true, memo.rest
 	end
 	local vel = nil
@@ -12440,9 +12473,13 @@ Mark.ballPath = function(root)
 		local now = CharacterMotionSmoothing.GetSmoothedServerTime()
 		local s0 = Physics.GetStateAtTime(state, now, world)
 		vel = s0 and s0.Velocity
-		local t = 0
-		while t < 8 do
-			t += (t < 1.2 - 1e-6) and 0.05 or 0.1
+		local spd0 = typeof(vel) == "Vector3" and vel.Magnitude or 0
+		-- GetStateAtTime integrates up to the asked time, so 90 queries out to 8 s is quadratic. A shot crosses
+		-- inside 3 s; a roller is at rest long before 5 s. Fine steps only inside the slide window.
+		local horizon = spd0 > 28 and 3.2 or 5.2
+		local t, prev = 0, pos
+		while t < horizon do
+			t += (t < 0.7 - 1e-6) and 0.05 or ((t < 2.2) and 0.1 or 0.2)
 			local s = Physics.GetStateAtTime(state, now + t, world)
 			local p = s and s.Position
 			if typeof(p) ~= "Vector3" then
@@ -12451,10 +12488,20 @@ Mark.ballPath = function(root)
 			samples[#samples + 1] = p
 			ts[#ts + 1] = t
 			local v = s.Velocity
-			if s.Mode == "Resting" or (typeof(v) == "Vector3" and v.Magnitude < 0.5) then
+			local vm = typeof(v) == "Vector3" and v.Magnitude or 0
+			-- a flick / lob is slow at the apex and still in the air: only a ball back down near the start height is resting
+			-- only a ball back at the start height counts as stopped; a lob is slow at the apex and must keep falling.
+			-- t > 0.3 so the first samples of a lob we just started tracking are not cut off
+			local grounded = p.Y <= samples[1].Y + 0.8
+			if s.Mode == "Resting" or vm < 0.6 or (grounded and vm < 2 and t > 0.3) then
 				rest = true
 				break
 			end
+			prev = p
+		end
+		if not Mark.pathLog or os.clock() - Mark.pathLog > 2 then
+			Mark.pathLog = os.clock()
+			logFile("ball path", "steps", #samples, "spd", string.format("%.0f", spd0), "rest", tostring(rest))
 		end
 	end
 	if typeof(vel) ~= "Vector3" then
@@ -12520,7 +12567,7 @@ Mark.volleyPlan = function(root, ev)
 	local threat, threatD = false, math.huge
 	-- a teammate's pass is ours to receive: only an opponent who actually gets there first makes it a volley
 	local pass = Mark.allyKickUntil and os.clock() < Mark.allyKickUntil
-	for _, model in Actors.GetAllCharacterModels() do
+	for _, model in Mark.models() do
 		local actor = Actors.GetFromCharacter(model)
 		if actor and actor ~= LocalPlayer and not sameTeam(actor) then
 			local r = ActorTargeting.GetActorRoot(actor)
@@ -12740,7 +12787,7 @@ Mark.akTry = function(tag, model, r, urgent)
 	end
 	-- never kick through a teammate or toward our own goal with the ball at his feet
 	local aimDir = bestAim
-	for _, m in Actors.GetAllCharacterModels() do
+	for _, m in Mark.models() do
 		local a = Actors.GetFromCharacter(m)
 		if a and a ~= LocalPlayer and sameTeam(a) then
 			local ar = ActorTargeting.GetActorRoot(a)
@@ -13207,6 +13254,10 @@ Mark.slideSweepBall = function(O, dir, m, samples, ts, ping)
 		end
 		return nil
 	end
+	local ballS = {}
+	for k = 0, 10 do
+		ballS[k + 1] = ballAt(lag + (t0 + (t1 - t0) * k / 10))
+	end
 	local best, bestHits = nil, 0
 	for _, deg in { 0, 6, -6, 12, -12, 18, -18 } do
 		local r = math.rad(deg)
@@ -13214,7 +13265,7 @@ Mark.slideSweepBall = function(O, dir, m, samples, ts, ping)
 		local hits = 0
 		for k = 0, 10 do
 			local tau = t0 + (t1 - t0) * k / 10
-			local B = ballAt(lag + tau)
+			local B = ballS[k + 1]
 			if B then
 				local h = B.Y - O.Y
 				if h >= hLo and h <= hHi then
@@ -13361,7 +13412,7 @@ Mark.blockSlide = function(character, root)
 	local fine = {}
 	for k = 0, 10 do
 		local tau = t0 + (t1 - t0) * k / 10
-		fine[#fine + 1] = { tau, Mark.dumpTravel(tau) }
+		fine[#fine + 1] = { tau, Mark.dumpTravel(tau), ballAt(ping * 0.5 + (CFG.SlideLag or 0.03) + tau) }
 	end
 	local best = nil
 	for a = 0, 345, 15 do
@@ -13371,7 +13422,7 @@ Mark.blockSlide = function(character, root)
 			local m = mLo + (mHi - mLo) * mi / 4
 			local hits = 0
 			for _, f in fine do
-				local B = ballAt(ping * 0.5 + (CFG.SlideLag or 0.03) + f[1])
+				local B = f[3]
 				if B then
 					local oy = landed and 0 or (vy * f[1] - 0.5 * g * f[1] * f[1])
 					local ctr = O + phi * (f[2] * m + boxMid)
@@ -13590,12 +13641,12 @@ Mark.routePlan = function(c)
 			return math.abs(lon) <= hz and math.abs(lat) <= hx
 		end
 		local slideLag = c.ping * 0.5 + (CFG.SlideLag or 0.03)
-		local function sweep(W, phi, m, tp)
+		local Bs = nil
+		local function sweep(W, phi, m)
 			local first, hits = nil, 0
 			for k = 1, #fine do
-				-- the press reaches the server ping/2 later and the ball keeps moving: the box window starts at tp + ping/2 + tau (the
-				-- old tp + tau put the ball ~1-3 studs behind where it really is when the box goes live: "the ball is already gone")
-				local B = ballAt(tp + slideLag + fine[k])
+				-- ball position depends only on the press time, computed once per tp (Bs)
+				local B = Bs[k]
 				if B and inBox(W, phi, m, k, B) then
 					first = first or fine[k]
 					hits += 1
@@ -13618,8 +13669,12 @@ Mark.routePlan = function(c)
 				break
 			end
 			local Cc, r = reach(tp)
+			Bs = {}
+			for k = 1, #fine do
+				Bs[k] = ballAt(tp + slideLag + fine[k])
+			end
 			for _, k in coarse do
-				local B = ballAt(tp + slideLag + fine[k])
+				local B = Bs[k]
 				if B then
 					local h = B.Y - O.Y
 					if h >= hLo and h <= hHi then
@@ -13636,7 +13691,7 @@ Mark.routePlan = function(c)
 							local off = flat(W - Cc).Magnitude
 							if off <= r + 0.05 then
 								local m = math.clamp((s - boxMid) / math.max(fineD[k], 1), mLo, mHi)
-								local first, hits = sweep(W, ur, m, tp)
+								local first, hits = sweep(W, ur, m)
 								if first and hits >= (CFG.SlideMinHits or 3) then
 									local tc = tp + first
 									local sc, scOld = math.min(hits, goodHits), slide and math.min(slide.hits, goodHits) or -1
@@ -13768,7 +13823,7 @@ Mark.killerSlide = function(root, routeDir, foes, ballNow, ourT, mLo, mHi, guard
 		end
 		if not mates then
 			mates = {}
-			for _, mm in Actors.GetAllCharacterModels() do
+			for _, mm in Mark.models() do
 				local a = Actors.GetFromCharacter(mm)
 				if a and a ~= LocalPlayer and sameTeam(a) then
 					local ar = ActorTargeting.GetActorRoot(a)
@@ -13948,7 +14003,7 @@ Mark.tickBall = function(character, root)
 	-- Enemy field players compete for the same loose ball (Ownership.FindNearestOwner: whoever's Receive hitbox the
 	-- ball enters first); Mark.routePlan races every candidate contact against them.
 	local foes = {}
-	for _, model in Actors.GetAllCharacterModels() do
+	for _, model in Mark.models() do
 		local actor = Actors.GetFromCharacter(model)
 		if actor and actor ~= LocalPlayer and not sameTeam(actor) and not isGoalkeeper(actor) then
 			local fr = ActorTargeting.GetActorRoot(actor)
@@ -14036,7 +14091,7 @@ Mark.tickBall = function(character, root)
 	local beaten = false
 	local homeDef = Mark.atHomeGoal(root, pos)
 	local ourNeed = math.max(0, gap - receiveHalf)
-	for _, model in Actors.GetAllCharacterModels() do
+	for _, model in Mark.models() do
 		local actor = Actors.GetFromCharacter(model)
 		if CFG.BallCompetitor ~= false and not homeDef and actor and actor ~= LocalPlayer and sameTeam(actor) and not isGoalkeeper(actor) and not Mark.mateDown(actor, model) then
 			local ar = ActorTargeting.GetActorRoot(actor)
@@ -14061,7 +14116,7 @@ Mark.tickBall = function(character, root)
 		local diveMod = Mark.gkDiveMod or require(Modules.Actions.GoalkeeperDive)
 		Mark.gkDiveMod = diveMod
 		local ourT = ourNeed / math.max(spd, 8)
-		for _, model in Actors.GetAllCharacterModels() do
+		for _, model in Mark.models() do
 			local actor = Actors.GetFromCharacter(model)
 			if actor and actor ~= LocalPlayer and not sameTeam(actor) and isGoalkeeper(actor) then
 				local ar = ActorTargeting.GetActorRoot(actor)
@@ -14145,7 +14200,7 @@ Mark.tickBall = function(character, root)
 	local noTouch = Mark.noTouchUntil and os.clock() < Mark.noTouchUntil
 	local allyBlock = Mark.allyKickUntil and os.clock() < Mark.allyKickUntil
 	if not allyBlock then
-		for _, model in Actors.GetAllCharacterModels() do
+		for _, model in Mark.models() do
 			local actor = Actors.GetFromCharacter(model)
 			if actor and actor ~= LocalPlayer and sameTeam(actor) and not isGoalkeeper(actor) and not Mark.mateDown(actor, model) then
 				local ar = ActorTargeting.GetActorRoot(actor)
@@ -15558,7 +15613,7 @@ Mark.hazAdd = function(st)
 		local v = st.vel + Vector3.new(0, -g * dt0, 0)
 		Mark.fieldMod = Mark.fieldMod or require(Modules.Gameplay.FieldSettings)
 		local bodies = {}
-		for _, model in Actors.GetAllCharacterModels() do
+		for _, model in Mark.models() do
 			local a = Actors.GetFromCharacter(model)
 			local r = a and ActorTargeting.GetActorRoot(a)
 			if r and a.UserId ~= st.src then
@@ -16893,7 +16948,8 @@ Mark.artInit = function()
 			return maxN
 		end
 		local dist = math.max((center - fp).Magnitude, 1)
-		return clamp(floor(r * (Mark.framePxK or 700) / dist * 0.55), 10, maxN)
+		local cap = ((Mark.dtAvg or 0) > 1 / 28) and math.min(maxN, 16) or maxN
+		return clamp(floor(r * (Mark.framePxK or 700) / dist * 0.55), 10, cap)
 	end
 	-- scratch arrays (no allocation per frame)
 	local RX, RY, RD = {}, {}, {}
