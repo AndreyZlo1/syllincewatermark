@@ -10,7 +10,7 @@ local _C = {}
 local _D = {}
 
 local Config = {
-	Version       = "A58",
+	Version       = "A59",
 	Enabled       = false,
 	Mode          = "Perfect",
 	SpecConsumeWindow = 0.45, -- A46: баф скорости (Jin ElectricWind/Zanshin) снимается на старте удара; помним снятое значение столько секунд
@@ -63,6 +63,10 @@ local Config = {
 	-- Калибровка по логам (A44/A46, 178 пар детект->хитбокс): центр ~3.55 студа от HRP; попадания лежат в
 	-- радиусе ~half+3.0 от центра (83% попаданий / 16% промахов); скорость атакующего на детекте на удар НЕ переносится.
 	PredictHit      = true,
+	-- A59: если после нажатия предиктор стабильно ушёл в MISS (A58-лог: 11/14 пустых блоков, 0/63 реальных попаданий) -- снять блок.
+	-- Работает против BlockCooldown только если сервер не ставит его при раннем Deactivated. НЕ ПРОВЕРЕНО, поэтому выкл.
+	LateCancel      = false,
+	LateCancelMin   = 0.03,
 	PredLead        = 0.05,
 	PredSigma0      = 0.50,
 	PredSigmaRate   = 2.0,
@@ -8390,6 +8394,28 @@ local schedulerStep = function(now)
 				base + Config.HoldAfter + (Config.HoldLateGrace or 0))
 		end
 	elseif State.blocking then
+		if Config.LateCancel then
+			local pa = now - (State.lastPress or 0)
+			if pa >= (Config.LateCancelMin or 0.03) and pa <= 0.30 then
+				local nM1, allMiss = 0, true
+				for lc = 1, #Threats do
+					local lt = Threats[lc]
+					if lt and not lt.resolved and not lt.dodged and (lt.threatens or lt.everThreatened or lt.predDone) then
+						nM1 = nM1 + 1
+						if not (lt.kind == "M1" and lt.predDone and lt.predHit == false and lt.predBreak) then
+							allMiss = false
+							break
+						end
+					end
+				end
+				if nM1 > 0 and allMiss then
+					diagPush("LATE-CANCEL t=%.3f held=%.0fms n=%d → промах по предиктору, блок снят",
+						now, pa * 1000, nM1)
+					releaseBlock()
+					State.multiHoldUntil = 0
+				end
+			end
+		end
 		local keepForCluster = Config.Mode ~= "Perfect" and ((multiThreat and farContact
 			and now < (farContact + Config.HoldAfter + (Config.HoldLateGrace or 0)))
 			or (State.multiHoldUntil and now < State.multiHoldUntil))
