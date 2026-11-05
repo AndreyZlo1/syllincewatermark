@@ -10,7 +10,7 @@ local _C = {}
 local _D = {}
 
 local Config = {
-	Version       = "A59",
+	Version       = "A61",
 	Enabled       = false,
 	Mode          = "Perfect",
 	SpecConsumeWindow = 0.45, -- A46: баф скорости (Jin ElectricWind/Zanshin) снимается на старте удара; помним снятое значение столько секунд
@@ -63,8 +63,10 @@ local Config = {
 	-- Калибровка по логам (A44/A46, 178 пар детект->хитбокс): центр ~3.55 студа от HRP; попадания лежат в
 	-- радиусе ~half+3.0 от центра (83% попаданий / 16% промахов); скорость атакующего на детекте на удар НЕ переносится.
 	PredictHit      = true,
-	-- A59: если после нажатия предиктор стабильно ушёл в MISS (A58-лог: 11/14 пустых блоков, 0/63 реальных попаданий) -- снять блок.
-	-- Работает против BlockCooldown только если сервер не ставит его при раннем Deactivated. НЕ ПРОВЕРЕНО, поэтому выкл.
+	-- A59: если после нажатия предиктор стабильно ушёл в MISS -- снять блок.
+	-- A60: ПРОВЕРЕНО по логу 2026-11-05: ранний релиз НЕ спасает. Релиз через 16мс/44мс после нажатия
+	-- (297.89, 251.29) дал BlockCooldown в ту же долю секунды -- сервер ставит кулдаун на любой релиз без парри.
+	-- Держать выключенным; не включать без нового лога, где кулдаун после раннего релиза не появляется.
 	LateCancel      = false,
 	LateCancelMin   = 0.03,
 	PredLead        = 0.05,
@@ -79,6 +81,12 @@ local Config = {
 	PredOmegaCap    = 14.0,
 	PredHyst        = 0.12,
 	PredStickyBreak = 0.15,
+	-- A60: ПРОВЕРЕНО БЭКТЕСТОМ и ОТВЕРГНУТО (лог 2026-11-05 + A58, 75 PERFECT / 21 пустышка): калибровка центра хитбокса
+	--   F = (forward - step*0.65) * hbMul - trim точнее по TRACE-HBGEOM (kyokushin 3.12 vs 3.14, boxing 3.86 vs 3.9), но на решении
+	--   даёт -3 PERFECT и 0 снятых пустышек: PredPad=3.0 подобран под старый F и держит бегущих атакующих (A58: PERFECT при дист 10.2).
+	--   Масштаб запаса по пингу на этих логах тоже ничего не меняет (все пинги 65-85мс) -- без логов с другим пингом не добавлять.
+	-- A60: мульти-удар (Boxing M2): парри первого удара связки отменяет остальные (PERFECT => атакующий Parried), додж на 2-й не планируем.
+	FollowUpCover   = true,
 
 	ComboEscape        = true,
 	ComboEscapeDodge   = true,
@@ -152,6 +160,8 @@ local Config = {
 	DodgeHeavy    = true,
 	FOV           = 360,
 
+	-- A60: MustDodge=false + AutoDodge=false = ноль доджей вообще (грабы тоже). Раньше isMustDodge был захардкожен
+	-- (wrestling/kure/judo/dirty/cqc + автограб из CombatConfig) и обходил оба тумблера: performDodge пропускал mustHit.
 	MustDodge       = true,
 	MustDodgeAutoGrab = true,
 	MustDodgeStyles = {
@@ -274,6 +284,14 @@ local Config = {
 	AliVariantSteerDur= 0.15,
 	AliEvasiveCounter = false,
 	AliDodgeAbuse     = false,
+	-- A61: после нерфа Ali обычный крит (M2) и додж-крит (StyleEvasiveCounter) делят ОДИН кулдаун (отчёт тестера 02.11, дамп от 29.10 это не отражает).
+	-- true: додж-абьюз разрешён только когда общий крит готов (атрибут M2Cooldown/M2CD снят и мы сами не стреляли критом недавно).
+	-- false: старая логика (додж-крит игнорирует M2-кулдаун -> абьюз при кулдауне M2 > 1с).
+	AliSharedCritCD   = true,
+	-- A61: кто идёт первым, когда доступны оба крита. "Counter" = обычный крит-контр (M2 в атакующего), додж только если контру не из чего
+	-- (не в зоне/не лицом/поздно). "Dodge" = как раньше: додж-абьюз всегда вытесняет контр.
+	AliCritPriority   = "Counter",
+	AliCritLockGuard  = 0.35,
 	CounterPreemptsDodge = true,
 	DodgeCenterFrac   = 0.38,
 
@@ -3661,6 +3679,7 @@ local counterReady = function()
 	if c:GetAttribute("RpCombatLocked") then return false, "RpCombatLocked" end
 	if c:GetAttribute("M2Cooldown") then return false, "M2Cooldown" end
 	if c:GetAttribute("M2CD") then return false, "M2CD" end
+	if cs == "ali" and os.clock() < (State.aliNormalLockUntil or 0) then return false, "ali-shared-lockout" end
 	local hum = c:FindFirstChildOfClass("Humanoid")
 	if not hum or hum.Health <= 0 then return false, "dead" end
 	if eHitActive(c) then return false, "EHit" end
@@ -3811,6 +3830,7 @@ State.updateAliM2Cooldown = function(now)
 		return
 	end
 	if active and not cd.active then
+		if Config.TraceDiag then diagPush("ALI-CRIT-CD-ON t=%.2f (M2Cooldown attr set; lock=%.2fs left)", now, math.max((State.aliCritLockUntil or 0) - now, 0)) end
 		loadGameModules()
 		local duration = 7
 		if GameData.cfg and GameData.cfg.GetStyleM2Cooldown then
@@ -3819,9 +3839,66 @@ State.updateAliM2Cooldown = function(now)
 		end
 		cd.started, cd.duration, cd.known = now, duration, true
 	elseif not active and cd.active then
+		-- A61: реально наблюдённая длина общего кулдауна (конфиг в дампе устарел после нерфа)
+		if cd.known and cd.started > 0 then
+			local obs = now - cd.started
+			if obs > 0.5 and obs < 30 then State.aliCritObservedCd = obs end
+			if Config.TraceDiag then diagPush("ALI-CRIT-CD-OFF t=%.2f observed=%.2fs (config says %.1fs)", now, obs, cd.duration or -1) end
+		end
 		cd.known, cd.started = false, 0
 	end
 	cd.active = active
+end
+
+-- A61: общий кулдаун критов Ali. true = крит (обычный или додж) сейчас можно выпустить и он не будет съеден кулдауном.
+-- Источники правды: атрибут M2Cooldown/M2CD на персонаже + собственная блокировка после нашего выстрела критом
+-- (репликация атрибута идёт ~RTT, за это время додж-абьюз уже ушёл бы «в пустую» и закинул нас во врага).
+_C.aliCritReady = function(now)
+	LPH_ATTRIBUTES(VM(NONE))
+	local c = localChar()
+	if not c then return false, "no-character" end
+	if c:GetAttribute("M2Cooldown") or c:GetAttribute("M2CD") then return false, "M2Cooldown" end
+	if now < (State.aliCritLockUntil or 0) then return false, "own-crit-lock" end
+	-- собственный кулдаун додж-крита (EvasiveCounter.Cooldown, в дампе 06.11 = 7с) -- без этого абьюз доджит впустую, пока крит «в откате»
+	local ec = _C.aliEvCfg()
+	if (now - (State.lastEvCounter or -99)) < ec.cd then return false, "evasive-cd" end
+	return true, "ready"
+end
+
+-- A61: параметры EvasiveCounter из игрового CombatConfig (Cooldown=7, SharedLockout=4 в дампе от 06.11; было 6 и без SharedLockout).
+_C.aliEvCfg = function()
+	LPH_ATTRIBUTES(VM(NONE))
+	local e = _C.aliEvCfgCache
+	if e then return e end
+	loadGameModules()
+	local cd, shared, range = 7, 4, 22
+	if GameData.cfg and GameData.cfg.GetStyleEvasiveCounter then
+		local ok, v = pcall(GameData.cfg.GetStyleEvasiveCounter, "ali")
+		if ok and type(v) == "table" then
+			cd = tonumber(v.Cooldown) or cd
+			shared = tonumber(v.SharedLockout) or shared
+			range = tonumber(v.MaxRange) or range
+		end
+	end
+	e = { cd = cd, shared = shared, range = range }
+	if GameData.cfg then _C.aliEvCfgCache = e end
+	return e
+end
+
+-- kind = "normal" (наш обычный крит-контр) | "evasive" (крит после PERFECT-доджа).
+-- SharedLockout: после крита одного вида другой заблокирован минимум на это время (по конфигу 4с), независимо от того, как именно
+-- сервер отражает это в атрибутах -- поэтому блокируем и сами.
+_C.aliCritLock = function(now, kind)
+	LPH_ATTRIBUTES(VM(NONE))
+	local ec = _C.aliEvCfg()
+	local guard = math.max(Config.AliCritLockGuard or 0.35, math.max(uplink(), 0.02) * 2 + 0.15)
+	local shared = math.max(guard, ec.shared)
+	if kind == "evasive" then
+		-- обычный крит после додж-крита недоступен shared секунд; додж-крит -- ec.cd (проверяется по lastEvCounter)
+		State.aliNormalLockUntil = now + shared
+	else
+		State.aliCritLockUntil = now + shared
+	end
 end
 
 _C.PARRY_ONLY_M2_CACHE = {}
@@ -3963,7 +4040,20 @@ function State.aliDodgeAbuseEligible(th, now, imminent, ifLat, ifDur)
 
 	local remaining = 999
 	local cd = State.aliM2CD
-	if cd and cd.active and cd.known then
+	if Config.AliSharedCritCD ~= false then
+		-- A61: общий кулдаун: додж-крит возможен ТОЛЬКО если крит сейчас готов, иначе додж не даёт ничего, кроме рывка во врага.
+		local ready, why = _C.aliCritReady(now)
+		if not ready then
+			if not th.aliCritCdLogged then
+				th.aliCritCdLogged = true
+				if Config.TraceDiag then
+					diagPush("ALI-ABUSE-SKIP t=%.2f target=%s gate=shared-crit-cd(%s) → без додж-абьюза (иначе рывок во врага без крита)", now, tostring(th.name), tostring(why))
+				end
+			end
+			return false, nil, "crit-on-cooldown"
+		end
+		remaining = 0
+	elseif cd and cd.active and cd.known then
 		remaining = (cd.started + cd.duration) - now
 		if remaining <= 1.0 then return false, nil, "m2-ready-soon" end
 	end
@@ -4044,6 +4134,7 @@ local fireBoxingCounter = function(th, targetDist)
 	end
 	if not fireNativeM2() then return end
 	local sentAt = os.clock()
+	if cs == "ali" then _C.aliCritLock(sentAt, "normal") end
 	State.lastCounter  = sentAt
 	State.counterFiredFrame = _C.FrameId
 	State.interruptLockUntil = math.max(State.interruptLockUntil or 0, sentAt + 0.40)
@@ -4130,7 +4221,7 @@ local tryAliEvasiveCounter = function(now)
 		GameData.aliEvCfg = ec0 or false
 	end
 	local ec = GameData.aliEvCfg ~= false and GameData.aliEvCfg or nil
-	local cd    = (ec and tonumber(ec.Cooldown))  or 6
+	local cd    = (ec and tonumber(ec.Cooldown))  or 7
 	local range = (ec and tonumber(ec.MaxRange))  or 22
 	if (now - (State.lastEvCounter or -99)) < cd then return false end
 		local procTTL = math.min(cd * (Config.AliProcTTLFrac or 0.25), Config.AliProcTTLMax or 1.5)
@@ -4206,6 +4297,7 @@ local tryAliEvasiveCounter = function(now)
 	end
 	tx.evCounterFired    = true
 	State.lastEvCounter  = now
+	_C.aliCritLock(now, "evasive")
 	State.evCounterCount = (State.evCounterCount or 0) + 1
 	State.flashUntil     = now + 0.25
 	State.status         = "ALI-EV-COUNTER"
@@ -4310,7 +4402,10 @@ local counterCandidate = function(now, ignoreTransient)
 			local ifLat = math.max(uplink(), 0.02)
 			local ifDur = GameData.iframeDur or Config.IFrameDur or 0.30
 			local ok = State.aliDodgeAbuseEligible(th, now, Threats, ifLat, ifDur)
-			if ok then yieldToAbuse = true end
+			-- A61: при общем кулдауне крит один -- по умолчанию отдаём его обычному контру (M2 в атакующего),
+			-- а додж-абьюз остаётся запасным, если контру не из чего (не лицом / вне зоны / поздно). Раньше абьюз вытеснял контр всегда:
+			-- при включённом доджe обычный крит не вылетал вообще.
+			if ok and (Config.AliCritPriority == "Dodge" or Config.AliSharedCritCD == false) then yieldToAbuse = true end
 		end
 		if aHRP and aHRP.Parent and not aliVsBoxingM2 and not yieldToAbuse and not th.dodged
 		   and not th.coveredByDodge and not th.coveredByCounter and not th.counterPendingId
@@ -4611,6 +4706,33 @@ local isMustDodge = function(th)
 	return false
 end
 State.isMustDodge = isMustDodge
+
+-- A60: единая точка «можно ли доджить эту угрозу». Мастер AutoDodge разрешает всё; при AutoDodge=false остаётся только
+-- принудительный додж (грабы / must-dodge список), и его гасит Config.MustDodge=false. Парри на граб это не возвращает:
+-- isMustDodge по-прежнему зануляет wantBlock (граб не парируется), так что при обоих выключенных мы просто принимаем удар.
+_C.dodgeAllowed = function(target)
+	LPH_ATTRIBUTES(VM(NONE))
+	if Config.AutoDodge ~= false then return true end
+	if Config.MustDodge == false then return false end
+	return target ~= nil and isMustDodge(target) == true
+end
+
+-- A60: 2-й удар связки (Boxing M2) не нуждается в доджe, пока 1-й удар парируется: PERFECT на любом ударе связки
+-- переводит атакующего в Parried и группа отменяется (см. result == "PERFECT" ... grp.cancelled). Лог 2026-11-05: парри 1-го
+-- хита дало PERFECT 3 из 3 раз (273.37 / 283.36 / 294.98), а додж на 2-й хит уходил за ~100мс ДО результата и ни разу ничего
+-- не накрыл (DODGE-CONFIRM covered=0), плюс sendDodge шлёт Deactivate и снимал наш же блок за ~30мс до контакта.
+-- Если 1-й удар не PERFECT, он станет resolved и 2-й удар вернётся в обычный план.
+_C.followUpOfParry = function(th)
+	LPH_ATTRIBUTES(VM(NONE))
+	if Config.FollowUpCover == false then return false end
+	local g = th.group
+	if not g or (th.strike or 1) < 2 or g.cancelled then return false end
+	local f = g.first
+	if not f or f == th or f.resolved or f.dodged or f.coveredByDodge then return false end
+	if not (f.plannedParry or f.pressed) then return false end
+	if isMustDodge(f) then return false end
+	return true
+end
 
 State.ap = {
 	m1         = nil,
@@ -6410,7 +6532,7 @@ local onAttack = function(attackerHRP, info, model, id, track, origin, hbPart)
 	local q = Pending[name]; if not q then q = {}; Pending[name] = q end
 	q[#q+1] = rec
 	if info.contacts and info.contacts[2] then
-		local group = { cancelled = false, held = false }
+		local group = { cancelled = false, held = false, first = th }
 		th.group, th.strike = group, 1
 		local hit2     = info.contacts[2]
 		local hit2Real = hit2
@@ -6748,11 +6870,11 @@ end
 
 local function performDodge(now, reason, preferBack, force, bypassAutoOff, dodgeTarget)
 	LPH_ATTRIBUTES(VM(NONE))
-	local mustHit = dodgeTarget and isMustDodge(dodgeTarget)
-	if Config.AutoDodge == false and not mustHit then
+	if not _C.dodgeAllowed(dodgeTarget) then
 		if State.lastDodgeRefuse ~= "AutoDodge-off" then
 			State.lastDodgeRefuse = "AutoDodge-off"
-			diagPush("DODGE-SKIP t=%.2f  %s  (AutoDodge disabled)", now, reason)
+			diagPush("DODGE-SKIP t=%.2f  %s  (dodge disabled: AutoDodge=%s MustDodge=%s)", now, tostring(reason),
+				tostring(Config.AutoDodge ~= false), tostring(Config.MustDodge ~= false))
 		end
 		return false
 	end
@@ -6892,7 +7014,7 @@ local function performDodge(now, reason, preferBack, force, bypassAutoOff, dodge
 	tx.dodgeDirMode = dirMode
 	tx.perfectConfirmed, tx.perfectAt = false, nil
 	if (counterStyle() or "") == "ali" and Config.SkillAddon and Config.AliEvasiveCounter then
-		diagPush("ALI-DODGE-ARM t=%.2f reason=%s await=StyleEvasiveCounter proc=one-perfect-dodge specialCd=6s range=22 ignoreNormalM2Cd=true deadline=%.0fms", now, tostring(reason), (tx.untilAt-now)*1000)
+		diagPush("ALI-DODGE-ARM t=%.2f reason=%s await=StyleEvasiveCounter proc=one-perfect-dodge specialCd=%.0fs sharedLockout=%.0fs range=22 deadline=%.0fms", now, tostring(reason), _C.aliEvCfg().cd, _C.aliEvCfg().shared, (tx.untilAt-now)*1000)
 	end
 	tx.evCounterFired, tx.evCounterExpiredLogged = false, false
 	tx.evCounterAwaitIframeLogged, tx.evCounterTargetGateLogged, tx.evCounterStateGate = false, false, nil
@@ -6956,7 +7078,7 @@ local updateDodgeTxn = function(now)
 		and not tx.perfectConfirmed
 	if (not tx.confirmed or awaitingProc) and budget > hardClose then hardClose = budget end
 	if tx.perfectConfirmed and not tx.evCounterFired and Config.AliEvasiveCounter then
-		local ttl = math.min(6 * (Config.AliProcTTLFrac or 0.25), Config.AliProcTTLMax or 1.5)
+		local ttl = math.min(_C.aliEvCfg().cd * (Config.AliProcTTLFrac or 0.25), Config.AliProcTTLMax or 1.5)
 		local procEnd = (tx.perfectAt or 0) + ttl
 		if procEnd > hardClose then hardClose = procEnd end
 	end
@@ -7671,6 +7793,14 @@ local schedulerStep = function(now)
 									tostring(anchor.name), tostring(anchor.kind),
 									(anchor.contactAbs - now) * 1000, covered)
 						end
+				elseif _C.followUpOfParry(anchor) then
+					-- A60: 2-й удар связки прикрыт парри 1-го -- додж не планируем и снимаем старый план
+					anchor.planCovered, anchor.plannedDodge, anchor.planStamp = true, nil, nil
+					if Config.TraceDiag and not anchor.followCoverLogged then
+						anchor.followCoverLogged = true
+						diagTrace("FOLLOWUP-COVER t=%.3f %s %s s%d contactIn=%+.0fms → додж не нужен: парри 1-го удара связки отменит остальные",
+							now, tostring(anchor.name), tostring(anchor.kind), anchor.strike or 2, (anchor.contactAbs - now) * 1000)
+					end
 				elseif Config.AutoDodge then
 					plannedDodges = plannedDodges + 1
 					anchor.plannedDodge, anchor.planStamp, anchor.planCovered = true, now, true
@@ -7858,7 +7988,7 @@ local schedulerStep = function(now)
 
 		local mustDodgeThreat = nil
 		for _, candidate in ipairs(imminent) do
-			if isMustDodge(candidate) then mustDodgeThreat = candidate; break end
+			if isMustDodge(candidate) and _C.dodgeAllowed(candidate) then mustDodgeThreat = candidate; break end
 		end
 		if mustDodgeThreat and dodgeReady() and canDodgeNow() then
 			local mustDt = mustDodgeThreat.contactAbs - now
@@ -8257,7 +8387,15 @@ local schedulerStep = function(now)
 				local cdGap   = (Config.BlockCooldown or 0.5) - (Config.BlockCooldownSafety or 0.03)
 				local stunnedPress = meC and stunEscapeNow(meC)
 				local multiHit = wantBlock.kind == "M2" and (wantBlock.strike or 1) >= 2
-				if multiHit and not stunnedPress and pressGap < cdGap then
+				if multiHit and not stunnedPress and pressGap < cdGap and State.blocking and _C.followUpOfParry(wantBlock) then
+					-- A60: блок 1-го удара связки ещё держим и он не resolved -> не снимаем его и не доджим: PERFECT отменит 2-й удар.
+					-- Раньше ветка ниже делала releaseBlock() посреди парри (релиз без парри = BlockCooldown) и следом додж.
+					if Config.TraceDiag and not wantBlock.followHoldLogged then
+						wantBlock.followHoldLogged = true
+						diagTrace("FOLLOWUP-HOLD t=%.3f %s s%d press gap=%.0fms → блок держим, додж/релиз не нужны до результата 1-го удара",
+							now, tostring(wantBlock.name), wantBlock.strike or 2, pressGap * 1000)
+					end
+				elseif multiHit and not stunnedPress and pressGap < cdGap then
 					if not wantBlock.cdPressLogged then
 						wantBlock.cdPressLogged = true
 						diagPush("CD-PRESS t=%.2f %s s2 press2−press1=%.0fms < CD %.0fms → сервер молча съест нажатие; гард снят",
@@ -8269,7 +8407,7 @@ local schedulerStep = function(now)
 					releaseBlock()
 					wantBlock.pressed = true
 					wantBlock.pressDt  = wantBlock.contactAbs - now
-					if (Config.AutoDodge ~= false or isMustDodge(wantBlock)) and dodgeReady() and canDodgeNow(true)
+					if _C.dodgeAllowed(wantBlock) and dodgeReady() and canDodgeNow(true)
 						and not wantBlock.coveredByDodge then
 						if performDodge(now, "must-dodge(m2-s2-cd)", false, true, false, wantBlock) then
 							diagPush("CD-DODGE-S2 t=%.2f %s s2 contactIn=%.0fms → CD съест парри, уходим доджем",
@@ -10987,6 +11125,10 @@ return function(_Lib, _Core)
 			function() return Config.DodgeOnParryCooldown ~= false end,
 			function(v) Config.DodgeOnParryCooldown = v end)
 		apDodge:SubLabel({ Text = "Dodges when parry is on cooldown." })
+		boolToggle(apDodge, "Must Dodge Enabled", "Must Dodge",
+			function() return Config.MustDodge ~= false end,
+			function(v) Config.MustDodge = v end)
+		apDodge:SubLabel({ Text = "Forced dodges (grabs + list below). Off together with Auto Dodge = no dodging at all." })
 
 		apDodge:Divider()
 		apDodge:Header({ Name = "Dodge Tuning" })
@@ -11083,6 +11225,12 @@ return function(_Lib, _Core)
 			function() return Config.AliEvasiveCounter end, function(v) Config.AliEvasiveCounter = v end)
 		boolToggle(apBox, "Ali Dodge Abuse", "Ali Dodge Abuse",
 			function() return Config.AliDodgeAbuse end, function(v) Config.AliDodgeAbuse = v end)
+		boolToggle(apBox, "Ali Shared Crit Cooldown", "Ali Shared Crit CD",
+			function() return Config.AliSharedCritCD ~= false end, function(v) Config.AliSharedCritCD = v end)
+		boolToggle(apBox, "Ali Counter Before Dodge Crit", "Ali Counter First",
+			function() return Config.AliCritPriority ~= "Dodge" end,
+			function(v) Config.AliCritPriority = v and "Counter" or "Dodge" end)
+		apBox:SubLabel({ Text = "Shared CD: dodge-crit only when the crit is off cooldown. Counter First: normal crit goes first, dodge-crit is the fallback." })
 		slider(apBox, { Name = "Ali Rotation Hold", Flag = "AP_AliFaceLockDur",
 			Default = math.floor((Config.AliFaceLockDur or 0.75) * 1000),
 			Min = 200, Max = 1400, Suffix = " ms",
