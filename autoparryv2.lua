@@ -10,7 +10,7 @@ local _C = {}
 local _D = {}
 
 local Config = {
-	Version       = "A61",
+	Version       = "A62",
 	Enabled       = false,
 	Mode          = "Perfect",
 	SpecConsumeWindow = 0.45, -- A46: баф скорости (Jin ElectricWind/Zanshin) снимается на старте удара; помним снятое значение столько секунд
@@ -282,6 +282,7 @@ local Config = {
 	AliProcTTLFrac    = 0.25,
 	AliProcTTLMax     = 1.5,
 	AliVariantSteerDur= 0.15,
+	AliVariantLead    = 0.06,
 	AliEvasiveCounter = false,
 	AliDodgeAbuse     = false,
 	-- A61: после нерфа Ali обычный крит (M2) и додж-крит (StyleEvasiveCounter) делят ОДИН кулдаун (отчёт тестера 02.11, дамп от 29.10 это не отражает).
@@ -292,6 +293,8 @@ local Config = {
 	-- (не в зоне/не лицом/поздно). "Dodge" = как раньше: додж-абьюз всегда вытесняет контр.
 	AliCritPriority   = "Counter",
 	AliCritLockGuard  = 0.35,
+	-- A61: граб-додж (wrestling/kure/judo/dirty/cqc M2 и автограбы). "Smart" | "Timing" (старое) | "Immediate". См. schedulerStep, блок mustDodgeThreat.
+	GrabDodgeMode     = "Smart",
 	CounterPreemptsDodge = true,
 	DodgeCenterFrac   = 0.38,
 
@@ -3636,7 +3639,7 @@ local function counterStyle()
 	return out
 end
 
-local function steerM2Variant(want)
+local function steerM2Variant(want, hold)
 	LPH_ATTRIBUTES(VM(NONE))
 	local c = localChar(); if not c then return end
 	local hum = c:FindFirstChildOfClass("Humanoid"); if not hum then return end
@@ -3646,7 +3649,7 @@ local function steerM2Variant(want)
 	dir = Vector3.new(dir.X, 0, dir.Z)
 	if dir.Magnitude < 0.05 then return end
 	State.ap.steerDir   = dir.Unit
-	State.ap.steerUntil = os.clock() + (Config.AliVariantSteerDur or 0.15)
+	State.ap.steerUntil = os.clock() + (hold or Config.AliVariantSteerDur or 0.15)
 	hum:Move(State.ap.steerDir, false)
 end
 
@@ -4130,7 +4133,26 @@ local fireBoxingCounter = function(th, targetDist)
 			end
 			_D.aliM2HasVars = hasVars
 		end
-		if _D.aliM2HasVars then steerM2Variant(Config.AliM2Variant or "Left") end
+		if _D.aliM2HasVars then
+			-- A61: вариант M2 (Left/Right) сервер выбирает по MoveDirection в момент приёма ServerCheck (клиент шлёт только позицию камеры).
+			-- Раньше steer и выстрел шли в одном кадре -> MoveDirection ещё не обновился/не доехал до сервера -> «50/50 правый шафл».
+			-- Теперь: сначала держим направление AliVariantLead секунд (по умолчанию 0.06), затем стреляем; руление держится ещё
+			-- AliVariantSteerDur после, чтобы приём на сервере попал внутрь удержания.
+			local want = Config.AliM2Variant or "Left"
+			local lead = Config.AliVariantLead or 0.06
+			local arm = State.aliVariantArm
+			local tNow = os.clock()
+			if lead > 0 and (not arm or arm.th ~= th or (tNow - arm.t) > 0.5) then
+				steerM2Variant(want, lead + (Config.AliVariantSteerDur or 0.15))
+				State.aliVariantArm = { th = th, t = tNow }
+				return
+			elseif lead > 0 and (tNow - arm.t) < lead then
+				return
+			elseif lead <= 0 then
+				steerM2Variant(want)
+			end
+			State.aliVariantArm = nil
+		end
 	end
 	if not fireNativeM2() then return end
 	local sentAt = os.clock()
@@ -7994,8 +8016,20 @@ local schedulerStep = function(now)
 			local mustDt = mustDodgeThreat.contactAbs - now
 			local coverLo = ifLat - 0.04
 			local coverHi = ifLat + ifDur - 0.04
-			if mustDt >= coverLo and mustDt <= coverHi then
+			-- A61: режимы граб-доджа. "Timing" = как было: ждём, пока контакт войдёт в окно i-frame, и пропускаем, если уже не накроет.
+			-- "Smart" (по умолчанию) = то же ожидание, но если окно уже упущено (контакт ближе coverLo: большой пинг/поздний детект) --
+			-- доджим сразу назад: рывок ~6 студов выводит из зоны граба, i-frame тут не нужен. "Immediate" = додж сразу после детекта.
+			local gmode = Config.GrabDodgeMode or "Smart"
+			local inWindow = mustDt >= coverLo and mustDt <= coverHi
+			local lateEscape = gmode ~= "Timing" and mustDt > 0.0 and mustDt < coverLo
+			local immediate  = gmode == "Immediate" and mustDt > 0.0 and mustDt > coverHi
+			if inWindow or lateEscape or immediate then
 				if performDodge(now, "must-dodge(unblockable→back)", true, false, true, mustDodgeThreat) then
+					if (lateEscape or immediate) and Config.TraceDiag then
+						diagTrace("GRAB-DODGE-%s t=%.3f %s %s contactIn=%.0fms window=[%.0f,%.0f]ms mode=%s",
+							lateEscape and "LATE" or "EARLY", now, tostring(mustDodgeThreat.name), tostring(mustDodgeThreat.kind),
+							mustDt * 1000, coverLo * 1000, coverHi * 1000, gmode)
+					end
 					return
 				end
 			elseif Config.DeepDiag and not mustDodgeThreat.mustDodgeCoverLogged then
@@ -11129,6 +11163,15 @@ return function(_Lib, _Core)
 			function() return Config.MustDodge ~= false end,
 			function(v) Config.MustDodge = v end)
 		apDodge:SubLabel({ Text = "Forced dodges (grabs + list below). Off together with Auto Dodge = no dodging at all." })
+		apDodge:Dropdown({
+			Name = "Grab Dodge Mode",
+			Options = { "Smart", "Immediate", "Timing" },
+			Default = Config.GrabDodgeMode or "Smart",
+			Callback = function(v)
+				if type(v) == "string" and v ~= "" then Config.GrabDodgeMode = v end
+			end,
+		}, ctx.flag("AP_GrabDodgeMode"))
+		apDodge:SubLabel({ Text = "Smart: wait for i-frames, but dash away at once if the window is already missed (high ping). Immediate: dash right on detect." })
 
 		apDodge:Divider()
 		apDodge:Header({ Name = "Dodge Tuning" })
