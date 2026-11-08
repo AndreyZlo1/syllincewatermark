@@ -10,7 +10,7 @@ local _C = {}
 local _D = {}
 
 local Config = {
-	Version       = "A62",
+	Version       = "A63",
 	Enabled       = false,
 	Mode          = "Perfect",
 	SpecConsumeWindow = 0.45, -- A46: баф скорости (Jin ElectricWind/Zanshin) снимается на старте удара; помним снятое значение столько секунд
@@ -9459,12 +9459,15 @@ local function neutralizeAC()
 	-- ключу. Регистр ключей обязан быть точным: _scanHitboxes/_reportVictimHit/_isSuppressed взяты из дампа
 	-- (VictimHitboxServiceClient, FallServiceClient); остальные имена в дампе не найдены (AC обфусцирован) —
 	-- это догадка по прежнему списку, неверное имя просто ничего не найдёт.
+	-- A63: `_isSuppressed` есть в ДВУХ классах: VictimHitboxServiceClient (нужен нам) и FallServiceClient (прыжок/падение/приземление).
+	-- Раньше патчился любой таблица с этим ключом -> FallService навсегда «подавлен» (_beginAirborne/_onLanded выходят сразу) ->
+	-- анимации прыжка/падения не играются -> T-поза у игроков со скриптом. Теперь только если в той же таблице есть _scanHitboxes.
 	local targets = {
 		{ "_sendAnticheatReport", noop }, { "_sendAnticheatShadowReport", noop },
 		{ "_reportVictimHit", noop }, { "_scanHitboxes", noop },
 		{ "_wireRemoteSpamTouch", noop }, { "_reportHitbox", noop },
 		{ "_reportSwing", noop }, { "_flag", noop },
-		{ "_isSuppressed", truefn },
+		{ "_isSuppressed", truefn, "_scanHitboxes" },
 	}
 	local patched, tablesHit = 0, 0
 	if type(filtergc) ~= "function" then
@@ -9477,7 +9480,9 @@ local function neutralizeAC()
 		if okF and type(found) == "table" then
 			local list = (type(rawget(found, t[1])) == "function") and { found } or found
 			for _, o in ipairs(list) do
-				if type(o) == "table" and type(rawget(o, t[1])) == "function" and pcall(rawset, o, t[1], t[2]) then
+				if type(o) == "table" and type(rawget(o, t[1])) == "function"
+				   and (t[3] == nil or type(rawget(o, t[3])) == "function")
+				   and pcall(rawset, o, t[1], t[2]) then
 					patched = patched + 1; tablesHit = tablesHit + 1
 				end
 			end
