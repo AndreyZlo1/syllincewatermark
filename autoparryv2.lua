@@ -8510,6 +8510,12 @@ local schedulerStep = function(now)
 							tostring(meP and meP:GetAttribute("Stunned") == true),
 							tostring(meP and meP:GetAttribute("ParryBuffered") == true),
 							tostring(meP and (meP:GetAttribute("CombatAttacking") or meP:GetAttribute("M1") or meP:GetAttribute("M2")) == true))
+						-- A62: какой именно атрибут своей атаки висел в момент нажатия (M1 / CombatAttacking / M2 / PendingM2) -- для разбора «потеющего» игрока
+						if meP then
+							local which = (meP:GetAttribute("M1") and "M1" or "") .. (meP:GetAttribute("CombatAttacking") and "+CA" or "")
+								.. (meP:GetAttribute("M2") and "+M2" or "") .. (meP:GetAttribute("PendingM2") and "+PM2" or "")
+							if which ~= "" then wantBlock.rec.pressState = wantBlock.rec.pressState .. " own=" .. which end
+						end
 					end
 					wantBlock.rec.pressServer = serverNow
 					wantBlock.rec.pressAt = wantBlock.contactAbs - (wantBlock.aimGap or Config.PerfectLead or 0)
