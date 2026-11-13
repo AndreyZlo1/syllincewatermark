@@ -200,6 +200,11 @@ local CFG = {
 	BlockGapMin = 2.0,
 	BlockMaxDepth = 9, -- AutoBlock in front of him: closes in to at most this depth (was a fixed 26: kept whatever distance we had)
 	BlockSmart = true, -- AutoBlock picks its man like a defender: the carrier near our goal, else the man he will pass to
+	BlockBehindLogic = true, -- we are behind a carrier running at our goal: take the next attacker, else cut him off
+	BlockBehindRcv = 14, -- ... a receiver must be at least this far from the carrier
+	BlockCutHopeless = 1.4, -- cut-off gives up when even the best point is this many seconds late and we are far behind
+	BlockTurnDeg = 35, -- a change of his heading over this (vs 0.3 s ago) is a turn
+	BlockTurnHedge = 0.35, -- after a turn the extrapolation horizon shrinks to this share and grows back over 0.6 s
 	BlockFarGoal = 100, -- carrier farther than this from our mouth: mark his teammate closer to our goal
 	BlockGoalRange = 70, -- carrier within BlockFarGoal and nobody of ours on him: start the block from this far
 	BlockLevelSlack = 8, -- with a teammate on the carrier: mark an enemy at most this much farther from goal than him
@@ -212,13 +217,16 @@ local CFG = {
 	ArcMaxErr = 2.5, -- FreezeGun: accepted height error of the scanned landing point (studs)
 	JumpSlide = true, -- a lofting carrier: jump first, slide from the air
 	JumpSlideDelay = 0.16,
-	AutoKickRange = 5.5, -- AutoBlock presses the kick when the carrier is within kick reach + this (was +2.5)
+	AutoKickRange = 16, -- AutoBlock starts the kick plan when the carrier is within kick reach + this (it runs to him)
+	AutoKickConf = 0.55, -- share of his possible futures the kick box must hold at the release
+	AutoKickMove = true, -- run to the kick spot first (the plan looks AutoKickLead s ahead), steer during the charge
+	AutoKickLead = 0.5, -- longest run-up the kick plan may use
+	AutoKickCancel = 0.25, -- a charge whose hit share falls under this is cancelled
+	KickHelper = true, -- while YOU charge a kick at a carrier, the body and the aim turn to where he will be at the release
+	KickHelperRange = 42,
 	AutoKickCooldown = 0.5,
 	AutoKickAway = 3, -- no kick when HE moves away from us faster than this (urgent air/counter kicks: twice)
 	AutoKickFlee = 9, -- no kick when the gap would open faster than this (he runs away, we are slowed to ~8 by the charge)
-	AutoKickPadPerSpeed = 0.1, -- extra solid-hit margin (studs) per stud/s of opening speed
-	AutoKickEager = true, -- press when he is inside the box at the earliest release, solid or not
-	AutoKickRelease = 0.4, -- earliest release charge (while he is in the box); >= the full charge (0.35) = always wait for full unless he would leave the box
 	SlideCenterWindow = 0.2, -- AutoBall slide: keep scanning this long after the first press that holds the ball, take the one with the most box hits
 	SlideGoodHits = 7, -- hits (of 11) that count as centred
 	SlideLag = 0.03, -- extra seconds the ball is taken ahead when a slide is planned (on top of ping/2)
@@ -10541,20 +10549,26 @@ Mark.kickReach = function()
 	return -k.CFrameOffset.Z + k.Size.Z * 0.5
 end
 
--- Non-owner kick hitbox is oriented by the charge aim ray (Shoot release -> AimFacing.GetAimedRoot(root, ray)),
--- not by body facing. While we charge without the ball, point the ray (Reticle hook) and the body at the carrier.
-Mark.blockCharge = function(root)
+-- KICK HELPER (its own function, CFG.KickHelper): while the PLAYER charges a kick without the ball, the aim ray (Reticle
+-- override) and the body turn to the enemy carrier, led to where he will be at the release. The non-owner kick hitbox is
+-- oriented by the charge aim ray (Shoot release -> AimFacing.GetAimedRoot), not by the body. Independent of AutoBlock; the
+-- scripted AutoKick sets its own aim and is skipped here.
+Mark.kickHelper = function(root)
 	local charging = ChargedKick.IsCharging and ChargedKick.IsCharging()
 	local aim = nil
-	if CFG.AutoBlock and charging and liveOwnerId() ~= LocalPlayer.UserId then
-		local carrier, _, _, p = Mark.blockTarget()
-		if carrier and flat(p - root.Position).Magnitude <= 42 then
-			aim = unitOrNil(flat(p - root.Position))
+	if CFG.KickHelper ~= false and charging and not Mark.ak and liveOwnerId() ~= LocalPlayer.UserId then
+		local carrier, _, chE, p, v = Mark.blockTarget()
+		if carrier and flat(p - root.Position).Magnitude <= (CFG.KickHelperRange or 42) then
+			local ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
+			local dly = chE and math.clamp(CharacterMotion.GetDisplayDelaySeconds(chE) or 0, 0, 0.25) or 0
+			local minRel = (KickCore.GetMinimumReleaseSeconds and KickCore.GetMinimumReleaseSeconds()) or 0.2
+			local at = p + flat(v) * (dly + ping * 0.5 + minRel)
+			aim = unitOrNil(flat(at - root.Position))
 		end
 	end
 	if aim then
 		if not Mark.blockAim then
-			logFile("block charge", "aim", fmtV(aim))
+			logFile("kick helper", "aim", fmtV(aim))
 		end
 		Mark.chargeFace = aim
 		Mark.blockAim = aim
@@ -11001,7 +11015,17 @@ Mark.blockChoose = function(root, carrier, cr, P, V, g)
 	local a1, a2 = lb and unitOrNil(flat(lb - P)), rb and unitOrNil(flat(rb - P))
 	local width = (a1 and a2) and math.deg(math.acos(math.clamp(a1:Dot(a2), -1, 1))) or 90
 	local far = dC > (CFG.BlockFarGoal or 100)
-	local passer = far or (dC > 40 and width < (CFG.BlockShotAngle or 9))
+	-- BEHIND him (he runs at our goal, we are on the far side of him): running after him to block his shot cannot work.
+	-- Two jobs, the user's: (1) take the next attacker ahead who is not on the carrier (the lane solver below: press him
+	-- and deny the pass), else (2) cut the carrier off (Mark.blockCutTick: the point on his line we reach first).
+	local behind = false
+	do
+		local eg0 = unitOrNil(flat(mouth - P))
+		if CFG.BlockBehindLogic ~= false and eg0 and dC < 170 then
+			behind = flat(root.Position - P):Dot(eg0) < -3 and flat(V):Dot(eg0) > 3
+		end
+	end
+	local passer = far or behind or (dC > 40 and width < (CFG.BlockShotAngle or 9))
 	local comp = nil
 	if not passer and CFG.BlockCompetitor ~= false and not Mark.atHomeGoal(root, P) then
 		comp = Mark.mateNear(P, CFG.CompetitorRadius or 12)
@@ -11022,7 +11046,7 @@ Mark.blockChoose = function(root, carrier, cr, P, V, g)
 				local dG = flat(pos - mouth).Magnitude
 				local toR = flat(pos - P)
 				local L = toR.Magnitude
-				if dG < maxD and L <= (CFG.BlockPassMax or 130) and L > 6 and not Mark.mateNear(pos, CFG.BlockCoverRadius or 8) then
+				if dG < maxD and L <= (CFG.BlockPassMax or 130) and L > (behind and (CFG.BlockBehindRcv or 14) or 6) and not Mark.mateNear(pos, CFG.BlockCoverRadius or 8) then
 					local ang = face and math.deg(math.acos(math.clamp(toR.Unit:Dot(face), -1, 1))) or 90
 					-- lane cover: one of ours on the lane already takes the pass
 					local covered = false
@@ -11052,8 +11076,89 @@ Mark.blockChoose = function(root, carrier, cr, P, V, g)
 	end
 	if best then
 		Mark.blkPick = { actor = best.actor, at = os.clock() }
+	elseif behind then
+		return { kind = "cut", dC = dC, width = width, mouth = mouth }
 	end
 	return best
+end
+
+-- Cut-off: the point on his run (his pose + velocity, display delay + ping + 0.1 s ahead) that we reach with a margin,
+-- the earliest such; none reachable -> the point we come closest to in time. Stand 1 stud inside our kick reach on the goal
+-- side of it. Hopeless (we lose it by BlockCutHopeless s) and far behind -> nothing (the old far/behind skip).
+Mark.blockCutTick = function(character, root, pick, P, V, chE, cr)
+	local mySpd = Mark.akSpeeds(character)
+	local ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
+	local dly = chE and math.clamp(CharacterMotion.GetDisplayDelaySeconds(chE) or 0, 0, 0.25) or 0
+	local lag = dly + ping + 0.1
+	local Vc = V.Magnitude > 30 and V.Unit * 30 or V
+	local feasible, best, bestSlack = nil, nil, -math.huge
+	for i = 2, 16 do
+		local t = i * 0.1
+		local Pt = P + Vc * (t + lag)
+		local slack = t - flat(Pt - root.Position).Magnitude / mySpd
+		if slack >= 0.12 then
+			feasible = { t = t, p = Pt, slack = slack }
+			break
+		end
+		if slack > bestSlack then
+			best, bestSlack = { t = t, p = Pt, slack = slack }, slack
+		end
+	end
+	local pk = feasible or best
+	local dist = flat(root.Position - P).Magnitude
+	if not feasible and bestSlack < -(CFG.BlockCutHopeless or 1.4) and dist > (CFG.BlockBehind or 22) then
+		return false
+	end
+	local toG = unitOrNil(flat(pick.mouth - pk.p)) or Vector3.zero
+	local tgt = pk.p + toG * math.max(Mark.kickReach() - 1, 2)
+	tgt = Vector3.new(tgt.X, root.Position.Y, tgt.Z)
+	local off = flat(tgt - root.Position)
+	local cmd = off.Magnitude > 0.6 and off.Unit or Vector3.zero
+	local now = os.clock()
+	if CFG.AutoKick ~= false and chE and dist <= Mark.kickReach() + (CFG.AutoKickRange or 16) then
+		Mark.akTry("block", chE, cr, false)
+		local ap = Mark.akApproach
+		if ap and now - ap.at < 0.12 then
+			cmd = ap.dir
+		end
+	end
+	Mark.move.look = unitOrNil(flat(P - root.Position))
+	Mark.move.pts = Mark.blockCurve(root.Position, tgt, flat(root.AssemblyLinearVelocity), V)
+	Mark.move.born = Mark.move.born or now
+	Mark.moveSteer(cmd, "block")
+	Mark.blockHold, Mark.blockLast, Mark.blockDest, Mark.blockRoot = now, now, tgt, cr
+	if not Mark.blockCutLog or now - Mark.blockCutLog > 0.5 then
+		Mark.blockCutLog = now
+		logFile("block cut", "t", string.format("%.2f", pk.t), "slack", string.format("%.2f", pk.slack), "reach", tostring(feasible ~= nil), "dist", string.format("%.1f", dist), "his", string.format("%.1f", V.Magnitude), "us", string.format("%.1f", mySpd))
+	end
+	if off.Magnitude > 6 then
+		Mark.agentHold(true, "chase")
+	end
+	return true
+end
+
+-- Agent route as a curve: cubic Hermite from our position (leaving along our own velocity) to the spot (arriving along
+-- his run). 6 points. Short or standing: the straight pair.
+Mark.blockCurve = function(from, to, vUs, vHim)
+	local d = flat(to - from)
+	local L = d.Magnitude
+	if L < 3 then
+		return { from, to }
+	end
+	local chord = d / L
+	local u0 = vUs.Magnitude > 4 and vUs.Unit or chord
+	local u1 = vHim.Magnitude > 3 and vHim.Unit or chord
+	local m0, m1 = u0 * (L * 0.5), u1 * (L * 0.4)
+	local out = table.create(6)
+	for i = 0, 5 do
+		local s = i / 5
+		local s2, s3 = s * s, s * s * s
+		local h00, h10, h01, h11 = 2 * s3 - 3 * s2 + 1, s3 - 2 * s2 + s, -2 * s3 + 3 * s2, s3 - s2
+		local p = from * h00 + m0 * h10 + to * h01 + m1 * h11
+		out[i + 1] = Vector3.new(p.X, from.Y, p.Z)
+	end
+	out[1], out[6] = from, to
+	return out
 end
 
 -- Marking. passer: the intercept point on the lane. else: his pass lane BlockMarkGap from him toward the carrier.
@@ -11181,7 +11286,6 @@ Mark.blockCone = function(Pt, g)
 end
 
 Mark.tickBlock = function(character, root)
-	Mark.blockCharge(root)
 	Mark.tickCounterJump(character, root)
 	-- idle polling at half rate when the frame budget is tight (>= ~100 fps): a started block runs every frame
 	Mark.blockFrame += 1
@@ -11302,6 +11406,9 @@ Mark.tickBlock = function(character, root)
 		Mark.blockMarkTick(character, root, pick, P)
 		return
 	end
+	if pick and pick.kind == "cut" and Mark.blockCutTick(character, root, pick, P, V, chE, cr) then
+		return
+	end
 	local active = Mark.move.mode == "block"
 	local goalSide = along > -1
 	local range = goalSide and ((CFG.BlockRange or 28) + (active and 6 or 0)) or ((CFG.BlockBehind or 14) + (active and 4 or 0))
@@ -11338,7 +11445,7 @@ Mark.tickBlock = function(character, root)
 	end
 	-- AutoKick inside the block: the shadow spot keeps him at the edge of our kick box; when the box really reaches him
 	-- (Mark.akTry predicts the release against his pose) the charge goes out and is released by the box
-	if CFG.AutoKick ~= false and dist <= Mark.kickReach() + (CFG.AutoKickRange or 5.5) and chE then
+	if CFG.AutoKick ~= false and dist <= Mark.kickReach() + (CFG.AutoKickRange or 16) and chE then
 		Mark.akTry("block", chE, cr, false)
 	end
 	Mark.mover = Mark.mover or require(Modules.Actions.ActionMovement)
@@ -11353,6 +11460,11 @@ Mark.tickBlock = function(character, root)
 	-- displayed pose lags the server pose, and the packet itself lags by ping. Stand where he will be.
 	local lag = delay + math.clamp(LocalPlayer:GetNetworkPing() or 0, 0, 0.22) + 0.1
 	-- light EMA on his velocity (carrierPose differentiates positions every >= 25 ms; single-step jitter swings the spot)
+	-- He does not run straight. A sharp change of heading (> BlockTurnDeg against 0.3 s ago) means the new line is not yet a
+	-- fact: extrapolating it for the whole horizon sent us to where he would be if he kept turning (and a feint made us run
+	-- the wrong way). For 0.6 s after the turn the horizon shrinks to BlockTurnHedge of its length (the spot stays near his
+	-- body, on his line to goal) and grows back as the new heading proves itself.
+	local turnK = 1
 	do
 		local nowc = os.clock()
 		local bs = Mark.blockVs
@@ -11361,6 +11473,34 @@ Mark.tickBlock = function(character, root)
 			V = bs.v + (V - bs.v) * k
 		end
 		Mark.blockVs = { ch = chE, t = nowc, v = V }
+		local h = Mark.blockHist
+		if not (h and h.ch == chE) then
+			h = { ch = chE, list = {} }
+			Mark.blockHist = h
+		end
+		local list = h.list
+		list[#list + 1] = { t = nowc, v = V }
+		while #list > 1 and nowc - list[1].t > 0.8 do
+			table.remove(list, 1)
+		end
+		local old = nil
+		for _, e in list do
+			if nowc - e.t >= 0.3 then
+				old = e
+			end
+		end
+		if old and V.Magnitude > 4 and old.v.Magnitude > 4 then
+			local ang = math.deg(math.acos(math.clamp(V.Unit:Dot(old.v.Unit), -1, 1)))
+			if ang > (CFG.BlockTurnDeg or 35) then
+				if not h.turnAt or nowc - h.turnAt > 0.3 then
+					logFile("block turn", string.format("%.0f", ang), "deg, hedge for 0.6 s", "his", string.format("%.1f", V.Magnitude))
+				end
+				h.turnAt = nowc
+			end
+		end
+		if h.turnAt then
+			turnK = math.clamp((nowc - h.turnAt) / 0.6, CFG.BlockTurnHedge or 0.35, 1)
+		end
 	end
 	-- He is charging a kick (ActionPresentationUpdate KickChargeStarted/Updated carries his aim): stand on his
 	-- shot line instead of the goal line, so the release hits our body.
@@ -11415,7 +11555,7 @@ Mark.tickBlock = function(character, root)
 	-- him to get there.
 	local Vc = V.Magnitude > 30 and V.Unit * 30 or V
 	local function spotAt(t)
-		local Pt = P + Vc * math.min(t + lag, 0.5)
+		local Pt = P + Vc * (math.min(t + lag, 0.5) * turnK)
 		local bis, cover = Mark.blockCone(Pt, g)
 		return Pt, shotLine or bis or unitOrNil(flat(g.Position - Pt)) or u, cover
 	end
@@ -11502,6 +11642,34 @@ Mark.tickBlock = function(character, root)
 			cmd = Vector3.zero
 		end
 	end
+	-- AutoKick plan (run at him / steer through the charge) owns the direction while it is fresh
+	do
+		local ap = Mark.akApproach
+		if ap and os.clock() - ap.at < 0.12 then
+			cmd = ap.dir
+		end
+	end
+	-- the line of the agent is a curve, not a ruler: it leaves along our own velocity (momentum) and bends to the spot, the
+	-- command follows it a little ahead, and a light low-pass keeps the heading from snapping when his velocity jumps
+	local route = Mark.blockCurve(root.Position, target, flat(root.AssemblyLinearVelocity), V)
+	if not pathSpot and not ahead and off.Magnitude > 5 and cmd.Magnitude > 0.2 and route[3] then
+		local dc = unitOrNil(flat(route[3] - route[1]))
+		if dc then
+			cmd = (cmd.Unit * 0.45 + dc * 0.55).Unit * cmd.Magnitude
+		end
+	end
+	do
+		local nowS = os.clock()
+		local pc = Mark.blockCmdPrev
+		if pc and nowS - pc.t < 0.25 and cmd.Magnitude > 0.2 and pc.v.Magnitude > 0.2 then
+			local k = 1 - math.exp(-(nowS - pc.t) / 0.06)
+			local mixed = pc.v + (cmd - pc.v) * k
+			if mixed.Magnitude > 0.2 then
+				cmd = mixed.Magnitude > 1 and mixed.Unit or mixed
+			end
+		end
+		Mark.blockCmdPrev = { t = nowS, v = cmd }
+	end
 	if not Mark.blockLogged then
 		Mark.blockLogged = true
 		Mark.blockAt = os.clock()
@@ -11519,13 +11687,8 @@ Mark.tickBlock = function(character, root)
 	do
 		local face = unitOrNil(flat(P - root.Position))
 		Mark.move.look = face or Mark.chargeFace
-		if face and ChargedKick.IsCharging and ChargedKick.IsCharging() then
-			Mark.chargeFace = face
-			Mark.blockAim = face
-			TurnControl.LockAutoRotate("AimCharge", face)
-		end
 	end
-	Mark.move.pts = { root.Position, target }
+	Mark.move.pts = route
 	Mark.move.born = Mark.move.born or os.clock()
 	Mark.moveSteer(cmd, "block")
 	if off.Magnitude > 6 then
@@ -13256,11 +13419,8 @@ Mark.tackleGate = function(character, root, player, ch, solved)
 	end
 	if mode == "smart" then
 		local d = rel.Magnitude
-		local kickLive = CFG.AutoKick ~= false and holding and not Mark.ak and now - (Mark.akAt or 0) >= (CFG.AutoKickCooldown or 0.5)
-		if kickLive then
-			local vAway = solved.spd and (solved.spd * 0.6) or 0
-			kickLive = d <= Mark.kickReach() + 0.5 and vAway <= (CFG.AutoKickFlee or 9)
-		end
+		local ap = Mark.akApproach
+		local kickLive = CFG.AutoKick ~= false and ((ap and now - ap.at < 0.15 and ap.conf >= (CFG.AutoKickConf or 0.55) and d <= Mark.kickReach() + 12) or (Mark.ak and true) or false)
 		if not kickLive then
 			return true, "free"
 		end
@@ -13485,25 +13645,7 @@ Mark.volleyPlan = function(root, ev)
 	return { aim = aim, threat = threat, near = near, goalD = goalD, threatD = threatD, meet = meet }
 end
 
--- Pending release of OUR volley press. It lived inside tickVolley, which stepLogic skips on several paths (keeper
--- branch, early returns): the release never came and the charge sat at full ("charge stuck ... ourVolley true").
--- Runs first thing every Heartbeat now; a press older than 0.6 s is released / cancelled unconditionally.
--- AutoKick (rewritten). Legit: the game's own charge (ChargedKick.HandleInputBegan with a real Kick input, the game's
--- own KickChargeStarted/Updated packets, release through HandleInputEnded with the SAME input object), never a raw
--- server command. Pressed only inside the AutoBlock / CounterJump logic, only when the kick box can actually reach the
--- target, and released by the box, not by a timer:
---   * KickCore: MinimumChargeSeconds 0.2 (earliest release), MaximumChargeSeconds 0.4 (ChargedKick.StartCharge arms
---     task.delay(max, ReleaseFullCharge): the game fires a held charge itself at 0.4, so a charge we cannot land is
---     cancelled before that, never left to fire), GetFullChargeSeconds = max - 0.05.
---   * The hit is resolved at release with HitboxSettings.Kick (6x7x7, CFrameOffset Z -1.5) laid along the FLAT aim on
---     AimFacing.GetAimedRoot (the same boxes kickThreat uses against us). Mark.akEval predicts our pose (root + v * rr)
---     and his server pose (displayed + v * (display delay + ping/2 + rr), ballistic Y when he is in the air) for a
---     release rr seconds from now, aims at that point and tests his HRP (and 4 points 0.6 around it: "solid").
---   * Wait for the full charge while he stays in the box (more power), release the frame before he would leave it
---     or at the full charge; urgent (air duel) = release at the first legal moment.
---   * The aim ray is replaced while the charge runs (Mark.volleyAim, the Reticle override that already exists).
--- Body knock-back of a kick is server-side (the dump only has KickPowerups.PoweredUpBodyKnockbackMultiplier): the
--- result is logged ("autokick release ... / end") to calibrate.
+-- AutoKick context: his pose (display delay aware), our velocity, gravity.
 Mark.akCtx = function(root, model, r)
 	local character = LocalPlayer.Character
 	local hum = character and character:FindFirstChildOfClass("Humanoid")
@@ -13523,44 +13665,116 @@ Mark.akCtx = function(root, model, r)
 	}
 end
 
--- while the Kick charges we walk at ActionMovement.GetChargingWalkSpeed (log: ws 27 -> 8): the box moves with THAT
-Mark.akClampUs = function(ctx, character)
-	Mark.mover = Mark.mover or require(Modules.Actions.ActionMovement)
-	local cw = Mark.mover.GetChargingWalkSpeed(Mark.mover.GetBaseWalkSpeed(character), false)
-	if type(cw) == "number" and ctx.vUs.Magnitude > cw then
-		ctx.vUs = ctx.vUs.Unit * cw
-	end
-	return ctx
+
+-- ===== AutoKick v2 ====================================================================================================
+-- The old kick asked "is he inside the box at the release, now?" and stood still while the charge (walking speed ~8)
+-- ran: a man pulling away left the box, a man we could have caught was never chased (no movement at all).
+-- Now a PLAN: for every start delay tp (0 .. AutoKickLead) our body is simulated (run at him with the current speed
+-- ramping up, then the charge at charging speed, still steering at him) to the release; his server pose comes from the
+-- weighted fan of futures AutoGK uses (keep, ease off, turns, retreat, and the two side bursts of a READY dribble). The
+-- kick aims at his main line at the release; confidence = the weight of the futures that stand in HitboxSettings.Kick
+-- then (box 6 x 7 x 7, 1.5 ahead of the aimed root), and the main line must hold with a margin. The earliest tp with
+-- confidence >= AutoKickConf wins: tp > 0 = run there first (Mark.akApproach feeds tickBlock's steering), tp = 0 = press
+-- the real ChargedKick now, release at the full charge (AutoKickFull) or when the share would only fall. A charge whose
+-- share drops under AutoKickCancel is cancelled. Nothing here learns: the thresholds are CFG numbers.
+Mark.akFutures = function(ctx, root, dribReady)
+	local g = Mark.defendGoal()
+	local aimP = g and g.Position or (root.Position + root.CFrame.LookVector * 50)
+	return Mark.gkFutures(ctx.pos, ctx.vel, ctx.vy, ctx.hisAir, false, root.Position.Y - 0.6, ctx.dly + ctx.ping * 0.5, aimP, ctx.g, dribReady and not ctx.hisAir)
 end
 
-Mark.akEval = function(ctx, rr, pad)
-	local t = ctx.dly + ctx.ping * 0.5 + rr
-	local tgt = ctx.pos + ctx.vel * t
-	if ctx.hisAir then
-		tgt = Vector3.new(tgt.X, ctx.pos.Y + ctx.vy * t - 0.5 * ctx.g * t * t, tgt.Z)
+-- our flat position after `tp` s of running at him plus `rr` s of charging (steering at his main line all the time)
+Mark.akSim = function(ctx, main, mySpd, chSpd, tp, rr)
+	local DT = 0.025
+	local px, pz = ctx.root.Position.X, ctx.root.Position.Z
+	local vx, vz = ctx.vUs.X, ctx.vUs.Z
+	local ramp = math.max(CFG.BallRamp or 0.2, 0.05)
+	local t, total = 0, tp + rr
+	while t < total - 1e-6 do
+		local k = math.min(math.floor((t + 0.2) / DT + 0.5) + 1, #main)
+		local dx, dz = main[k].X - px, main[k].Z - pz
+		local m = math.sqrt(dx * dx + dz * dz)
+		if m > 1e-3 then
+			dx, dz = dx / m, dz / m
+		end
+		local spd
+		if t < tp then
+			local s0 = math.clamp(vx * dx + vz * dz, 0, mySpd)
+			spd = s0 + (mySpd - s0) * math.min(t / ramp, 1)
+		else
+			spd = chSpd
+		end
+		px += dx * spd * DT
+		pz += dz * spd * DT
+		t += DT
 	end
-	local us = ctx.root.Position + ctx.vUs * rr
-	if ctx.usAir then
-		us = Vector3.new(us.X, ctx.root.Position.Y + ctx.vyUs * rr - 0.5 * ctx.g * rr * rr, us.Z)
-	end
-	local aim = unitOrNil(flat(tgt - us)) or unitOrNil(flat(ctx.root.CFrame.LookVector))
+	return px, pz
+end
+
+-- share of his futures inside the kick box for a release tp + rr from now. -> conf, mainSolid, aim, usPos, mainPos
+Mark.akShare = function(ctx, futs, mySpd, chSpd, tp, rr)
+	local DT = 0.025
+	local px, pz = Mark.akSim(ctx, futs[1].pts, mySpd, chSpd, tp, rr)
+	local tot = tp + rr
+	local us = Vector3.new(px, ctx.usAir and (ctx.root.Position.Y + ctx.vyUs * tot - 0.5 * ctx.g * tot * tot) or ctx.root.Position.Y, pz)
+	local k = math.min(math.floor(tot / DT + 0.5) + 1, #futs[1].pts)
+	local m = futs[1].pts[k]
+	local aim = unitOrNil(flat(m - us)) or unitOrNil(flat(ctx.root.CFrame.LookVector))
 	if not aim then
-		return false, false, nil, tgt
+		return 0, false, nil, us, m
 	end
 	local box = HitboxSettings.Kick
 	local aimed = AimFacing.GetAimedRoot({ Position = us }, aim)
-	local inside = HitboxSettings.ContainsPoint(aimed, box, tgt)
-	local solid = inside
-	if inside then
-		local pd = pad or 0.6
-		for _, o in { { pd, 0 }, { -pd, 0 }, { 0, pd }, { 0, -pd } } do
-			if not HitboxSettings.ContainsPoint(aimed, box, tgt + Vector3.new(o[1], 0, o[2])) then
-				solid = false
-				break
-			end
+	local conf, wSum = 0, 0
+	for _, f in futs do
+		wSum += f.w
+		local p = f.pts[k]
+		if p and HitboxSettings.ContainsPoint(aimed, box, p) then
+			conf += f.w
 		end
 	end
-	return inside, solid, aim, tgt
+	local solid = true
+	for _, o in { { 0.5, 0 }, { -0.5, 0 }, { 0, 0.5 }, { 0, -0.5 } } do
+		if not HitboxSettings.ContainsPoint(aimed, box, m + Vector3.new(o[1], 0, o[2])) then
+			solid = false
+			break
+		end
+	end
+	return conf / math.max(wSum, 1e-6), solid, aim, us, m
+end
+
+Mark.akSpeeds = function(character)
+	Mark.mover = Mark.mover or require(Modules.Actions.ActionMovement)
+	local base = Mark.mover.GetBaseWalkSpeed(character)
+	local run = Mark.mover.GetRunWalkSpeed(base, false)
+	local ch = Mark.mover.GetChargingWalkSpeed(base, false)
+	return (type(run) == "number" and run >= 8) and run or 16, (type(ch) == "number" and ch > 1) and ch or 8
+end
+
+-- earliest start delay whose release holds >= AutoKickConf of his futures. -> plan | nil, bestConf
+Mark.akPlan = function(ctx, futs, character, urgent)
+	local mySpd, chSpd = Mark.akSpeeds(character)
+	local minRel = (KickCore.GetMinimumReleaseSeconds and KickCore.GetMinimumReleaseSeconds()) or 0.2
+	local maxC = KickCore.Constants.MaximumChargeSeconds or 0.4
+	local fullT = (KickCore.GetFullChargeSeconds and KickCore.GetFullChargeSeconds()) or (maxC - 0.05)
+	local rrs = (CFG.AutoKickFull ~= false) and { fullT } or { minRel, (minRel + fullT) * 0.5, fullT }
+	local need = urgent and 0.35 or (CFG.AutoKickConf or 0.55)
+	local tpMax = (urgent or CFG.AutoKickMove == false or ctx.usAir) and 0 or (CFG.AutoKickLead or 0.5)
+	local bestConf = 0
+	local tp = 0
+	while tp <= tpMax + 1e-6 do
+		for _, rr in rrs do
+			local conf, solid, aim, us, m = Mark.akShare(ctx, futs, mySpd, chSpd, tp, rr)
+			if conf > bestConf then
+				bestConf = conf
+			end
+			if aim and conf >= need and (solid or urgent) then
+				return { tp = tp, rr = rr, conf = conf, aim = aim, us = us, hit = m, chSpd = chSpd, mySpd = mySpd }, conf
+			end
+		end
+		tp += 0.04
+	end
+	return nil, bestConf
 end
 
 Mark.akTry = function(tag, model, r, urgent)
@@ -13590,82 +13804,33 @@ Mark.akTry = function(tag, model, r, urgent)
 		Mark.akDrib[model] = now
 		return false, "iframe"
 	end
-	local down = Mark.mateDown(Actors.GetFromCharacter(model), model)
-	if down then
+	local actor = Actors.GetFromCharacter(model)
+	if Mark.mateDown(actor, model) then
 		return false, "down"
 	end
-	local ctx = Mark.akClampUs(Mark.akCtx(root, model, r), character)
-	local minRel = (KickCore.GetMinimumReleaseSeconds and KickCore.GetMinimumReleaseSeconds()) or 0.2
-	local maxC = KickCore.Constants.MaximumChargeSeconds or 0.4
-	-- A charge slows us to ~8 studs/s (ws 27 -> 8) and stands us still for ~0.3 s: against a carrier who is pulling AWAY
-	-- (we are behind him, he runs straight) the box is empty by the time it goes live - the charge is wasted and the chase
-	-- is lost. opening = how fast the gap grows with us at charging speed. Fleeing -> no kick: the run / slide / AutoBall
-	-- logic goes on (the tackle gate takes him); a slow opening gap needs a margin that scales with it.
-	local toHim = unitOrNil(flat(r.Position - root.Position))
-	local vHim = flat(r.AssemblyLinearVelocity)
-	if ctx.vel.Magnitude > vHim.Magnitude then
-		vHim = flat(ctx.vel)
-	end
-	local opening = toHim and (vHim:Dot(toHim) - ctx.vUs:Dot(toHim)) or 0
-	-- Being inside the radius says nothing. What counts is where HE goes: his own velocity along the line from us to him
-	-- (not relative to us, and not against the charging speed we get clamped to). Leaving -> no kick, the tackle / dribble
-	-- answer / block take him. Same after his dribble: the iframe ends with him already dashing off (log: the kick was
-	-- pressed again right after "cancel iframe"). Applies to every tag; the urgent (air / counter) ones get a looser limit.
-	local away = toHim and math.max(flat(r.AssemblyLinearVelocity):Dot(toHim), flat(ctx.vel):Dot(toHim)) or 0
-	local awayLim = (CFG.AutoKickAway or 3) * (urgent and 2 or 1)
-	local dribbled = now - (Mark.akDrib[model] or -9) < 0.9
-	if away > awayLim or (dribbled and away > -1) then
-		if not Mark.akFleeLog or now - Mark.akFleeLog > 0.8 then
-			Mark.akFleeLog = now
-			logFile("autokick skip leaving", tag, actorName(Actors.GetFromCharacter(model)), "away", string.format("%.1f", away), "lim", string.format("%.1f", awayLim), "dribbled", tostring(dribbled), "dist", string.format("%.1f", flat(r.Position - root.Position).Magnitude))
+	local ctx = Mark.akCtx(root, model, r)
+	local drec = dribbleSeen[model] or (actor and dribbleSeen[actor.UserId])
+	local dribReady = not (drec and drec.cdUntil and drec.cdUntil > now + 0.4)
+	local futs = Mark.akFutures(ctx, root, dribReady)
+	local plan, bestConf = Mark.akPlan(ctx, futs, character, urgent)
+	if not plan then
+		Mark.akApproach = nil
+		if not Mark.akSkipLog or now - Mark.akSkipLog > 0.8 then
+			Mark.akSkipLog = now
+			local toHim = unitOrNil(flat(r.Position - root.Position))
+			local away = toHim and flat(ctx.vel):Dot(toHim) or 0
+			logFile("autokick skip", tag, actorName(actor), "conf", string.format("%.2f", bestConf), "need", string.format("%.2f", urgent and 0.35 or (CFG.AutoKickConf or 0.55)), "away", string.format("%.1f", away), "dist", string.format("%.1f", flat(r.Position - root.Position).Magnitude), "drib", dribReady and "ready" or "spent")
 		end
-		return false, "leaving"
-	end
-	if not urgent and opening > (CFG.AutoKickFlee or 9) then
-		if not Mark.akFleeLog or now - Mark.akFleeLog > 0.8 then
-			Mark.akFleeLog = now
-			logFile("autokick skip fleeing", tag, actorName(Actors.GetFromCharacter(model)), "opening", string.format("%.1f", opening), "his", string.format("%.1f", vHim.Magnitude), "dist", string.format("%.1f", flat(r.Position - root.Position).Magnitude))
-		end
-		return false, "fleeing"
-	end
-	local pad = 0.6 + math.max(opening, 0) * (CFG.AutoKickPadPerSpeed or 0.1)
-	local first, bestSolid, bestAim = nil, nil, nil
-	local rr = minRel
-	while rr <= maxC - 0.02 do
-		local inside, solid, aim = Mark.akEval(ctx, rr, pad)
-		if inside then
-			first = first or rr
-			if solid then
-				bestSolid, bestAim = rr, aim
-			end
-			bestAim = bestAim or aim
-		end
-		rr += 0.02
-	end
-	-- eager: press as soon as the box already holds him at the earliest release (a solid hit later is a bonus, not a condition);
-	-- waiting for a solid hit across the whole 0.2-0.4 s window made the kick start after he had gone
-	if not first or (not urgent and not bestSolid and not (CFG.AutoKickEager ~= false and opening <= 2 and first <= minRel + 0.07)) then
 		return false, "nohit"
 	end
-	if CFG.AutoKickFull ~= false then
-		-- the kick will be released at the full charge: he has to be inside the box THEN, not only at the earliest release
-		local fullT = (KickCore.GetFullChargeSeconds and KickCore.GetFullChargeSeconds()) or (maxC - 0.05)
-		if not Mark.akEval(ctx, fullT, pad) then
-			return false, "nohit full"
-		end
-	end
 	-- never kick through a teammate or toward our own goal with the ball at his feet
-	local aimDir = bestAim
 	for _, m in Mark.models() do
 		local a = Actors.GetFromCharacter(m)
 		if a and a ~= LocalPlayer and sameTeam(a) then
 			local ar = ActorTargeting.GetActorRoot(a)
-			if ar then
-				local usAt = root.Position + ctx.vUs * (bestSolid or first)
-				local aimed = AimFacing.GetAimedRoot({ Position = usAt }, aimDir)
-				if HitboxSettings.ContainsPoint(aimed, HitboxSettings.Kick, ar.Position) then
-					return false, "mate"
-				end
+			if ar and HitboxSettings.ContainsPoint(AimFacing.GetAimedRoot({ Position = plan.us }, plan.aim), HitboxSettings.Kick, ar.Position) then
+				Mark.akApproach = nil
+				return false, "mate"
 			end
 		end
 	end
@@ -13673,11 +13838,34 @@ Mark.akTry = function(tag, model, r, urgent)
 	local goal = Mark.defendGoal()
 	if ball and goal and flat(ball - r.Position).Magnitude < 7 then
 		local own = unitOrNil(flat(goal.Position - root.Position))
-		if own and own:Dot(aimDir) > 0.5 and flat(goal.Position - root.Position).Magnitude < 70 then
+		if own and own:Dot(plan.aim) > 0.5 and flat(goal.Position - root.Position).Magnitude < 70 then
+			Mark.akApproach = nil
 			return false, "ownside"
 		end
 	end
-	Mark.volleyAim = aimDir
+	if plan.tp > 0.04 then
+		-- RUN: tickBlock takes this direction instead of its shadow spot while the plan is fresh
+		local DT = 0.025
+		local main = futs[1].pts
+		local chase = main[math.min(math.floor((plan.tp + 0.2) / DT + 0.5) + 1, #main)]
+		local dir = unitOrNil(flat(chase - root.Position))
+		if not (Mark.akApproach and now - Mark.akApproach.at < 0.3) then
+			Mark.akAppSince = now
+		end
+		if dir and now - (Mark.akAppSince or now) <= 1.2 then
+			Mark.akApproach = { at = now, dir = dir, tp = plan.tp, conf = plan.conf, phase = "run", model = model }
+			if not Mark.akAppLog or now - Mark.akAppLog > 0.5 then
+				Mark.akAppLog = now
+				logFile("autokick run", tag, actorName(actor), "tp", string.format("%.2f", plan.tp), "conf", string.format("%.2f", plan.conf), "dist", string.format("%.1f", flat(r.Position - root.Position).Magnitude), "drib", dribReady and "ready" or "spent")
+			end
+			return false, "run", dir
+		end
+		Mark.akApproach = nil
+		Mark.akAt = now -- ran for 1.2 s without getting there: cooldown, the tackle / block go on
+		logFile("autokick", "run timeout", tag, actorName(actor))
+		return false, "timeout"
+	end
+	Mark.volleyAim = plan.aim
 	Mark.volleyAimUntil = now + 0.7
 	local input = Controls.CreateInput("Kick")
 	if not (ChargedKick.HandleInputBegan(input, false) and ChargedKick.IsCharging()) then
@@ -13687,9 +13875,10 @@ Mark.akTry = function(tag, model, r, urgent)
 	Mark.volleyAt = now
 	Mark.scriptChargeAt = now
 	Mark.userVolleyAt = now
-	Mark.ak = { input = input, at = now, model = model, root = r, tag = tag, urgent = urgent and true or false, miss = 0, lastT = now }
+	Mark.akApproach = nil
+	Mark.ak = { input = input, at = now, model = model, root = r, tag = tag, urgent = urgent and true or false, lastT = now, low = 0, conf0 = plan.conf }
 	Mark.akAt = now
-	logFile("autokick", "press", tag, actorName(Actors.GetFromCharacter(model)), "first", string.format("%.2f", first), "solid", bestSolid and string.format("%.2f", bestSolid) or "-", "urgent", tostring(urgent == true), "dist", string.format("%.1f", flat(r.Position - root.Position).Magnitude), "air", tostring(ctx.hisAir) .. "/" .. tostring(ctx.usAir))
+	logFile("autokick", "press", tag, actorName(actor), "conf", string.format("%.2f", plan.conf), "urgent", tostring(urgent and true or false), "dist", string.format("%.1f", flat(r.Position - root.Position).Magnitude), "drib", dribReady and "ready" or "spent")
 	return true, "pressed"
 end
 
@@ -13706,7 +13895,9 @@ Mark.akTick = function(character, root)
 			ChargedKick.CancelCharge()
 		end
 		Mark.ak = nil
+		Mark.akApproach = nil
 		Mark.volleyAim, Mark.volleyAimUntil = nil, nil
+		TurnControl.ReleaseAutoRotate("AimCharge")
 		logFile("autokick", why, ak.tag, "held", string.format("%.2f", now - ak.at))
 	end
 	if not (ChargedKick.IsCharging and ChargedKick.IsCharging()) then
@@ -13717,6 +13908,7 @@ Mark.akTick = function(character, root)
 	end
 	if Mark.realKick and Mark.realKick.down and Mark.realKick.at and Mark.realKick.at > ak.at then
 		Mark.ak = nil -- the user took the kick over
+		Mark.akApproach = nil
 		return
 	end
 	-- he dribbled: the iframe eats the kick. Cancel it, remember his Dodge (carrierDribbleWait) so the tackle gate
@@ -13725,7 +13917,6 @@ Mark.akTick = function(character, root)
 		Mark.akDrib = Mark.akDrib or {}
 		Mark.akDrib[ak.model] = now
 		carrierDribbleWait(Actors.GetFromCharacter(ak.model), 0)
-		TurnControl.ReleaseAutoRotate("AimCharge")
 		return finish("cancel iframe", true)
 	end
 	local inst = Mark.chargeInst()
@@ -13733,64 +13924,54 @@ Mark.akTick = function(character, root)
 	local minRel = (KickCore.GetMinimumReleaseSeconds and KickCore.GetMinimumReleaseSeconds()) or 0.2
 	local maxC = KickCore.Constants.MaximumChargeSeconds or 0.4
 	local fullAt = KickCore.GetFullChargeSeconds and KickCore.GetFullChargeSeconds() or (maxC - 0.05)
-	local ctx = Mark.akClampUs(Mark.akCtx(root, ak.model, ak.root), character)
-	do
-		local toHim = unitOrNil(flat(ak.root.Position - root.Position))
-		local away = toHim and math.max(flat(ak.root.AssemblyLinearVelocity):Dot(toHim), flat(ctx.vel):Dot(toHim)) or 0
-		if away > (CFG.AutoKickAway or 3) * 2 + 2 and held < minRel + 0.05 then
-			logFile("autokick", "cancel leaving", ak.tag, "away", string.format("%.1f", away))
-			TurnControl.ReleaseAutoRotate("AimCharge")
-			return finish("cancel", true)
-		end
-	end
-	local r0 = math.max(minRel - held, 0)
-	local inNow, solidNow, aimNow = Mark.akEval(ctx, r0)
-	-- keep the override on the aim of the best upcoming moment
-	if aimNow then
-		Mark.volleyAim = aimNow
+	local full = CFG.AutoKickFull ~= false
+	local actor = Actors.GetFromCharacter(ak.model)
+	local ctx = Mark.akCtx(root, ak.model, ak.root) -- we are already slowed by the charge: vUs is the real one
+	local drec = dribbleSeen[ak.model] or (actor and dribbleSeen[actor.UserId])
+	local dribReady = not (drec and drec.cdUntil and drec.cdUntil > now + 0.4)
+	local futs = Mark.akFutures(ctx, root, dribReady)
+	local mySpd, chSpd = Mark.akSpeeds(character)
+	local relAt = full and (fullAt + 0.002) or minRel
+	local rem = math.max(relAt - held, 0)
+	local conf, _, aim, _, m = Mark.akShare(ctx, futs, mySpd, chSpd, 0, rem)
+	if aim then
+		Mark.volleyAim = aim
 		Mark.volleyAimUntil = now + 0.5
-		TurnControl.LockAutoRotate("AimCharge", aimNow)
+		TurnControl.LockAutoRotate("AimCharge", aim)
 	end
-	if held >= minRel - 0.004 then
-		if inNow then
-			ak.miss = 0
-			-- release at the FULL charge when the box still holds him then; earlier only if he would be out of it by then
-			-- (a hit at 0.30 s is half the power: the log showed every release at held 0.30)
-			local toFull = math.max(fullAt - 0.008 - held, 0)
-			local inFull = toFull <= 0 or Mark.akEval(ctx, toFull)
-			local releaseNow
-			if CFG.AutoKickFull ~= false then
-				-- always the FULL charge: no early release for an urgent kick or a carrier who would leave the box; if he
-				-- leaves it the charge is cancelled below (miss) instead of sending a weak kick
-				releaseNow = held >= fullAt + 0.002 or held >= maxC - 0.03
-			else
-				releaseNow = ak.urgent or held >= math.min(fullAt - 0.008, CFG.AutoKickRelease or 9) or not inFull or held >= maxC - 0.045
-			end
-			if releaseNow then
-				Mark.ak = nil
-				Mark.volleyAimUntil = now + 0.25
-				ChargedKick.HandleInputEnded(ak.input)
-				TurnControl.ReleaseAutoRotate("AimCharge")
-				logFile("autokick", "release", ak.tag, "held", string.format("%.3f", held), "full", tostring(held >= fullAt - 0.01), "solid", tostring(solidNow), "dist", string.format("%.1f", flat(ak.root.Position - root.Position).Magnitude))
-				return
-			end
-		else
-			ak.miss += dt
-			-- he is out of the box now: any later moment still in the window?
-			local any = false
-			local rr = r0 + 0.02
-			while rr <= maxC - held - 0.02 do
-				if Mark.akEval(ctx, rr) then
-					any = true
-					break
-				end
-				rr += 0.02
-			end
-			if not any or ak.miss > 0.16 then
-				TurnControl.ReleaseAutoRotate("AimCharge")
-				return finish("cancel miss", true)
-			end
+	-- steer at him through the charge (the game caps us at the charging speed)
+	local toM = unitOrNil(flat(m - root.Position))
+	if toM then
+		Mark.akApproach = { at = now, dir = toM, tp = 0, conf = conf, phase = "charge", model = ak.model }
+	end
+	if conf < (CFG.AutoKickCancel or 0.25) then
+		ak.low = (ak.low or 0) + dt
+	else
+		ak.low = 0
+	end
+	if ak.low > 0.14 and held < fullAt - 0.03 then
+		logFile("autokick", "cancel low", ak.tag, "conf", string.format("%.2f", conf))
+		return finish("cancel miss", true)
+	end
+	local releaseNow = false
+	if full then
+		releaseNow = held >= fullAt + 0.002 or held >= maxC - 0.03
+	elseif held >= minRel - 0.004 then
+		-- early release only while the share is good and would not get better by waiting for more power
+		local confFull = Mark.akShare(ctx, futs, mySpd, chSpd, 0, math.max(fullAt - held, 0))
+		releaseNow = (conf >= (CFG.AutoKickConf or 0.55) and confFull < conf - 0.05) or held >= fullAt or held >= maxC - 0.03
+	end
+	if releaseNow then
+		if conf < (CFG.AutoKickCancel or 0.25) then
+			logFile("autokick", "cancel at release", ak.tag, "conf", string.format("%.2f", conf))
+			return finish("cancel miss", true)
 		end
+		Mark.ak = nil
+		Mark.akApproach = nil
+		Mark.volleyAimUntil = now + 0.25
+		ChargedKick.HandleInputEnded(ak.input)
+		TurnControl.ReleaseAutoRotate("AimCharge")
+		logFile("autokick", "release", ak.tag, "held", string.format("%.3f", held), "conf", string.format("%.2f", conf), "dist", string.format("%.1f", flat(ak.root.Position - root.Position).Magnitude))
 	end
 end
 
@@ -13819,6 +14000,7 @@ end
 Mark.tickVolley = function(character, root)
 	Mark.volleyPending()
 	Mark.akTick(character, root)
+	Mark.kickHelper(root)
 	if not (CFG.AutoBall or CFG.AutoBlock) then
 		return
 	end
@@ -18918,8 +19100,12 @@ return function(_Lib, _Core)
 			tog(b, "Jump + Air Slide", "BlockSlideJump")
 			tog(b, "Pass Solver", "BlockSmart", "If he cannot score, cuts the pass to his teammate.")
 			tog(b, "Show Marking", "DrawBlock", "The pass lane and where you cut it.")
+			tog(b, "Behind Logic", "BlockBehindLogic", "Behind the carrier: take the next attacker, else cut him off.")
 			advanced(b, "Block", function()
 				sld(b, "Far From Goal", "BlockFarGoal", 40, 200, { suffix = " st" })
+				sld(b, "Turn Hedge", "BlockTurnHedge", 0.15, 1, { prec = 2, text = "How far ahead to trust a fresh change of direction." })
+				sld(b, "Turn Angle", "BlockTurnDeg", 15, 90, { suffix = "°" })
+				sld(b, "Behind Receiver Gap", "BlockBehindRcv", 6, 40, { suffix = " st" })
 				sld(b, "Near Goal Range", "BlockGoalRange", 30, 120, { suffix = " st" })
 				sld(b, "Mark Gap", "BlockMarkGap", 2, 10, { prec = 1, suffix = " st" })
 				sld(b, "No-Shot Angle", "BlockShotAngle", 3, 25, { suffix = "°" })
@@ -18938,16 +19124,18 @@ return function(_Lib, _Core)
 			head(k, "AutoKick")
 			feature(k, "AutoKick", "AutoKick")
 			note(k, "Works inside AutoBlock and CounterJump.")
+			tog(k, "Run To Kick", "AutoKickMove", "Runs at him first and steers while charging.")
 			tog(k, "Always Full Charge", "AutoKickFull", "Never releases early: a miss instead of a weak kick.")
-			sld(k, "Range", "AutoKickRange", 1, 12, { prec = 1, suffix = " st" })
+			sld(k, "Confidence", "AutoKickConf", 0.3, 0.95, { prec = 2, text = "How sure the hit must be." })
+			sld(k, "Range", "AutoKickRange", 2, 30, { prec = 1, suffix = " st" })
 			advanced(k, "Kick", function()
 				sld(k, "Cooldown", "AutoKickCooldown", 0.2, 2, { prec = 2, suffix = " s" })
-				sld(k, "Min Charge", "AutoKickRelease", 0.2, 0.4, { prec = 2, suffix = " s", text = "Only when Always Full Charge is off." })
-				tog(k, "Eager Press", "AutoKickEager")
-				sld(k, "Leaving Limit", "AutoKickAway", 0, 12, { suffix = " st/s", text = "No kick if he moves away from you faster than this (also right after his dribble)." })
-				sld(k, "Flee Limit", "AutoKickFlee", 3, 20, { suffix = " st/s", text = "No kick if the gap opens faster than this at charging speed." })
-				sld(k, "Flee Margin", "AutoKickPadPerSpeed", 0, 0.3, { prec = 2 })
+				sld(k, "Run-Up", "AutoKickLead", 0.1, 1, { prec = 2, suffix = " s" })
+				sld(k, "Cancel Under", "AutoKickCancel", 0.05, 0.6, { prec = 2 })
 			end)
+			head(k, "Kick Helper")
+			tog(k, "Kick Helper", "KickHelper", "Turns you to the carrier while you charge a kick.")
+			sld(k, "Helper Range", "KickHelperRange", 10, 80, { suffix = " st" })
 
 			-- AutoDribble ----------------------------------------------------------------------------------
 			local d = card(tab, "Right")
