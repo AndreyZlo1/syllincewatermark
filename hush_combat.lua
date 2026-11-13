@@ -178,6 +178,7 @@ local CFG = {
     -- Door/seat prompt hold -> 0 (client-side hold), and the local climb-in/out pose is finished at
     -- once (CarAnimFor). Whatever the server itself waits before the car is usable is untouched.
     InstantSit = true,
+    InstantInteract = false, -- SearchPrompt / PryPrompt hold -> 0 (client-side hold)
     FastBolt = true,
     FastBoltScale = 0.25, -- local bolt cycle; a server prime timer (State.primeLeft) still wins
     NoHeat = true, -- Config.Guns.HeatPerShot -> 0: no climbing recoil/spread from sustained fire
@@ -5798,12 +5799,13 @@ end
 -- InstantSit: zero the client-side hold on vehicle entry prompts only when they are shown.
 Visual.sitHolds = setmetatable({}, { __mode = "k" })
 Visual.onPromptShown = function(prompt)
-    if not running or not CFG.InstantSit then return end
+    if not running then return end
     local n = prompt.Name
-    if (n == "CarDoorPrompt" or n == "SitPrompt") and prompt.HoldDuration > 0 then
-        if Visual.sitHolds[prompt] == nil then Visual.sitHolds[prompt] = prompt.HoldDuration end
-        prompt.HoldDuration = 0
-    end
+    local vehicle = n == "CarDoorPrompt" or n == "SitPrompt"
+    local loot = n == "SearchPrompt" or n == "PryPrompt"
+    if not ((vehicle and CFG.InstantSit) or (loot and CFG.InstantInteract)) or prompt.HoldDuration <= 0 then return end
+    if Visual.sitHolds[prompt] == nil then Visual.sitHolds[prompt] = prompt.HoldDuration end
+    prompt.HoldDuration = 0
 end
 Visual.sitStop = function()
     for prompt, hold in Visual.sitHolds do
@@ -7021,10 +7023,18 @@ Visual.baseTick = function(now)
         RunService:BindToRenderStep("HushFullBright", Enum.RenderPriority.Last.Value + 1, Visual.fullBright)
         b.fbCheckAt = now + 2
     end
+    if b.fbBound and not CFG.FullBright then
+        b.fbBound, b.fbCheckAt = nil, nil
+        RunService:UnbindFromRenderStep("HushFullBright") -- the game's own Lighting writes return on the next frame
+    end
     if b.fbCheckAt and now >= b.fbCheckAt then
         b.fbCheckAt = nil
-        if CFG.FullBright and b.lighting.Ambient ~= Visual.FB_AMBIENT then
-            warn("[hush] FullBright: the game wrote Lighting after us; values do not hold")
+        if CFG.FullBright then
+            local L, bad = b.lighting, {}
+            if L.Ambient ~= Visual.FB_AMBIENT then bad[#bad + 1] = "Ambient" end
+            if L.Brightness ~= 2 then bad[#bad + 1] = "Brightness" end
+            if L.ClockTime ~= 14 then bad[#bad + 1] = "ClockTime" end
+            if #bad > 0 then warn("[hush] Fullbright: overwritten after our write: " .. table.concat(bad, ", ")) end
         end
     end
     if b.fullAuto ~= CFG.FullAuto then
@@ -7104,6 +7114,7 @@ Visual.fullBright = function()
     if not (running and CFG.FullBright and L) then return end
     L.Ambient, L.OutdoorAmbient = Visual.FB_AMBIENT, Visual.FB_AMBIENT
     L.Brightness, L.ExposureCompensation, L.FogEnd, L.GlobalShadows = 2, 0.3, 1e6, false
+    L.ClockTime = 14
     local atm = Visual.base.atmosphere
     if atm == nil or (atm and not atm.Parent) then
         atm = L:FindFirstChildOfClass("Atmosphere") or false
@@ -8493,7 +8504,7 @@ return function(_Lib, _Core)
         local function advanced(s, key, build)
             local group = {}
             local switch = s:Toggle({
-                Name = "Show advanced", Default = false,
+                Name = "Advanced", Default = false,
                 Callback = function(v)
                     for _, el in ipairs(group) do el:SetVisibility(v) end
                 end,
@@ -8564,159 +8575,205 @@ return function(_Lib, _Core)
             }, flag(id)))
         end
         local function rarity(s, key)
-            choice(s, "Minimum rarity", key, {
+            choice(s, "Min Rarity", key, {
                 { "Common+", 1 }, { "Uncommon+", 2 }, { "Rare+", 3 },
                 { "Epic+", 4 }, { "Legendary+", 5 }, { "Limited", 6 },
             })
         end
 
-        -- SilentAim: one feature, split by the stages of its solve, not arbitrary rows.
+        local SIMPLE = {
+            AutoBreath = { "Main", "Auto Breath", "Plays the breath checks at their normal pace." },
+            AutoHotwire = { "Main", "Auto Hotwire", "Plays the hotwire / lockpick timing minigames." },
+            NoRecoil = { "GunMods", "No Recoil", "Suppresses local recoil, jump sway and jump kick." },
+            FullAuto = { "GunMods", "Full Auto", "Fire delay and bolt / break-action rules of the weapon still apply." },
+            NoHeat = { "GunMods", "No Heat", "Stops the client heat buildup from sustained fire." },
+            InstantEquip = { "GunMods", "Instant Equip", "Local draw animation only; ammo and reload stay server-owned." },
+            ShootEverywhere = { "GunMods", "Shoot Everywhere", "Clears the local firing gates for the shot. Server acceptance is unverified." },
+            NoFall = { "Movement", "No Fall", "Never reports a fall to the server." },
+            InfStamina = { "Movement", "Infinite Stamina", "Keeps the local stamina full." },
+            NoRagdoll = { "Movement", "No Ragdoll", "Local rig and knockback handling; does not cancel a server knockout." },
+            AntiClimb = { "Movement", "Anti Climb", "Blocks new vaults, ledge grabs and wall moves. Takes priority over Fast Climb." },
+            FullBright = { "Visuals", "Fullbright", "Local lighting only." },
+        }
+        local function simple(option, side)
+            local row = SIMPLE[option]
+            local s = card(row[1], side, row[2], row[3])
+            toggle(s, "Enabled", option)
+            keyToggle(s, option, option)
+        end
+        local function fxCard(pre, title, side)
+            local s = card("Visuals", side, title, "Client-only materials and colors; originals are restored on disable / unload.")
+            toggle(s, "Enabled", pre)
+            keyToggle(s, pre, pre)
+            choice(s, "Material", pre .. "Material", { "ForceField", "Neon", "SmoothPlastic", "Glass", "Metal" })
+            slider(s, "Transparency", pre .. "Transparency", 0, 0.95, 2)
+            color(s, "Color 1", pre .. "ColorA")
+            color(s, "Color 2", pre .. "ColorB")
+            slider(s, "Cycle Speed", pre .. "Speed", 0, 2, 2)
+            slider(s, "Gradient Spacing", pre .. "Flow", 0, 0.5, 2, nil, nil, nil, function()
+                for _, group in pairs(Visual.skin.groups) do
+                    if group.prefix == pre and group.root then Visual.skinRelease(group) end
+                end
+                Visual.skin.findAt = 0
+            end)
+            if pre == "SelfFx" then
+                toggle(s, "Hide Clothes", "SelfFxStripClothes")
+                note(s, "Model Swap takes priority over Self Chams.")
+            end
+            advanced(s, pre, function()
+                head(s, "Highlight")
+                toggle(s, "Highlight", pre .. "Highlight")
+                slider(s, "Fill Transparency", pre .. "HlFill", 0, 1, 2)
+                slider(s, "Outline Transparency", pre .. "HlOutline", 0, 1, 2)
+            end)
+        end
+        local function interactCard(side)
+            local s = card("Main", side, "Instant Interact", "Zeroes the local hold time of prompts. How the server judges hold time is not readable from the dump.")
+            toggle(s, "Enabled", "InstantInteract", "Loot (SearchPrompt) and pry (PryPrompt) prompts.", function(v) if not v then Visual.sitStop() end end)
+            toggle(s, "Vehicle Doors / Seats", "InstantSit", "Door and seat prompts, plus the local climb-in / climb-out pose.", function(v) if not v then Visual.sitStop() end end)
+        end
+
+        -- Order inside a tab = priority: main function first, utilities after, test / debug last.
         do
-            local s = card("SilentAim", "Left", "Salent aimchik", "Redirects the shot without moving your camera. Firearm required.")
+            local s = card("SilentAim", "Left", "Silent Aim", "Redirects the shot without moving your camera. Firearm required.")
             toggle(s, "Enabled", "Silent")
-            slider(s, "FOV radius", "FOV", 20, 600, 0, " px")
-            slider(s, "Target distance", "SilentAimDistance", 50, 3000, 0, " st")
-            toggle(s, "Respect weapon range", "RespectRange")
+            slider(s, "FOV", "FOV", 20, 600, 0, " px")
+            slider(s, "Max Distance", "SilentAimDistance", 50, 3000, 0, " st")
+            toggle(s, "Weapon Range Check", "RespectRange")
             bindAction(s, "Toggle key", "Silent", function() toggles.Silent:UpdateState(not CFG.Silent) end)
-            head(s, "Target filters")
-            toggle(s, "Team / party check", "TeamCheck")
-            toggle(s, "Safe-zone check", "SafeZoneCheck")
-            toggle(s, "Target monsters", "Monsters", "Also controls ordinary monster espyxa.")
-            toggle(s, "Target bosses", "Bosses", "Also permits boss espyxa / markers; marker style is in Visuals.")
-            slider(s, "Player priority radius", "PriorityRadius", 0, 1000, 0, " st", "Nearby players take priority; NPCs come last.")
+            head(s, "Target Filters")
+            toggle(s, "Team Check", "TeamCheck")
+            toggle(s, "Safe Zone Check", "SafeZoneCheck")
+            toggle(s, "Target NPCs", "Monsters", "Also controls ordinary monster ESP.")
+            toggle(s, "Target Bosses", "Bosses", "Also permits boss ESP / markers; marker style is in Visuals.")
+            slider(s, "Player Priority Radius", "PriorityRadius", 0, 1000, 0, " st", "Nearby players take priority; NPCs come last.")
             advanced(s, "Targeting", function()
-                slider(s, "Safe-zone padding", "SafeMargin", 0, 8, 1, " st")
+                slider(s, "Safe Zone Padding", "SafeMargin", 0, 8, 1, " st")
             end)
-
-            s = card("SilentAim", "Right", "Cover & MultiPoint")
-            toggle(s, "Check visibility", "VisibleCheck")
-            choice(s, "Wall penetration", "Wallbang", { { "Game penetration", "Game" }, { "Clean line only", "Off" }, { "Ignore cover (unverified)", "Ignore" } }, "Game uses the held gun's penetration rules. Ignore is not a guaranteed wall hit.")
-            toggle(s, "Try visible head / body points", "AimPoints")
-            toggle(s, "MultiPoint origins", "MultiPoint", "Tries offset shot origins within the configured budget.")
-            toggle(s, "Prefer MultiPoint before head edges", "MPFirst")
+        end
+        do
+            local s = card("SilentAim", "Right", "Wall Check & MultiPoint")
+            toggle(s, "Visible Check", "VisibleCheck")
+            choice(s, "Wallbang", "Wallbang", { { "Game penetration", "Game" }, { "Clean line only", "Off" }, { "Ignore cover (unverified)", "Ignore" } }, "Game uses the held gun's penetration rules. Ignore is not a guaranteed wall hit.")
+            toggle(s, "Visible Aim Points", "AimPoints")
+            toggle(s, "MultiPoint", "MultiPoint", "Tries offset shot origins within the configured budget.")
+            toggle(s, "MultiPoint Priority", "MPFirst")
             advanced(s, "MultiPoint", function()
-                slider(s, "Origin reach", "MPReach", 0, 3.5, 2, " st", "Increasing the origin offset can make the server replace it.")
-                slider(s, "Origin safety margin", "MPSlackMargin", 0.3, 2, 2, " st")
-                slider(s, "First offset fraction", "MPPreferFrac", 0.1, 1, 2)
-                toggle(s, "Compensate local movement", "MPLagComp")
-                slider(s, "Extra origin lag", "MPLagExtra", 0, 0.2, 3, " s")
-                slider(s, "Origin cache interval", "MPRate", 0.05, 0.5, 2, " s")
-                setList(s, "Never wallbang these guns", "NoWallbangGuns", CFG.NoWallbangGuns, firearmIds)
+                slider(s, "Origin Reach", "MPReach", 0, 3.5, 2, " st", "Increasing the origin offset can make the server replace it.")
+                slider(s, "Origin Safety Margin", "MPSlackMargin", 0.3, 2, 2, " st")
+                slider(s, "First Offset", "MPPreferFrac", 0.1, 1, 2)
+                toggle(s, "Lag Compensation", "MPLagComp")
+                slider(s, "Extra Lag", "MPLagExtra", 0, 0.2, 3, " s")
+                slider(s, "Update Rate", "MPRate", 0.05, 0.5, 2, " s")
+                setList(s, "No Wallbang Guns", "NoWallbangGuns", CFG.NoWallbangGuns, firearmIds)
             end)
-
-            s = card("SilentAim", "Left", "Resolver", "Position-based lead and the game's projectile ballistics.")
+        end
+        do
+            local s = card("SilentAim", "Left", "Resolver", "Position-based lead and the game's projectile ballistics.")
             toggle(s, "Enabled", "Resolver")
-            toggle(s, "Ping compensation", "PingPredict")
-            toggle(s, "Rebuild distant downed pose", "DownedReplicaFix")
-            toggle(s, "Slope / stair vertical lead", "SlopeLead")
-            toggle(s, "Prefer torso on airborne targets", "AirBody")
-            toggle(s, "Avoid blocking helmets", "HelmetAim")
+            toggle(s, "Ping Prediction", "PingPredict")
+            toggle(s, "Downed Pose Fix", "DownedReplicaFix")
+            toggle(s, "Slope Lead", "SlopeLead")
+            toggle(s, "Air Body Aim", "AirBody")
+            toggle(s, "Helmet Aim", "HelmetAim")
             advanced(s, "Resolver", function()
-                slider(s, "Maximum lead", "LeadCap", 0, 50, 1, " st")
-                slider(s, "Acceleration cap", "ResolverAccel", 0, 150, 0, " st/s²")
-                slider(s, "Acceleration weight", "ResolverAccelK", 0, 1, 2)
-                slider(s, "Interpolation estimate", "PredictInterp", 0, 0.3, 3, " s")
-                slider(s, "Vertical slope cap", "SlopeCap", 0, 8, 1, " st")
+                slider(s, "Max Lead", "LeadCap", 0, 50, 1, " st")
+                slider(s, "Max Acceleration", "ResolverAccel", 0, 150, 0, " st/s²")
+                slider(s, "Acceleration Weight", "ResolverAccelK", 0, 1, 2)
+                slider(s, "Interpolation", "PredictInterp", 0, 0.3, 3, " s")
+                slider(s, "Slope Cap", "SlopeCap", 0, 8, 1, " st")
             end)
-
-            s = card("SilentAim", "Right", "Server cone placement", "Chooses a larger body region when the estimated server cone is wider than the head. Does not remove server spread.")
+        end
+        do
+            local s = card("SilentAim", "Right", "Spread Aim", "Chooses a larger body region when the estimated server cone is wider than the head. Does not remove server spread.")
             toggle(s, "Enabled", "ServerSpread")
             advanced(s, "ServerSpread", function()
-                slider(s, "Head value", "SSHead", 1, 3, 2)
-                slider(s, "Limb value", "SSLimb", 0, 1, 2)
-                slider(s, "Required improvement", "SSGain", 0, 0.5, 2)
-                slider(s, "Movement uncertainty", "SSLeadSlop", 0, 0.2, 3, " s")
-                slider(s, "Position uncertainty", "SSSlop", 0, 1.5, 2, " st")
-                slider(s, "Minimum cone radius", "SSMin", 0, 2, 2, " st")
+                slider(s, "Head Weight", "SSHead", 1, 3, 2)
+                slider(s, "Limb Weight", "SSLimb", 0, 1, 2)
+                slider(s, "Min Gain", "SSGain", 0, 0.5, 2)
+                slider(s, "Lead Slop", "SSLeadSlop", 0, 0.2, 3, " s")
+                slider(s, "Position Slop", "SSSlop", 0, 1.5, 2, " st")
+                slider(s, "Min Cone Radius", "SSMin", 0, 2, 2, " st")
             end)
-
-            s = card("SilentAim", "Left", "Aim feedback")
-            toggle(s, "Target overlay & FOV", "AimVisuals")
-            choice(s, "Centre mark", "AimCenter", { { "Ring + dot", 1 }, { "Turning ticks", 2 }, { "Dashed ring", 3 } })
-            toggle(s, "Server cone ring", "AimCone")
-            toggle(s, "Muzzle guide", "MuzzleVisual")
-            slider(s, "Guide opacity", "MuzzleAlpha", 0, 1, 2)
         end
-
         do
-            local s = card("Main", "Left", "Auto heal", "Uses medical items in the backpack. Does not create items or shorten server effects.")
+            local s = card("SilentAim", "Left", "Aim Visuals")
+            toggle(s, "Target Overlay", "AimVisuals")
+            choice(s, "Center Mark", "AimCenter", { { "Ring + dot", 1 }, { "Turning ticks", 2 }, { "Dashed ring", 3 } })
+            toggle(s, "Cone Ring", "AimCone")
+            toggle(s, "Muzzle Line", "MuzzleVisual")
+            slider(s, "Muzzle Opacity", "MuzzleAlpha", 0, 1, 2)
+        end
+        do
+            local s = card("Main", "Left", "Auto Heal", "Uses medical items in the backpack. Does not create items or shorten server effects.")
             toggle(s, "Enabled", "AutoHeal")
-            slider(s, "Use below health", "AutoHealThreshold", 5, 100, 0, "%")
-            toggle(s, "Only during server combat", "AutoHealPvP")
-            slider(s, "Use interval", "AutoHealDelay", 0.5, 10, 1, " s")
+            slider(s, "Heal Below", "AutoHealThreshold", 5, 100, 0, "%")
+            toggle(s, "Only In Combat", "AutoHealPvP")
+            slider(s, "Heal Delay", "AutoHealDelay", 0.5, 10, 1, " s")
             keyToggle(s, "AutoHeal", "AutoHeal")
-
-            s = card("Main", "Right", "Auto de$rypto", "Opens nearby containers through their prompts; distance is still checked by the game.")
+        end
+        do
+            local s = card("Main", "Right", "Auto Decrypt", "Opens nearby containers through their prompts; distance is still checked by the game.")
             toggle(s, "Enabled", "AutoDecrypt", nil, function(v) if not v then Loot.stopAuto() end end)
-            slider(s, "Open radius", "AutoDecryptRadius", 2, 15, 1, " st")
-            toggle(s, "Reveal hidden slots", "AutoDecryptReveal", "Off: open, read the slot count, then close.")
+            slider(s, "Radius", "AutoDecryptRadius", 2, 15, 1, " st")
+            toggle(s, "Reveal Slots", "AutoDecryptReveal", "Off: open, read the slot count, then close.")
             keyToggle(s, "AutoDecrypt", "AutoDecrypt")
             advanced(s, "AutoDecrypt", function()
-                slider(s, "Concurrent containers", "AutoDecryptMax", 1, 3, 0, nil, "The runtime reduces concurrency if earlier containers get closed.")
+                slider(s, "Max Parallel", "AutoDecryptMax", 1, 3, 0, nil, "The runtime reduces concurrency if earlier containers get closed.")
             end)
-
-            s = card("Main", "Left", "Sledge aura", "Uses the real sledge quick-swing path. It does not extend server melee reach.")
-            toggle(s, "Enabled", "KillAura")
-            choice(s, "Aim region", "KaAim", { "Head", { "Root / torso", "HRP" } })
-            toggle(s, "Face nearby enemy", "KaTurn")
-            slider(s, "Facing distance", "KaFaceRange", 5, 15, 1, " st")
-            toggle(s, "Movement lead", "KaLead")
-            toggle(s, "Keep aim through cover", "KaWall", "Server acceptance of covered swings is not confirmed.")
-            keyToggle(s, "KillAura", "KillAura")
-            advanced(s, "KillAura", function()
-                slider(s, "Maximum lead", "KaLeadMax", 0, 8, 1, " st")
-                slider(s, "Interpolation estimate", "KaInterp", 0, 0.3, 3, " s")
-            end)
-
-            s = card("Main", "Right", "PvP focus", "Hides world clutter and can pause Auto de$rypto while fighting.")
-            toggle(s, "Manual focus", "PvPMode")
-            toggle(s, "Automatic focus", "PvPAuto")
-            slider(s, "Enemy trigger distance", "PvPRange", 25, 600, 0, " st")
-            slider(s, "Hold after threat", "PvPHold", 0, 30, 1, " s")
-            toggle(s, "Pause Auto de$rypto", "PvPPauseLoot")
-            toggle(s, "Keep recent corpses visible", "PvPKeepCorpses")
-            slider(s, "Recent corpse lifetime", "PvPCorpseSeconds", 5, 180, 0, " s")
-            keyToggle(s, "PvP", "PvPMode")
-        end
-
-        -- Independent functions each own a card, including simple one-switch functions.
-        for _, row in ipairs({
-            { "Main", "Left", "Auto breath", "AutoBreath", "Plays the breath checks at their normal pace." },
-            { "Main", "Right", "Auto hotwire / lockpick", "AutoHotwire", "Plays the game's timing minigames; no instant completion claim." },
-            { "GunMods", "Left", "No recoil", "NoRecoil", "Suppresses local recoil, jump sway and jump kick." },
-            { "GunMods", "Right", "No heat", "NoHeat", "Stops client heat growth from sustained fire." },
-            { "GunMods", "Left", "Full auto", "FullAuto", "The weapon's fire delay and bolt / break-action restrictions remain." },
-            { "GunMods", "Right", "Shoot everywhere", "ShootEverywhere", "Temporarily clears local firing gates. Server acceptance is unverified." },
-            { "GunMods", "Left", "Instant equip", "InstantEquip", "Local draw animation only; ammo and reload remain server-owned." },
-            { "Movement", "Left", "No fall damage", "NoFall", "Suppresses the client's fall report." },
-            { "Movement", "Right", "Infinite stamina", "InfStamina", "Controls the local stamina path." },
-            { "Movement", "Left", "No ragdoll", "NoRagdoll", "Local rig / knockback handling; does not cancel server knockout." },
-            { "Movement", "Right", "Anti climb", "AntiClimb", "Blocks new vaults / wall moves. Takes priority over Fast climb." },
-            { "Misc", "Left", "Instant interaction / seat", "InstantSit", "Removes local prompt holds and climb-in animation, not server seat timers." },
-            { "Visuals", "Right", "Full bright", "FullBright", "Local lighting only; restores originals on disable / unload." },
-        }) do
-            local s = card(row[1], row[2], row[3], row[5])
-            toggle(s, "Enabled", row[4])
-            keyToggle(s, row[4], row[4])
         end
         do
-            local s = card("GunMods", "Right", "Fast bolt")
-            toggle(s, "Enabled", "FastBolt")
-            slider(s, "Animation duration", "FastBoltScale", 0.05, 1, 2, "x", "Smaller = faster local cycle. The server prime timer still wins.")
-
-            s = card("GunMods", "Left", "ADS spoof")
-            toggle(s, "Spoof ADS for each shot", "AimSpoof")
-            toggle(s, "Hold ADS while target is locked", "AimSpoofHold")
-            toggle(s, "Always ADS for selected guns", "AlwaysAim")
-            setList(s, "Always ADS guns", "AlwaysAimGuns", CFG.AlwaysAimGuns, firearmIds)
+            local s = card("Main", "Left", "Kill Aura", "Uses the real sledge quick-swing path. It does not extend server melee reach.")
+            toggle(s, "Enabled", "KillAura")
+            choice(s, "Aim Part", "KaAim", { "Head", { "Root / torso", "HRP" } })
+            toggle(s, "Face Target", "KaTurn")
+            slider(s, "Face Range", "KaFaceRange", 5, 15, 1, " st")
+            toggle(s, "Lead", "KaLead")
+            toggle(s, "Wall Aim", "KaWall", "Server acceptance of covered swings is not confirmed.")
+            keyToggle(s, "KillAura", "KillAura")
+            advanced(s, "KillAura", function()
+                slider(s, "Max Lead", "KaLeadMax", 0, 8, 1, " st")
+                slider(s, "Interpolation", "KaInterp", 0, 0.3, 3, " s")
+            end)
+        end
+        do
+            local s = card("Main", "Right", "PvP Mode", "Hides world clutter and can pause Auto Decrypt while fighting.")
+            toggle(s, "Enabled", "PvPMode")
+            toggle(s, "Auto Enable", "PvPAuto")
+            slider(s, "Auto Range", "PvPRange", 25, 600, 0, " st")
+            slider(s, "Hold Time", "PvPHold", 0, 30, 1, " s")
+            toggle(s, "Pause Auto Decrypt", "PvPPauseLoot")
+            toggle(s, "Keep Corpses", "PvPKeepCorpses")
+            slider(s, "Corpse Time", "PvPCorpseSeconds", 5, 180, 0, " s")
+            keyToggle(s, "PvP", "PvPMode")
+        end
+        simple("AutoBreath", "Left")
+        simple("AutoHotwire", "Right")
+        interactCard("Left")
+        simple("NoRecoil", "Left")
+        simple("FullAuto", "Right")
+        do
+            local s = card("GunMods", "Left", "ADS Spoof")
+            toggle(s, "Spoof ADS On Shot", "AimSpoof")
+            toggle(s, "Hold ADS On Target", "AimSpoofHold")
+            toggle(s, "Always ADS", "AlwaysAim")
+            setList(s, "Always ADS Guns", "AlwaysAimGuns", CFG.AlwaysAimGuns, firearmIds)
             note(s, "Reports scoped state without forcing your local camera into ADS.")
-
-            s = card("GunMods", "Right", "Crouch spoof · experimental")
+        end
+        do
+            local s = card("GunMods", "Right", "Fast Bolt")
+            toggle(s, "Enabled", "FastBolt")
+            slider(s, "Bolt Time Scale", "FastBoltScale", 0.05, 1, 2, "x", "Smaller = faster local cycle. The server prime timer still wins.")
+        end
+        simple("NoHeat", "Left")
+        simple("InstantEquip", "Right")
+        simple("ShootEverywhere", "Left")
+        do
+            local s = card("GunMods", "Right", "Crouch Spoof")
             toggle(s, "Enabled", "CrouchSpoof")
-            toggle(s, "Also while moving", "CrouchSpoofMoving")
+            toggle(s, "While Moving", "CrouchSpoofMoving")
             note(s, "No local crouch. Server cone benefit is unconfirmed; moving may change server speed allowances.")
         end
-
         do
             local s = card("Movement", "Left", "Speed", "Existing Safe / Pulse / Hop paths. Mode names are not a promise of server safety.")
             toggle(s, "Enabled", "Speed")
@@ -8724,68 +8781,75 @@ return function(_Lib, _Core)
             keyToggle(s, "Speed", "Speed")
             advanced(s, "Speed", function()
                 head(s, "Safe / Pulse")
-                slider(s, "Target speed", "SpeedValue", 12, 80, 1, " st/s")
-                slider(s, "Pulse duration", "PulseLength", 0.05, 1, 2, " s")
-                slider(s, "Pulse pause", "PulseDelay", 0.05, 2, 2, " s")
-                slider(s, "Safe speed cap", "SpeedMax", 12, 60, 1, " st/s")
-                slider(s, "Safe smoothing", "SpeedRamp", 1, 30, 1)
-                toggle(s, "Falling bonus (Safe / Pulse)", "SpeedFallBonus")
-                toggle(s, "Only push while falling (Safe / Pulse)", "SpeedFallOnly")
-                head(s, "Hop limits")
-                slider(s, "Horizontal limit", "HopHorizontalSpeed", 12, 40, 1, " st/s")
-                slider(s, "Downward limit", "HopFallSpeed", 12, 40, 1, " st/s")
-                slider(s, "Maximum extra", "HopExtra", 0, 40, 1, " st/s")
-                slider(s, "Fall-to-speed ratio", "HopK", 0, 2, 2)
-                slider(s, "Push acceleration", "HopRamp", 10, 150, 0, " st/s²")
-                toggle(s, "Short descent bursts", "HopFallBurst")
-                slider(s, "Burst horizontal limit", "HopHorizontalBurstSpeed", 15, 45, 1, " st/s")
-                slider(s, "Burst downward limit", "HopFallBurstSpeed", 15, 45, 1, " st/s")
-                slider(s, "Burst duration", "HopFallBurstLength", 0.03, 0.3, 2, " s")
+                slider(s, "Speed Value", "SpeedValue", 12, 80, 1, " st/s")
+                slider(s, "Pulse Length", "PulseLength", 0.05, 1, 2, " s")
+                slider(s, "Pulse Delay", "PulseDelay", 0.05, 2, 2, " s")
+                slider(s, "Safe Max Speed", "SpeedMax", 12, 60, 1, " st/s")
+                slider(s, "Safe Ramp", "SpeedRamp", 1, 30, 1)
+                toggle(s, "Fall Bonus", "SpeedFallBonus")
+                toggle(s, "Fall Only", "SpeedFallOnly")
+                head(s, "Bunny Hop")
+                slider(s, "Max Horizontal", "HopHorizontalSpeed", 12, 40, 1, " st/s")
+                slider(s, "Max Fall Speed", "HopFallSpeed", 12, 40, 1, " st/s")
+                slider(s, "Max Extra", "HopExtra", 0, 40, 1, " st/s")
+                slider(s, "Fall Ratio", "HopK", 0, 2, 2)
+                slider(s, "Acceleration", "HopRamp", 10, 150, 0, " st/s²")
+                toggle(s, "Fall Burst", "HopFallBurst")
+                slider(s, "Burst Horizontal", "HopHorizontalBurstSpeed", 15, 45, 1, " st/s")
+                slider(s, "Burst Fall Speed", "HopFallBurstSpeed", 15, 45, 1, " st/s")
+                slider(s, "Burst Length", "HopFallBurstLength", 0.03, 0.3, 2, " s")
                 slider(s, "Burst cooldown", "HopFallBurstEvery", 3, 30, 1, " s")
-                head(s, "Hop state claim")
-                toggle(s, "Claim slide state", "HopClaim")
-                slider(s, "Claim renewal", "HopClaimRenew", 0.5, 3.8, 1, " s")
-                slider(s, "Uplink margin", "HopUplinkMargin", 0, 0.2, 3, " s")
-                slider(s, "State multiplier", "HopStateK", 1, 2, 2)
+                head(s, "Slide Claim")
+                toggle(s, "Claim Slide", "HopClaim")
+                slider(s, "Claim Renew", "HopClaimRenew", 0.5, 3.8, 1, " s")
+                slider(s, "Uplink Margin", "HopUplinkMargin", 0, 0.2, 3, " s")
+                slider(s, "State Multiplier", "HopStateK", 1, 2, 2)
                 note(s, "No movement algorithm or auto-jump setting is changed by mounting this UI.")
             end)
-
-            s = card("Movement", "Right", "Strafer")
-            toggle(s, "Enabled", "Strafer")
-            slider(s, "Minimum steering speed", "StrafeSpeed", 6, 40, 1, " st/s")
-            toggle(s, "Stop in air when keys are released", "StrafeStop")
-            keyToggle(s, "Strafer", "Strafer")
-
-            s = card("Movement", "Right", "High jump")
-            toggle(s, "Enabled", "HighJump")
-            slider(s, "Vertical launch speed", "HighJumpPower", 30, 80, 1, " st/s", "Higher values can exceed the game's movement allowance.")
-            keyToggle(s, "HighJump", "HighJump")
-
-            s = card("Movement", "Left", "Fast climb")
-            toggle(s, "Enabled", "FastClimb")
-            slider(s, "Hop duration scale", "FastClimbPace", 0.1, 1, 2, "x", "Smaller = faster. Anti climb must be off.")
-            toggle(s, "Continue an existing climb", "ClimbAuto")
-            toggle(s, "Start nearby climbs / vaults", "ClimbForce")
-            keyToggle(s, "FastClimb", "FastClimb")
-
-            s = card("Movement", "Right", "Anti drown")
-            toggle(s, "Enabled", "AntiDrown")
-            slider(s, "Water platform offset", "WaterMargin", 0, 2, 2, " st", "Keeps the feet above the water and suppresses the local drown report.")
         end
-
+        simple("NoFall", "Right")
         do
-            local s = card("Visuals", "Left", "Player / NPC espyxa")
+            local s = card("Movement", "Left", "Strafer")
+            toggle(s, "Enabled", "Strafer")
+            slider(s, "Min Speed", "StrafeSpeed", 6, 40, 1, " st/s")
+            toggle(s, "Air Stop", "StrafeStop")
+            keyToggle(s, "Strafer", "Strafer")
+        end
+        simple("InfStamina", "Right")
+        do
+            local s = card("Movement", "Left", "High Jump")
+            toggle(s, "Enabled", "HighJump")
+            slider(s, "Jump Power", "HighJumpPower", 30, 80, 1, " st/s", "Higher values can exceed the game's movement allowance.")
+            keyToggle(s, "HighJump", "HighJump")
+        end
+        simple("NoRagdoll", "Right")
+        do
+            local s = card("Movement", "Left", "Fast Climb")
+            toggle(s, "Enabled", "FastClimb")
+            slider(s, "Climb Pace", "FastClimbPace", 0.1, 1, 2, "x", "Smaller = faster. Anti climb must be off.")
+            toggle(s, "Auto Continue", "ClimbAuto")
+            toggle(s, "Force Climb", "ClimbForce")
+            keyToggle(s, "FastClimb", "FastClimb")
+        end
+        simple("AntiClimb", "Right")
+        do
+            local s = card("Movement", "Left", "Anti Drown")
+            toggle(s, "Enabled", "AntiDrown")
+            slider(s, "Water Offset", "WaterMargin", 0, 2, 2, " st", "Keeps the feet above the water and suppresses the local drown report.")
+        end
+        do
+            local s = card("Visuals", "Left", "Player ESP")
             toggle(s, "Enabled", "ESP")
             keyToggle(s, "ESP", "ESP")
-            slider(s, "Player distance", "EspPlayerMaxDist", 100, 3000, 0, " st")
-            slider(s, "NPC distance", "EspNpcMaxDist", 50, 1500, 0, " st")
-            toggle(s, "Show allies / protected players", "EspAllies")
-            toggle(s, "Rounded box corners", "EspRound")
-            toggle(s, "Show armor", "EspArmor")
-            choice(s, "Stroke quality", "Quality", { { "Light", 0 }, { "Layered", 1 } })
+            slider(s, "Player Distance", "EspPlayerMaxDist", 100, 3000, 0, " st")
+            slider(s, "NPC Distance", "EspNpcMaxDist", 50, 1500, 0, " st")
+            toggle(s, "Show Allies", "EspAllies")
+            toggle(s, "Rounded Boxes", "EspRound")
+            toggle(s, "Armor", "EspArmor")
+            choice(s, "Quality", "Quality", { { "Light", 0 }, { "Layered", 1 } })
             note(s, "Monster / boss inclusion shares the target filters in SilentAim.")
             advanced(s, "CharacterESP", function()
-                head(s, "Role colors")
+                head(s, "Colors")
                 for _, row in ipairs({
                     { "Visible enemy", "Visible", COL_VIS }, { "Covered enemy", "Hidden", COL_HID },
                     { "NPC", "NPC", COL_NPC },
@@ -8797,27 +8861,28 @@ return function(_Lib, _Core)
                     end }, flag("Color_" .. row[2])))
                 end
                 color(s, "Ally", "ally", PAL, "Color_Ally")
-                color(s, "Protected player", "safe", PAL, "Color_Safe")
-                color(s, "Peek point", "peek", PAL, "Color_Peek")
-                color(s, "Low health", "hpLow", PAL, "Color_HpLow")
-                color(s, "Full health", "hpHigh", PAL, "Color_HpHigh")
-                setList(s, "Hide item IDs", "EspHideIds", CFG.EspHideIds, equipmentIds)
-                head(s, "Information refresh")
-                slider(s, "Equipment refresh", "EspInfoRate", 0.1, 1, 2, " s")
-                slider(s, "State refresh", "EspStateRate", 0.1, 1, 2, " s")
-                slider(s, "Health refresh", "EspHealthRate", 0.05, 0.5, 2, " s")
-                note(s, "These only affect espyxa information, not resolver sampling or shot accuracy.")
+                color(s, "Protected", "safe", PAL, "Color_Safe")
+                color(s, "Peek", "peek", PAL, "Color_Peek")
+                color(s, "Low HP", "hpLow", PAL, "Color_HpLow")
+                color(s, "Full HP", "hpHigh", PAL, "Color_HpHigh")
+                setList(s, "Hidden Items", "EspHideIds", CFG.EspHideIds, equipmentIds)
+                head(s, "Refresh Rates")
+                slider(s, "Items Rate", "EspInfoRate", 0.1, 1, 2, " s")
+                slider(s, "State Rate", "EspStateRate", 0.1, 1, 2, " s")
+                slider(s, "Health Rate", "EspHealthRate", 0.05, 0.5, 2, " s")
+                note(s, "These only affect ESP information, not resolver sampling or shot accuracy.")
             end)
-
-            s = card("Visuals", "Right", "Loot containers · espyxa", "Container contents stay unknown until the game reveals them.")
+        end
+        do
+            local s = card("Visuals", "Right", "Loot ESP", "Container contents stay unknown until the game reveals them.")
             toggle(s, "Enabled", "LootViz")
-            slider(s, "Nearby contents distance", "LootRange", 10, 200, 0, " st")
-            slider(s, "Object box distance", "EspObjectMaxDist", 50, 1500, 0, " st")
-            slider(s, "Supply / body distance", "EspSupplyMaxDist", 100, 4000, 0, " st")
+            slider(s, "Contents Distance", "LootRange", 10, 200, 0, " st")
+            slider(s, "Box Distance", "EspObjectMaxDist", 50, 1500, 0, " st")
+            slider(s, "Supply Distance", "EspSupplyMaxDist", 100, 4000, 0, " st")
             rarity(s, "LootMinRarity")
-            toggle(s, "Include unknown contents", "LootUnknown")
-            toggle(s, "Hide empty containers", "LootHideEmpty")
-            bindAction(s, "Rare+ quick filter", "LootFilter", function()
+            toggle(s, "Show Unknown", "LootUnknown")
+            toggle(s, "Hide Empty", "LootHideEmpty")
+            bindAction(s, "Rare+ Filter Key", "LootFilter", function()
                 local rare = CFG.LootMinRarity ~= 3
                 local opt = ctx.MacLib.Options[flag("LootMinRarity")]
                 opt:UpdateSelection(rare and "Rare+" or "Common+")
@@ -8825,7 +8890,7 @@ return function(_Lib, _Core)
                 Loot.nextQuery = 0
             end)
             advanced(s, "LootClasses", function()
-                head(s, "Container categories & colors")
+                head(s, "Categories")
                 for _, row in ipairs({
                     { "AirDrop", "Flare airdrops" }, { "SupplyDrop", "Death loot bags" },
                     { "Corpse", "Corpses" }, { "Weapons", "Weapons" }, { "Ammo", "Ammo" },
@@ -8840,8 +8905,9 @@ return function(_Lib, _Core)
                     color(s, row[2] .. " color", "color", data, id .. "_Color")
                 end
             end)
-
-            s = card("Visuals", "Left", "Equipment rarities", "Filters and colors for the weapon list under player boxes, not loot-container visibility.")
+        end
+        do
+            local s = card("Visuals", "Left", "Weapon ESP Rarity", "Filters and colors for the weapon list under player boxes, not loot-container visibility.")
             for _, key in ipairs({ "Common", "Uncommon", "Rare", "Epic", "Legendary", "Limited" }) do
                 local data = CFG.WeaponRarity[key]
                 s:Toggle({ Name = key, Default = data.on, Callback = function(v)
@@ -8849,53 +8915,60 @@ return function(_Lib, _Core)
                 end }, flag("WeaponRarity_" .. key))
                 color(s, key .. " color", "color", data, "WeaponRarityColor_" .. key)
             end
-
-            s = card("Visuals", "Right", "Extraction markers")
+        end
+        do
+            local s = card("Visuals", "Right", "Extract ESP")
             toggle(s, "Enabled", "ExtractMarkers")
             slider(s, "Distance", "ExtractMaxDist", 100, 6000, 0, " st")
             slider(s, "Opacity", "ExtractAlpha", 0.1, 1, 2)
-
-            s = card("Visuals", "Right", "World item markers", "Shown if the category is selected OR rarity meets the threshold OR the game marks it RareFind.")
+        end
+        do
+            local s = card("Visuals", "Right", "World Items ESP", "Shown if the category is selected OR rarity meets the threshold OR the game marks it RareFind.")
             toggle(s, "Enabled", "FindMarkers")
             slider(s, "Distance", "FindMaxDist", 50, 4000, 0, " st")
             slider(s, "Opacity", "FindAlpha", 0.1, 1, 2)
             rarity(s, "FindMinRarity")
-            setList(s, "Always show categories", "FindFilter", CFG.FindFilter,
+            setList(s, "Always Show", "FindFilter", CFG.FindFilter,
                 { "Firearms", "Ammo", "Melee", "Medical", "Armor", "Attachments", "Tools", "Valuables",
                     "Materials", "Building", "Food", "Water", "Accessories", "Junk", "Unknown" }, false,
                 function() Visual.finds.at = 0 end)
-
-            s = card("Visuals", "Right", "Boss markers")
-            toggle(s, "Skull marker instead of box", "BossMarkers")
+        end
+        do
+            local s = card("Visuals", "Right", "Boss ESP")
+            toggle(s, "Skull Marker", "BossMarkers")
             note(s, "On: skull markers. Off: boss boxes remain if Target bosses is enabled in SilentAim.")
-
-            s = card("Visuals", "Right", "Death marker")
+        end
+        do
+            local s = card("Visuals", "Right", "Death Marker")
             toggle(s, "Enabled", "DeathMarker")
             note(s, "Marks your last death position; hidden during PvP focus.")
-
-            s = card("Visuals", "Left", "Bullet tracers")
+        end
+        do
+            local s = card("Visuals", "Left", "Bullet Tracers")
             toggle(s, "Enabled", "BulletTracer")
             choice(s, "Style", "TracerStyle", {
                 { "Needle", 1 }, { "Comet", 2 }, { "Beam + ring", 3 }, { "Dashes", 4 },
                 { "Helix", 5 }, { "Lightning", 6 }, { "Rail", 7 },
             })
-            toggle(s, "Fading wake", "TracerTrail")
-            toggle(s, "Forked lightning (Lightning style)", "BoltTracer")
-            slider(s, "Fade after impact", "TracerFade", 0.1, 3, 2, " s")
-
-            s = card("Visuals", "Left", "Hit marker")
+            toggle(s, "Trail", "TracerTrail")
+            toggle(s, "Forked Lightning", "BoltTracer")
+            slider(s, "Fade Time", "TracerFade", 0.1, 3, 2, " s")
+        end
+        do
+            local s = card("Visuals", "Left", "Hit Marker")
             toggle(s, "Enabled", "HitMarker")
             choice(s, "Style", "HitMarkerStyle", {
                 { "Pull-in", 1 }, { "Pull-in + ring", 2 }, { "Wedges", 3 }, { "Crit + damage", 4 },
             })
-
-            s = card("Visuals", "Left", "Hit sound")
+        end
+        do
+            local s = card("Visuals", "Left", "Hit Sound")
             toggle(s, "Enabled", "HitSound")
-            choice(s, "Preset", "HitSoundPreset", {
+            choice(s, "Sound", "HitSoundPreset", {
                 "Fatality", "Minecraft XP", "Minecraft Hit", "Minecraft Egg", "Minecraft Bow",
                 "Click", "Bell", "Neverlose", "Primordial", "Custom",
             })
-            s:Input({ Name = "Custom sound ID", Default = tostring(CFG.HitSoundId), AcceptedCharacters = "Numeric",
+            s:Input({ Name = "Custom Sound ID", Default = tostring(CFG.HitSoundId), AcceptedCharacters = "Numeric",
                 Callback = function(v)
                     local id = tonumber(v)
                     if running and id and id > 0 and id % 1 == 0 then CFG.HitSoundId = id end
@@ -8904,81 +8977,61 @@ return function(_Lib, _Core)
             note(s, "Custom ID is used only with the Custom preset. The asset must be accessible to this game.")
             slider(s, "Volume", "HitSoundVolume", 0, 10, 1)
             slider(s, "Pitch", "HitSoundPitch", 0.5, 2, 2)
-            s:Button({ Name = "Preview sound", Callback = function() if running then play_hit() end end })
-
-            s = card("Visuals", "Left", "Hit particles")
-            toggle(s, "Enabled", "HitParticles")
-            slider(s, "Scale", "ParticleScale", 0.2, 3, 1)
-            color(s, "Start color", "ParticleColorA")
-            color(s, "Middle color", "ParticleColorB")
-            color(s, "End color", "ParticleColorC")
-            bindAction(s, "Preview particles", "ParticleTest", Visual.pfxDemo)
-            s:Button({ Name = "Preview particles", Callback = function() if running then Visual.pfxDemo() end end })
-        end
-
-        for _, row in ipairs({ { "WeaponFx", "Weapon appearance", "Left" }, { "SelfFx", "Character appearance", "Right" } }) do
-            local pre = row[1]
-            local s = card("Visuals", row[3], row[2], "Client-only materials and colors; originals are restored on disable / unload.")
-            toggle(s, "Enabled", pre)
-            keyToggle(s, pre, pre)
-            choice(s, "Material", pre .. "Material", { "ForceField", "Neon", "SmoothPlastic", "Glass", "Metal" })
-            slider(s, "Transparency", pre .. "Transparency", 0, 0.95, 2)
-            color(s, "Gradient start", pre .. "ColorA")
-            color(s, "Gradient end", pre .. "ColorB")
-            slider(s, "Color cycle speed", pre .. "Speed", 0, 2, 2)
-            slider(s, "Gradient spacing", pre .. "Flow", 0, 0.5, 2, nil, nil, nil, function()
-                for _, group in pairs(Visual.skin.groups) do
-                    if group.prefix == pre and group.root then Visual.skinRelease(group) end
-                end
-                Visual.skin.findAt = 0
-            end)
-            if pre == "SelfFx" then
-                toggle(s, "Hide clothes locally", "SelfFxStripClothes")
-                note(s, "Model swap takes priority over the character material effect.")
-            end
-            advanced(s, pre, function()
-                head(s, "Highlight")
-                toggle(s, "Highlight", pre .. "Highlight")
-                slider(s, "Fill transparency", pre .. "HlFill", 0, 1, 2)
-                slider(s, "Outline transparency", pre .. "HlOutline", 0, 1, 2)
-            end)
+            s:Button({ Name = "Test Sound", Callback = function() if running then play_hit() end end })
         end
         do
-            local s = card("Visuals", "Left", "Weapon size", "Only scales your third-person held model, not first person or server hitboxes.")
+            local s = card("Visuals", "Left", "Hit Effects")
+            toggle(s, "Enabled", "HitParticles")
+            slider(s, "Scale", "ParticleScale", 0.2, 3, 1)
+            color(s, "Color 1", "ParticleColorA")
+            color(s, "Color 2", "ParticleColorB")
+            color(s, "Color 3", "ParticleColorC")
+            bindAction(s, "Test Effect", "ParticleTest", Visual.pfxDemo)
+            s:Button({ Name = "Test Effect", Callback = function() if running then Visual.pfxDemo() end end })
+        end
+        fxCard("WeaponFx", "Weapon Chams", "Left")
+        fxCard("SelfFx", "Self Chams", "Right")
+        do
+            local s = card("Visuals", "Left", "Weapon Scale", "Only scales your third-person held model, not first person or server hitboxes.")
             toggle(s, "Enabled", "WeaponScale")
-            slider(s, "Scale factor", "WeaponScaleFactor", 0.1, 8, 1, "x")
-
-            s = card("Visuals", "Right", "Model swap", "Changes your local appearance only. The real character and hitboxes stay unchanged.")
+            slider(s, "Scale", "WeaponScaleFactor", 0.1, 8, 1, "x")
+        end
+        do
+            local s = card("Visuals", "Right", "Model Swap", "Changes your local appearance only. The real character and hitboxes stay unchanged.")
             toggle(s, "Enabled", "ModelSwap")
             choice(s, "Model", "ModelSwapModel", Visual.SWAP_ORDER)
-            slider(s, "Facing adjustment", "ModelSwapYaw", -180, 180, 0, "°")
+            slider(s, "Yaw Offset", "ModelSwapYaw", -180, 180, 0, "°")
             keyToggle(s, "ModelSwap", "ModelSwap")
-            bindAction(s, "Next model", "ModelSwapNext", function()
+            bindAction(s, "Next Model Key", "ModelSwapNext", function()
                 local at = table.find(Visual.SWAP_ORDER, CFG.ModelSwapModel) or 1
                 ctx.MacLib.Options[flag("ModelSwapModel")]:UpdateSelection(Visual.SWAP_ORDER[at % #Visual.SWAP_ORDER + 1])
             end)
-
-            s = card("Misc", "Right", "Staff detection", "Uses replicated staff signals. It cannot guarantee an undetected server.")
-            choice(s, "Action", "StaffDetect", { "Off", "Alert", "Kick" })
-            toggle(s, "Include Config clippers", "StaffClippers")
-            slider(s, "Group rank threshold (0 = off)", "StaffGroupRank", 0, 255, 0)
-            slider(s, "Kick delay", "StaffKickDelay", 0, 5, 1, " s")
+        end
+        simple("FullBright", "Right")
+        do
+            local s = card("Misc", "Right", "Staff Detector", "Uses replicated staff signals. It cannot guarantee an undetected server.")
+            choice(s, "Mode", "StaffDetect", { "Off", "Alert", "Kick" })
+            toggle(s, "Include Clippers", "StaffClippers")
+            slider(s, "Group Rank (0 = Off)", "StaffGroupRank", 0, 255, 0)
+            slider(s, "Kick Delay", "StaffKickDelay", 0, 5, 1, " s")
             s:Input({ Name = "Kick message", Default = CFG.StaffKickMsg, CharacterLimit = 160,
                 Callback = function(v) if running then CFG.StaffKickMsg = v end end,
             }, flag("StaffKickMsg"))
-
-            s = card("Misc", "Left", "Visual gallery", "Toggles the existing world-space preview gallery; does not move it with the character.")
-            s:Button({ Name = "Show / hide gallery", Callback = function() if running then drop_mock() end end })
+        end
+        do
+            local s = card("Misc", "Left", "FX Gallery", "Toggles the existing world-space preview gallery; does not move it with the character.")
+            s:Button({ Name = "Toggle Gallery", Callback = function() if running then drop_mock() end end })
             bindAction(s, "Gallery key", "Gallery", drop_mock)
-
-            s = card("Debug", "Right", "HUSH · shot logs")
-            toggle(s, "Write shot logs", "DebugFile")
-            toggle(s, "Record post-shot target samples", "DebugAfter")
-            toggle(s, "Console shot details", "ShotLog")
-            toggle(s, "Console Hop details", "HopLog")
+        end
+        do
+            local s = card("Debug", "Right", "Shot Logs")
+            toggle(s, "Shot Log File", "DebugFile")
+            toggle(s, "Post-Shot Samples", "DebugAfter")
+            toggle(s, "Console Log", "ShotLog")
+            toggle(s, "Hop Log", "HopLog")
             note(s, "Files: executor workspace / hush / shots_<time>.jsonl. Existing logs are never deleted.")
             head(s, "Performance")
-            toggle(s, "Periodic section timings", "PerfLog")
+            toggle(s, "Perf Log", "PerfLog")
             local function report()
                 if not running then return end
                 warn("[hush] sections/resources: " .. game:GetService("HttpService"):JSONEncode({
@@ -8986,12 +9039,13 @@ return function(_Lib, _Core)
                 }))
                 ctx.notify("HUSH", "Section timings and resource counts printed to the console.")
             end
-            s:Button({ Name = "Print performance / resources", Callback = report })
+            s:Button({ Name = "Print Perf", Callback = report })
             bindAction(s, "Performance key", "Perf", report)
-
-            s = card("Misc", "Right", "HUSH lifecycle")
+        end
+        do
+            local s = card("Misc", "Right", "Script")
             note(s, "Unloading the Syllinse window also stops HUSH hooks, renderers and movement. Reload the file to start again.")
-            s:Button({ Name = "Unload HUSH", DoubleClick = true, Callback = unload })
+            s:Button({ Name = "Unload", DoubleClick = true, Callback = unload })
             bindAction(s, "Unload key", "Unload", unload)
         end
         Life.uiState = function(key)
