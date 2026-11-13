@@ -164,6 +164,7 @@ local CFG = {
 	GkPressLastMan = true, -- no press while an open attacker nearer / level with the goal can take the pass
 	GkPressReachFrac = 0.85, -- contact only in the first part of the dive curve (the end is a threshold)
 	GkPressRadiusFrac = 0.75, -- share of the catch radius that must hold: centred hits, not edge hits
+	GkPressFace = true, -- turn the keeper's body to the carrier before and during a press dive
 	GkPressExact = true, -- dive at any angle (not only the 8 camera directions)
 	GkPressHome = true, -- steer the dive at him while it runs (what turning the camera does)
 	GkPressTurn = 6, -- rad/s of that steering
@@ -5645,6 +5646,13 @@ Mark.rebaseAim = function()
 	Shoot.rebased = os.clock()
 end
 
+-- We are the keeper: enemy slides do not stun / strip a keeper (server side; the keeper has no slide either), so the
+-- dribble / dodge answers to tackles are wasted cooldowns and hijacked movement. Kicks and projectiles keep their own logic.
+Mark.meKeeper = function()
+	local ch = LocalPlayer.Character
+	return ch ~= nil and MatchSettings.IsGoalkeeperCharacter(ch)
+end
+
 local function stepLogic()
 	Mark.logicId = (Mark.logicId or 0) + 1
 	Mark.volleyPending()
@@ -5815,7 +5823,7 @@ local function stepLogic()
 					Mark.kickWalkAt = os.clock()
 					dribbleWhy = "kick into"
 				end
-			else
+			elseif not Mark.meKeeper() then
 				threat = dribbleThreat(root)
 			end
 			if kt and (dribbleWhy == "kick" or dribbleWhy == "kick into") then
@@ -5867,7 +5875,7 @@ local function stepLogic()
 		note("d", dribbleWhy)
 	end
 
-	if CFG.AutoDodge and not own and not ClientSlide.IsSlideTackling() and not slideAim and Mark.move.mode ~= "dodge" and Mark.dodgeSteer then
+	if CFG.AutoDodge and not own and not ClientSlide.IsSlideTackling() and not slideAim and Mark.move.mode ~= "dodge" and Mark.dodgeSteer and not Mark.meKeeper() then
 		local threat = dribbleThreat(root)
 		if threat and threat.fire and not Mark.dodgeDone then
 			dribbleDanger = threat
@@ -8264,14 +8272,26 @@ Mark.gkAimHook()
 
 -- homing of a running press dive (what turning the camera does in the game)
 Mark.gkAimTick = function(root)
+	local now = os.clock()
+	-- pre-turn (gkPress turns the body to him while a contact is near): released 0.15 s after the last refresh
+	local pf = Mark.gkPreFace
+	if pf and now - pf.at > 0.15 and not Mark.gkDiveAim then
+		Mark.gkPreFace = nil
+		TurnControl.ReleaseAutoRotate("Goalkeeper")
+	end
 	local a = Mark.gkDiveAim
 	if not a then
 		return
 	end
-	local now = os.clock()
 	if now >= a.untilT then
 		Mark.gkDiveAim = nil
+		if a.faceLock then
+			TurnControl.ReleaseAutoRotate("Goalkeeper")
+		end
 		return
+	end
+	if a.faceLock then
+		TurnControl.LockAutoRotate("Goalkeeper", a.dir)
 	end
 	local dt = math.clamp(now - (a.tickAt or now), 0, 0.05)
 	a.tickAt = now
@@ -8789,6 +8809,13 @@ Mark.gkPress = function(character, root, c)
 	if not best then
 		return note("no contact " .. info)
 	end
+	-- turn to him before the dive: with the body already on the line the dash and its "F" animation start the same way
+	-- (and the facing lock does not have to swing the body during the dash). Only for a near contact and exact aim (the
+	-- 8 camera choices depend on the facing, turning would change them).
+	if CFG.GkPressFace ~= false and (CFG.GkPressExact ~= false) and best.t <= 0.6 and best.conf >= need * 0.5 and not Mark.gkDiveAim then
+		TurnControl.LockAutoRotate("Goalkeeper", best.dir)
+		Mark.gkPreFace = { at = c.now }
+	end
 	-- a charging carrier releases within KickCore's 0.4 s: the dive must land before that, otherwise the save logic owns it
 	local crec = Mark.charges and Mark.charges[pl.UserId]
 	if crec and crec.live and c.now - (crec.seen or 0) < 0.6 and not committed then
@@ -8838,7 +8865,14 @@ Mark.gkPress = function(character, root, c)
 	Mark.gkDive = c.now
 	local ok = c.role.Dive()
 	Mark.diveRestore(character, best.dir)
-	TurnControl.ReleaseAutoRotate("Goalkeeper")
+	if ok and exact then
+		-- hold the body on the dash for the whole dive (gkAimTick re-locks it along the homing dir and releases at the
+		-- end). Released right after Dive(), GoalkeeperCameraFacing turned the body back to the camera: a sideways dash
+		-- with the body (and the "F" animation) pointing at the goal-out direction.
+		Mark.gkDiveAim.faceLock = true
+	else
+		TurnControl.ReleaseAutoRotate("Goalkeeper")
+	end
 	if not ok then
 		Mark.gkDiveAim = nil
 	end
@@ -9085,13 +9119,22 @@ Mark.gkComboTick = function(character, root)
 		Mark.gkDiveAim = nil
 	end
 	Mark.diveRestore(character, wd)
-	TurnControl.ReleaseAutoRotate("Goalkeeper")
+	if ok and cb.dir and Mark.gkDiveAim then
+		Mark.gkDiveAim.faceLock = true
+	else
+		TurnControl.ReleaseAutoRotate("Goalkeeper")
+	end
 	logFile("gk press", "air dive", ok and "ok" or "no", cb.name, "airborne", tostring(not CharacterControllers.IsLanded(character, character:FindFirstChildOfClass("Humanoid"))))
 end
 
 Mark.tickGk = function(character, root)
 	if not CFG.AutoGK or not MatchSettings.IsGoalkeeperCharacter(character) then
 		Mark.ballSrcId = nil
+		if Mark.gkPreFace or (Mark.gkDiveAim and Mark.gkDiveAim.faceLock) then
+			-- AutoGK off / no longer the keeper with our facing lock on: do not leave the body locked
+			Mark.gkPreFace, Mark.gkDiveAim = nil, nil
+			TurnControl.ReleaseAutoRotate("Goalkeeper")
+		end
 		return false
 	end
 	local posMod = Mark.gkPos or require(Modules.Gameplay.GoalkeeperPositioning)
@@ -10024,7 +10067,7 @@ local function onEnemyTackleStarted(userId, aim)
 	if not Mark.playLive() then
 		return
 	end
-	if not (CFG.AutoDribble or CFG.AutoDodge) then
+	if not (CFG.AutoDribble or CFG.AutoDodge) or Mark.meKeeper() then
 		return
 	end
 	if type(userId) ~= "number" or userId == LocalPlayer.UserId then
@@ -10432,7 +10475,7 @@ end
 BallGroup.TackleEffect.OnClientEvent:Connect(onFx)
 Remotes.Get("Ball", "ActionPresentationUpdate").OnClientEvent:Connect(onFx)
 SlideTackle.SlidingUntilChanged.Event:Connect(function(ch)
-	if not (CFG.AutoDribble or CFG.AutoDodge) then
+	if not (CFG.AutoDribble or CFG.AutoDodge) or Mark.meKeeper() then
 		return
 	end
 	if not ch then
@@ -17214,6 +17257,14 @@ Mark.projTick = function(character, root)
 		end
 		local dt = math.max(nowS - st.at, 0)
 		if st.homing then
+			if own and Mark.meKeeper() then
+				-- the keeper's ball is not knocked out by the punch: no lob, no dump
+				if not st.keeperLogged then
+					st.keeperLogged = true
+					logFile("proj punch", "keeper holds: ignored")
+				end
+				continue
+			end
 			if not own then
 				if not st.waitLogged then
 					st.waitLogged = true
@@ -19463,6 +19514,7 @@ return function(_Lib, _Core)
 			tog(p, "Press Jump", "GkPressJump", "Jump + dive at players in the air.")
 			tog(p, "Come Out", "GkPressMove", "Steps out to cut his angle. Your own movement always wins.")
 			tog(p, "Last Man Only", "GkPressLastMan", "No press while another attacker can take the pass.")
+			tog(p, "Face Him", "GkPressFace", "Turns your body to him for the dive.")
 			tog(p, "Show Press", "DrawGk", "His possible paths and your dive.")
 			sld(p, "Confidence", "GkPressConf", 0.3, 0.95, { prec = 2, text = "How sure the dive must be." })
 			advanced(p, "GkPress", function()
