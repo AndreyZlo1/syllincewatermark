@@ -132,6 +132,7 @@ local CFG = {
 	AgentSpotStyle = "corners",
 	-- agent route look: "flow" (gradient + pulses, matches the corner spot) or "classic" (old chalk route)
 	AgentPathStyle = "flow",
+	AgentPathAlpha = 0.5, -- opacity of the agent route line
 	-- new looks, ON by default: shot "aurora", positions "phantom", tackle sight "reticle"; any other value
 	-- ("classic") = the old drawing
 	ShotStyle = "aurora",
@@ -152,13 +153,15 @@ local CFG = {
 	GkLostPath = true, -- no reachable point on the path: walk to where the PATH is soonest within dive range, not to the goal-line crossing
 	GkLostDiveFrac = 0.75,
 	GkPressJump = true, -- no ground dive reaches him (flier / lob): jump first, dive from the air
-	GkPressZone = 45, -- a carrier this close to the mouth segment and closing on it is a press target
+	GkPressZone = 90, -- a carrier this close to the mouth segment and closing on it is a press target (~90 st: our body already covers most of the mouth)
 	GkPressConf = 0.6, -- share of his possible futures the dive must catch
 	GkPressConfLate = 0.35, -- the same when he reaches the mouth within GkPressLate s (or flies in)
 	GkPressLate = 0.9,
 	GkPressMove = true, -- come out on his line to the mouth while he closes in
-	GkPressGap = 11, -- ... staying this far in front of him
-	GkPressOut = 12, -- ... and at most this far off the line
+	GkPressGap = 12, -- ... staying this far in front of him (inside the dive's first 85 %)
+	GkPressOut = 40, -- ... and at most this far off the line
+	GkPressReachFrac = 0.85, -- contact only in the first part of the dive curve (the end is a threshold)
+	GkPressRadiusFrac = 0.75, -- share of the catch radius that must hold: centred hits, not edge hits
 	GkPressExact = true, -- dive at any angle (not only the 8 camera directions)
 	GkPressHome = true, -- steer the dive at him while it runs (what turning the camera does)
 	GkPressTurn = 6, -- rad/s of that steering
@@ -8391,35 +8394,41 @@ Mark.gkPressSolve = function(o)
 		local yBase = o.root.Y + (op.jump and math.max(vJ * op.jump - 0.5 * o.g * op.jump * op.jump, 0) or 0)
 		local dirs = {}
 		if o.exact then
-			for k = 3, #cen, 3 do
-				if (k - 1) * DT > T0 + 0.03 then
-					local d1 = unitOrNil(flat(cen[k] - p0))
-					if d1 then
-						dirs[#dirs + 1] = d1
-					end
-					local d2 = (k % 6 == 0) and unitOrNil(flat(futs[1].pts[k] - p0))
-					if d2 then
-						dirs[#dirs + 1] = d2
-					end
+			-- AIM AT HIM, not at where he will be: the line to his server pose at the moment the dash starts (homing keeps
+			-- turning it at him while it runs). A lead toward the main future is tried only after the direct line scored
+			-- >= 0.85, and only a fraction of the way (0.3 / 0.6): a guess about a man who can still turn is what put the
+			-- dash beside him.
+			local kS = math.min(math.floor(T0 / DT + 0.5) + 1, #futs[1].pts)
+			local now = flat(futs[1].pts[kS] - p0)
+			local kC = math.min(math.floor((T0 + 0.32) / DT + 0.5) + 1, #cen)
+			local fut = flat(cen[kC] - p0)
+			for _, fr in { 0, 0.3, 0.6 } do
+				local d1 = unitOrNil(now + (fut - now) * fr)
+				if d1 then
+					dirs[#dirs + 1] = { dir = d1, frac = fr }
 				end
 			end
 		else
 			for _, choice in Mark.actionMotion.DirectionChoices do
 				local wd = Mark.gkAimOrig(choice, o.camCF, o.facing)
 				if typeof(wd) == "Vector3" then
-					dirs[#dirs + 1] = wd
+					dirs[#dirs + 1] = { dir = wd, frac = 0 }
 				end
 			end
 		end
-		for _, dir in dirs do
-			if dir:Dot(o.fwd) > -0.25 then
+		local leadOk = false
+		for _, rec in dirs do
+			local dir = rec.dir
+			if dir:Dot(o.fwd) > -0.25 and (rec.frac == 0 or leadOk) then
 				local conf, tMain, tAny, hits = 0, nil, nil, nil
 				for fi, f in futs do
 					local pts = f.pts
 					for i = 1, 35 do
 						local tau = i * DT
 						local travel = D.GetTravel(tau, o.dist)
-						if travel > o.maxD then
+						-- contact on the last stretch of the curve is a threshold: one step back by him and the dash ends short
+						-- (log: the dash did not even reach him). Only the first RF of the dive counts.
+						if travel > o.maxD or travel > o.dist * o.RF then
 							break
 						end
 						local tAbs = T0 + tau
@@ -8447,11 +8456,14 @@ Mark.gkPressSolve = function(o)
 					end
 				end
 				conf /= wSum
+				if rec.frac == 0 then
+					leadOk = conf >= 0.85
+				end
 				if conf > 0 then
-					local cand = { conf = conf, dir = dir, T0 = T0, jump = op.jump, t = tMain or tAny, hits = hits }
+					local cand = { conf = conf, dir = dir, T0 = T0, jump = op.jump, t = tMain or tAny, hits = hits, frac = rec.frac }
 					local now0 = T0 == 0 or op.jump ~= nil
 					local cur = now0 and bestNow or bestLater
-					if not cur or conf > cur.conf + 0.01 or (math.abs(conf - cur.conf) <= 0.01 and cand.t < cur.t) then
+					if not cur or conf - 0.12 * rec.frac > cur.conf - 0.12 * (cur.frac or 0) + 0.01 or (math.abs(conf - cur.conf) <= 0.01 and cand.t < cur.t) then
 						if now0 then
 							bestNow = cand
 						else
@@ -8564,7 +8576,7 @@ Mark.gkPress = function(character, root, c)
 
 	local diveReady = c.now - (Mark.gkDive or 0) > D.Constants.RepeatDelaySeconds + 0.05
 	local iframe = Dodge.IsDribbling(model)
-	local viz = { at = c.now, futs = futs, from = root.Position, conf = 0, need = 1, stand = Mark.gkPressStandP, R = CFG.PressReach or 2.6 }
+	local viz = { at = c.now, futs = futs, from = root.Position, conf = 0, need = 1, stand = Mark.gkPressStandP, R = (CFG.PressReach or 2.6) * ((airborne or jet) and 1 or (CFG.GkPressRadiusFrac or 0.75)) }
 	Mark.gkViz = viz
 	if not diveReady then
 		return note("wait dive cooldown")
@@ -8583,7 +8595,8 @@ Mark.gkPress = function(character, root, c)
 		Mark.actionMotion = Mark.actionMotion or require(Modules.Actions.ActionMotion)
 		best, later, cen = Mark.gkPressSolve({
 			root = root.Position, vel = flat(root.AssemblyLinearVelocity), futs = futs, D = D, dist = dist,
-			maxD = math.min(CFG.PressDist or (dist - 0.5), dist - 0.5), R = CFG.PressReach or 2.6, H = CFG.PressVert or 4,
+			maxD = math.min(CFG.PressDist or (dist - 0.5), dist - 0.5), R = (CFG.PressReach or 2.6) * ((airborne or jet) and 1 or (CFG.GkPressRadiusFrac or 0.75)), H = CFG.PressVert or 4,
+			RF = CFG.GkPressReachFrac or 0.85,
 			mouth = mouth, fwd = fwd, g = g, jumpH = Mark.jumpH or 7.2, air = airborne or jet,
 			exact = CFG.GkPressExact ~= false, camCF = cam and cam.CFrame or root.CFrame,
 			facing = unitOrNil(flat(root.CFrame.LookVector)) or fwd,
@@ -8656,9 +8669,16 @@ end
 -- the escapes as faint paper), the dive as a ruler from us to the contact, a ripple where it lands (state palette:
 -- safe = watching, armed = sure enough, live = fired), a post up to the contact height for a jump + dive, a small
 -- squircle ripple on the spot we come out to.
+-- Our own defensive overlays (AutoGK press, AutoBlock marking) are NOT threats: no red / amber (those colours mean an enemy
+-- charge). Same hue family, the state is brightness: steel (watching) -> mint (sure enough) -> white-hot (fired / too late).
+Mark.defPalette = {
+	safe = { Color3.fromRGB(96, 140, 184), Color3.fromRGB(122, 156, 204), Color3.fromRGB(88, 176, 196) },
+	armed = { Color3.fromRGB(92, 255, 196), Color3.fromRGB(146, 255, 224), Color3.fromRGB(64, 218, 176) },
+	live = { Color3.fromRGB(240, 255, 250), Color3.fromRGB(150, 255, 226), Color3.fromRGB(92, 255, 196) },
+}
 Mark.gkArt = function(seg, v, gy, t)
 	local key = v.fired and "live" or ((v.conf or 0) >= (v.need or 1) and "armed" or "safe")
-	local pal = Mark.kickPalette[key]
+	local pal = Mark.defPalette[key]
 	local col = pal[1]
 	for fi, f in v.futs do
 		local caught = v.hits and v.hits[fi]
@@ -8699,7 +8719,7 @@ Mark.gkArt = function(seg, v, gy, t)
 		end
 	end
 	if v.stand and not v.fired then
-		Mark.kickRipple(seg, Vector3.new(v.stand.X, gy, v.stand.Z), 1.1, Mark.kickPalette.safe, Mark.rippleStep("gk-stand", Mark.rippleRates.safe), t, 4)
+		Mark.kickRipple(seg, Vector3.new(v.stand.X, gy, v.stand.Z), 1.1, Mark.defPalette.safe, Mark.rippleStep("gk-stand", Mark.rippleRates.safe), t, 4)
 	end
 end
 Mark.drawGk = function(gy)
@@ -11121,7 +11141,7 @@ Mark.drawBlk = function(gy)
 	if CFG.DrawBlock ~= false and v and now - v.at < 0.25 and v.pick.lane then
 		local ln = v.pick.lane
 		local key = ln.ok and ((ln.slack or 0) > 0.4 and "armed" or "safe") or "live"
-		local pal = Mark.kickPalette[key]
+		local pal = Mark.defPalette[key]
 		local seg = Mark.blkPool.seg
 		local a = Vector3.new(ln.from.X, gy + 0.05, ln.from.Z)
 		local b = Vector3.new(ln.to.X, gy + 0.05, ln.to.Z)
@@ -11130,14 +11150,14 @@ Mark.drawBlk = function(gy)
 		if n > 1 then
 			local u = d / n
 			local nrm = Vector3.new(-u.Z, 0, u.X) * 0.45
-			seg(a, b, COL.Ink, 0.4, 3.8, 39)
-			seg(a, b, pal[1], 0.85, 1.6, 41)
+			seg(a, b, COL.Ink, 0.3, 3.0, 39)
+			seg(a, b, pal[1], 0.7, 1.4, 41)
 			for s = 4, n - 1, 5 do
 				local m = a + u * s
 				seg(m - nrm, m + nrm, COL.Paper, 0.6, 1.1, 41)
 			end
 			Mark.kickRipple(seg, Vector3.new(ln.spot.X, gy, ln.spot.Z), 2.4, pal, Mark.rippleStep("blk-spot", Mark.rippleRates[key]), now, 2)
-			Mark.kickRipple(seg, Vector3.new(b.X, gy, b.Z), 1.2, Mark.kickPalette.safe, Mark.rippleStep("blk-rcv", Mark.rippleRates.safe), now, 4)
+			Mark.kickRipple(seg, Vector3.new(b.X, gy, b.Z), 1.2, Mark.defPalette.safe, Mark.rippleStep("blk-rcv", Mark.rippleRates.safe), now, 4)
 		end
 	end
 	Mark.blkPool.finish()
@@ -18245,9 +18265,10 @@ Mark.agentPath = function(seg, pts, y, style, key, t, classicCol)
 	end
 	if style == "classic" then
 		local col = classicCol or COL.Line
+		local A = CFG.AgentPathAlpha or 0.5
 		for i = 1, n - 1 do
-			seg(g[i], g[i + 1], COL.Ink, 0.55, 2.2, 41)
-			seg(g[i], g[i + 1], col, 1, 1.45, 42)
+			seg(g[i], g[i + 1], COL.Ink, 0.55 * A, 2.2, 41)
+			seg(g[i], g[i + 1], col, A, 1.3, 42)
 		end
 		for k = 1, 3 do
 			local p, tang = atDist(total * (0.22 + (k - 1) * 0.28))
@@ -18255,8 +18276,8 @@ Mark.agentPath = function(seg, pts, y, style, key, t, classicCol)
 				local dir = tang.Unit
 				local r = Vector3.new(-dir.Z, 0, dir.X)
 				local tip, base = p + dir * 0.65, p - dir * 0.18
-				seg(tip, base + r * 0.4, COL.Paper, 1, 1.85, 43)
-				seg(tip, base - r * 0.4, COL.Paper, 1, 1.85, 43)
+				seg(tip, base + r * 0.4, COL.Paper, A, 1.5, 43)
+				seg(tip, base - r * 0.4, COL.Paper, A, 1.5, 43)
 			end
 		end
 		return
@@ -18269,6 +18290,7 @@ Mark.agentPath = function(seg, pts, y, style, key, t, classicCol)
 		return pal[i % 3 + 1]:Lerp(pal[(i + 1) % 3 + 1], k - i)
 	end
 	local ink = Color3.fromRGB(12, 14, 18)
+	local pathA = CFG.AgentPathAlpha or 0.5
 	-- dock into the corner frame: the path stops at its edge instead of running through the middle
 	local dock = total > 3.4 and 2.0 or 0
 	local len = total - dock
@@ -18284,8 +18306,8 @@ Mark.agentPath = function(seg, pts, y, style, key, t, classicCol)
 		local p = atDist(startTrim + span * f1)
 		local k = f1
 		-- brighter and a touch thicker toward the destination, tail fades out behind us
-		seg(prev, p, ink, 0.35 + 0.2 * k, 3.4, 41)
-		seg(prev, p, grad(f1 * 0.9 - t * flowSpeed), 0.3 + 0.65 * k, 1.3 + 0.7 * k, 42)
+		seg(prev, p, ink, (0.35 + 0.2 * k) * pathA, 2.8, 41)
+		seg(prev, p, grad(f1 * 0.9 - t * flowSpeed), (0.3 + 0.65 * k) * pathA, 1.1 + 0.5 * k, 42)
 		prev = p
 	end
 	local hot = Color3.fromRGB(255, 255, 255)
@@ -18294,7 +18316,7 @@ Mark.agentPath = function(seg, pts, y, style, key, t, classicCol)
 		local f = ((t / period) + q / 3) % 1
 		local a0 = atDist(startTrim + span * f)
 		local a1 = atDist(startTrim + span * math.min(f + 0.07, 1))
-		seg(a0, a1, hot:Lerp(grad(f), 0.35 * f), 1 - f * 0.5, 2.6, 44)
+		seg(a0, a1, hot:Lerp(grad(f), 0.35 * f), (1 - f * 0.5) * pathA, 1.8, 44)
 	end
 end
 
@@ -19001,12 +19023,14 @@ return function(_Lib, _Core)
 			tog(p, "Show Press", "DrawGk", "His possible paths and your dive.")
 			sld(p, "Confidence", "GkPressConf", 0.3, 0.95, { prec = 2, text = "How sure the dive must be." })
 			advanced(p, "GkPress", function()
-				sld(p, "Press Zone", "GkPressZone", 15, 80, { suffix = " st" })
+				sld(p, "Press Zone", "GkPressZone", 20, 140, { suffix = " st" })
+				sld(p, "Hit Margin", "GkPressRadiusFrac", 0.4, 1, { prec = 2 })
+				sld(p, "Dive Reach Share", "GkPressReachFrac", 0.5, 1, { prec = 2 })
 				sld(p, "Last-Second Confidence", "GkPressConfLate", 0.1, 0.9, { prec = 2 })
 				sld(p, "Last Second", "GkPressLate", 0.3, 1.5, { prec = 2, suffix = " s" })
 				sld(p, "Max Contact Time", "GkPressMaxT", 0.2, 0.6, { prec = 2, suffix = " s" })
-				sld(p, "Come Out Max", "GkPressOut", 2, 20, { suffix = " st" })
-				sld(p, "Gap To Him", "GkPressGap", 4, 20, { suffix = " st" })
+				sld(p, "Come Out Max", "GkPressOut", 2, 60, { suffix = " st" })
+				sld(p, "Gap To Him", "GkPressGap", 4, 24, { suffix = " st" })
 				tog(p, "Any-Angle Dive", "GkPressExact")
 				tog(p, "Steer Dive", "GkPressHome")
 			end)
@@ -19166,6 +19190,7 @@ return function(_Lib, _Core)
 			drop(st, "Positions", "PosStyle", { "phantom", "classic" })
 			drop(st, "Route Destination", "AgentSpotStyle", { "corners", "ripple", "kick" })
 			drop(st, "Route Line", "AgentPathStyle", { "flow", "classic" })
+			sld(st, "Route Opacity", "AgentPathAlpha", 0.15, 1, { prec = 2 })
 
 			local r = card(tab, "Right")
 			head(r, "Colors")
