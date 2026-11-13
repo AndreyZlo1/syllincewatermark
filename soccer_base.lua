@@ -110,7 +110,7 @@ local CFG = {
 	FakeLatMul = 1.5, -- prefilter: the straight line through the mate may miss the goal by post * this + FakeSlop (curves bend it back)
 	FakeMaxDepth = 100, -- a mate farther than this from the goal is not used
 	DrawPos = true, DrawTackle = true, DrawDanger = true, DrawGoal = true, DrawBall = true, DrawShot = true, DrawRoute = true,
-	DrawHazards = true, DrawKickBox = true, DrawGk = true, DrawSilent = true, DrawSilentFov = true, DrawHud = false, ShotDebug = false,
+	DrawHazards = true, DrawKickBox = true, DrawGk = true, DrawBlock = true, DrawSilent = true, DrawSilentFov = true, DrawHud = false, ShotDebug = false,
 	AgentAddon = true,
 	AutoDodge = true,
 	AutoBlock = true,
@@ -201,6 +201,9 @@ local CFG = {
 	BlockLevelSlack = 8, -- with a teammate on the carrier: mark an enemy at most this much farther from goal than him
 	BlockCoverRadius = 8, -- an enemy with one of ours this close is already marked
 	BlockMarkGap = 4, -- marking: stand this far from him toward the carrier (the pass lane)
+	BlockShotAngle = 9, -- mouth angle (deg) from the carrier under which he cannot score: he passes (Pass Solver)
+	BlockPassSpeed = 80, -- assumed pass speed for the intercept timing
+	BlockInterceptMargin = 0.25, -- we must reach the intercept point this much earlier than the ball
 	BlockPassMax = 130, -- receivers beyond this from the carrier are not a pass option
 	ArcMaxErr = 2.5, -- FreezeGun: accepted height error of the scanned landing point (studs)
 	JumpSlide = true, -- a lofting carrier: jump first, slide from the air
@@ -709,6 +712,9 @@ local function hideWorld()
 	end
 	if Mark.gkPool then
 		Mark.gkPool.finish()
+	end
+	if Mark.blkPool then
+		Mark.blkPool.finish()
 	end
 	hideLines(ourPath)
 	hideLines(enemyPath)
@@ -5678,6 +5684,16 @@ local function stepLogic()
 			end
 		end
 	end
+	-- A slide the player started by hand also burns SlideTackle.CooldownSeconds (3 s). lastTackleAt only knew our own slides:
+	-- AutoTackle retried every frame for 3 s (log: "tackle reject" + block start/stop flapping, then it fired when the
+	-- cooldown ended), and each retry called moveStop, which dropped the block.
+	do
+		local sliding = ClientSlide.IsSlideTackling()
+		if sliding and not Mark.slideWasOn and os.clock() - lastTackleAt > 0.5 then
+			lastTackleAt = os.clock()
+		end
+		Mark.slideWasOn = sliding
+	end
 	if ClientSlide.IsSlideTackling() and not slideAim then
 		if Mark.move.mode and Mark.move.mode ~= "block" then
 			Mark.moveStop()
@@ -6335,6 +6351,7 @@ local function paintWorld()
 		Mark.drawRoute(root, gy)
 	end
 	Mark.drawGk(gy)
+	Mark.drawBlk(gy)
 	Mark.artFinish()
 end
 
@@ -8850,6 +8867,9 @@ Mark.tickGk = function(character, root)
 	else
 		state, gkWorld = Renderer.GetMovementState()
 	end
+	if not gkWorld then
+		state = nil -- no boundary world: nothing to integrate the flight in
+	end
 	local ballPos = (state and state.Position) or Renderer.GetPosition() or Renderer.GetMainMatchPosition()
 	local ballVel = (state and state.Velocity) or Renderer.GetTargetVelocity(nil, root.Position) or Vector3.zero
 	local crossP, crossT, crossWhy = nil, nil, state and "plane" or "no-state"
@@ -9887,6 +9907,9 @@ Mark.chargeShot = function(uid)
 		local _, w = Renderer.GetMovementState()
 		world = w
 	end
+	if not world then
+		return nil
+	end
 	local t0 = Workspace:GetServerTimeNow()
 	local st = Physics.NewState(launch, vel, Physics.BallRadius, t0, (typeof(spin) == "Vector3") and spin or Vector3.zero)
 	if type(st) ~= "table" then
@@ -10859,10 +10882,16 @@ Mark.atHomeGoal = function(root, ballPos)
 	return z > 0 and g ~= nil and flat(ballPos - g.Position).Magnitude <= z and flat(root.Position - g.Position).Magnitude <= z
 end
 
--- Who AutoBlock takes (user's defender logic): near our goal (BlockFarGoal) the server lets a body block stop almost
--- every shot, so the carrier is ours unless a teammate (not the keeper) is already within CompetitorRadius of him; then
--- the enemy level with him or closer to our goal that nobody of ours marks. Far from our goal the carrier passes:
--- mark the open enemy closer to our goal than him, most likely the one he faces. nil = the old carrier block.
+-- Who AutoBlock takes. Two situations:
+--  shooter  he can really shoot (the mouth is wide from where he stands, he is near it) and nobody of ours is on him:
+--           the carrier is ours (body on the shot cone, Mark.blockCone). With a teammate on him: the open enemy level
+--           with him or closer to goal.
+--  passer   he cannot score (mouth under BlockShotAngle degrees: he stands out wide, or he is farther than BlockFarGoal):
+--           he gives the ball. Solver: every open enemy closer to our goal than him is a receiver, scored by how well it
+--           fits his run / facing, goal progress, openness and pass length; then the INTERCEPT point on the lane
+--           carrier -> receiver: the one nearest the receiver that we reach before the ball (pass speed + wind-up) by a
+--           margin, else the one we get closest to. Pick has hysteresis so two receivers do not flip it every frame.
+-- nil = the old carrier block.
 Mark.blockChoose = function(root, carrier, cr, P, V, g)
 	if CFG.BlockSmart == false then
 		return nil
@@ -10870,16 +10899,20 @@ Mark.blockChoose = function(root, carrier, cr, P, V, g)
 	local lb, _, rb = goalMouthCorners(g)
 	local mouth = (lb and rb) and (lb + rb) * 0.5 or g.Position
 	local dC = flat(P - mouth).Magnitude
+	local a1, a2 = lb and unitOrNil(flat(lb - P)), rb and unitOrNil(flat(rb - P))
+	local width = (a1 and a2) and math.deg(math.acos(math.clamp(a1:Dot(a2), -1, 1))) or 90
 	local far = dC > (CFG.BlockFarGoal or 100)
+	local passer = far or (dC > 40 and width < (CFG.BlockShotAngle or 9))
 	local comp = nil
-	if not far and CFG.BlockCompetitor ~= false and not Mark.atHomeGoal(root, P) then
+	if not passer and CFG.BlockCompetitor ~= false and not Mark.atHomeGoal(root, P) then
 		comp = Mark.mateNear(P, CFG.CompetitorRadius or 12)
 	end
-	if not far and not comp then
-		return { kind = "carrier", dC = dC }
+	if not passer and not comp then
+		return { kind = "carrier", dC = dC, width = width }
 	end
 	local face = unitOrNil(flat(V)) or (cr and unitOrNil(flat(cr.CFrame.LookVector)))
-	local maxD = far and dC or dC + (CFG.BlockLevelSlack or 8)
+	local maxD = passer and dC or dC + (CFG.BlockLevelSlack or 8)
+	local prev = Mark.blkPick
 	local best = nil
 	for _, model in Mark.models() do
 		local actor = Actors.GetFromCharacter(model)
@@ -10889,27 +10922,93 @@ Mark.blockChoose = function(root, carrier, cr, P, V, g)
 				local pos = CharacterMotion.GetPosition(model) or r.Position
 				local dG = flat(pos - mouth).Magnitude
 				local toR = flat(pos - P)
-				if dG < maxD and toR.Magnitude <= (CFG.BlockPassMax or 130) and not Mark.mateNear(pos, CFG.BlockCoverRadius or 8) then
-					local ang = (face and toR.Magnitude > 1) and math.deg(math.acos(math.clamp(toR.Unit:Dot(face), -1, 1))) or 90
-					local score = dG + flat(pos - root.Position).Magnitude * 0.3 + ang * 0.15
-					if not best or score < best.score then
-						best = { kind = "mark", actor = actor, model = model, root = r, pos = pos, dG = dG, dC = dC, score = score, ang = ang, why = far and "far" or "mate", comp = comp, mouth = mouth }
+				local L = toR.Magnitude
+				if dG < maxD and L <= (CFG.BlockPassMax or 130) and L > 6 and not Mark.mateNear(pos, CFG.BlockCoverRadius or 8) then
+					local ang = face and math.deg(math.acos(math.clamp(toR.Unit:Dot(face), -1, 1))) or 90
+					-- lane cover: one of ours on the lane already takes the pass
+					local covered = false
+					for k = 1, 4 do
+						if Mark.mateNear(P + toR * (k / 5), 3.5) then
+							covered = true
+							break
+						end
+					end
+					local val
+					if passer then
+						local progress = math.clamp((dC - dG) / math.max(dC, 1), -0.2, 0.6)
+						local lenF = 1 - math.clamp(math.abs(L - 35) / 100, 0, 0.8)
+						val = (1 - ang / 90) * 2 + progress * 2.5 + (covered and 0.1 or 1) + lenF
+						if prev and prev.actor == actor and os.clock() - prev.at < 0.8 then
+							val *= 1.25
+						end
+					else
+						val = 3 - (dG + flat(pos - root.Position).Magnitude * 0.3 + ang * 0.15) / 30
+					end
+					if not best or val > best.val then
+						best = { kind = "mark", actor = actor, model = model, root = r, pos = pos, dG = dG, dC = dC, val = val, ang = ang, L = L, covered = covered, passer = passer, width = width, why = passer and (far and "far" or "wide") or "mate", comp = comp, mouth = mouth, P = P, V = V }
 					end
 				end
 			end
 		end
 	end
+	if best then
+		Mark.blkPick = { actor = best.actor, at = os.clock() }
+	end
 	return best
 end
 
--- Marking: stand in his pass lane (BlockMarkGap from him toward the carrier), 1.5 studs goal-side, facing the carrier.
+-- Marking. passer: the intercept point on the lane. else: his pass lane BlockMarkGap from him toward the carrier.
 Mark.blockMarkTick = function(character, root, pick, P)
 	local dly = math.clamp(CharacterMotion.GetDisplayDelaySeconds(pick.model) or 0, 0, 0.25)
 	local vel = flat(CharacterMotion.GetVelocity(pick.model) or Vector3.zero)
-	local R = pick.pos + vel * (dly + 0.3)
-	local toC = flat(P - R)
-	local toG = unitOrNil(flat(pick.mouth - R)) or Vector3.zero
-	local S = R + (unitOrNil(toC) or Vector3.zero) * math.min(CFG.BlockMarkGap or 4, toC.Magnitude * 0.5) + toG * 1.5
+	local ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
+	Mark.mover = Mark.mover or require(Modules.Actions.ActionMovement)
+	local mySpd = Mark.mover.GetRunWalkSpeed(Mark.mover.GetBaseWalkSpeed(character), false)
+	if type(mySpd) ~= "number" or mySpd < 8 then
+		mySpd = 16
+	end
+	local toG = unitOrNil(flat(pick.mouth - pick.pos)) or Vector3.zero
+	local S, info
+	if pick.passer then
+		local passSpd = CFG.BlockPassSpeed or 80
+		local wind = 0.3 + ping * 0.5 -- charge + the packet
+		local L0 = flat(pick.pos - P).Magnitude
+		local R = pick.pos + vel * (dly + wind + L0 / passSpd)
+		local C0 = P + flat(pick.V) * math.min(wind, 0.4) * 0.5
+		local lane = flat(R - C0)
+		local LL = lane.Magnitude
+		local ld = unitOrNil(lane) or Vector3.zero
+		local margin = CFG.BlockInterceptMargin or 0.25
+		local stand = (CFG.BlockMarkGap or 4)
+		local fBest, slackBest = nil, -math.huge
+		for k = 20, 2, -1 do
+			local f = k / 20
+			local d = LL * f
+			if LL - d >= stand or k == 2 then
+				local pt = C0 + ld * d
+				local tb = wind + d / passSpd
+				local ts = flat(pt - root.Position).Magnitude / mySpd + dly * 0.5
+				local slack = tb - ts - margin
+				if slack >= 0 then
+					fBest, slackBest = f, slack
+					break
+				end
+				if slack > slackBest then
+					fBest, slackBest = f, slack
+				end
+			end
+		end
+		fBest = fBest or 0.5
+		S = C0 + ld * (LL * fBest)
+		pick.lane = { from = C0, to = R, spot = S, ok = slackBest >= 0, slack = slackBest }
+		info = string.format("f %.2f slack %.2f", fBest, slackBest)
+	else
+		local toC = flat(P - pick.pos)
+		local R = pick.pos + vel * (dly + 0.3)
+		S = R + (unitOrNil(toC) or Vector3.zero) * math.min(CFG.BlockMarkGap or 4, toC.Magnitude * 0.5) + toG * 1.5
+		info = "lane"
+		pick.lane = { from = P, to = R, spot = S, ok = true, slack = 0 }
+	end
 	S = Vector3.new(S.X, root.Position.Y, S.Z)
 	local off = flat(S - root.Position)
 	local cmd = Vector3.zero
@@ -10923,13 +11022,46 @@ Mark.blockMarkTick = function(character, root, pick, P)
 	Mark.moveSteer(cmd, "block")
 	Mark.blockMarkAt = now
 	Mark.blockHold, Mark.blockLast, Mark.blockDest, Mark.blockRoot = now, now, S, pick.root
+	Mark.blkViz = { at = now, pick = pick, S = S, carrier = P }
 	if not Mark.blockMarkLog or now - Mark.blockMarkLog > 0.5 or Mark.blockMarkWho ~= pick.actor then
 		Mark.blockMarkLog, Mark.blockMarkWho = now, pick.actor
-		logFile("block mark", actorName(pick.actor), pick.why, "his goal d", string.format("%.1f", pick.dG), "carrier goal d", string.format("%.1f", pick.dC), "ang", string.format("%.0f", pick.ang), "off", string.format("%.1f", off.Magnitude), "comp", pick.comp and actorName(pick.comp) or "-")
+		logFile("block mark", actorName(pick.actor), pick.why, "mouth angle", string.format("%.1f", pick.width or 0), "his goal d", string.format("%.1f", pick.dG), "carrier goal d", string.format("%.1f", pick.dC), "pass len", string.format("%.1f", pick.L or 0), "ang", string.format("%.0f", pick.ang), "lane cover", tostring(pick.covered), info, "off", string.format("%.1f", off.Magnitude), "comp", pick.comp and actorName(pick.comp) or "-")
 	end
 	if off.Magnitude > 6 then
 		Mark.agentHold(true, "chase")
 	end
+end
+
+-- Marking overlay: the pass lane (ink bed + state colour: safe = we make it, armed = we make it with margin, live = too late),
+-- a ripple at the intercept point, a small ring on the receiver.
+Mark.drawBlk = function(gy)
+	Mark.blkLines = Mark.blkLines or makeLines(160, 1.4, 40)
+	Mark.blkPool = Mark.blkPool or Mark.segPool(Mark.blkLines)
+	local v = Mark.blkViz
+	local now = os.clock()
+	if CFG.DrawBlock ~= false and v and now - v.at < 0.25 and v.pick.lane then
+		local ln = v.pick.lane
+		local key = ln.ok and ((ln.slack or 0) > 0.4 and "armed" or "safe") or "live"
+		local pal = Mark.kickPalette[key]
+		local seg = Mark.blkPool.seg
+		local a = Vector3.new(ln.from.X, gy + 0.05, ln.from.Z)
+		local b = Vector3.new(ln.to.X, gy + 0.05, ln.to.Z)
+		local d = flat(b - a)
+		local n = d.Magnitude
+		if n > 1 then
+			local u = d / n
+			local nrm = Vector3.new(-u.Z, 0, u.X) * 0.45
+			seg(a, b, COL.Ink, 0.4, 3.8, 39)
+			seg(a, b, pal[1], 0.85, 1.6, 41)
+			for s = 4, n - 1, 5 do
+				local m = a + u * s
+				seg(m - nrm, m + nrm, COL.Paper, 0.6, 1.1, 41)
+			end
+			Mark.kickRipple(seg, Vector3.new(ln.spot.X, gy, ln.spot.Z), 2.4, pal, Mark.rippleStep("blk-spot", Mark.rippleRates[key]), now, 2)
+			Mark.kickRipple(seg, Vector3.new(b.X, gy, b.Z), 1.2, Mark.kickPalette.safe, Mark.rippleStep("blk-rcv", Mark.rippleRates.safe), now, 4)
+		end
+	end
+	Mark.blkPool.finish()
 end
 
 -- Coverage cone: the ball can go anywhere between the posts, so the body must sit on the bisector of the lines to both
@@ -13089,6 +13221,15 @@ Mark.ballPath = function(root)
 	else
 		state, world = Renderer.GetMovementState()
 	end
+	-- Renderer.GetBoundaryWorld is nil when no arena is registered (goal replay / intermission): the game itself
+	-- guards it. Physics.GetStateAtTime indexes world.Solids -> "attempt to index nil with 'Solids'" every frame.
+	if state and not world then
+		state = nil
+		if not Mark.noWorldLog or os.clock() - Mark.noWorldLog > 5 then
+			Mark.noWorldLog = os.clock()
+			logFile("ball world", "nil: no boundary world, path skipped")
+		end
+	end
 	local memo = Mark.ballMemo
 	-- Callers only read the arrays. The old memo died at 40 ms, so below ~25 fps every frame re-ran the sim
 	-- (weak-pc log: ballPath p90 9 ms, one stall 386 ms). Same state and the ball has not moved: reuse.
@@ -13784,6 +13925,9 @@ Mark.flickShot = function(actor)
 		return nil
 	end
 	local _, world = Renderer.GetMovementState()
+	if not world then
+		return nil
+	end
 	local pts, ts = { launch }, { left }
 	for i = 1, 40 do
 		local t = i * 0.04
@@ -16228,6 +16372,9 @@ Mark.hazAdd = function(st)
 	if item == "grenade" then
 		Mark.grenMod = Mark.grenMod or require(Modules.Items.Grenade)
 		local _, world = Renderer.GetMovementState()
+		if not world then
+			return
+		end
 		local flight = Mark.grenMod.NewFlight(st.pos0, st.vel0, st.born)
 		local tDet = Mark.grenMod.GetDetonationTime(flight, world, nil)
 		if type(st.det) == "number" then
@@ -17064,7 +17211,10 @@ Mark.dodgeSteer = function(root, threat)
 				return
 			end
 		else
-			logFile("dodge gate", "dodge: dribble cd at impact", "cdLeft", string.format("%.2f", cdLeft), "hitIn", string.format("%.2f", hitIn), "strong", tostring(threat.strong))
+			if not Mark.ownDodgeLog or now - Mark.ownDodgeLog > 0.3 or Mark.ownDodgeWhy ~= "dodge" then
+				Mark.ownDodgeLog, Mark.ownDodgeWhy = now, "dodge"
+				logFile("dodge gate", "dodge: dribble cd at impact", "cdLeft", string.format("%.2f", cdLeft), "hitIn", string.format("%.2f", hitIn), "strong", tostring(threat.strong))
+			end
 		end
 	end
 	local elapsed = lock.t0 and (os.clock() - lock.t0) or (lock.elapsed or threat.elapsed or 0)
@@ -18665,11 +18815,15 @@ return function(_Lib, _Core)
 			tog(b, "Slide Block", "BlockSlide")
 			tog(b, "Defend Goal", "BlockGoal", "Blocks a ball flying into our goal with the body: run, jump or slide into its path.")
 			tog(b, "Jump + Air Slide", "BlockSlideJump")
-			tog(b, "Smart Marking", "BlockSmart", "Far from goal or with a teammate on him: marks the man he passes to.")
+			tog(b, "Pass Solver", "BlockSmart", "If he cannot score, cuts the pass to his teammate.")
+			tog(b, "Show Marking", "DrawBlock", "The pass lane and where you cut it.")
 			advanced(b, "Block", function()
 				sld(b, "Far From Goal", "BlockFarGoal", 40, 200, { suffix = " st" })
 				sld(b, "Near Goal Range", "BlockGoalRange", 30, 120, { suffix = " st" })
 				sld(b, "Mark Gap", "BlockMarkGap", 2, 10, { prec = 1, suffix = " st" })
+				sld(b, "No-Shot Angle", "BlockShotAngle", 3, 25, { suffix = "°" })
+				sld(b, "Pass Speed", "BlockPassSpeed", 40, 140, { suffix = " st/s" })
+				sld(b, "Cut Margin", "BlockInterceptMargin", 0, 0.8, { prec = 2, suffix = " s" })
 				sld(b, "Marked Radius", "BlockCoverRadius", 3, 16, { suffix = " st" })
 				sld(b, "Behind Limit", "BlockBehind", 8, 40, { suffix = " st", text = "How far behind the carrier it may still start." })
 				sld(b, "Stand Closer By", "BlockCloser", -1, 3, { prec = 1, suffix = " st" })
