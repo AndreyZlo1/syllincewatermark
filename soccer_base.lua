@@ -162,6 +162,7 @@ local CFG = {
 	GkPressExact = true, -- dive at any angle (not only the 8 camera directions)
 	GkPressHome = true, -- steer the dive at him while it runs (what turning the camera does)
 	GkPressTurn = 6, -- rad/s of that steering
+	GkPressMaxT = 0.36, -- no press dive for a contact later than this (s) unless he is at the mouth / flying
 	GkPress = true, -- AutoGK: forward dive into a carrier who runs / flies into the goal (stuns him)
 	PressDist = nil, -- max dive travel to contact (default: dive distance - 2)
 	PressReach = 2.6, -- horizontal body-to-body contact radius of the dive (server value unknown: calibrate from `gk press result`)
@@ -8199,10 +8200,49 @@ Mark.gkAimHook = function()
 	Mark.gkAimOrig = D.GetWorldDirection
 	D.GetWorldDirection = function(choice, cf, fb)
 		local a = Mark.gkDiveAim
-		if a and os.clock() < a.untilT then
+		if a and not a.hold and os.clock() < a.untilT then
 			return a.dir
 		end
 		return Mark.gkAimOrig(choice, cf, fb)
+	end
+	-- The animation is DirectionChoice.Name (GetDirectionChoice reads the move command against the CAMERA); the dash goes
+	-- along GetWorldDirection. With our exact direction the name came from the camera frame while the body was locked to
+	-- another facing: dash forward, animation "left" (log report). A press dive faces the way it goes: choice = F.
+	local AM = require(Modules.Actions.ActionMotion)
+	local origChoice = D.GetDirectionChoice
+	D.GetDirectionChoice = function(...)
+		local a = Mark.gkDiveAim
+		if a and a.faceF and os.clock() < a.untilT then
+			return AM.DirectionChoices.F
+		end
+		return origChoice(...)
+	end
+	-- GoalkeeperDiveAssist bends every dive toward the BALL's flight (yaw up to 12 deg, travel scale 0.3..1.3, extra reach
+	-- up to 3 studs) and re-locks it each curve update. Against a carrier the ball is at his feet and moves with him: the
+	-- dash left our solved line (log: two dives, closest 6.0 / 9.1). A press dive is exactly what we solved: no assist.
+	local A = require(Modules.Actions.GoalkeeperDiveAssist)
+	local function pressLive()
+		local a = Mark.gkDiveAim
+		return a and a.faceF and os.clock() < a.untilT
+	end
+	local oGet, oBody, oRelock = A.GetAssist, A.GetBodyAssist, A.CreateDiveRelock
+	A.GetAssist = function(...)
+		if pressLive() then
+			return nil
+		end
+		return oGet(...)
+	end
+	A.GetBodyAssist = function(...)
+		if pressLive() then
+			return nil
+		end
+		return oBody(...)
+	end
+	A.CreateDiveRelock = function(...)
+		if pressLive() then
+			return function() end
+		end
+		return oRelock(...)
 	end
 end
 Mark.gkAimHook()
@@ -8250,7 +8290,7 @@ local function gkRot(v, a)
 end
 
 -- weighted futures of his server pose, sampled every 0.025 s from now (index 1 = now)
-Mark.gkFutures = function(P, V, vy, air, jet, floorY, lead, aimP, g)
+Mark.gkFutures = function(P, V, vy, air, jet, floorY, lead, aimP, g, dribReady)
 	local DT, N = 0.025, 52
 	local sp = flat(V).Magnitude
 	local dGoal = unitOrNil(flat(aimP - P)) or Vector3.new(0, 0, 1)
@@ -8261,7 +8301,12 @@ Mark.gkFutures = function(P, V, vy, air, jet, floorY, lead, aimP, g)
 	elseif air then
 		list = { { 0, 1, 1 }, { 0.14, 1, 0.5 }, { -0.14, 1, 0.5 }, { 0, 0.85, 0.4 } }
 	else
-		list = { { 0, 1, 1 }, { 0, 0.6, 0.5 }, { 0.44, 1, 0.6 }, { -0.44, 1, 0.6 }, { 0.87, 0.9, 0.3 }, { -0.87, 0.9, 0.3 }, { "goal", 1, 0.6 }, { "stop", 0, 0.35 } }
+		list = { { 0, 1, 1 }, { 0, 0.6, 0.5 }, { 0.44, 1, 0.6 }, { -0.44, 1, 0.6 }, { 0.87, 0.9, 0.3 }, { -0.87, 0.9, 0.3 }, { 2.8, 0.8, 0.25 }, { -2.8, 0.8, 0.25 }, { "goal", 1, 0.6 }, { "stop", 0, 0.35 } }
+		if dribReady then
+			-- his dribble is ready: Dodge = a ~5 stud side dash + iframe, a dive into it is wasted
+			list[#list + 1] = { "burst", 1, 0.9, 1 }
+			list[#list + 1] = { "burst", 1, 0.9, -1 }
+		end
 	end
 	local perp = Vector3.new(-base.Z, 0, base.X)
 	local gAng = math.atan2(dGoal:Dot(perp), dGoal:Dot(base))
@@ -8269,6 +8314,10 @@ Mark.gkFutures = function(P, V, vy, air, jet, floorY, lead, aimP, g)
 	local out = {}
 	for _, h in list do
 		local A, sc = h[1], h[2]
+		local burst = nil
+		if A == "burst" then
+			A, burst = 0, h[4]
+		end
 		local s1 = sp
 		if A == "goal" then
 			A = gAng
@@ -8294,6 +8343,10 @@ Mark.gkFutures = function(P, V, vy, air, jet, floorY, lead, aimP, g)
 			local spd = (sp + (s1 * sc - sp) * f)
 			x += dir.X * spd * DT
 			z += dir.Z * spd * DT
+			if burst and tt > 0.08 and tt < 0.3 then
+				x += -base.Z * burst * 25 * DT
+				z += base.X * burst * 25 * DT
+			end
 			pts[k + 1] = Vector3.new(x, y(lead + k * DT), z)
 		end
 		out[#out + 1] = { w = h[3], pts = pts, air = air or jet }
@@ -8479,11 +8532,21 @@ Mark.gkPress = function(character, root, c)
 	local committed = airborne and along <= D.GetDistance(LocalPlayer) and inMouth
 	local zone = CFG.GkPressZone or 45
 	local threat = committed or dSeg <= 14 or (dSeg <= zone and appr > 2) or (tReach <= 2.2 and appr > 6)
+	-- appr hovers around the 2 st/s edge while he dribbles: the stand flipped press/free every frame (log). Hold 0.6 s.
+	if threat then
+		Mark.gkThreatUntil = c.now + 0.6
+		Mark.gkThreatId = c.ownerId
+	elseif Mark.gkThreatUntil and c.now < Mark.gkThreatUntil and Mark.gkThreatId == c.ownerId and dSeg <= zone * 1.2 then
+		threat = true
+	end
 	if not threat then
 		return note(string.format("idle dSeg %.1f appr %.1f", dSeg, appr))
 	end
+	-- his dribble (Dodge: side dash + iframe, our dive cooldown 1.9 s afterwards = open goal) is ready unless we saw it spent
+	local drec = dribbleSeen[model] or dribbleSeen[pl.UserId]
+	local dribReady = not (drec and drec.cdUntil and drec.cdUntil > c.now + 0.6)
 	-- the post he is going for is the side of the mouth he closes on; aim the futures' "cut in" at it
-	local futs = Mark.gkFutures(P, V, vy, airborne, jet, root.Position.Y, lead, nearP + fwd * 0.5, g)
+	local futs = Mark.gkFutures(P, V, vy, airborne, jet, root.Position.Y, lead, nearP + fwd * 0.5, g, dribReady and not airborne and not jet)
 
 	-- come out on his line to the mouth: close the angle so the dive reaches him before he reaches the line
 	if CFG.GkPressMove ~= false and not committed then
@@ -8495,6 +8558,7 @@ Mark.gkPress = function(character, root, c)
 			local lat = flat(S - mouth):Dot(side)
 			S = S - side * (lat - math.clamp(lat, -(half + 2), half + 2))
 			Mark.gkPressStandP = Vector3.new(S.X, root.Position.Y, S.Z)
+			Mark.gkStandLast = { p = Mark.gkPressStandP, at = c.now, id = c.ownerId }
 		end
 	end
 
@@ -8537,7 +8601,7 @@ Mark.gkPress = function(character, root, c)
 	local function fmt(x)
 		return string.format("%.2f", x)
 	end
-	local info = string.format("dSeg %.1f appr %.1f tReach %s air %s vy %.1f dy %.1f", dSeg, appr, tReach == math.huge and "-" or fmt(tReach), tostring(airborne), vy, P.Y - root.Position.Y)
+	local info = string.format("dSeg %.1f appr %.1f tReach %s air %s vy %.1f dy %.1f drib %s", dSeg, appr, tReach == math.huge and "-" or fmt(tReach), tostring(airborne), vy, P.Y - root.Position.Y, dribReady and "ready" or "spent")
 	if not best then
 		return note("no contact " .. info)
 	end
@@ -8550,6 +8614,12 @@ Mark.gkPress = function(character, root, c)
 	end
 	if best.conf < need then
 		return note(string.format("watch conf %.2f need %.2f t %s %s", best.conf, need, fmt(best.t), info))
+	end
+	-- a contact further than GkPressMaxT is a guess about a man who can still turn, dribble or shoot: the miss costs the
+	-- dive cooldown (1.9 s open goal). Come out (stand above) until the contact is short. Committed / flying: allowed.
+	local maxT = CFG.GkPressMaxT or 0.36
+	if best.t > maxT and not committed and not imminent then
+		return note(string.format("far contact t %s max %.2f conf %.2f %s", fmt(best.t), maxT, best.conf, info))
 	end
 	if later and later.conf >= best.conf + 0.15 and not imminent then
 		return note(string.format("wait surer conf %.2f later %.2f in %.2f %s", best.conf, later.conf, later.T0, info))
@@ -8565,11 +8635,10 @@ Mark.gkPress = function(character, root, c)
 		end
 		return note("jump refused " .. info)
 	end
-	TurnControl.LockAutoRotate("Goalkeeper", fwd)
-	if exact then
-		Mark.gkDiveAim = { dir = best.dir, at = c.now, untilT = c.now + D.Constants.DurationSeconds + 0.05, model = model, lead = lead, fwd = fwd }
-	end
-	Mark.diveSet(character, best.dir, fwd)
+	local face = exact and best.dir or fwd
+	TurnControl.LockAutoRotate("Goalkeeper", face)
+	Mark.gkDiveAim = { dir = best.dir, at = c.now, untilT = c.now + D.Constants.DurationSeconds + 0.05, model = model, lead = lead, fwd = fwd, faceF = exact, hold = not exact }
+	Mark.diveSet(character, best.dir, face)
 	Mark.gkDive = c.now
 	local ok = c.role.Dive()
 	Mark.diveRestore(character, best.dir)
@@ -8781,11 +8850,11 @@ Mark.gkComboTick = function(character, root)
 	if not (typeof(wd) == "Vector3") then
 		return
 	end
-	TurnControl.LockAutoRotate("Goalkeeper", cb.fwd)
+	TurnControl.LockAutoRotate("Goalkeeper", cb.dir or cb.fwd)
 	if cb.dir then
-		Mark.gkDiveAim = { dir = cb.dir, at = now, untilT = now + D.Constants.DurationSeconds + 0.05, model = cb.model, lead = cb.lead or 0.1, fwd = cb.fwd }
+		Mark.gkDiveAim = { dir = cb.dir, at = now, untilT = now + D.Constants.DurationSeconds + 0.05, model = cb.model, lead = cb.lead or 0.1, fwd = cb.fwd, faceF = true }
 	end
-	Mark.diveSet(character, wd, cb.fwd)
+	Mark.diveSet(character, wd, cb.dir or cb.fwd)
 	Mark.gkDive = now
 	local ok = cb.role.Dive()
 	if not ok then
@@ -9211,9 +9280,19 @@ Mark.tickGk = function(character, root)
 	end
 	-- PRESS (Mark.gkPress): dive / jump + dive into the carrier, or come out on his line to the mouth
 	Mark.gkPressStandP = nil
-	if not free and ownerRoot and landed and role and role.Dive then
-		if Mark.gkPress(character, root, { now = now, ownerId = ownerId, fwd = fwd, side = side, half = half, mouth = mouthP, diveMod = diveMod, role = role }) then
+	-- ownership flickers "free" for a frame or two while the ball is at his feet: keep pressing HIM (log: press/free/charge
+	-- alternated every frame and the keeper shook on the spot)
+	local pid = (not free and ownerRoot) and ownerId or nil
+	if not pid and free and Mark.gkFreeAt and now - Mark.gkFreeAt.at < 0.3 then
+		pid = Mark.gkFreeAt.id
+	end
+	if pid and landed and role and role.Dive then
+		if Mark.gkPress(character, root, { now = now, ownerId = pid, fwd = fwd, side = side, half = half, mouth = mouthP, diveMod = diveMod, role = role }) then
 			return true
+		end
+		local sl = Mark.gkStandLast
+		if not Mark.gkPressStandP and sl and sl.id == pid and now - sl.at < 0.35 then
+			Mark.gkPressStandP = sl.p
 		end
 	end
 	local stand, why, eta = nil, "free", nil
@@ -18925,6 +19004,7 @@ return function(_Lib, _Core)
 				sld(p, "Press Zone", "GkPressZone", 15, 80, { suffix = " st" })
 				sld(p, "Last-Second Confidence", "GkPressConfLate", 0.1, 0.9, { prec = 2 })
 				sld(p, "Last Second", "GkPressLate", 0.3, 1.5, { prec = 2, suffix = " s" })
+				sld(p, "Max Contact Time", "GkPressMaxT", 0.2, 0.6, { prec = 2, suffix = " s" })
 				sld(p, "Come Out Max", "GkPressOut", 2, 20, { suffix = " st" })
 				sld(p, "Gap To Him", "GkPressGap", 4, 20, { suffix = " st" })
 				tog(p, "Any-Angle Dive", "GkPressExact")
