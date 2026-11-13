@@ -159,7 +159,9 @@ local CFG = {
 	GkPressLate = 0.9,
 	GkPressMove = true, -- come out on his line to the mouth while he closes in
 	GkPressGap = 12, -- ... staying this far in front of him (inside the dive's first 85 %)
-	GkPressOut = 40, -- ... and at most this far off the line
+	GkPressOut = 18, -- ... and at most this far off the line
+	GkPressMoveZone = 50, -- the keeper is moved for a press only inside this (and never against the player's own input)
+	GkPressLastMan = true, -- no press while an open attacker nearer / level with the goal can take the pass
 	GkPressReachFrac = 0.85, -- contact only in the first part of the dive curve (the end is a threshold)
 	GkPressRadiusFrac = 0.75, -- share of the catch radius that must hold: centred hits, not edge hits
 	GkPressExact = true, -- dive at any angle (not only the 8 camera directions)
@@ -203,6 +205,8 @@ local CFG = {
 	BlockBehindLogic = true, -- we are behind a carrier running at our goal: take the next attacker, else cut him off
 	BlockBehindRcv = 14, -- ... a receiver must be at least this far from the carrier
 	BlockCutHopeless = 1.4, -- cut-off gives up when even the best point is this many seconds late and we are far behind
+	TrendVel = true, -- long predictions follow where a zig-zag goes, not the last zig
+	TrendWindow = 0.7,
 	BlockTurnDeg = 35, -- a change of his heading over this (vs 0.3 s ago) is a turn
 	BlockTurnHedge = 0.35, -- after a turn the extrapolation horizon shrinks to this share and grows back over 0.6 s
 	BlockFarGoal = 100, -- carrier farther than this from our mouth: mark his teammate closer to our goal
@@ -8300,6 +8304,54 @@ local function gkRot(v, a)
 	return v * math.cos(a) + Vector3.new(-v.Z, 0, v.X) * math.sin(a)
 end
 
+-- JETPACK (dump: Modules.Actions.JetpackMotion.Run, run by HIS client, we see the replicated body):
+--   horizontal RunCFrameDash 55 st over 3.5 s, Quart-Out, along his facing (he steers, ControlledTurnSpeed 2.5 rad/s);
+--   lift: LiftDelaySeconds 0.5, then 25 st over 1 s Cubic-InOut (a CFrame rig: no gravity while it runs), then the rig is
+--   released and he FALLS (StartItemFallLoop) until WatchLanding -> a 14 st / 0.875 s landing dash forward.
+-- JetpackMotion.IsActive only knows the local player (SetActive is never called for others), so the old "jet" branch
+-- never ran: a jetpack flier was the generic "air" case, ballistic with his tiny initial vy (log: vy 7.2, dy 0.5 ->
+-- "contact" in 0.28 s, conf 1.00, he was 10+ studs up by then). jet = { te = phase of his displayed pose, dir, base }.
+Mark.jetCurveH = function(te)
+	local u = math.clamp(te / 3.5, 0, 1)
+	return 55 * (1 - (1 - u) ^ 4)
+end
+Mark.jetCurveY = function(te, g)
+	if te <= 0.5 then
+		return 0
+	elseif te <= 1.5 then
+		local u = te - 0.5
+		return 25 * (u < 0.5 and 4 * u * u * u or 1 - ((-2 * u + 2) ^ 3) / 2)
+	end
+	local tf = te - 1.5
+	return math.max(25 - 0.5 * g * tf * tf, 0)
+end
+Mark.jetFutures = function(P, jet, floorY, lead, g)
+	local DT, N = 0.025, 52
+	local out = {}
+	local ground = jet.base or floorY
+	for _, h in { { 0, 1 }, { 0.45, 0.5 }, { -0.45, 0.5 }, { 1, 0.25 }, { -1, 0.25 } } do
+		local pts = table.create(N + 1)
+		local x, z = P.X, P.Z
+		local te = jet.te
+		local function step(t0, t1, A)
+			local dist = Mark.jetCurveH(t1) - Mark.jetCurveH(t0)
+			local f = math.min((t1 - jet.te) * 2.5 / math.max(math.abs(A), 1e-3), 1)
+			local dir = A ~= 0 and gkRot(jet.dir, A * f) or jet.dir
+			x += dir.X * dist
+			z += dir.Z * dist
+		end
+		step(te, te + lead, h[1])
+		pts[1] = Vector3.new(x, ground + Mark.jetCurveY(te + lead, g), z)
+		for k = 1, N do
+			local a, b = te + lead + (k - 1) * DT, te + lead + k * DT
+			step(a, b, h[1])
+			pts[k + 1] = Vector3.new(x, math.max(ground + Mark.jetCurveY(b, g), floorY), z)
+		end
+		out[#out + 1] = { w = h[2], pts = pts, air = true }
+	end
+	return out
+end
+
 -- weighted futures of his server pose, sampled every 0.025 s from now (index 1 = now)
 Mark.gkFutures = function(P, V, vy, air, jet, floorY, lead, aimP, g, dribReady)
 	local DT, N = 0.025, 52
@@ -8307,7 +8359,9 @@ Mark.gkFutures = function(P, V, vy, air, jet, floorY, lead, aimP, g, dribReady)
 	local dGoal = unitOrNil(flat(aimP - P)) or Vector3.new(0, 0, 1)
 	local base = sp > 2 and flat(V).Unit or dGoal
 	local list
-	if jet then
+	if type(jet) == "table" then
+		return Mark.jetFutures(P, jet, floorY, lead, g)
+	elseif jet then
 		list = { { 0, 1, 1 }, { 0.26, 1, 0.5 }, { -0.26, 1, 0.5 } }
 	elseif air then
 		list = { { 0, 1, 1 }, { 0.14, 1, 0.5 }, { -0.14, 1, 0.5 }, { 0, 0.85, 0.4 } }
@@ -8519,21 +8573,93 @@ Mark.gkPress = function(character, root, c)
 	local lead = math.clamp(CharacterMotion.GetDisplayDelaySeconds(model) or 0, 0, 0.25) + ping * 0.5
 	local airborne = not CharacterControllers.IsLanded(model, hum)
 	local g = workspace.Gravity
-	-- vertical speed: CharacterMotion.GetVelocity has Y = 0 for another player -> finite difference of the displayed Y
-	Mark.yTrack = Mark.yTrack or setmetatable({}, { __mode = "k" })
-	local yt = Mark.yTrack[model]
-	local vyT = 0
-	if yt and c.now - yt.t > 0.02 and c.now - yt.t < 0.4 then
-		vyT = yt.vy * 0.5 + (P.Y - yt.y) / (c.now - yt.t) * 0.5
-		Mark.yTrack[model] = { y = P.Y, t = c.now, vy = vyT }
-	elseif not yt or c.now - yt.t >= 0.4 then
-		Mark.yTrack[model] = { y = P.Y, t = c.now, vy = 0 }
+	-- VERTICAL STATE. CharacterMotion.GetVelocity has Y = 0 for another player: vy and ay come from the history of his
+	-- displayed Y (samples >= 12 ms apart, 0.3 s kept): vy = slope of the last 0.1 s, ay = change of the slope against the
+	-- 0.1 s before. Launchers do not all fly the same way (dump):
+	--   ShotgunRecoil: AssemblyLinearVelocity = up 30 (+50 aiming down) + back 30 -> ballistic;
+	--   bazooka at the feet / explosions: server knock-back -> ballistic;
+	--   JetpackMotion: a CFrame lift rig (Mark.jetFutures); GrappleMotion: a 75 st/s pull at the hook -> powered.
+	-- "ballistic" = ay within 35 % of -gravity: the arc is known, the solver gets the measured vy. "fresh" = in the air for
+	-- < 0.1 s, the slope is not measured yet. "powered" = anything else rising / hovering: the arc is NOT known.
+	Mark.yHist = Mark.yHist or setmetatable({}, { __mode = "k" })
+	local yh = Mark.yHist[model]
+	if not yh or c.now - yh.last > 0.3 then
+		yh = { list = {}, last = c.now - 1, airAt = nil }
+		Mark.yHist[model] = yh
+	end
+	if c.now - yh.last >= 0.012 then
+		yh.list[#yh.list + 1] = { t = c.now, y = P.Y }
+		yh.last = c.now
+	end
+	while #yh.list > 2 and c.now - yh.list[1].t > 0.3 do
+		table.remove(yh.list, 1)
+	end
+	local function yAt(age)
+		local best = nil
+		for _, e in yh.list do
+			if c.now - e.t >= age - 0.02 then
+				best = e
+			end
+		end
+		return best
+	end
+	local yNow, yMid, yOld = yh.list[#yh.list], yAt(0.1), yAt(0.2)
+	local vyT, ayT = 0, nil
+	if yMid and yNow.t - yMid.t > 0.04 then
+		vyT = (yNow.y - yMid.y) / (yNow.t - yMid.t)
+		if yOld and yMid.t - yOld.t > 0.04 then
+			local vOld = (yMid.y - yOld.y) / (yMid.t - yOld.t)
+			ayT = (vyT - vOld) / ((yNow.t - yOld.t) * 0.5)
+		end
+	end
+	local dyNow = P.Y - root.Position.Y
+	if not airborne and dyNow > 3 then
+		airborne = true -- IsLanded lags a launch by a few frames; 3 studs over our root is not standing
+	end
+	if airborne then
+		yh.airAt = yh.airAt or c.now
 	else
-		vyT = yt.vy
+		yh.airAt = nil
+	end
+	local vKind = "ground"
+	if airborne then
+		if c.now - yh.airAt < 0.1 or not ayT then
+			vKind = "fresh"
+		elseif math.abs(ayT + g) <= g * 0.35 then
+			vKind = "ballistic"
+		elseif vyT < -4 and ayT < 0 then
+			vKind = "ballistic" -- falling and still accelerating down: a drop, the arc ends on the floor either way
+		else
+			vKind = "powered"
+		end
+	end
+	if vKind == "ballistic" and yMid then
+		vyT = vyT - g * (yNow.t - yMid.t) * 0.5 -- the slope is the speed at the middle of the window: bring it to now
 	end
 	local vy = airborne and ((math.abs(W.Y) > 0.5) and W.Y or vyT) or 0
+	-- a launcher fired by him a moment ago while he still stands: he is about to fly, the arc is unknown
+	local lr = Mark.launchRec and Mark.launchRec[pl.UserId]
+	local launchPending = lr and not airborne and c.now - lr.at < 0.45 and lr.kind or nil
 	Mark.jetM = Mark.jetM or require(Modules.Actions.JetpackMotion)
-	local jet = Mark.jetM.IsActive(pl) == true
+	local jet = false
+	local jr = Mark.jets and Mark.jets[pl.UserId]
+	if jr and c.now - jr.at < 4 then
+		-- phase of the DISPLAYED pose: packet time + ping/2 - his display delay; while he is in the lift his height says
+		-- it better (invert the Cubic-InOut), the packet time is only the fallback
+		local te = c.now - jr.at + ping * 0.5 - (lead - ping * 0.5)
+		local hgt = P.Y - root.Position.Y
+		if te > 0.4 and te < 1.6 and hgt > 0.8 and hgt < 24.5 and vyT > 1 then
+			local f = hgt / 25
+			local u = f < 0.5 and (f / 4) ^ (1 / 3) or (1 - ((2 - 2 * f) ^ (1 / 3)) / 2)
+			te = 0.5 + u
+		end
+		if te > 1.6 and not airborne then
+			Mark.jets[pl.UserId] = nil -- landed
+		elseif te < 2.6 then
+			local dirJ = unitOrNil(flat(er.CFrame.LookVector)) or unitOrNil(flat(V)) or c.fwd
+			jet = { te = te, dir = dirJ, base = P.Y - Mark.jetCurveY(te, g) }
+		end
+	end
 	local fwd, side, mouth, half = c.fwd, c.side, c.mouth, c.half
 
 	-- threat: distance to the mouth segment and the speed he closes on it
@@ -8550,8 +8676,12 @@ Mark.gkPress = function(character, root, c)
 	local tReach = appr > 1 and dSeg / appr or math.huge
 	local inMouth = math.abs(rel:Dot(side)) <= half + 2.5
 	local committed = airborne and along <= D.GetDistance(LocalPlayer) and inMouth
-	local zone = CFG.GkPressZone or 45
-	local threat = committed or dSeg <= 14 or (dSeg <= zone and appr > 2) or (tReach <= 2.2 and appr > 6)
+	local zone = CFG.GkPressZone or 90
+	-- a press target GOES at the goal: most of his speed points at the mouth (appr >= half his speed and >= 6 st/s), or he is
+	-- already on top of it. "appr > 2" made every carrier drifting in the zone a target (log: press/stand all the time).
+	local spd = flat(V).Magnitude
+	local going = appr >= math.max(6, spd * 0.5)
+	local threat = committed or dSeg <= 16 or (dSeg <= zone and going) or (tReach <= 2.2 and appr > 6)
 	-- appr hovers around the 2 st/s edge while he dribbles: the stand flipped press/free every frame (log). Hold 0.6 s.
 	if threat then
 		Mark.gkThreatUntil = c.now + 0.6
@@ -8562,18 +8692,51 @@ Mark.gkPress = function(character, root, c)
 	if not threat then
 		return note(string.format("idle dSeg %.1f appr %.1f", dSeg, appr))
 	end
+	-- he flicked: the ball leaves his feet (detach in ~0.4 s) and goes over us. The save logic owns the ball; a dive at the
+	-- man who no longer has it is the open goal.
+	local fr = Mark.flickRec and Mark.flickRec[pl.UserId]
+	if fr and c.now - fr.at < 1.2 then
+		return note("skip flick")
+	end
+	local imminentT = tReach <= (CFG.GkPressLate or 0.9)
+	-- the last man only: an open attacker nearer the goal or level with him (BlockLevelSlack) is the pass he plays the
+	-- moment we leave the line. Then we do not come out and do not dive; he can still score himself only if he is at the
+	-- mouth within GkPressLate s or flying in.
+	if CFG.GkPressLastMan ~= false and not committed and not imminentT then
+		local sup, sd = Mark.gkSupport(pl, P, mouth, side, half, dSeg)
+		if sup then
+			return note(string.format("pass option %s dSeg %.1f vs %.1f", actorName(sup), sd, dSeg))
+		end
+	end
 	-- his dribble (Dodge: side dash + iframe, our dive cooldown 1.9 s afterwards = open goal) is ready unless we saw it spent
 	local drec = dribbleSeen[model] or dribbleSeen[pl.UserId]
 	local dribReady = not (drec and drec.cdUntil and drec.cdUntil > c.now + 0.6)
 	-- the post he is going for is the side of the mouth he closes on; aim the futures' "cut in" at it
 	local futs = Mark.gkFutures(P, V, vy, airborne, jet, root.Position.Y, lead, nearP + fwd * 0.5, g, dribReady and not airborne and not jet)
 
-	-- come out on his line to the mouth: close the angle so the dive reaches him before he reaches the line
-	if CFG.GkPressMove ~= false and not committed then
-		local Pl = futs[1].pts[13] or E0
+	-- come out on his line to the mouth: close the angle so the dive reaches him before he reaches the line. Only when it
+	-- matters: he is inside GkPressMoveZone and reaches the mouth within 3.5 s, and the player is not steering himself
+	-- (any move input = the player has the keeper). A flier: stand under where he comes down, close to it.
+	local landP = nil
+	if airborne and not jet then
+		for k = 2, #futs[1].pts do
+			local q = futs[1].pts[k]
+			if q.Y <= root.Position.Y + 1 then
+				landP = q
+				break
+			end
+		end
+	end
+	-- a jetpack flier: no coming out (he lands where the dash ends, or shoots from above: the save logic blocks the ball)
+	local moveOk = CFG.GkPressMove ~= false and not committed and not jet and (dSeg <= (CFG.GkPressMoveZone or 50) and tReach <= 3.5 or landP ~= nil)
+	if moveOk and Mark.userInputDir() then
+		moveOk = false
+	end
+	if moveOk then
+		local Pl = landP or futs[1].pts[13] or E0
 		local u = unitOrNil(flat(Pl - mouth))
 		if u and u:Dot(fwd) > 0.15 then
-			local depth = math.clamp(flat(Pl - mouth).Magnitude - (CFG.GkPressGap or 11), 1.5, CFG.GkPressOut or 12)
+			local depth = math.clamp(flat(Pl - mouth).Magnitude - (landP and 5 or (CFG.GkPressGap or 12)), 1.5, CFG.GkPressOut or 18)
 			local S = mouth + u * depth
 			local lat = flat(S - mouth):Dot(side)
 			S = S - side * (lat - math.clamp(lat, -(half + 2), half + 2))
@@ -8611,7 +8774,7 @@ Mark.gkPress = function(character, root, c)
 		})
 		Mark.gkSolveCache = { model = model, at = c.now, best = best, later = later, cen = cen }
 	end
-	local imminent = committed or tReach <= (CFG.GkPressLate or 0.9)
+	local imminent = committed or imminentT
 	local need = imminent and (CFG.GkPressConfLate or 0.35) or (CFG.GkPressConf or 0.6)
 	viz.need = need
 	if best then
@@ -8622,7 +8785,7 @@ Mark.gkPress = function(character, root, c)
 	local function fmt(x)
 		return string.format("%.2f", x)
 	end
-	local info = string.format("dSeg %.1f appr %.1f tReach %s air %s vy %.1f dy %.1f drib %s", dSeg, appr, tReach == math.huge and "-" or fmt(tReach), tostring(airborne), vy, P.Y - root.Position.Y, dribReady and "ready" or "spent")
+	local info = string.format("dSeg %.1f appr %.1f tReach %s air %s vy %.1f dy %.1f drib %s jet %s vk %s", dSeg, appr, tReach == math.huge and "-" or fmt(tReach), tostring(airborne), vy, P.Y - root.Position.Y, dribReady and "ready" or "spent", jet and fmt(jet.te) or "-", vKind)
 	if not best then
 		return note("no contact " .. info)
 	end
@@ -8632,6 +8795,18 @@ Mark.gkPress = function(character, root, c)
 		if best.t + ping * 0.5 > (crec.at or c.now) + 0.4 - c.now then
 			return note("skip charging t " .. fmt(best.t) .. " " .. info)
 		end
+	end
+	-- never a dive at a man whose height we cannot predict: about to launch, just launched (slope not measured yet), or
+	-- flying on something that is not a ballistic arc (lift rigs, grapple). Exception for powered: he is at our height
+	-- right now and the contact is immediate. The jetpack has its own timeline (jet ~= false) and skips this.
+	if launchPending then
+		return note("launch pending " .. launchPending .. " " .. info)
+	end
+	if not jet and vKind == "fresh" then
+		return note("wait arc " .. info)
+	end
+	if not jet and vKind == "powered" and not (best.t <= 0.15 and math.abs(dyNow) <= (CFG.PressVert or 4) * 0.75) then
+		return note(string.format("powered flight ay %s %s", ayT and string.format("%.0f", ayT) or "-", info))
 	end
 	if best.conf < need then
 		return note(string.format("watch conf %.2f need %.2f t %s %s", best.conf, need, fmt(best.t), info))
@@ -8671,6 +8846,27 @@ Mark.gkPress = function(character, root, c)
 	Mark.gkPressRec = { at = c.now, pl = pl, model = model, minD = math.huge, name = actorName(pl) }
 	logFile("gk press", "dive", ok and "ok" or "no", actorName(pl), "conf", fmt(best.conf), "need", fmt(need), "hit t", fmt(best.t), "exact", tostring(exact), "dir", fmtV(best.dir), info)
 	return ok and true or false
+end
+
+-- An open attacker (not on the ground, not marked by our field player within BlockCoverRadius) who is nearer the mouth
+-- segment than the carrier or level with him (+ BlockLevelSlack), 8+ studs away from him, within 130 studs of the mouth.
+Mark.gkSupport = function(pl, P, mouth, side, half, dSeg)
+	local slack = CFG.BlockLevelSlack or 8
+	for _, m in Mark.models() do
+		local a = Actors.GetFromCharacter(m)
+		if a and a ~= pl and a ~= LocalPlayer and not sameTeam(a) and not isGoalkeeper(a) and not Mark.mateDown(a, m) then
+			local ar = ActorTargeting.GetActorRoot(a)
+			if ar then
+				local pos = ar.Position
+				local nearP = mouth + side * math.clamp(flat(pos - mouth):Dot(side), -half, half)
+				local dO = flat(pos - nearP).Magnitude
+				if dO <= math.min(dSeg + slack, 130) and flat(pos - P).Magnitude >= 8 and not Mark.mateNear(pos, CFG.BlockCoverRadius or 8) then
+					return a, dO
+				end
+			end
+		end
+	end
+	return nil
 end
 
 -- Press overlay. One renderer: his futures as threads (the ones the dive catches in the state colour over an ink bed,
@@ -9311,10 +9507,16 @@ Mark.tickGk = function(character, root)
 	-- ownership flickers "free" for a frame or two while the ball is at his feet: keep pressing HIM (log: press/free/charge
 	-- alternated every frame and the keeper shook on the spot)
 	local pid = (not free and ownerRoot) and ownerId or nil
-	if not pid and free and Mark.gkFreeAt and now - Mark.gkFreeAt.at < 0.3 then
-		pid = Mark.gkFreeAt.id
+	if not pid and free and Mark.gkFreeAt and now - Mark.gkFreeAt.at < 0.3 and not shot and not plan then
+		-- a 1-2 frame "free" with the ball still at his feet only; a ball that left him (flick, shot, pass) is the ball's
+		local fp = playerOf(Mark.gkFreeAt.id)
+		local fr = fp and ActorTargeting.GetActorRoot(fp)
+		local bp = Renderer.GetPosition()
+		if fr and bp and flat(bp - fr.Position).Magnitude <= 4 then
+			pid = Mark.gkFreeAt.id
+		end
 	end
-	if pid and landed and role and role.Dive then
+	if pid and landed and role and role.Dive and not shot and not plan then
 		if Mark.gkPress(character, root, { now = now, ownerId = pid, fwd = fwd, side = side, half = half, mouth = mouthP, diveMod = diveMod, role = role }) then
 			return true
 		end
@@ -10540,7 +10742,50 @@ Mark.blockTarget = function()
 	end
 	local ch = Actors.GetCharacter(carrier)
 	local p, v = Mark.carrierPose(cr, ch)
-	return carrier, cr, ch, p, v
+	return carrier, cr, ch, p, Mark.trendVel(ch, v)
+end
+
+-- TREND velocity for the long predictions (AutoBlock spot, kick helper, Pass Assist receivers). A man weaving left /
+-- right has an instantaneous velocity that swings +-45 deg every few tenths of a second: extrapolating it 0.5 s put the
+-- spot on whichever side he zigged to last (the "he turned" read on every zig). Over the last TrendWindow s: mean
+-- velocity vs mean speed. Straight (ratio ~1) -> his velocity as it is; weaving / reversing (ratio drops) -> the mean,
+-- i.e. where the zig-zag actually goes. A real stop stays a stop (speeds drop together, the ratio stays 1).
+Mark.trendVel = function(model, V)
+	if CFG.TrendVel == false or not model then
+		return V
+	end
+	Mark.trend = Mark.trend or setmetatable({}, { __mode = "k" })
+	local now = os.clock()
+	local h = Mark.trend[model]
+	if not h or now - h.last > 0.3 then
+		h = { list = {}, last = now - 1 }
+		Mark.trend[model] = h
+	end
+	local list = h.list
+	if now - h.last >= 0.03 then
+		list[#list + 1] = { t = now, v = V }
+		h.last = now
+	end
+	while #list > 1 and now - list[1].t > (CFG.TrendWindow or 0.7) do
+		table.remove(list, 1)
+	end
+	if #list < 4 then
+		return V
+	end
+	local sx, sz, sm = 0, 0, 0
+	for _, e in list do
+		sx += e.v.X
+		sz += e.v.Z
+		sm += e.v.Magnitude
+	end
+	local n = #list
+	local mean = Vector3.new(sx / n, 0, sz / n)
+	local avgM = sm / n
+	if avgM < 3 then
+		return V
+	end
+	local straight = math.clamp(1 - (1 - mean.Magnitude / avgM) * 3, 0, 1)
+	return mean + (V - mean) * straight
 end
 
 -- Kick hitbox reach ahead of the aimed root: HitboxSettings.Kick CFrameOffset Z -1.5, Size Z 7 -> 5 studs.
@@ -11750,6 +11995,7 @@ end
 
 Mark.paPose = function(sel)
 	local pos, vel = Mark.carrierPose(sel.root, sel.model)
+	vel = Mark.trendVel(sel.model, vel)
 	sel.pos = pos
 	sel.vel = Vector3.new(vel.X, 0, vel.Z)
 end
@@ -16222,6 +16468,14 @@ Mark.onItemActivate = function(pkt)
 	local ch = actor and Actors.GetCharacter(actor)
 	local r = ch and ch:FindFirstChild("HumanoidRootPart")
 	logFile("skill activate", tostring(pkt.ItemId), actorName(actor), r and string.format("d %.1f", (r.Position - (ActorTargeting.GetActorRoot(LocalPlayer) or r).Position).Magnitude) or "-", "land", tostring(pkt.LandingSeconds))
+	if pkt.ItemId == "jetpack" then
+		Mark.jets = Mark.jets or {}
+		Mark.jets[uid] = { at = os.clock() }
+	elseif pkt.ItemId == "shotgun" or pkt.ItemId == "bazooka" or pkt.ItemId == "grapplingHook" or pkt.ItemId == "rocketPunch" then
+		-- self-launchers (recoil up / rocket at the feet / pull): AutoGK holds the press until the flight is measured
+		Mark.launchRec = Mark.launchRec or {}
+		Mark.launchRec[uid] = { at = os.clock(), kind = pkt.ItemId }
+	end
 	if pkt.ItemId == "sledgehammer" and r and type(pkt.StartedAt) == "number" then
 		local look = unitOrNil(flat(r.CFrame.LookVector)) or Vector3.new(0, 0, 1)
 		local land = r.Position + look * 12
@@ -19207,7 +19461,8 @@ return function(_Lib, _Core)
 			head(p, "Press")
 			tog(p, "Press", "GkPress", "Dives into a carrier running at your goal.")
 			tog(p, "Press Jump", "GkPressJump", "Jump + dive at players in the air.")
-			tog(p, "Come Out", "GkPressMove", "Steps out to cut his angle.")
+			tog(p, "Come Out", "GkPressMove", "Steps out to cut his angle. Your own movement always wins.")
+			tog(p, "Last Man Only", "GkPressLastMan", "No press while another attacker can take the pass.")
 			tog(p, "Show Press", "DrawGk", "His possible paths and your dive.")
 			sld(p, "Confidence", "GkPressConf", 0.3, 0.95, { prec = 2, text = "How sure the dive must be." })
 			advanced(p, "GkPress", function()
@@ -19218,6 +19473,7 @@ return function(_Lib, _Core)
 				sld(p, "Last Second", "GkPressLate", 0.3, 1.5, { prec = 2, suffix = " s" })
 				sld(p, "Max Contact Time", "GkPressMaxT", 0.2, 0.6, { prec = 2, suffix = " s" })
 				sld(p, "Come Out Max", "GkPressOut", 2, 60, { suffix = " st" })
+				sld(p, "Come Out Zone", "GkPressMoveZone", 15, 120, { suffix = " st" })
 				sld(p, "Gap To Him", "GkPressGap", 4, 24, { suffix = " st" })
 				tog(p, "Any-Angle Dive", "GkPressExact")
 				tog(p, "Steer Dive", "GkPressHome")
