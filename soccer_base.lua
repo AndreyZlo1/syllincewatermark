@@ -7762,7 +7762,7 @@ Mark.wallVsPath = function(root, pathFn, tEnd, tag, o)
 	-- the press reaches the server after ping/2, the wall exists WallLatency later (seen 0.11-0.14 s after the press at
 	-- ping 0.08 = round trip + ~0.04); equipping first costs WallEquipDelay more
 	local ready = ping * 0.5 + (CFG.WallLatency or 0.06) + (CFG.WallMargin or 0.05) + (equipped and 0 or (CFG.WallEquipDelay or 0.3))
-	local dtS = 0.02
+	local dtS = 0.04
 	local pts = Mark.wallPts or {}
 	Mark.wallPts = pts
 	local n = math.floor(tEnd / dtS) + 2
@@ -7883,6 +7883,11 @@ Mark.wallTick = function(root, oid, own)
 		return
 	end
 	local now = os.clock()
+	-- the solver is 48 yaws x the path samples per threat: 15 Hz is plenty for a 0.5 s decision window
+	if now - (Mark.wallTickAt or 0) < 0.066 then
+		return
+	end
+	Mark.wallTickAt = now
 	local inHand = use.IsEquipped and use.IsEquipped()
 	local isWall = inHand and Mark.equippedId() == "barricades"
 	if isWall and Mark.wallEquipAt and now - Mark.wallEquipAt > (CFG.WallEquipHold or 3.5) and now - (Mark.skillAt or 0) > (CFG.WallEquipHold or 3.5) then
@@ -10863,7 +10868,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v142")
+	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v143")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -11353,7 +11358,7 @@ end
 
 -- ===== AIR DUEL / LOB overlay ========================================================================================
 -- STRIKE. An air duel is two arcs that must meet: his (the airborne man / the lob) and ours (run to the take-off, the
--- jump), drawn as thin rails. Lightning discharges fall from his arc onto the grass and ricochet (Mark.duelBolts): with a
+-- jump). Lightning discharges fall from his arc onto the grass and ricochet (Mark.duelBolts): with a
 -- plan they strike our take-off spot and bounce into the contact knot, so the bolt itself draws who meets whom where.
 --   steel = SEEN: his rail only (no contact we can make);
 --   mint  = PLAN: our rail, the ties, the take-off squircle, the contact knot (a small 3D cross) and its ripple;
@@ -11481,53 +11486,8 @@ Mark.duelArt = function(seg, v, gy, t)
 		local p = path[i]:Lerp(path[j], math.clamp(x - i, 0, 1))
 		return (p.Y - gy < 200) and p or nil -- (a lob path is lifted out of reach before its no-touch moment)
 	end
-	-- ours: run to the take-off (td), then the jump arc to the contact; airborne: our own arc
-	local ourAt = nil
-	if pl then
-		local us, Q, E = v.us, pl.Q, pl.E
-		if v.landed and type(pl.td) == "number" then
-			local td = math.max(pl.td - el, 0)
-			local Qg = Vector3.new(Q.X, us.Y, Q.Z)
-			ourAt = function(tau)
-				if tau <= td then
-					return us:Lerp(Qg, td > 1e-3 and tau / td or 1)
-				end
-				local x, dur = tau - td, math.max(T - td, 0.05)
-				local p = Qg:Lerp(Vector3.new(E.X, us.Y, E.Z), math.clamp(x / dur, 0, 1))
-				return p + Vector3.new(0, math.max(v.vJ * x - 0.5 * v.g * x * x, 0), 0)
-			end
-		elseif v.landed then
-			ourAt = function(tau)
-				return us:Lerp(Vector3.new(E.X, us.Y, E.Z), T > 1e-3 and math.clamp(tau / T, 0, 1) or 1)
-			end
-		else
-			local floor = v.floorY or gy + 3
-			ourAt = function(tau)
-				local p = us:Lerp(Vector3.new(E.X, us.Y, E.Z), T > 1e-3 and math.clamp(tau / T, 0, 1) or 1)
-				return Vector3.new(p.X, math.max(us.Y + v.vy * tau - 0.5 * v.g * tau * tau, floor), p.Z)
-			end
-		end
-	end
-	local H = pl and T or 1.0
-	-- a rail: ink bed + coloured line, the curtain of stitches down to the grass, thinning with time ahead
-	local function rail(at, c, w, a)
-		local prev = nil
-		local tau = 0
-		while tau <= H + 1e-6 do
-			local p = at(tau)
-			if p then
-				if prev then
-					seg(prev, p, COL.Ink, 0.35 * a, w + 2, 39)
-					seg(prev, p, c, a, w, 42)
-				end
-			end
-			prev = p
-			tau += 0.05
-		end
-	end
-	rail(hisAt, pl and COL.Paper or col, pl and 1.3 or 1.6, pl and 0.85 or 0.9)
 	-- LIGHTNING: discharges fall from his arc, hit the grass and ricochet. Seen: they skim on along his heading. Plan: they
-	-- strike our take-off spot and bounce up into the contact knot (where we meet him). Committed: white, twice as often.
+	-- strike our take-off spot and bounce up into the contact point (where we meet him). Committed: white, twice as often.
 	local P = v.P
 	local ahead = nil
 	if not pl then
@@ -11549,18 +11509,7 @@ Mark.duelArt = function(seg, v, gy, t)
 		Mark.kickRipple(seg, Vector3.new(P.X, gy, P.Z), 2.2, pal, Mark.rippleStep("duel-foot", Mark.rippleRates[key]), t, 2)
 		return
 	end
-	rail(ourAt, col, 1.8, 1)
-	-- the contact knot: a 3D cross at E (three axes), its plumb and ripple on the grass
-	local E = pl.E
-	local kr = 1.1 + 0.6 * math.clamp(T / 0.6, 0, 1) -- tightens as the contact comes
-	for _, ax in { Vector3.new(kr, 0, 0), Vector3.new(0, kr, 0), Vector3.new(0, 0, kr) } do
-		seg(E - ax, E + ax, COL.Ink, 0.45, 4, 39)
-		seg(E - ax, E + ax, COL.Paper, 1, 1.8, 43)
-	end
-	local Eg = Vector3.new(E.X, gy, E.Z)
-	if E.Y - gy > 1 then
-		seg(Eg, E, col, 0.6, 1, 40)
-	end
+	local Eg = Vector3.new(pl.E.X, gy, pl.E.Z)
 	Mark.kickRipple(seg, Eg, 2.2, pal, Mark.rippleStep("duel-foot", Mark.rippleRates[key]), t, 2)
 	-- the take-off: a still squircle (n = 4) where we leave the grass, tighter as the take-off comes
 	if v.landed and type(pl.td) == "number" then
