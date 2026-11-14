@@ -168,6 +168,7 @@ local CFG = {
 	GkPressExact = true, -- dive at any angle (not only the 8 camera directions)
 	GkPressHome = true, -- steer the dive at him while it runs (what turning the camera does)
 	GkPressTurn = 6, -- rad/s of that steering
+	GkLauncherReact = 0.2, -- AutoGK press: an enemy holding a launcher fires this fast after seeing our dash (s)
 	GkPressMaxT = 0.36, -- no press dive for a contact later than this (s) unless he is at the mouth / flying
 	GkPress = true, -- AutoGK: forward dive into a carrier who runs / flies into the goal (stuns him)
 	PressDist = nil, -- max dive travel to contact (default: dive distance - 2)
@@ -3118,6 +3119,20 @@ Mark.chargeInst = function()
 	return nil
 end
 
+-- The real auto-release moment of OUR kick charge: ChargedKick.StartCharge task.delay(MaximumChargeSeconds) ->
+-- ReleaseFullCharge (no HandleInputEnded, so no hook sees it). A kick powerup (KickPowerups.GetMultiplier > 1) cuts it
+-- by PoweredUpChargeReductionSeconds: 0.4 -> 0.3 s.
+Mark.chargeMax = function()
+	local maxC = KickCore.Constants.MaximumChargeSeconds or 0.4
+	Mark.kickPow = Mark.kickPow or require(Modules.Actions.KickPowerups)
+	local mul = Mark.kickPow.GetMultiplier and Mark.kickPow.GetMultiplier(LocalPlayer)
+	if type(mul) == "number" and mul > 1 then
+		local cut = (Mark.kickPow.Constants and Mark.kickPow.Constants.PoweredUpChargeReductionSeconds) or 0.1
+		maxC = math.max((KickCore.Constants.MinimumChargeSeconds or 0.2) + 0.001, maxC - cut)
+	end
+	return maxC
+end
+
 Mark.weOwn = function()
 	if liveOwnerId() == LocalPlayer.UserId then
 		return true
@@ -3254,7 +3269,8 @@ tryTackle = function(character, root, dir, mult, target, skipHazard)
 	if type(target) == "table" and target.char then
 		local lw = Mark.lofting(target.char, target.root)
 		local humJ = character:FindFirstChildOfClass("Humanoid")
-		if lw and humJ and CharacterControllers.IsLanded(character, humJ) and not (lw == "flick" and Mark.duelFlickOk) then
+		-- the air duel planned this exact contact against his path (a hook man next to the high ball is "ball high" too)
+		if lw and humJ and CharacterControllers.IsLanded(character, humJ) and not (lw == "flick" and Mark.duelFlickOk) and not Mark.duelPress then
 			return false, "lofting"
 		end
 	end
@@ -6985,6 +7001,29 @@ Remotes.Get("Items", "Effect").OnClientEvent:Connect(function(pkt)
 		end
 	elseif type(pkt) == "table" and pkt.Kind == "HeldItemActivate" then
 		Mark.onItemActivate(pkt)
+	elseif type(pkt) == "table" and (pkt.Kind == "Grapple" or pkt.Kind == "GrappleStop") and type(pkt.UserId) == "number" then
+		-- GrapplePull.Start payload {UserId, BallId, StartedAt, PullStartsAt, FlightSeconds}: the hook flies to the BALL,
+		-- then pulls him at it (GrappleMotion: 75 st/s, Quad-out ramp 0.5 s, homing on the ball every step)
+		Mark.grapples = Mark.grapples or {}
+		if pkt.Kind == "GrappleStop" or pkt.UserId == LocalPlayer.UserId then
+			Mark.grapples[pkt.UserId] = nil
+		else
+			local st = tonumber(pkt.StartedAt) or Workspace:GetServerTimeNow()
+			Mark.grapples[pkt.UserId] = { pullAt = tonumber(pkt.PullStartsAt) or (st + (tonumber(pkt.FlightSeconds) or 0.3)), at = os.clock() }
+			local pl = playerOf(pkt.UserId)
+			logFile("grapple seen", pl and actorName(pl) or tostring(pkt.UserId), "pull in", string.format("%.2f", Mark.grapples[pkt.UserId].pullAt - Workspace:GetServerTimeNow()), "enemy", tostring(pl ~= nil and not sameTeam(pl)))
+		end
+	elseif type(pkt) == "table" and pkt.Kind == "MagnetAim" and type(pkt.UserId) == "number" then
+		-- MagnetAim {UserId, IsActive, IsSuspended, EndsAt}: while active the server pulls a LOOSE ball toward him
+		Mark.magnets = Mark.magnets or {}
+		if pkt.IsActive == false or (type(pkt.EndsAt) == "number" and pkt.EndsAt <= Workspace:GetServerTimeNow()) then
+			Mark.magnets[pkt.UserId] = nil
+		else
+			local m = Mark.magnets[pkt.UserId] or {}
+			m.endsAt = tonumber(pkt.EndsAt) or m.endsAt or (Workspace:GetServerTimeNow() + 5)
+			m.suspended = pkt.IsSuspended == true
+			Mark.magnets[pkt.UserId] = m
+		end
 	elseif type(pkt) == "table" and type(pkt.Kind) == "string" and pkt.Kind:sub(1, 10) == "OilPatches" then
 		if pkt.Kind == "OilPatchesClear" then
 			table.clear(Mark.oil)
@@ -8797,6 +8836,19 @@ Mark.gkPress = function(character, root, c)
 	if best.conf < need then
 		return note(string.format("watch conf %.2f need %.2f t %s %s", best.conf, need, fmt(best.t), info))
 	end
+	-- TIME TO IMPACT vs HIS ESCAPE. A launcher in his hands (bazooka at the feet, shotgun down, grapple, jetpack) takes
+	-- him off the ground the moment he fires; he sees our dash after the latency (~our ping) and fires after a reaction
+	-- (GkLauncherReact). A contact later than that is a dive into the air he is about to leave (log: bazooka boost
+	-- right after our dash, the dive passed under him, 1.9 s open goal). Stand and read the launch instead.
+	if not airborne and not jet then
+		local held = Mark.heldLauncher(pl.UserId)
+		if held then
+			local escT = (CFG.GkLauncherReact or 0.2) + ping
+			if best.t > escT then
+				return note(string.format("launcher %s in hand: hit t %s > escape %.2f %s", held, fmt(best.t), escT, info))
+			end
+		end
+	end
 	-- a contact further than GkPressMaxT is a guess about a man who can still turn, dribble or shoot: the miss costs the
 	-- dive cooldown (1.9 s open goal). Come out (stand above) until the contact is short. Committed / flying: allowed.
 	local maxT = CFG.GkPressMaxT or 0.36
@@ -8839,6 +8891,100 @@ Mark.gkPress = function(character, root, c)
 	Mark.gkPressRec = { at = c.now, pl = pl, model = model, minD = math.huge, name = actorName(pl) }
 	logFile("gk press", "dive", ok and "ok" or "no", actorName(pl), "conf", fmt(best.conf), "need", fmt(need), "hit t", fmt(best.t), "exact", tostring(exact), "dir", fmtV(best.dir), info)
 	return ok and true or false
+end
+
+-- GRAPPLE PATH (dump GrappleMotion.Step): until PullStartsAt he stands (the hook flies); then every step he moves
+-- toward GetTargetPosition(ball) (the ball + standing offset - radius) at PullSpeed * QuadOut(t / SpeedRampSeconds),
+-- re-aimed at the ball each step; within the step he arrives (pickup), then RunOvershoot: OvershootDistanceStuds along
+-- his velocity in OvershootDurationSeconds (Quad-out). The ball comes from Mark.ballPath. Returns pts (0.025 s, 1.3 s),
+-- tArr (nil = not in 1.3 s).
+Mark.grapplePath = function(uid, model, P, root)
+	local gr = Mark.grapples and Mark.grapples[uid]
+	if not gr then
+		return nil
+	end
+	local nowS = Workspace:GetServerTimeNow()
+	if nowS - gr.pullAt > 2.5 then
+		Mark.grapples[uid] = nil
+		return nil
+	end
+	local _, _, bs, bt = Mark.ballPath(root)
+	if not bs then
+		return nil
+	end
+	Mark.grappleM = Mark.grappleM or require(Modules.Items.GrappleMotion)
+	local K = Mark.grappleM.Constants
+	local nb, hint = #bs, 2
+	local function ballAt(t)
+		if nb < 2 or t >= bt[nb] then
+			return bs[nb]
+		end
+		while hint < nb and bt[hint] < t do
+			hint += 1
+		end
+		local a, b = bt[hint - 1], bt[hint]
+		return bs[hint - 1]:Lerp(bs[hint], b > a and (t - a) / (b - a) or 0)
+	end
+	local DT, N = 0.025, 52
+	local pts = table.create(N + 1)
+	local p = P
+	pts[1] = p
+	local tArr, pArr, dir = nil, nil, nil
+	for k = 1, N do
+		local t = k * DT
+		local tS = nowS + t
+		if not tArr then
+			if tS >= gr.pullAt then
+				local b = ballAt(t)
+				local tgt = Mark.grappleM.GetTargetPosition(model, b) or b
+				local u = math.clamp((tS - gr.pullAt) / K.SpeedRampSeconds, 0, 1)
+				local step = K.PullSpeed * (1 - (1 - u) * (1 - u)) * DT
+				local d = tgt - p
+				local m = d.Magnitude
+				if m > 1e-3 then
+					dir = d / m
+				end
+				if m <= math.max(step, K.ArrivalConfirmationToleranceStuds) then
+					p, tArr, pArr = tgt, t, tgt
+				else
+					p += d / m * step
+				end
+			end
+		elseif dir then
+			local u = math.clamp((t - tArr) / K.OvershootDurationSeconds, 0, 1)
+			p = pArr + dir * K.OvershootDistanceStuds * (1 - (1 - u) * (1 - u))
+		end
+		pts[k + 1] = p
+	end
+	return pts, tArr
+end
+
+-- The launcher an enemy HOLDS right now (dump HeldItems: rig models in workspace.Misc.Items, attribute UserId = owner,
+-- ItemId, HeldItemLifecycle = 0 while equipped and not fired). Known BEFORE the shot - the packet (launchRec) only
+-- comes after it. Memo 0.1 s per user.
+Mark.launcherIds = { bazooka = true, shotgun = true, grapplingHook = true, jetpack = true, rocketPunch = true }
+Mark.heldLauncher = function(uid)
+	local now = os.clock()
+	Mark.heldMemo = Mark.heldMemo or {}
+	local m = Mark.heldMemo[uid]
+	if m and now - m.at < 0.1 then
+		return m.id
+	end
+	local id = nil
+	local misc = workspace:FindFirstChild("Misc")
+	local cont = misc and misc:FindFirstChild("Items")
+	if cont then
+		local uAttr = Actors.UserIdAttributeName or "UserId"
+		for _, ch in cont:GetChildren() do
+			local it = ch:GetAttribute("ItemId")
+			if it and Mark.launcherIds[it] and ch:GetAttribute(uAttr) == uid and ch:GetAttribute("HeldItemLifecycle") == 0 then
+				id = it
+				break
+			end
+		end
+	end
+	Mark.heldMemo[uid] = { at = now, id = id }
+	return id
 end
 
 -- An open attacker (not on the ground, not marked by our field player within BlockCoverRadius) who is nearer the mouth
@@ -10498,7 +10644,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v133")
+	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v135")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -11019,9 +11165,43 @@ Mark.tickCounterJump = function(character, root)
 	if Mark.duel and now - (Mark.duel.seen or Mark.duel.at) > 0.3 then
 		Mark.duelEnd("stale") -- no plan refreshed it (he flies a powered / fresh arc): do not keep AutoBlock parked
 	end
+	-- GRAPPLE first: an enemy pulled at the ball on a hook whose path comes within range. If AutoBall wins the ball race
+	-- (Mark.grappleRace, fresh) the ball is the answer; otherwise we meet HIM on his path (his path is exact: homing on the
+	-- ball at 75 st/s, then the overshoot) with the same air / ground slide-kick planner.
+	local grap = nil
+	if Mark.grapples and next(Mark.grapples) then
+		for uid, _ in Mark.grapples do
+			local a = playerOf(uid)
+			local m = a and not sameTeam(a) and Actors.GetCharacter(a)
+			local rr = m and ActorTargeting.GetActorRoot(a)
+			if rr then
+				local pts, tArr = Mark.grapplePath(uid, m, (Mark.carrierPose(rr, m)), root)
+				local near = false
+				if pts then
+					for k = 1, #pts, 4 do
+						if flat(pts[k] - root.Position).Magnitude <= (CFG.CounterJumpRange or 24) then
+							near = true
+							break
+						end
+					end
+				end
+				local race = Mark.grappleRace
+				local ballWins = race and race.uid == uid and race.win and os.clock() - race.at < 0.3
+				if near and ballWins then
+					if not Mark.grapSkipLog or now - Mark.grapSkipLog > 0.5 then
+						Mark.grapSkipLog = now
+						logFile("duel skip", "grapple: AutoBall takes the ball first", actorName(a))
+					end
+				elseif near then
+					grap = { actor = a, model = m, r = rr, pts = pts, tArr = tArr }
+					break
+				end
+			end
+		end
+	end
 	-- the target: the enemy carrier within range (the ball is with him)
 	local oid = liveOwnerId()
-	local actor = type(oid) == "number" and playerOf(oid) or nil
+	local actor = grap and grap.actor or (type(oid) == "number" and playerOf(oid)) or nil
 	if not actor or sameTeam(actor) or isGoalkeeper(actor) then
 		if Mark.duel then
 			Mark.duelEnd("no carrier")
@@ -11031,14 +11211,14 @@ Mark.tickCounterJump = function(character, root)
 	local model = Actors.GetCharacter(actor)
 	local r = ActorTargeting.GetActorRoot(actor)
 	local hisHum = model and model:FindFirstChildOfClass("Humanoid")
-	if not (model and r and hisHum) or flat(r.Position - root.Position).Magnitude > (CFG.CounterJumpRange or 24) then
+	if not (model and r and hisHum) or (not grap and flat(r.Position - root.Position).Magnitude > (CFG.CounterJumpRange or 24)) then
 		if Mark.duel then
 			Mark.duelEnd("range")
 		end
 		return
 	end
 	-- a flick wind-up: the slide, if it lands before the detach; the ball after it is AutoBall's
-	if CFG.CounterCompetitor then
+	if CFG.CounterCompetitor and not grap then
 		local myD = flat(r.Position - root.Position).Magnitude
 		for _, m2 in Mark.models() do
 			local a2 = Actors.GetFromCharacter(m2)
@@ -11056,7 +11236,7 @@ Mark.tickCounterJump = function(character, root)
 		end
 	end
 	local wind, left = Mark.enemyWind(actor)
-	if wind then
+	if wind and not grap then
 		if landed and flat(r.Position - root.Position).Magnitude <= (CFG.FlickTackleRange or 10) + 6 then
 			Mark.duelFlickTackle(character, root, actor, model, r, left)
 		end
@@ -11072,7 +11252,7 @@ Mark.tickCounterJump = function(character, root)
 	end
 	local floor = Mark.duelFloor or root.Position.Y
 	local vs = Mark.vertState(model, P, floor, not CharacterControllers.IsLanded(model, hisHum), now, g)
-	if not vs.airborne then
+	if not vs.airborne and not grap then
 		if Mark.duel then
 			Mark.duelEnd("he landed")
 		end
@@ -11091,7 +11271,9 @@ Mark.tickCounterJump = function(character, root)
 	local vyPlan, hoverP = vs.vy, nil
 	local crec = Mark.charges and Mark.charges[actor.UserId]
 	local hisCharge = crec and crec.live and now - (crec.seen or 0) < 0.6 and crec.at
-	if hisCharge then
+	if grap then
+		vyPlan = 0 -- the path is the hook's (grap.pts)
+	elseif hisCharge then
 		-- BICYCLE (dump BicycleKick.StartHover): a charge started in the air freezes him - LinearVelocity = his velocity at
 		-- the start * (1 - t / StopSeconds)^2, held up to MaximumHoverSeconds until the release. What is left of the drift
 		-- from now: v(now) * (StopSeconds - e) / 3. He was "powered" (ay ~ 0) for vertState: the old code skipped him.
@@ -11135,7 +11317,9 @@ Mark.tickCounterJump = function(character, root)
 		local lead = math.clamp(CharacterMotion.GetDisplayDelaySeconds(model) or 0, 0, 0.25) + ping * 0.5
 		local goal = Mark.defendGoal()
 		local path
-		if hoverP then
+		if grap then
+			path = grap.pts
+		elseif hoverP then
 			path = table.create(53, hoverP)
 		else
 			path = Mark.gkFutures(P, V, vyPlan, true, false, floor, lead, goal and goal.Position or (P + flat(V) * 10), g, false)[1].pts
@@ -11158,7 +11342,7 @@ Mark.tickCounterJump = function(character, root)
 		})
 		Mark.duelMemo = { model = model, at = now, plan = plan }
 		if not plan then
-			skip((hoverP and "bicycle: " or "") .. (deadline and string.format("no contact before his release (%.2f s)", deadline) or "no contact"))
+			skip((grap and "grapple: " or hoverP and "bicycle: " or "") .. (deadline and string.format("no contact before his release (%.2f s)", deadline) or "no contact"))
 		end
 	end
 	if not plan then
@@ -11170,7 +11354,7 @@ Mark.tickCounterJump = function(character, root)
 	local name = actorName(actor)
 	if not Mark.duel or Mark.duel.model ~= model then
 		Mark.duel = { model = model, at = now, name = name }
-		logFile("duel", "plan", plan.kind, name, "td", type(plan.td) == "number" and string.format("%.2f", plan.td) or (plan.td or "air"), "tp", string.format("%.2f", plan.tp), "T", string.format("%.2f", plan.T), "bike", tostring(hoverP ~= nil), "d", string.format("%.1f", flat(P - root.Position).Magnitude), "h", string.format("%.1f", P.Y - floor))
+		logFile("duel", "plan", plan.kind, name, "td", type(plan.td) == "number" and string.format("%.2f", plan.td) or (plan.td or "air"), "tp", string.format("%.2f", plan.tp), "T", string.format("%.2f", plan.T), "bike", tostring(hoverP ~= nil), "grapple", grap and (grap.tArr and string.format("arrives %.2f", grap.tArr) or "flying") or "-", "d", string.format("%.1f", flat(P - root.Position).Magnitude), "h", string.format("%.1f", P.Y - floor))
 	end
 	Mark.duel.seen = now
 	-- move: to where we press, facing him (the agent; air control steers too)
@@ -11201,7 +11385,9 @@ Mark.tickCounterJump = function(character, root)
 	local sent = false
 	if plan.kind == "slide" then
 		predict = { dist = flat(P - root.Position).Magnitude, eta = plan.T, hit = plan.E, spd = V.Magnitude, iframe = 0, serverPos = P, livePos = r.Position, distLive = flat(r.Position - root.Position).Magnitude, delay = 0 }
+		Mark.duelPress = true
 		sent = tryTackle(character, root, plan.aim, plan.mult, { char = model, root = r })
+		Mark.duelPress = nil
 	else
 		sent = Mark.akTry("duel", model, r, true)
 	end
@@ -12709,8 +12895,11 @@ Mark.feintTick = function(own)
 	if fd.done or not fd.doIt then
 		return
 	end
+	-- the cancel must beat the game's own release: with a kick powerup it comes at 0.30 s, before Cancel At 0.32 (log:
+	-- "feint decide ... feint", the shot left at 0.30, the feint only saw the player's late release -> "no ball")
 	local held = inst.GetHeldSeconds()
-	if held and held >= (CFG.FeintAt or 0.32) then
+	local at = math.min(CFG.FeintAt or 0.32, Mark.chargeMax() - 0.05)
+	if held and held >= at then
 		Mark.feintNow("timer")
 	end
 end
@@ -13673,6 +13862,112 @@ end
 -- Ball path from the renderer's authoritative movement state through Physics.GetStateAtTime (rolling damping,
 -- bounces, walls). Dense 0.05 s for the first 1.2 s (slide/jump/volley windows), then 0.1 s until the state says the
 -- ball is at rest (Mode Resting / speed under Physics StopSpeed-ish), capped at 8 s. No fixed "2 s ahead" point.
+-- MAGNET (dump: Magnet.DurationSeconds 5, MagnetMotion.GetPullAcceleration = flat unit to the holder * PullAcceleration *
+-- a power fraction by distance, applied by the SERVER to a loose ball). The client Physics state has no such force: the
+-- path from the last state is a straight line, every new server state bends it again - the planner chased ghosts.
+-- The pull strength is not in the client dump: measured from consecutive server states (the velocity the plain physics
+-- predicts at the new state's start vs the velocity the server sent). The path is then integrated with the pull toward
+-- each holder (his pose + velocity, 0.5 s), Air / Rolling damping 0.5 / 2 from Physics.Constants, the height from the
+-- plain sim; it ends at the holder's receive box.
+Mark.magnetBend = function(state, world, now, samples, ts)
+	local me = Mark.magEst or {}
+	Mark.magEst = me
+	if me.state ~= state then
+		local ps = me.state
+		if ps and me.world and type(state.StartedAt) == "number" and type(ps.StartedAt) == "number" and typeof(state.InitialVelocity) == "Vector3" then
+			local dtS = state.StartedAt - ps.StartedAt
+			if dtS > 0.01 and dtS < 0.5 then
+				local sp = Physics.GetStateAtTime(ps, state.StartedAt, me.world)
+				if sp and typeof(sp.Velocity) == "Vector3" then
+					local a = flat(state.InitialVelocity - sp.Velocity).Magnitude / dtS
+					if a > 3 and a < 400 then -- a kick / touch is a jump of 40+ st/s in one tick: not a pull
+						me.A = me.A and (me.A * 0.6 + a * 0.4) or a
+						me.at = os.clock()
+					end
+				end
+			end
+		end
+		me.state, me.world = state, world
+	end
+	local nowS = Workspace:GetServerTimeNow()
+	local pulls = {}
+	for uid, m in Mark.magnets do
+		if type(m.endsAt) ~= "number" or m.endsAt <= nowS then
+			Mark.magnets[uid] = nil
+		elseif not m.suspended then
+			local pl = playerOf(uid)
+			local r = pl and ActorTargeting.GetActorRoot(pl)
+			if r then
+				pulls[#pulls + 1] = { p = r.Position, v = flat(r.AssemblyLinearVelocity), endsAt = m.endsAt }
+			end
+		end
+	end
+	if #pulls == 0 or not me.A or os.clock() - (me.at or 0) > 1.5 then
+		if #pulls > 0 and (not Mark.magLog or os.clock() - Mark.magLog > 1) then
+			Mark.magLog = os.clock()
+			logFile("magnet path", "no pull measured", "A", me.A and string.format("%.0f", me.A) or "-", "holders", #pulls)
+		end
+		return nil -- no measured pull yet: the plain path
+	end
+	local s0 = Physics.GetStateAtTime(state, now, world)
+	if not (s0 and typeof(s0.Position) == "Vector3" and typeof(s0.Velocity) == "Vector3") then
+		return nil
+	end
+	local n0 = #samples
+	local floorY = math.huge
+	for i = 1, n0 do
+		floorY = math.min(floorY, samples[i].Y)
+	end
+	local hint = 2
+	local function yAt(t)
+		if n0 < 2 or t >= ts[n0] then
+			return samples[n0].Y
+		end
+		while hint < n0 and ts[hint] < t do
+			hint += 1
+		end
+		local a, b = ts[hint - 1], ts[hint]
+		return samples[hint - 1].Y + (samples[hint].Y - samples[hint - 1].Y) * (b > a and (t - a) / (b - a) or 0)
+	end
+	local half = HitboxSettings.Receive.Size.X * 0.5
+	local p, v = s0.Position, flat(s0.Velocity)
+	local outS, outT = { samples[1] }, { 0 }
+	local rest, t, DT = false, 0, 0.05
+	while t < 3 do
+		t += DT
+		local acc, done = Vector3.zero, false
+		for _, q in pulls do
+			if nowS + t < q.endsAt then
+				local d = flat(q.p + q.v * math.min(t, 0.5) - p)
+				local m = d.Magnitude
+				if m <= half then
+					done = true
+				elseif m > 1e-3 then
+					acc += d / m * me.A
+				end
+			end
+		end
+		local y = yAt(t)
+		local damp = (y <= floorY + 0.6) and 2 or 0.5
+		v += (acc - v * damp) * DT
+		p = Vector3.new(p.X + v.X * DT, y, p.Z + v.Z * DT)
+		outS[#outS + 1] = p
+		outT[#outT + 1] = t
+		if done then
+			break
+		end
+		if acc.Magnitude < 1e-3 and v.Magnitude < 0.6 then
+			rest = true
+			break
+		end
+	end
+	if not Mark.magLog or os.clock() - Mark.magLog > 1 then
+		Mark.magLog = os.clock()
+		logFile("magnet path", "pull", string.format("%.0f", me.A), "holders", #pulls, "steps", #outS, "end", fmtV(outS[#outS]), "rest", tostring(rest))
+	end
+	return { samples = outS, ts = outT, rest = rest }
+end
+
 Mark.ballPath = function(root)
 	local pos = Renderer.GetTargetPosition(nil, root.Position) or Renderer.GetMainMatchPosition()
 	if typeof(pos) ~= "Vector3" then
@@ -13743,6 +14038,12 @@ Mark.ballPath = function(root)
 		if not Mark.pathLog or os.clock() - Mark.pathLog > 2 then
 			Mark.pathLog = os.clock()
 			logFile("ball path", "steps", #samples, "spd", string.format("%.0f", spd0), "rest", tostring(rest))
+		end
+	end
+	if state and Mark.magnets and next(Mark.magnets) then
+		local bent = Mark.magnetBend(state, world, CharacterMotionSmoothing.GetSmoothedServerTime(), samples, ts)
+		if bent then
+			samples, ts, rest = bent.samples, bent.ts, bent.rest
 		end
 	end
 	if typeof(vel) ~= "Vector3" then
@@ -14843,7 +15144,9 @@ Mark.routePlan = function(c)
 	local foeFirst = math.huge
 	for _, f in c.foes do
 		local first = math.huge
-		if f.s > 1 then
+		if f.grappleT then
+			first = f.grappleT
+		elseif f.s > 1 then
 			for i = 1, n do
 				-- a foe touches only a ball his receive box (+ a jump, 0.15 s to rise) reaches: the old race ignored the
 				-- height, so a lob over everyone was "his" the moment he stood under it and every jump plan lost
@@ -15189,6 +15492,9 @@ Mark.tickBall = function(character, root)
 		Mark.flickTrace("ball", "busy", Mark.aerial and "aerial" or Mark.move.mode)
 		return
 	end
+	if Mark.duel then
+		return -- the air duel (CounterJump: a man in the air / on a hook) owns the body
+	end
 	-- FLICK: an enemy carrier winding up a RainbowFlick still owns the ball, but its lob is already known (Mark.flickShot:
 	-- GetCharacterLaunch + the ball physics, detach in BallDetachSeconds). It is a loose ball with a fixed path from that
 	-- moment: plan it like any other (run / jump / slide, raced against the foes), the flicker himself a racer only after
@@ -15331,7 +15637,14 @@ Mark.tickBall = function(character, root)
 		local actor = Actors.GetFromCharacter(model)
 		if actor and actor ~= LocalPlayer and not sameTeam(actor) and not isGoalkeeper(actor) then
 			local fr = ActorTargeting.GetActorRoot(actor)
-			if fr and not threat and flat(fr.Position - pos).Magnitude < 60 then
+			local grT = nil
+			if fr and Mark.grapples and Mark.grapples[actor.UserId] then
+				-- he flies at the ball on a hook: his touch is the arrival of the pull, at any distance / height
+				local _, tA = Mark.grapplePath(actor.UserId, model, (Mark.carrierPose(fr, model)), root)
+				grT = tA or math.huge
+				foes[#foes + 1] = { p = fr.Position, s = 75, root = fr, model = model, actor = actor, delay = 0, grappleT = grT, sliding = false }
+			end
+			if fr and not grT and not threat and flat(fr.Position - pos).Magnitude < 60 then
 				-- delay = seconds until he can move again (stun / ragdoll / freeze ice / WalkSpeed 0): a downed enemy is not a
 				-- racer for that long (it was: killer slides and "foe near" boosts at men who could not walk)
 				local down, left = Mark.mateDown(actor, model)
@@ -15431,6 +15744,22 @@ Mark.tickBall = function(character, root)
 	end
 	if flick and plan then
 		Mark.flickBallAt = os.clock() -- AutoBlock yields the body to the flick plan
+	end
+	do
+		local gf = nil
+		for _, f in foes do
+			if f.grappleT and (not gf or f.grappleT < gf.grappleT) then
+				gf = f
+			end
+		end
+		if gf then
+			local win = plan ~= nil and (plan.t or math.huge) < gf.grappleT - 0.05
+			Mark.grappleRace = { at = os.clock(), uid = gf.actor.UserId, win = win }
+			if not Mark.grapRaceLog or os.clock() - Mark.grapRaceLog > 0.4 then
+				Mark.grapRaceLog = os.clock()
+				logFile("grapple race", actorName(gf.actor), "his arrival", gf.grappleT < math.huge and string.format("%.2f", gf.grappleT) or "-", "our contact", plan and string.format("%.2f", plan.t or 0) or "-", win and "BALL" or "-> duel him")
+			end
+		end
 	end
 	if lobOn then
 		if plan then
@@ -16541,6 +16870,10 @@ Mark.onItemActivate = function(pkt)
 	local ch = actor and Actors.GetCharacter(actor)
 	local r = ch and ch:FindFirstChild("HumanoidRootPart")
 	logFile("skill activate", tostring(pkt.ItemId), actorName(actor), r and string.format("d %.1f", (r.Position - (ActorTargeting.GetActorRoot(LocalPlayer) or r).Position).Magnitude) or "-", "land", tostring(pkt.LandingSeconds))
+	if pkt.ItemId == "magnet" then
+		Mark.magnets = Mark.magnets or {}
+		Mark.magnets[uid] = { endsAt = (tonumber(pkt.StartedAt) or Workspace:GetServerTimeNow()) + 5 } -- Magnet.DurationSeconds
+	end
 	if pkt.ItemId == "jetpack" then
 		Mark.jets = Mark.jets or {}
 		Mark.jets[uid] = { at = os.clock() }
@@ -19548,6 +19881,7 @@ return function(_Lib, _Core)
 				sld(p, "Last-Second Confidence", "GkPressConfLate", 0.1, 0.9, { prec = 2 })
 				sld(p, "Last Second", "GkPressLate", 0.3, 1.5, { prec = 2, suffix = " s" })
 				sld(p, "Max Contact Time", "GkPressMaxT", 0.2, 0.6, { prec = 2, suffix = " s" })
+				sld(p, "Launcher Reaction", "GkLauncherReact", 0.05, 0.5, { prec = 2, suffix = " s", text = "Enemy holding a bazooka, shotgun, grapple or jetpack: no dive that lands later than this." })
 				sld(p, "Come Out Max", "GkPressOut", 2, 60, { suffix = " st" })
 				sld(p, "Come Out Zone", "GkPressMoveZone", 15, 120, { suffix = " st" })
 				sld(p, "Gap To Him", "GkPressGap", 4, 24, { suffix = " st" })
