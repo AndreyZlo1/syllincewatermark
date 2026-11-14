@@ -12587,6 +12587,16 @@ end
 Mark.feintNow = function(why)
 	local fd = Mark.fd
 	local nm = Shoot.shotName
+	-- no ball, nothing to feint: the cancel would only eat a charge, and in Count mode it still COUNTED (log: the ball was
+	-- tackled away 0.3 s into a press decided as a feint, the release 0.35 s later "feinted" an empty charge, n 1 -> the
+	-- next press was the "real" one: the player never saw a feint). The decision stays for when the ball is ours again.
+	if not Mark.weOwn() then
+		if fd and not fd.noBallLogged then
+			fd.noBallLogged = true
+			logFile("feint skip", "no ball", why)
+		end
+		return false
+	end
 	local skip = nil
 	if (nm == "BOUNCE FAKE" and CFG.FeintSkipBounce ~= false) or ((nm == "FAKE" or nm == "FAKE CORNER") and CFG.FeintSkipFake ~= false) then
 		skip = nm
@@ -15266,6 +15276,42 @@ Mark.tickBall = function(character, root)
 			end
 		end
 	end
+	-- GOAL GUARD (CFG.KillerGuard). A loose ball near OUR goal, we are near it: the enemy nearest to the ball is slid first.
+	-- It used to live inside Rival Slide, after the route plan: off with Rival Slide, off with Slide Boost (readyB), and
+	-- never reached exactly when it mattered - the enemy is closer to the ball, our plan loses the race, tickBall returned
+	-- "no aim" before the guard. Now it runs first, on its own switch, against the plain tackle readiness.
+	if CFG.KillerGuard ~= false and CFG.AutoTackle and not threat then
+		local gGoal = Mark.defendGoal()
+		local humG = character:FindFirstChildOfClass("Humanoid")
+		if gGoal and humG and CharacterControllers.IsLanded(character, humG) and Mark.tackleReady(character) and not slideAim
+			and not (Mark.allyKickUntil and os.clock() < Mark.allyKickUntil)
+			and flat(pos - gGoal.Position).Magnitude <= (CFG.KillerGuardGoal or 55)
+			and flat(pos - root.Position).Magnitude <= (CFG.KillerGuardNear or 22) then
+			local bestF, bestD = nil, math.huge
+			for _, f in foes do
+				local dB = flat(f.p - pos).Magnitude
+				if (f.delay or 0) <= 0 and not f.sliding and dB <= (CFG.KillerGuardFoe or 40) and dB < bestD then
+					bestF, bestD = f, dB
+				end
+			end
+			if bestF then
+				local mHiG = math.max(0.4, CFG.TackleSpeed)
+				local mLoG = math.min(mHiG, CFG.TackleMinSpeed or 0.6)
+				local k, kWhy = Mark.killerSlide(root, nil, { bestF }, pos, nil, mLoG, mHiG, true)
+				if k then
+					predict = solveIntercept(root, bestF.root, bestF.model, tackleTuning()) or predict
+					local sent, why = tryTackle(character, root, k.aim, k.mult, { char = bestF.model, root = bestF.root })
+					logFile("killer guard", sent and "sent" or ("no " .. tostring(why)), k.name, "ang", string.format("%.0f", k.ang), "hits", tostring(k.hits), "mult", string.format("%.2f", k.mult), "ballD", string.format("%.1f", bestD))
+					if sent then
+						return
+					end
+				elseif not Mark.guardSkipLog or os.clock() - Mark.guardSkipLog > 1 then
+					Mark.guardSkipLog = os.clock()
+					logFile("killer guard skip", kWhy or "-")
+				end
+			end
+		end
+	end
 	-- real run speed: the speed boosts (ws 33.3 in the log) were planned as 26.9
 	do
 		local humS = character:FindFirstChildOfClass("Humanoid")
@@ -15319,6 +15365,27 @@ Mark.tickBall = function(character, root)
 		Mark.ballInfo = nil
 	end
 	local aimP = steer
+	if not aimP and threat then
+		-- Defend Goal with no contact in time: still put the body as close to the shot path as the run allows (the least
+		-- late sample within jump reach). It used to stop here ("no aim") = the defender stood and watched the goal.
+		local bestS, bestT, bestL = nil, nil, math.huge
+		for i = 2, #samples do
+			local p = samples[i]
+			if p.Y - root.Position.Y <= recvHi + jumpH then
+				local late = math.max(flat(p - root.Position).Magnitude - receiveHalf, 0) / spd - ts[i]
+				if late < bestL then
+					bestS, bestT, bestL = p, ts[i], late
+				end
+			end
+		end
+		if bestS then
+			aimP, steerT, how = bestS, bestT, "goal line"
+			if not Mark.guardLateLog or os.clock() - Mark.guardLateLog > 0.8 then
+				Mark.guardLateLog = os.clock()
+				logFile("block goal", "best effort", "late", string.format("%.2f", bestL), "t", string.format("%.2f", bestT))
+			end
+		end
+	end
 	if not aimP then
 		Mark.ballStop("no aim")
 		return
@@ -15470,29 +15537,7 @@ Mark.tickBall = function(character, root)
 	local kill, killWhy, killRacer = nil, nil, false
 	if CFG.CandidateKiller ~= false and CFG.AutoTackle and readyB and not slideDir and not noTouch
 		and not (Mark.allyKickUntil and os.clock() < Mark.allyKickUntil) then
-		-- GUARD: the loose ball is close to OUR goal and we are within ~20 studs of it. The enemy nearest to the ball (not its
-		-- owner yet, not downed / in iframe / sliding) is slid first if the geometry allows; the run for the ball goes on
-		-- regardless (a miss costs the 3 s cooldown, not the chase).
-		local guardFoes = nil
-		do
-			local gGoal = Mark.defendGoal()
-			if CFG.KillerGuard ~= false and gGoal and flat(pos - gGoal.Position).Magnitude <= (CFG.KillerGuardGoal or 55) and flat(pos - root.Position).Magnitude <= (CFG.KillerGuardNear or 22) then
-				local bestF, bestD = nil, math.huge
-				for _, f in foes do
-					local dB = flat(f.p - pos).Magnitude
-					if (f.delay or 0) <= 0 and not f.sliding and dB <= (CFG.KillerGuardFoe or 40) and dB < bestD then
-						bestF, bestD = f, dB
-					end
-				end
-				if bestF then
-					guardFoes = { bestF }
-				end
-			end
-		end
-		kill, killWhy = Mark.killerSlide(root, dir, guardFoes or foes, pos, steerT, mLoB, mHiB, guardFoes ~= nil)
-		if kill and guardFoes then
-			kill.guard = true
-		end
+		kill, killWhy = Mark.killerSlide(root, dir, foes, pos, steerT, mLoB, mHiB, false)
 		killRacer = kill ~= nil or (killWhy ~= nil and killWhy:find("angle") ~= nil)
 		if not kill and killWhy and killWhy ~= "" and (not Mark.killLogAt or os.clock() - Mark.killLogAt > 1) then
 			Mark.killLogAt = os.clock()
@@ -19328,9 +19373,12 @@ return function(_Lib, _Core)
 				sld(k, "Run-Up", "AutoKickLead", 0.1, 1, { prec = 2, suffix = " s" })
 				sld(k, "Cancel Under", "AutoKickCancel", 0.05, 0.6, { prec = 2 })
 			end)
-			head(k, "Kick Helper")
-			tog(k, "Kick Helper", "KickHelper", "Turns you to the carrier while you charge a kick.")
-			sld(k, "Helper Range", "KickHelperRange", 10, 80, { suffix = " st" })
+
+			-- Kick Helper -----------------------------------------------------------------------------------
+			local kh = card(tab, "Right")
+			head(kh, "Kick Helper")
+			tog(kh, "Enabled", "KickHelper", "Turns you to the carrier while you charge a kick.")
+			sld(kh, "Range", "KickHelperRange", 10, 80, { suffix = " st" })
 
 			-- AutoDribble ----------------------------------------------------------------------------------
 			local d = card(tab, "Right")
