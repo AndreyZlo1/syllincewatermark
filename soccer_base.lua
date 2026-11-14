@@ -108,7 +108,7 @@ local CFG = {
 	FakeLatMul = 1.5, -- prefilter: the straight line through the mate may miss the goal by post * this + FakeSlop (curves bend it back)
 	FakeMaxDepth = 100, -- a mate farther than this from the goal is not used
 	DrawPos = true, DrawTackle = true, DrawDanger = true, DrawGoal = true, DrawBall = true, DrawShot = true, DrawRoute = true,
-	DrawHazards = true, DrawKickBox = true, DrawGk = true, DrawBlock = true, DrawSilent = true, DrawSilentFov = true, DrawHud = false, ShotDebug = false,
+	DrawHazards = true, DrawKickBox = true, DrawGk = true, DrawBlock = true, DrawDuel = true, DrawSilent = true, DrawSilentFov = true, DrawHud = false, ShotDebug = false,
 	AgentAddon = true,
 	AutoDodge = true,
 	AutoBlock = true,
@@ -243,7 +243,8 @@ local CFG = {
 	WallHeight = 6, -- wall height estimate for the projectile-height test
 	WallHalf = 4, -- half width of the wall for the ambush test until a placed one is measured
 	WallCooldown = 0.7,
-	RouteSlideGain = 0.4, -- AutoBall route: a slide replaces the run when it touches the ball this much earlier (or the run loses the race)
+	BallJumpGain = 0.12, -- AutoBall route: a jump is used when it meets the ball this much earlier than a plain run (s)
+	RouteSlideGain = 0.3, -- AutoBall route: a slide replaces the run when it touches the ball this much earlier (or the run loses the race)
 	BallRamp = 0.2, -- AutoBall: seconds to go from the current speed to full sprint (unmeasured: see "ball track" v= in the log)
 	CounterTackle = true, -- air duel x AutoTackle: the slide (flick wind-up on the ground, from the air at an airborne carrier)
 	GkAutoClear = false,
@@ -6335,6 +6336,7 @@ local function paintWorld()
 	end
 	Mark.drawGk(gy)
 	Mark.drawBlk(gy)
+	Mark.drawDuel(gy)
 	Mark.artFinish()
 end
 
@@ -10676,7 +10678,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v138")
+	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v139")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -11164,6 +11166,133 @@ Mark.duelEnd = function(why)
 	Mark.moveStop("duel")
 end
 
+-- ===== AIR DUEL / LOB overlay ========================================================================================
+-- What the script sees and whether it acts. A plumb-line diagram, read by geometry and state colour (Mark.defPalette):
+--   steel = SEEN, no contact yet: a plumb line from the target (the airborne man / the lob) to the ground, height ticks
+--           every 2 studs, a ripple at its foot;
+--   mint  = PLAN: + the FUSE - his / the ball's path from now to the contact, it burns down as the contact nears; the
+--           contact ring in the air with its own plumb; OUR path: run to the take-off squircle, the jump arc up to the
+--           contact (a straight ground line for a slide / kick without a jump);
+--   white = committed (we jumped / pressed).
+-- One renderer: Mark.duelArt(seg, v, gy, t). Mark.duelSee feeds it from Mark.tickCounterJump and Mark.tickLob.
+Mark.duelSee = function(key, P, o)
+	local v = o or {}
+	v.at, v.key, v.P = os.clock(), key, P
+	local old = Mark.duelViz
+	if old and old.liveUntil and v.at < old.liveUntil then
+		v.liveUntil = old.liveUntil
+	end
+	Mark.duelViz = v
+end
+
+Mark.duelArt = function(seg, v, gy, t)
+	local key = (v.liveUntil and t < v.liveUntil) and "live" or v.key
+	local pal = Mark.defPalette[key]
+	local col = pal[1]
+	local function plumb(top, a)
+		local foot = Vector3.new(top.X, gy, top.Z)
+		if top.Y - gy < 0.6 then
+			return foot
+		end
+		seg(foot, top, COL.Ink, 0.3 * a, 2.6, 39)
+		seg(foot, top, col, 0.75 * a, 1.1, 41)
+		local n = math.min(math.floor((top.Y - gy) / 2), 9)
+		for i = 1, n do
+			local y = gy + i * 2
+			seg(Vector3.new(top.X - 0.35, y, top.Z), Vector3.new(top.X + 0.35, y, top.Z), COL.Paper, 0.55 * a, 1, 41)
+		end
+		return foot
+	end
+	local function ring(c, r, shape, color, a, th)
+		Mark.squircleLut = Mark.squircleLut or {}
+		local lut = Mark.squircleLut[shape] or Mark.squircleLut[2] -- [2] is built by the foot ripple just before
+		if not lut then
+			return
+		end
+		local prev = nil
+		for s = 0, 28, 2 do
+			local p = c + lut[s] * r
+			if prev then
+				seg(prev, p, color, a, th, 42)
+			end
+			prev = p
+		end
+	end
+	local foot = plumb(v.P, 1)
+	Mark.kickRipple(seg, foot, 2.2, pal, Mark.rippleStep("duel-foot", Mark.rippleRates[key]), t, 2)
+	local pl = v.plan
+	if not pl then
+		return
+	end
+	local left = math.max(pl.T - (t - v.at), 0)
+	-- the fuse: his / the ball's path, from now to the contact
+	if v.path then
+		local i0 = math.floor((t - v.pathAt) / 0.025) + 1
+		local i1 = math.min(math.floor((t - v.pathAt + left) / 0.025) + 1, #v.path)
+		local prev = nil
+		for i = math.max(i0, 1), i1, 2 do
+			local p = v.path[i]
+			if p.Y - gy < 200 then -- (the lob path is lifted out of reach before its no-touch moment)
+				if prev then
+					seg(prev, p, COL.Ink, 0.3, 3.0, 39)
+					seg(prev, p, pal[2], 0.9, 1.5, 41)
+				end
+				prev = p
+			end
+		end
+	end
+	-- the contact
+	plumb(pl.E, 0.6)
+	ring(pl.E, 1.5, 4, COL.Ink, 0.35, 3.2)
+	ring(pl.E, 1.5, 4, COL.Paper, 0.95, 1.3)
+	-- our path: ground run to the take-off, then the arc
+	local us = v.us
+	local Q = Vector3.new(pl.Q.X, gy, pl.Q.Z)
+	local Ef = Vector3.new(pl.E.X, gy, pl.E.Z)
+	local function lip(a, b)
+		seg(a, b, COL.Ink, 0.35, 3.2, 39)
+		seg(a, b, col, 0.95, 1.4, 42)
+	end
+	if v.landed then
+		lip(Vector3.new(us.X, gy, us.Z), Q)
+		if type(pl.td) == "number" then
+			ring(Q, 1.6, 4, col, 0.9, 1.6)
+			-- the jump: rises vJ x - g x^2 / 2 from the take-off, drawn up to the contact
+			local dur = math.max(pl.T - pl.td, 0.05)
+			local prev = Q
+			for k = 1, 8 do
+				local x = dur * k / 8
+				local p = Q:Lerp(Ef, k / 8) + Vector3.new(0, math.max(v.vJ * x - 0.5 * v.g * x * x, 0), 0)
+				lip(prev, p)
+				prev = p
+			end
+		else
+			lip(Q, Ef)
+		end
+	else
+		-- airborne: our own arc from here
+		local prev = us
+		local base = us.Y - gy
+		for k = 1, 8 do
+			local x = left * k / 8
+			local p = Vector3.new(us.X, gy, us.Z):Lerp(Ef, k / 8) + Vector3.new(0, math.max(base + v.vy * x - 0.5 * v.g * x * x, 0), 0)
+			lip(prev, p)
+			prev = p
+		end
+	end
+end
+
+Mark.drawDuel = function(gy)
+	Mark.duelLines = Mark.duelLines or makeLines(260, 1.4, 41)
+	Mark.duelPool = Mark.duelPool or Mark.segPool(Mark.duelLines)
+	local v = Mark.duelViz
+	local now = os.clock()
+	if CFG.DrawDuel ~= false and v and (now - v.at < 0.25 or (v.liveUntil and now < v.liveUntil and now - v.at < 0.7)) then
+		Mark.duelArt(Mark.duelPool.seg, v, gy, now)
+	end
+	Mark.duelPool.finish()
+end
+
 -- ===== FLICK LOB CATCH ===============================================================================================
 -- An enemy RainbowFlick: the lob is known from the wind-up (Mark.flickShot), during the flight it is the real ball state
 -- (or the wind-up solve shifted, while the flicker still "owns" it - SelfDeliveryControlSeconds). The ball is NOT his:
@@ -11304,7 +11433,7 @@ Mark.tickLob = function(character, root)
 		local pB = Mark.duelSolve(base)
 		local near = pB and flat(pB.E - root.Position).Magnitude <= (CFG.LobBodyRange or 9)
 		plan = (near and pB) or pS or pB
-		Mark.lobMemo = { at = now, plan = plan }
+		Mark.lobMemo = { at = now, plan = plan, path = pts }
 		if plan and (not Mark.lobPlan or Mark.lobPlan.kind ~= plan.kind) then
 			logFile("lob", "plan", plan.kind, actorName(lb.actor), "td", type(plan.td) == "number" and string.format("%.2f", plan.td) or tostring(plan.td or "air"), "tp", string.format("%.2f", plan.tp), "T", string.format("%.2f", plan.T), "contact d", string.format("%.1f", flat(plan.E - root.Position).Magnitude), "h", string.format("%.1f", plan.E.Y - root.Position.Y), "path", src, "slide ready", tostring(slideOk and true or false))
 		elseif not plan and (not Mark.lobSkipLog or now - Mark.lobSkipLog > 0.4) then
@@ -11312,12 +11441,18 @@ Mark.tickLob = function(character, root)
 			logFile("lob", "no contact", actorName(lb.actor), "path", src, "ball d", string.format("%.1f", flat(pts[#pts] - root.Position).Magnitude), "slide ready", tostring(slideOk and true or false))
 		end
 	end
+	local ballP = Renderer.GetPosition() or root.Position
 	if not plan then
+		Mark.duelSee("safe", ballP)
 		if Mark.lobPlan and now - Mark.lobPlan.seen > 0.2 then
 			Mark.lobEnd("no contact")
 		end
 		return
 	end
+	Mark.duelSee("armed", ballP, {
+		plan = plan, path = Mark.lobMemo and Mark.lobMemo.path, pathAt = Mark.lobMemo and Mark.lobMemo.at or now,
+		us = root.Position, landed = landed, vy = root.AssemblyLinearVelocity.Y, vJ = math.sqrt(2 * g * (Mark.jumpH or 7.2)), g = g,
+	})
 	Mark.lobPlan = Mark.lobPlan or { at = now }
 	Mark.lobPlan.kind, Mark.lobPlan.seen = plan.kind, now
 	-- move: on the ground to the take-off / press spot; in the air straight at the contact (air control)
@@ -11341,6 +11476,7 @@ Mark.tickLob = function(character, root)
 	Mark.moveSteer(cmd, "lob")
 	if landed and type(plan.td) == "number" then
 		if plan.td <= 0.035 and Mark.doJump("lob") then
+			Mark.duelViz.liveUntil = now + 0.6
 			logFile("lob", "jump", plan.kind, "tp", string.format("%.2f", plan.tp), "T", string.format("%.2f", plan.T))
 		end
 		return
@@ -11349,6 +11485,7 @@ Mark.tickLob = function(character, root)
 		local sent, why = tryTackle(character, root, plan.aim, plan.mult)
 		logFile("lob", "slide", sent and "sent" or ("refused " .. tostring(why)), "T", string.format("%.2f", plan.T), "mult", string.format("%.2f", plan.mult or 0), "air", tostring(not landed))
 		if sent then
+			Mark.duelViz.liveUntil = now + 0.6
 			Mark.lobMemo = nil
 		end
 	end
@@ -11472,6 +11609,7 @@ Mark.tickCounterJump = function(character, root)
 		return -- a grounded carrier is AutoTackle / AutoKick / AutoBlock work
 	end
 	local function skip(why)
+		Mark.duelSee("safe", P)
 		if not Mark.duelSkipLog or now - Mark.duelSkipLog > 0.4 then
 			Mark.duelSkipLog = now
 			logFile("duel skip", why, actorName(actor), "d", string.format("%.1f", flat(P - root.Position).Magnitude), "h", string.format("%.1f", P.Y - floor), "vk", vs.kind, "vy", string.format("%.1f", vs.vy))
@@ -11553,7 +11691,7 @@ Mark.tickCounterJump = function(character, root)
 			minRel = (KickCore.GetMinimumReleaseSeconds and KickCore.GetMinimumReleaseSeconds()) or 0.2,
 			deadline = deadline,
 		})
-		Mark.duelMemo = { model = model, at = now, plan = plan }
+		Mark.duelMemo = { model = model, at = now, plan = plan, path = path }
 		if not plan then
 			skip((grap and "grapple: " or hoverP and "bicycle: " or "") .. (deadline and string.format("no contact before his release (%.2f s)", deadline) or "no contact"))
 		end
@@ -11570,6 +11708,10 @@ Mark.tickCounterJump = function(character, root)
 		logFile("duel", "plan", plan.kind, name, "td", type(plan.td) == "number" and string.format("%.2f", plan.td) or (plan.td or "air"), "tp", string.format("%.2f", plan.tp), "T", string.format("%.2f", plan.T), "bike", tostring(hoverP ~= nil), "grapple", grap and (grap.tArr and string.format("arrives %.2f", grap.tArr) or "flying") or "-", "d", string.format("%.1f", flat(P - root.Position).Magnitude), "h", string.format("%.1f", P.Y - floor))
 	end
 	Mark.duel.seen = now
+	Mark.duelSee("armed", P, {
+		plan = plan, path = Mark.duelMemo and Mark.duelMemo.path, pathAt = Mark.duelMemo and Mark.duelMemo.at or now,
+		us = root.Position, landed = landed, vy = root.AssemblyLinearVelocity.Y, vJ = math.sqrt(2 * g * (Mark.jumpH or 7.2)), g = g,
+	})
 	-- move: to where we press, facing him (the agent; air control steers too)
 	if CFG.CounterMove ~= false then
 		local mySpd = Mark.akSpeeds(character)
@@ -11588,6 +11730,7 @@ Mark.tickCounterJump = function(character, root)
 	if landed and plan.td ~= "ground" then
 		if type(plan.td) == "number" and plan.td <= 0.035 and Mark.doJump("duel") then
 			Mark.duel.jumpAt = now
+			Mark.duelViz.liveUntil = now + 0.6
 			logFile("duel", "jump", plan.kind, name, "tp", string.format("%.2f", plan.tp), "T", string.format("%.2f", plan.T))
 		end
 		return
@@ -11606,6 +11749,7 @@ Mark.tickCounterJump = function(character, root)
 	end
 	logFile("duel", "press", plan.kind, sent and "sent" or "refused", name, "T", string.format("%.2f", plan.T), "mult", plan.mult and string.format("%.2f", plan.mult) or "-")
 	if sent then
+		Mark.duelViz.liveUntil = now + 0.6
 		Mark.duelMemo = nil
 		Mark.duelEnd("pressed")
 	end
@@ -15036,58 +15180,6 @@ Mark.preJump = function(character, root, oid)
 	end
 end
 
--- Slide at the BALL, verified against its path: the box (5x5x5, 3 studs ahead, travel = the game's cubic-out dash x the multiplier)
--- must hold the ball in >= SlideMinHits of 11 samples of the live window, the ball taken at press + ping/2 + SlideLag + tau
--- (the server receives the press later and the ball keeps rolling). Tries the given direction and small rotations.
-Mark.slideSweepBall = function(O, dir, m, samples, ts, ping)
-	local box = HitboxSettings.SlideTackle
-	local boxMid = -box.CFrameOffset.Z
-	local hx, hz = box.Size.X * 0.5 + 0.25, box.Size.Z * 0.5 + 0.25
-	local hLo = box.CFrameOffset.Y - box.Size.Y * 0.5 - 0.5
-	local hHi = box.CFrameOffset.Y + box.Size.Y * 0.5 + 0.5
-	local t0, t1 = C.HitboxDelaySeconds, C.HitboxDelaySeconds + C.HitboxSeconds
-	local lag = ping * 0.5 + (CFG.SlideLag or 0.03)
-	local function ballAt(t)
-		if t <= 0 then
-			return samples[1]
-		end
-		for i = 2, #ts do
-			if ts[i] >= t then
-				local k = (t - ts[i - 1]) / math.max(ts[i] - ts[i - 1], 1e-3)
-				return samples[i - 1]:Lerp(samples[i], k)
-			end
-		end
-		return nil
-	end
-	local ballS = {}
-	for k = 0, 10 do
-		ballS[k + 1] = ballAt(lag + (t0 + (t1 - t0) * k / 10))
-	end
-	local best, bestHits = nil, 0
-	for _, deg in { 0, 6, -6, 12, -12, 18, -18 } do
-		local r = math.rad(deg)
-		local phi = Vector3.new(dir.X * math.cos(r) - dir.Z * math.sin(r), 0, dir.X * math.sin(r) + dir.Z * math.cos(r))
-		local hits = 0
-		for k = 0, 10 do
-			local tau = t0 + (t1 - t0) * k / 10
-			local B = ballS[k + 1]
-			if B then
-				local h = B.Y - O.Y
-				if h >= hLo and h <= hHi then
-					local rel = flat(B - (O + phi * (Mark.dumpTravel(tau) * m + boxMid)))
-					if math.abs(rel:Dot(phi)) <= hz and math.abs(rel.X * phi.Z - rel.Z * phi.X) <= hx then
-						hits += 1
-					end
-				end
-			end
-		end
-		if hits > bestHits then
-			best, bestHits = phi, hits
-		end
-	end
-	return best, bestHits
-end
-
 -- measured, not modelled: what did the slide really cover, and how close did the ball come to its box? (`slide audit`)
 Mark.slideTrackTick = function(root)
 	local tr = Mark.slideTrack
@@ -15376,23 +15468,54 @@ Mark.routePlan = function(c)
 		foeFirst = math.min(foeFirst, first)
 	end
 	local safe = 0.08 + c.ping * 0.5
-	-- RUN / JUMP
+	-- BODY: run under it, jump into it, or (already in the air) ride our own arc. The earliest sample the body reaches.
+	--   run : the ball in the Receive band of a standing body;
+	--   jump: higher - the root height that puts the ball a stud under the top of AirReceive, reached on the RISE
+	--         (x = time from take-off), take-off at td = tb - x. A high ball is met on its way down, not where it lands;
+	--   air : we are airborne (c.air): the root follows O.Y + vy t - g t^2 / 2 down to the floor we left.
+	-- (It used to treat an airborne body as standing: the plan vanished the frame after the jump - "no aim" - and the
+	-- agent stopped steering in the air. The jump band used the ground box: 1.8 studs of reach were missing.)
+	local g, vJ, floorY = c.g, c.vJ, c.floorY or O.Y
 	local run = nil
 	for i = 2, n do
 		local p, tb = S[i], T[i]
-		local h = p.Y - O.Y
-		local mode = nil
-		if h >= c.recvLo - 0.6 and h <= c.recvHi then
-			mode = "run"
-		elseif h > c.recvHi and h <= c.recvHi + c.jumpH - 0.4 then
-			mode = "jump"
+		local mode, td = nil, nil
+		if c.air then
+			local y = math.max(O.Y + c.vy * tb - 0.5 * g * tb * tb, floorY)
+			local h = p.Y - y
+			if y > floorY + 0.3 then
+				mode = (h >= c.airLo and h <= c.airHi) and "air" or nil
+			elseif h >= c.recvLo - 0.6 and h <= c.recvHi then
+				mode = "run"
+			end
+		else
+			local h = p.Y - O.Y
+			if h >= c.recvLo - 0.6 and h <= c.recvHi then
+				mode = "run"
+			elseif h > c.recvHi and h - c.airHi <= c.jumpH - 0.4 then
+				local yT = math.clamp(h - c.airHi + 1, 0.4, c.jumpH - 0.2)
+				local x = (vJ - math.sqrt(math.max(vJ * vJ - 2 * g * yT, 0))) / g
+				if tb - x >= 0 then
+					mode, td = "jump", tb - x
+				end
+			end
 		end
 		if mode then
 			local tU = arriveT(p, c.half)
-			if tU + safe + (mode == "jump" and 0.12 or 0) <= tb then
-				run = { kind = mode, p = p, t = tb, tUs = tU, way = p }
-				break
+			if tU + safe <= tb then
+				local cand = { kind = mode == "air" and "jump" or mode, p = p, t = tb, tUs = tU, way = p, td = td }
+				if mode == "jump" then
+					run = run or cand -- kept only if no plain run comes within JumpGain of it
+				elseif run and tb - run.t > (CFG.BallJumpGain or 0.12) then
+					break
+				else
+					run = cand
+					break
+				end
 			end
+		end
+		if run and tb - run.t > (CFG.BallJumpGain or 0.12) then
+			break
 		end
 	end
 	if not run and c.rest and n >= 2 then
@@ -15400,7 +15523,12 @@ Mark.routePlan = function(c)
 		local tU = arriveT(p, c.half)
 		run = { kind = "rest", p = p, t = math.max(T[n], tU), tUs = tU, way = p }
 	end
-	-- RUN + SLIDE (W, phi, m)
+	-- RUN + SLIDE (W, phi, m). A slide is TRANSPORT: from the press the body dashes (StartupDash 10 st * mult in 0.27 s,
+	-- then Distance 24 * mult) and the ball is ours when EITHER the SlideTackle box (live 0.27..0.57 s) OR the sliding
+	-- body itself (our receive oval, the whole dash up to VelocityReleaseStartsAt) passes over it. The old plan counted
+	-- the box only: a ball 8-15 studs away was "contact at 0.27+" while the body is on it at 0.15-0.2, and a slide that
+	-- ran through the ball after the box closed was no contact at all (log: "slide audit ball ... ballClosest 0.2 at
+	-- 0.63-0.70" = taken by the body, three steals). Ball time = press + ping/2 + SlideLag + tau (the server's slide).
 	local slide = nil
 	if c.slideReady then
 		local t0, t1 = C.HitboxDelaySeconds, C.HitboxDelaySeconds + C.HitboxSeconds
@@ -15410,31 +15538,33 @@ Mark.routePlan = function(c)
 		local hLo = box.CFrameOffset.Y - box.Size.Y * 0.5 - 0.5
 		local hHi = box.CFrameOffset.Y + box.Size.Y * 0.5 + 0.5
 		local mLo, mHi = c.mLo, c.mHi
-		local fine, fineD = {}, {}
-		for k = 0, 10 do
-			local tau = t0 + (t1 - t0) * k / 10
-			fine[k + 1], fineD[k + 1] = tau, Mark.dumpTravel(tau)
+		local rb = c.half - 0.5 -- body radius used (half a stud inside the receive oval)
+		local fine, fineD, fineBox = {}, {}, {}
+		local tau = 0.06
+		while tau <= (C.VelocityReleaseStartsAt or 0.75) + 1e-6 do
+			local k = #fine + 1
+			fine[k], fineD[k], fineBox[k] = tau, Mark.dumpTravel(tau), tau >= t0 - 1e-6 and tau <= t1 + 1e-6
+			tau += 0.03
 		end
-		local coarse = { 1, 3, 5, 7, 9, 11 }
-		local function inBox(W, phi, m, k, B)
+		local NF = #fine
+		local function touch(W, phi, m, k, B)
 			local h = B.Y - O.Y
-			if h < hLo or h > hHi then
-				return false
-			end
-			local ctr = W + phi * (fineD[k] * m + boxMid)
-			local rel = flat(B - ctr)
+			local rel = flat(B - (W + phi * (fineD[k] * m)))
 			local lon = rel:Dot(phi)
 			local lat = rel.X * phi.Z - rel.Z * phi.X
-			return math.abs(lon) <= hz and math.abs(lat) <= hx
+			if fineBox[k] and h >= hLo and h <= hHi and math.abs(lon - boxMid) <= hz and math.abs(lat) <= hx then
+				return true
+			end
+			return h >= c.recvLo - 0.6 and h <= c.recvHi and lon * lon + lat * lat <= rb * rb
 		end
 		local slideLag = c.ping * 0.5 + (CFG.SlideLag or 0.03)
 		local Bs = nil
-		local function sweep(W, phi, m)
+		-- contact samples around the candidate sample k0 (the ball depends only on the press time: Bs, once per tp)
+		local function sweep(W, phi, m, k0)
 			local first, hits = nil, 0
-			for k = 1, #fine do
-				-- ball position depends only on the press time, computed once per tp (Bs)
+			for k = math.max(k0 - 4, 1), math.min(k0 + 4, NF) do
 				local B = Bs[k]
-				if B and inBox(W, phi, m, k, B) then
+				if B and touch(W, phi, m, k, B) then
 					first = first or fine[k]
 					hits += 1
 				end
@@ -15444,31 +15574,29 @@ Mark.routePlan = function(c)
 		local rots = { 0, math.rad(35), -math.rad(35), math.rad(70), -math.rad(70) }
 		local limit = math.min(run and run.t or math.huge, 3)
 		local tp = 0
-		-- Centre the ball in the live box. The scan used to stop at the FIRST press time that held the ball in 3 of 11 box
-		-- samples: that is the tail of the window (log: tc 0.51-0.56 of a 0.27-0.57 box, ball closest at 0.58-0.59 = a hair
-		-- after the box closed; the slide itself travels 0.4-0.9 studs short of the model, ping and frame time add more).
-		-- Now it keeps scanning SlideCenterWindow s past the first hit and takes the press with the most box samples
-		-- (capped at SlideGoodHits), earliest on a tie.
 		local slideTp0 = nil
-		local goodHits = CFG.SlideGoodHits or 7
+		local goodHits = math.min(CFG.SlideGoodHits or 7, 4) -- the body follows the box through the ball: 4 samples is centred
+		local minHits = math.min(CFG.SlideMinHits or 3, 3)
 		while tp <= 1.5 + 1e-6 do
-			if tp + t0 >= limit or (slideTp0 and tp > slideTp0 + (CFG.SlideCenterWindow or 0.2)) then
+			if tp + fine[1] >= limit or (slideTp0 and tp > slideTp0 + (CFG.SlideCenterWindow or 0.2)) then
 				break
 			end
 			local Cc, r = reach(tp)
 			Bs = {}
-			for k = 1, #fine do
+			for k = 1, NF do
 				Bs[k] = ballAt(tp + slideLag + fine[k])
 			end
-			for _, k in coarse do
+			for k = 2, NF, 3 do
 				local B = Bs[k]
 				if B then
 					local h = B.Y - O.Y
-					if h >= hLo and h <= hHi then
+					local boxK = fineBox[k] and h >= hLo and h <= hHi
+					if boxK or (h >= c.recvLo - 0.6 and h <= c.recvHi) then
 						local toB = flat(B - Cc)
 						local dCB = toB.Magnitude
-						local Slo = fineD[k] * mLo + boxMid - hz + 0.6
-						local Shi = fineD[k] * mHi + boxMid + hz - 0.6
+						-- distance from the press point to the ball along the slide: the box (centre boxMid ahead) or the body
+						local Slo = boxK and (fineD[k] * mLo + boxMid - hz + 0.6) or (fineD[k] * mLo)
+						local Shi = boxK and (fineD[k] * mHi + boxMid + hz - 0.6) or (fineD[k] * mHi + rb - 0.6)
 						local s = math.clamp(dCB, Slo, Shi)
 						local u = dCB > 1e-3 and toB / dCB or Vector3.new(1, 0, 0)
 						for _, a in rots do
@@ -15477,15 +15605,15 @@ Mark.routePlan = function(c)
 							local W = Vector3.new(B.X, O.Y, B.Z) - ur * s
 							local off = flat(W - Cc).Magnitude
 							if off <= r + 0.05 then
-								local m = math.clamp((s - boxMid) / math.max(fineD[k], 1), mLo, mHi)
-								local first, hits = sweep(W, ur, m)
-								if first and hits >= (CFG.SlideMinHits or 3) then
+								local m = math.clamp((s - (boxK and boxMid or 0)) / math.max(fineD[k], 1), mLo, mHi)
+								local first, hits = sweep(W, ur, m, k)
+								if first and hits >= minHits then
 									local tc = tp + first
 									local sc, scOld = math.min(hits, goodHits), slide and math.min(slide.hits, goodHits) or -1
-									if not slide or sc > scOld or (sc == scOld and tc < slide.tc - 0.02) then
+									if not slide or tc < slide.tc - 0.04 or (math.abs(tc - slide.tc) <= 0.04 and sc > scOld) then
 										slideTp0 = slideTp0 or tp
 										local heading = off > 0.3 and unitOrNil(flat(W - Cc)) or nil
-										slide = { kind = "slide", p = B, tc = tc, t = tc, tp = tp, W = W, phi = ur, mult = m, hits = hits, rot = math.deg(a), heading = heading, way = W }
+										slide = { kind = "slide", p = B, tc = tc, t = tc, tp = tp, W = W, phi = ur, mult = m, hits = hits, rot = math.deg(a), heading = heading, way = W, body = not boxK }
 									end
 								end
 							end
@@ -15500,7 +15628,7 @@ Mark.routePlan = function(c)
 	if slide then
 		local runMargin = run and (foeFirst - run.t) or -math.huge
 		local slideMargin = foeFirst - slide.tc
-		if not run or slide.tc < run.t - (CFG.RouteSlideGain or 0.4) or (runMargin < 0.15 and slideMargin > runMargin + 0.05) then
+		if not run or slide.tc < run.t - (CFG.RouteSlideGain or 0.3) or (runMargin < 0.15 and slideMargin > runMargin + 0.05) then
 			pick = slide
 		end
 	end
@@ -15885,18 +16013,26 @@ Mark.tickBall = function(character, root)
 	local plan = nil
 	local memo = Mark.routeMemo
 	local nowR = os.clock()
-	if memo and nowR - memo.at < 0.06 and memo.ready == (readyB and true or false) then
+	local airB = humB ~= nil and not CharacterControllers.IsLanded(character, humB)
+	if memo and nowR - memo.at < 0.06 and memo.ready == (readyB and true or false) and memo.air == airB then
 		plan = memo.plan
 		if plan and plan.tp then
 			plan.tp = math.max(0, memo.tp0 - (nowR - memo.at))
+		end
+		if plan and memo.td0 then
+			plan.td = math.max(0, memo.td0 - (nowR - memo.at))
 		end
 	else
 	plan = Mark.routePlan({
 		O = root.Position, v0 = flat(root.AssemblyLinearVelocity), spd = spd, samples = samples, ts = ts, rest = rest, foes = foes,
 		half = receiveHalf, recvLo = recvLo, recvHi = recvHi, jumpH = jumpH, ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25),
 		slideReady = readyB, mLo = mLoB, mHi = mHiB,
+		g = Workspace.Gravity, vJ = math.sqrt(2 * Workspace.Gravity * jumpH), air = airB, vy = root.AssemblyLinearVelocity.Y,
+		floorY = airB and (Mark.duelFloor or root.Position.Y) or root.Position.Y,
+		airLo = HitboxSettings.AirReceive.CFrameOffset.Y - HitboxSettings.AirReceive.Size.Y * 0.5,
+		airHi = HitboxSettings.AirReceive.CFrameOffset.Y + HitboxSettings.AirReceive.Size.Y * 0.5,
 	})
-		Mark.routeMemo = { at = nowR, plan = plan, tp0 = plan and plan.tp, ready = readyB and true or false }
+		Mark.routeMemo = { at = nowR, plan = plan, tp0 = plan and plan.tp, td0 = plan and plan.td, ready = readyB and true or false, air = airB }
 	end
 	do
 		local gf = nil
@@ -16061,12 +16197,6 @@ Mark.tickBall = function(character, root)
 	elseif Mark.move.mode == "ball" then
 		Mark.moveSteer(Vector3.zero, "ball")
 	end
-	local cross = 0
-	if dir then
-		cross = flat(vel - dir * dir:Dot(vel)).Magnitude
-	end
-	local boxHalf = HitboxSettings.SlideTackle.Size.X * 0.5
-	local leaves = cross * C.HitboxSeconds > boxHalf + 1.2
 	local noTouch = Mark.noTouchUntil and os.clock() < Mark.noTouchUntil
 	local allyBlock = Mark.allyKickUntil and os.clock() < Mark.allyKickUntil
 	if not allyBlock then
@@ -16089,61 +16219,26 @@ Mark.tickBall = function(character, root)
 	local nowBox = liveH0 >= slideLo and liveH0 <= slideHi
 	-- Jump timing: a ball that will pass above the standing contact band (FrontAssist top) but under jump reach,
 	-- close enough to be at us when the rise lifts the root to it. Volley press itself is tickVolley (game evaluation).
+	-- the route's own jump (take-off at plan.td); Mark.planJump only when the route has no jump of its own (rest / goal line)
 	local jumpAt, jumpMeet = nil, nil
-	if landed then
+	if landed and plan and plan.kind == "jump" then
+		if plan.td and plan.td <= 0.035 then
+			jumpAt, jumpMeet = plan.t, plan.p.Y - root.Position.Y
+		end
+	elseif landed then
 		jumpAt, jumpMeet = Mark.planJump(root, samples, ts, spd)
 	end
 	local slideDir = slidePress and slidePress.phi
 	-- CandidateKiller first: an enemy racing us for this ball and a slide within KillerAngle of our route that hits him.
 	-- While such a racer exists the "slide as a sprint" toward the ball is off (that was the slide the user saw: our
 	-- route direction, the enemy beside it untouched).
-	local kill, killWhy, killRacer = nil, nil, false
+	local kill, killWhy = nil, nil
 	if CFG.CandidateKiller ~= false and CFG.AutoTackle and readyB and not slideDir and not noTouch
 		and not (Mark.allyKickUntil and os.clock() < Mark.allyKickUntil) then
 		kill, killWhy = Mark.killerSlide(root, dir, foes, pos, steerT, mLoB, mHiB, false)
-		killRacer = kill ~= nil or (killWhy ~= nil and killWhy:find("angle") ~= nil)
 		if not kill and killWhy and killWhy ~= "" and (not Mark.killLogAt or os.clock() - Mark.killLogAt > 1) then
 			Mark.killLogAt = os.clock()
 			logFile("killer skip", killWhy)
-		end
-	end
-	local boostDir = nil
-	if CFG.AutoTackle and CFG.BallSlideBoost ~= false and not slideDir and not killRacer and landed and dir and steer and steerT and how ~= "now" and not allyBlock and not noTouch and not leaves then
-		local D = flat(aimP - root.Position).Magnitude
-		local face = unitOrNil(flat(root.CFrame.LookVector))
-		if D >= 26 and D <= 90 and face and face:Dot(dir) > 0.94 and not ClientDodge.IsDribbling() then
-			local mulB = math.max(0.4, CFG.TackleSpeed)
-			local tS = nil
-			for tt = 0.3, 1.02, 0.02 do
-				if Mark.dumpTravel(tt) * mulB >= D - 2 then
-					tS = tt
-					break
-				end
-			end
-			local Tslide = tS or (1.02 + (D - Mark.dumpTravel(1.02) * mulB) / spd)
-			local Trun = D / spd
-			local gain = Trun - Tslide
-			local ourT = math.max(0, D - receiveHalf) / spd
-			local foeNear = false
-			for _, f in foes do
-				if f.s > 1 and (f.delay or 0) + math.max(0, flat(aimP - f.p).Magnitude - receiveHalf) / f.s < ourT + 0.4 then
-					foeNear = true
-					break
-				end
-			end
-			if gain >= 0.3 and (steerT - ourT < 0.3 or foeNear) then
-				-- the old test was "the slide covers D - 2 sooner than the run": it fired with slack -0.35 (the run is already
-				-- LATE) and never looked at where the ball is when the box goes live. Now the box must hold the ball.
-				local pingB = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
-				local bd, bh = Mark.slideSweepBall(root.Position, dir, mulB, samples, ts, pingB)
-				if bd and bh >= (CFG.SlideMinHits or 3) then
-					boostDir = bd
-				end
-				if not Mark.slideBoostLog or os.clock() - Mark.slideBoostLog > 1 then
-					Mark.slideBoostLog = os.clock()
-					logFile("ball slideboost", boostDir and "go" or "no sweep", "D", string.format("%.1f", D), "gain", string.format("%.2f", gain), "slack", string.format("%.2f", steerT - ourT), "foe", tostring(foeNear), "hits", tostring(bh))
-				end
-			end
 		end
 	end
 	if kill then
@@ -16152,10 +16247,8 @@ Mark.tickBall = function(character, root)
 		predict = solved or predict
 		local sent, why = tryTackle(character, root, kill.aim, kill.mult, { char = f.model, root = f.root })
 		logFile(kill.guard and "killer guard" or "killer", sent and "sent" or ("no " .. tostring(why)), kill.name, "ang", string.format("%.0f", kill.ang), "hits", tostring(kill.hits), "mult", string.format("%.2f", kill.mult), "dist", string.format("%.1f", kill.dist), "ballD", string.format("%.1f", kill.dBall), "hisFirst", string.format("%.2f", f.first or -1), "ourT", string.format("%.2f", steerT or -1))
-	elseif boostDir and not (slideAim or ClientSlide.IsSlideTackling()) then
-		tryTackle(character, root, boostDir)
 	elseif CFG.AutoTackle and slideDir and not allyBlock and not noTouch and (landed or (airborne and nowBox)) then
-		logFile("ball tackle", "route", "tc", string.format("%.2f", slideT or 0), "h", string.format("%.1f", slideP.Y - root.Position.Y), "rot", string.format("%.0f", slidePress.rot or 0), "hits", tostring(slidePress.hits), "mult", string.format("%.2f", slidePress.mult))
+		logFile("ball tackle", "route", "tc", string.format("%.2f", slideT or 0), "h", string.format("%.1f", slideP.Y - root.Position.Y), "rot", string.format("%.0f", slidePress.rot or 0), "hits", tostring(slidePress.hits), "mult", string.format("%.2f", slidePress.mult), "by", slidePress.body and "body" or "box")
 		tryTackle(character, root, slideDir, slidePress.mult)
 	elseif jumpAt then
 		if Mark.doJump("ball") then
@@ -19980,6 +20073,7 @@ return function(_Lib, _Core)
 			head(c, "CounterJump")
 			feature(c, "CounterJump", "CounterJump")
 			note(c, "Catches an enemy in the air (bicycle, jump with the ball) with a jump + slide or kick.")
+			tog(c, "Show Plan", "DrawDuel", "The target, where you meet it and your jump. Steel = seen, mint = going, white = committed.")
 			tog(c, "Move To Him", "CounterMove", "Runs you to the take-off point.")
 			tog(c, "Counter Tackle", "CounterTackle", "Slides him: from the air, or before his flick lets go.")
 			tog(c, "Competitor Check", "CounterCompetitor", "Stops when a teammate is already on him.")
