@@ -190,7 +190,9 @@ local CFG = {
     NoFall = true, -- the client measures the fall and reports it (Move "fall"); we never report one
     AntiDrown = true, -- silence the local Drown report AND keep the feet on a local slab at the water surface
     BulletTracer = true,
-    TracerStyle = 6, -- Lightning; 5 = Helix
+    TracerStyle = 1, -- 1 Lightning, 2 Helix, 3 Rail
+    HelixSpin = 14, -- rad/s the helix strands turn at
+    HelixRadius = 0.26, -- studs, helix strand radius at the middle of the path
     TracerTrail = true, -- fading comet wake along the whole path (muzzle -> impact), fades out with the tracer
     HitMarker = true,
     HitMarkerStyle = 3, -- Wedges
@@ -285,7 +287,6 @@ local CFG = {
     SlopeLead = true,  -- grounded non-seated target: lead vertically with the fitted speed (both regression windows must agree, |vy| 2..40 st/s, offset <= SlopeCap)
     SlopeCap = 3,      -- studs, vertical lead cap
     AirBody = true,    -- a jumping/bhopping player with the head selected: aim the upper torso (3x bigger target vertically) instead of leading the jump
-    BoltTracer = true, -- TracerStyle 6: one jagged, forking bolt along the whole path with an iridescent gradient (replaces the straight wake)
     TracerFade = 0.95, -- seconds a tracer lives after the round landed
     -- Keeps telling the server we are scoped (Gun "Aim" ads=true) while a silent target is locked, so an ADS focus timer, if it keeps one, runs before the shot (debug file: focusAge).
     AimSpoofHold = true,
@@ -339,6 +340,27 @@ local CFG = {
     AutoDecryptRadius = 10,
     AutoDecryptMax = 3, -- prompts fired in the same frame; drops to 1 if the server closes the earlier one
     AutoDecryptReveal = true, -- false: open, read the slot count, close at once
+    -- AutoLoot: Remotes.Loot "take" (part, slot) on an OPEN container (opened by AutoDecrypt, or by hand with AutoLootManual). A slot is taken when its category is on in
+    -- AutoLootCats and its rarity order >= AutoLootMinRarity, or its rarity order >= AutoLootAlways (any category; 7 = off). Hidden slots wait for their reveal.
+    AutoLoot = false,
+    AutoLootManual = true,
+    AutoLootMinRarity = 1,
+    AutoLootAlways = 7,
+    AutoLootDelay = 0.25, -- s between two takes; a slot the server leaves unchanged after two takes is skipped
+    AutoLootCats = {
+        Firearms = true, Ammo = true, Medical = true, Armor = true, Attachments = true, Valuables = true,
+        Melee = false, Tools = false, Materials = false, Building = false, Food = false, Water = false, Accessories = false, Junk = false,
+    },
+    -- AutoArmor: InvAction Wear from the backpack, ranked by Items rarity order (light < medium < heavy; helmets by their tier). Empty slots are always filled;
+    -- "Upgrade" also replaces a worn piece with a higher tier, and waits for the end of the server combat flag when AutoArmorSafe is on.
+    AutoArmor = false,
+    AutoArmorBody = true,
+    AutoArmorHelmet = true,
+    AutoArmorMode = "Upgrade", -- "Upgrade" | "Empty"
+    AutoArmorSafe = true,
+    -- CrouchAB: alternates CrouchSpoof in random on/off pairs of CrouchABBlock shots and tags each shot record (ab = { block, idx, want }); tools/ab_crouch.py reads it.
+    CrouchAB = false,
+    CrouchABBlock = 20,
     -- K is Backpack, P is Bounty, L is Doors and J is MotherTurn in this game. Rebind here.
     Keys = {
         ESP = Enum.KeyCode.RightControl,
@@ -2054,6 +2076,7 @@ Visual.fireShot = function(plan, id, hand)
     Visual.sentBySeq[seq] = { from = from, dir = dir, aiming = cch ~= nil and cch:GetAttribute("Aiming") == true, coneKey = Visual.coneKey(id) }
     Visual.ledAdd({ seq = seq, ss = plan.ss and plan.ss.part or "-", body = plan.bodyAim, t = os.clock(), gun = id, name = plan.model and plan.model.Name or "?", dist = (plan.aim - from).Magnitude, lead = plan.lead or 0,
         speed = plan.speed or 0, veh = plan.veh, how = plan.how })
+    Visual.crouchAB.tag = Visual.crouchABShot()
     if CFG.DebugFile then
         local okd, errd = pcall(Visual.dbgShot, plan, id, def, fl, from, dir, spread, sp0, seq, boss, os.clock())
         if not okd and not Visual.dbg.errWarned then Visual.dbg.errWarned = true; warn("[hush] debug file: shot record failed: " .. tostring(errd)) end
@@ -2290,6 +2313,7 @@ Visual.dbgShot = function(plan, id, def, f, from, dir, spread, sp0, seq, boss, n
         crouchSpoof = { enabled = CFG.CrouchSpoof, sent = Visual.crouchS.on, age = Visual.crouchS.sent and R(now - Visual.crouchS.sent), rejected = Visual.crouchS.blocked == true },
         floor = hum0 and tostring(hum0.FloorMaterial) or nil, moveDir = hum0 and R(hum0.MoveDirection.Magnitude) or nil, ctlAiming = Visual.fire.u and Visual.fire.u[Visual.fire.S.ctl].aiming or nil, ctlCrouch = Visual.fire.u and Visual.fire.u[Visual.fire.S.ctl].crouching or nil }
     rec.claim = { sent = R(spread), game = R(sp0) }
+    rec.ab = Visual.crouchAB.tag
     rec.aim = { dir = V3(dir), aim = V3(plan.aim), T = V3(plan.T), raw = V3(plan.raw), how = plan.how, peek = plan.peek ~= nil, bodyAim = plan.bodyAim }
     rec.pred = { lead = R(plan.lead), drop = R(plan.drop), flight = R(plan.flightT), speed = R(plan.speed), vsrc = plan.vsrc, stale = R(plan.stale), lag = R(plan.lag), unc = R(plan.unc), why = plan.why, veh = plan.veh }
     rec.boss = boss
@@ -2502,6 +2526,23 @@ Visual.crouchStep = function(now)
     if (not S.on or char:GetAttribute("Crouch") ~= true) and now - (S.sent or -1) >= 0.35 then
         Visual.crouchSend(true)
     end
+end
+Visual.crouchAB = { block = 0, idx = 0, first = true }
+Visual.crouchABFlip = function()
+    local A = Visual.crouchAB
+    if A.block % 2 == 1 then A.first = math.random() < 0.5 end -- each pair of blocks is on/off in random order
+    CFG.CrouchSpoof = (A.block % 2 == 1) == A.first
+    if Life.uiState then Life.uiState("CrouchSpoof") end
+end
+-- called once per own shot: tags the record and swaps the state after the last shot of a block
+Visual.crouchABShot = function()
+    local A = Visual.crouchAB
+    if not (running and CFG.CrouchAB) then A.block, A.idx = 0, 0; return nil end
+    if A.block == 0 then A.block, A.idx = 1, 0; Visual.crouchABFlip() end
+    A.idx += 1
+    local tag = { block = A.block, idx = A.idx, want = CFG.CrouchSpoof }
+    if A.idx >= CFG.CrouchABBlock then A.block, A.idx = A.block + 1, 0; Visual.crouchABFlip() end
+    return tag
 end
 Visual.aimS = { on = false, at = 0 }
 -- The spoof is re-sent before every shot: the game re-sends its own Aim(false) when its pitch moves.
@@ -4361,8 +4402,7 @@ Visual.ob = function(x) x = Visual.c01(x) - 1; return 1 + x * x * (2.70158 * x +
 -- 3D ribbons: camera-facing strips in world space, width in studs, every profile goes to zero at the ends.
 Visual.shapeF = {
     function(u) return math.sin(math.pi * u) ^ 0.6 end,          -- 1 spindle: sharp at both ends
-    function(u) return u ^ 0.7 end,                              -- 2 comet: sharp tail, full head
-    function(u) local e = math.min(u, 1 - u) * 9; return e > 1 and 1 or e end, -- 3 flat body, sharp tips
+    function(u) local e = math.min(u, 1 - u) * 9; return e > 1 and 1 or e end, -- 2 flat body, sharp tips
 }
 Visual.trK = 1 -- widths/jitter scale with distance (set around the style call)
 Visual.tr = { A = Vector3.zero, B = Vector3.zero, D = Vector3.zero, side = Vector3.xAxis, up2 = Vector3.yAxis }
@@ -4400,11 +4440,6 @@ Visual.ribbon = function(pen, s0, s1, n, w, shape, col, aTail, aHead, fade, mode
         pl, pr = l, r
     end
 end
--- Wide faint glow + core, no dark bed between joined pieces.
-Visual.ribbon3 = function(pen, s0, s1, n, w, shape, core, glow, aTail, aHead, fade, mode, amp, turns, phase)
-    Visual.ribbon(pen, s0, s1, n, w * 3.6, shape, glow, aTail * 0.2, aHead * 0.2, fade, mode, amp, turns, phase)
-    Visual.ribbon(pen, s0, s1, n, w, shape, core, aTail, aHead, fade, mode, amp, turns, phase)
-end
 -- Billboard ring (camera plane) at world point C
 Visual.bring = function(pen, C, r, col, alpha, n)
     local cf = Cam.CFrame
@@ -4419,60 +4454,31 @@ Visual.bring = function(pen, C, r, col, alpha, n)
     pen.thin(prev, first, col, alpha, 1.8)
 end
 
--- Tracer timeline (loop 2.8 s): shot at 0.15 s, round flies 0.22 s, trail fades 0.9 s.
-Visual.trNames = { "NEEDLE", "COMET", "BEAM + RING", "DASHES", "HELIX", "LIGHTNING", "RAIL" }
+-- Tracer styles: 1 Lightning (Visual.boltTracer, also on the live path), 2 Helix, 3 Rail. Gallery loop 2.8 s: shot at 0.15 s, round flies 0.22 s, trail fades 0.9 s.
+Visual.trNames = { "LIGHTNING", "HELIX", "RAIL" }
 Visual.trStyles = {
-    function(pen, t, p, f) -- needle: spindle trail, pointed at both ends, tail catches up with the head as it fades
-        local C = Visual.FXC
-        local s0 = math.max(0, p - 0.5)
-        s0 = s0 + (p - s0) * Visual.oe(f)
-        Visual.ribbon3(pen, s0, p, 18, 0.16 * (1 - f * 0.5), 1, C.white, C.cyan, 0.05, 1, 1, 0)
+    function(pen, t, p, f) -- lightning: same bolt the live path draws, here over the gallery segment
+        local R = Visual.tr
+        Visual.boltTracer(pen, R.A, R.A + R.D * p, f, t, os.clock())
     end,
-    function(pen, t, p, f) -- comet: sharp tail, full head with a hot blob
-        local C = Visual.FXC
-        local s0 = math.max(0, p - 0.75)
-        s0 = s0 + (p - s0) * f
-        Visual.ribbon3(pen, s0, p, 20, 0.34, 2, C.hot, C.orange, 0, 1, 1 - f * 0.6, 0)
-        local R, cf = Visual.tr, Cam.CFrame
-        local h, r = R.A + R.D * p, 0.3 * (1 - f)
-        local ax, ay = cf.RightVector * r, cf.UpVector * r
-        pen.tri(h + ax, h + ay, h - ax, C.white, 1 - f)
-        pen.tri(h + ax, h - ay, h - ax, C.white, 1 - f)
-    end,
-    function(pen, t, p, f) -- beam: the whole line appears at once, collapses to nothing, ring blooms at the impact
-        local C = Visual.FXC
-        Visual.ribbon3(pen, 0, p, 18, 0.07 + 0.22 * (1 - Visual.oe(f)), 3, C.white, C.cyan, 0.5, 1, 1 - f * 0.4, 0)
-        if p >= 1 then Visual.bring(pen, Visual.tr.B, 0.3 + 1.5 * Visual.oe(f), C.cyan, 1 - f, 12) end
-    end,
-    function(pen, t, p, f) -- dashes: sharp lozenges revealed as the round passes
-        local C = Visual.FXC
-        for i = 1, 6 do
-            local s = (i - 0.5) / 6
-            if p >= s then
-                Visual.ribbon(pen, s - 0.055, s + 0.055, 3, 0.4, 1, C.ink, 0.6, 0.6, (1 - f), 0)
-                Visual.ribbon(pen, s - 0.055, s + 0.055, 3, 0.2, 1, C.gold, 0.4 + 0.6 * i / 6, 0.4 + 0.6 * i / 6, (1 - f), 0)
-            end
-        end
-    end,
-    function(pen, t, p, f) -- helix: two ribbons wound around the axis in 3D, plus a thin straight core
-        local C = Visual.FXC
-        Visual.ribbon(pen, 0, p, 64, 0.07, 1, C.mint, 0.1, 0.45, 1 - f, 1, 0.24, 5, 0)
-        Visual.ribbon(pen, 0, p, 64, 0.07, 1, C.violet, 0.1, 0.45, 1 - f, 1, 0.24, 5, math.pi)
-        Visual.ribbon(pen, 0, p, 8, 0.07, 3, C.white, 0.7, 1, 1 - f, 0)
-    end,
-    function(pen, t, p, f) -- lightning: jagged strip, re-jitters at 20 Hz, flickers after the hit
-        local C = Visual.FXC
-        local k = Visual.trK
-        local seed = math.floor(t * 32) * 3.7
-        local fl = p >= 1 and (0.7 + 0.3 * math.sin(t * 70)) or 1
-        Visual.ribbon3(pen, 0, p, 30, 0.12 * k, 1, C.white, C.violet, 0.25, 0.65, (1 - f) * fl, 2, 0.3 * k, 0, seed)
-        Visual.ribbon3(pen, 0, p, 18, 0.06 * k, 1, C.white, C.cyan, 0.15, 0.5, (1 - f) * fl, 2, 0.45 * k, 0, seed + 11.3) -- second bolt, jittered on its own
-        Visual.ribbon(pen, 0, p, 6, 0.07 * k, 3, C.white, 0.8, 1, 1 - f, 0)
+    function(pen, t, p, f) -- helix = rifling: pitch fixed in studs, the twist runs toward the impact, the strands tighten into the line as it fades
+        local C, R, k = Visual.FXC, Visual.tr, Visual.trK
+        local len = R.D.Magnitude * p
+        if len < 1 then return end
+        local pitch = math.max(7, R.D.Magnitude / 12) -- long shots stay under ~12 turns
+        local turns = len / pitch
+        local n = math.clamp(math.floor(turns * 9), 24, 120)
+        local spin = -t * CFG.HelixSpin
+        local amp = CFG.HelixRadius * k * (1 - 0.85 * Visual.oe(f)) * math.min(1, 0.35 + len / 20)
+        local w, a = 0.075 * k, 1 - f
+        Visual.ribbon(pen, 0, p, n, w, 1, C.mint, 0.1, 0.55, a, 1, amp, turns, spin)
+        Visual.ribbon(pen, 0, p, n, w, 1, C.violet, 0.1, 0.55, a, 1, amp, turns, spin + math.pi)
+        Visual.ribbon(pen, 0, p, 8, 0.06 * k, 2, C.white, 0.7, 1, a, 0)
     end,
     function(pen, t, p, f) -- rail: thin core + 3D rings perpendicular to the path, spawned as the round passes
         local C = Visual.FXC
         local R = Visual.tr
-        Visual.ribbon(pen, 0, p, 8, 0.08, 3, C.white, 0.3, 1, 1 - f, 0)
+        Visual.ribbon(pen, 0, p, 8, 0.08, 2, C.white, 0.3, 1, 1 - f, 0)
         for k = 1, 3 do
             local sk = k * 0.25
             local kk = Visual.c01((t - 0.15 - 0.22 * sk) / 0.55)
@@ -4490,8 +4496,8 @@ Visual.trStyles = {
         end
     end,
 }
--- Wake: a comet-shaped trail along the whole path from four stacked low-alpha ribbons plus a thin core; while fading the tail slides to the tip.
-Visual.WAKE = { Visual.FXC.cyan, Visual.FXC.orange, Visual.FXC.cyan, Visual.FXC.gold, Visual.FXC.mint, Visual.FXC.violet, Visual.FXC.violet }
+-- Rail trail: a comet-shaped wake along the whole path from four stacked low-alpha ribbons plus a thin core; while fading the tail slides to the tip.
+Visual.WAKE = { Visual.FXC.violet, Visual.FXC.mint, Visual.FXC.violet }
 Visual.wake = function(pen, from, tip, fade)
     if (tip - from).Magnitude < 1 then return end
     Visual.trSet(from, tip)
@@ -4512,8 +4518,8 @@ end
 Visual.drawTracers = function(pen, st, age, label)
     local look = st.look
     local right = Vector3.new(-look.Z, 0, look.X)
-    for i = 1, 7 do
-        local h = 0.7 + (i - 1) * 1.0
+    for i = 1, #Visual.trStyles do
+        local h = 0.7 + (i - 1) * 1.6
         local A = st.feet + right * -5 + look * -2.4 + Vector3.new(0, h + 0.35, 0)
         local B = st.feet + right * 5 + look * 2.6 + Vector3.new(0, h - 0.2, 0)
         local t = (age - i * 0.37) % 2.8
@@ -4657,7 +4663,7 @@ Visual.drawnAt = function(f, r, ext, mz, tt)
     end
     return pt
 end
--- Bolt tracer (TracerStyle 6, CFG.BoltTracer): one jagged bolt muzzle > bullet with forks and an iridescent gradient. The zigzag is smooth noise between two 24 Hz re-rolls,
+-- Bolt tracer (TracerStyle 1): one jagged bolt muzzle > bullet with forks and an iridescent gradient. The zigzag is smooth noise between two 24 Hz re-rolls,
 -- the bolt lives TracerFade s after the landing.
 Visual.hn = function(i, k, s)
     local x = math.sin(i * 12.9898 + k * 78.233 + s * 37.719) * 43758.5453
@@ -4803,14 +4809,19 @@ Visual.stepLiveFx = function(now)
                 local tail = Visual.drawnAt(f, r, ext, mz, math.max(0, t - 0.09))
                 if (tip - tail).Magnitude > 0.02 then
                     budget -= 1
-                    if CFG.BoltTracer and (CFG.TracerStyle == 6 or CFG.TracerStyle == nil) then
-                        Visual.boltTracer(pen, mz or r.origin, tip, fade, elapsed, now)
+                    local id = Visual.trStyles[CFG.TracerStyle] and CFG.TracerStyle or 1
+                    local from = mz or r.origin
+                    if id == 1 then
+                        Visual.boltTracer(pen, from, tip, fade, elapsed, now)
                     else
-                        if CFG.TracerTrail then Visual.wake(pen, mz or r.origin, tip, fade) end
-                        Visual.trSet(tail, tip)
-                        local style = Visual.trStyles[CFG.TracerStyle] or Visual.trStyles[6]
                         Visual.trK = math.clamp((tip - Cam.CFrame.Position).Magnitude / 120, 1, 2.2)
-                        style(pen, elapsed, 1, fade)
+                        if id == 3 then -- rail: the dart tail -> tip plus the optional wake over the whole path
+                            if CFG.TracerTrail then Visual.wake(pen, from, tip, fade) end
+                            Visual.trSet(tail, tip)
+                        else -- helix: the whole path muzzle -> round
+                            Visual.trSet(from, tip)
+                        end
+                        Visual.trStyles[id](pen, elapsed, 1, fade)
                         Visual.trK = 1
                     end
                 end
@@ -5169,7 +5180,7 @@ Loot.refresh = function(row)
     Loot.nextQuery = 0
 end
 Loot.say = function(...)
-    warn("[hush] auto de$rypto:", ...)
+    warn("[hush] auto decrypt:", ...)
 end
 local function note_loot(action, part, a, b)
     if not running or typeof(part) ~= "Instance" then return end
@@ -5231,7 +5242,7 @@ local function note_loot(action, part, a, b)
                 for other, p in Loot.pending do
                     if other ~= part and p.opened and p.openedAt and p.openedAt >= pending.openedAt then
                         Loot.maxPar = 1
-                        Loot.say("server keeps ONE open container: multi de$rypto falls back to 1")
+                        Loot.say("server keeps ONE open container: multi decrypt falls back to 1")
                         break
                     end
                 end
@@ -5519,8 +5530,46 @@ Loot.finish = function()
     end
 end
 Loot.stopAuto = Loot.finish
+-- AutoLoot: at most one take per CFG.AutoLootDelay, best rarity first, revealed slots only. Returns true while this container still has a wanted slot or an unanswered take.
+Loot.takeAt = 0
+Loot.want = function(id)
+    local cat, rank = Visual.itemInfo(id)
+    return rank >= CFG.AutoLootAlways or (CFG.AutoLootCats[cat] == true and rank >= CFG.AutoLootMinRarity)
+end
+Loot.takeStep = function(part, info, now)
+    if not (Loot.remote and info and info.slots and CFG.AutoLoot) or (CFG.PvPPauseLoot and Visual.pvp.on) then return false end
+    local busy, pick, pickRank, pickSlot = false, nil, -1, nil
+    for index, slot in info.slots do
+        if not slot.hidden and type(slot.id) == "string" and (slot.qty or 0) > 0 and Loot.want(slot.id) then
+            if slot.lastQty ~= slot.qty then slot.lastQty, slot.takeN = slot.qty, 0 end
+            local n = slot.takeN or 0
+            if n < 2 then
+                busy = true
+                if now - (slot.takeAt or -9) > 1.2 then
+                    local _, rank = Visual.itemInfo(slot.id)
+                    if rank > pickRank then pick, pickRank, pickSlot = index, rank, slot end
+                end
+            elseif now - slot.takeAt <= 1.2 then
+                busy = true
+            elseif not slot.refused then
+                slot.refused = true
+                Loot.say("take refused twice:", slot.id, "(backpack full or the server closed the slot)")
+            end
+        end
+    end
+    if pick ~= nil and now >= Loot.takeAt then
+        pickSlot.takeAt, pickSlot.takeN = now, (pickSlot.takeN or 0) + 1
+        Loot.takeAt = now + CFG.AutoLootDelay
+        Loot.remote:FireServer("take", part, pick)
+        if CFG.ShotLog then Loot.say("take", pickSlot.id, "x" .. tostring(pickSlot.qty), "slot", tostring(pick)) end
+    end
+    return busy
+end
 Loot.auto = function(now)
     local root = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+    if CFG.AutoLoot and CFG.AutoLootManual and Loot.manual and Loot.manual.Parent then
+        Loot.takeStep(Loot.manual, lootKnown[Loot.manual], now)
+    end
     -- the user took over (holding E, or a box of theirs is open): drop our boxes, touch neither window nor server state
     if Loot.manual or now - Loot.userAt < 1.5 then
         if next(Loot.pending) then
@@ -5544,7 +5593,9 @@ Loot.auto = function(now)
             elseif pending.opened then
                 anyOpen = true
                 local info = lootKnown[part]
-                local done = not CFG.AutoDecryptReveal or not info or info.total == 0 or info.hidden == 0
+                local busy = CFG.AutoLoot and Loot.takeStep(part, info, now)
+                local waits = info and info.total > 0 and info.hidden > 0 and (CFG.AutoDecryptReveal or CFG.AutoLoot)
+                local done = not waits and not busy
                 if done or now - pending.lastEvent > 12 then Loot.closeOne(part) end
             elseif now - pending.sentAt > 1.5 then
                 local row = searchPrompts[pending.prompt]
@@ -5573,7 +5624,7 @@ Loot.auto = function(now)
     if type(fireproximityprompt) ~= "function" then
         CFG.AutoDecrypt = false
         if Life.uiState then Life.uiState("AutoDecrypt") end
-        Loot.say("this executor has no fireproximityprompt, auto de$rypto is OFF")
+        Loot.say("this executor has no fireproximityprompt, auto decrypt is OFF")
         return
     end
     if not Loot.module then
@@ -6753,6 +6804,53 @@ Visual.healTick = function(now, client)
     if CFG.ShotLog then warn(string.format("[hush] AutoHeal: used %s at %.0f/%.0f HP", id, hum.Health, hum.MaxHealth)) end
 end
 
+-- AutoArmor: snap.slots.armor / snap.slots.helmet = worn id, snap.backpack = { id = count }; Wear is the verb the inventory UI sends when a piece is dropped on the ARMOR / HELMET square.
+Visual.armor = { at = 0, tries = {} }
+Visual.armorTick = function(now, client)
+    local A = Visual.armor
+    if not (running and CFG.AutoArmor) or now < A.at then return end
+    A.at = now + 1
+    local char = LP.Character
+    local hum = char and hum_of(char)
+    if not (hum and hum.Health > 0 and LP:GetAttribute("RaidState") == "Raid") then return end
+    if char:GetAttribute("Downed") == true or char:GetAttribute("Slumped") == true then return end
+    local u2 = Visual.healState(client)
+    local snap = u2 and u2.snap
+    local backpack, slots = snap and snap.backpack, snap and snap.slots
+    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+    local remote = remotes and remotes:FindFirstChild("InvAction")
+    if not (backpack and slots and remote and Visual.itemDefs()) then return end
+    local c = LP:GetAttribute("CombatAt")
+    local combat = type(c) == "number" and Workspace:GetServerTimeNow() - c < 15
+    for _, row in { { "armor", "armor", CFG.AutoArmorBody }, { "helmet", "helmet", CFG.AutoArmorHelmet } } do
+        if row[3] then
+            local worn = slots[row[1]]
+            if type(worn) == "table" then worn = worn.id end
+            local wornRank = 0
+            if type(worn) == "string" then local _, r = Visual.itemInfo(worn); wornRank = math.max(r, 1) end
+            local best, bestRank
+            for id, n in backpack do
+                local _, rank, def = Visual.itemInfo(id)
+                if type(n) == "number" and n > 0 and def and def[row[2]] == true and rank > (bestRank or 0) then best, bestRank = id, rank end
+            end
+            if best and best ~= worn and bestRank > wornRank then
+                local fill = wornRank == 0
+                if fill or (CFG.AutoArmorMode == "Upgrade" and not (CFG.AutoArmorSafe and combat)) then
+                    local try = A.tries[best]
+                    if try and try.n >= 2 and now - try.at < 30 then continue end
+                    A.tries[best] = { n = (try and try.n or 0) + 1, at = now }
+                    A.at = now + 1.5
+                    remote:FireServer({ action = "Wear", id = best, from = "backpack" })
+                    if CFG.ShotLog then warn(string.format("[hush] AutoArmor: wear %s (%s, tier %d over %d)", best, row[1], bestRank, wornRank)) end
+                    return
+                end
+            elseif best == worn then
+                A.tries[best] = nil
+            end
+        end
+    end
+end
+
 -- AntiDrown: the server also judges the replicated body (Config.Drown.ServerFeet 1.4), so a local invisible slab at the water surface under the feet keeps the point 1.4 st above them dry.
 -- Entries 0.5..6 st deep are lifted onto it. 20 Hz terrain ray.
 Visual.water = { at = 0, ray = nil, slab = nil, lastSeen = 0, lifted = 0 }
@@ -6848,6 +6946,7 @@ Visual.baseTick = function(now)
         Visual.attachRoundsFx(client)
     end
     Visual.healTick(now, client)
+    Visual.armorTick(now, client)
     if client and not b.drown then
         local inst = client:FindFirstChild("Drown")
         if inst then
@@ -7407,6 +7506,19 @@ Visual.itemDefs = function()
     end
     return Visual.items
 end
+-- category (Weapons split into Firearms / Melee), rarity order (0 = unknown), def, rarity row
+Visual.itemInfo = function(id)
+    local I = Visual.itemDefs()
+    local def = I and I.Defs[id]
+    local rar = def and I.Rarity[def.rarity]
+    local cat = def and def.category or "Unknown"
+    if cat == "Weapons" then
+        local g = guns()
+        local gd = g and g.Defs[id]
+        cat = (gd and gd.ammo ~= nil and not gd.melee) and "Firearms" or "Melee"
+    end
+    return cat, rar and rar.order or 0, def, rar
+end
 Visual.finds = { rows = setmetatable({}, { __mode = "k" }), list = {}, P = { texts = {} }, at = 0 }
 Visual.FIND_COL = Color3.fromRGB(150, 225, 255)
 Visual.findScan = function(now)
@@ -7424,16 +7536,9 @@ Visual.findScan = function(now)
                 local r = F.rows[m]
                 if not r then
                     local id = m.Name:match("^%a+_(.+)$") or m.Name
-                    local def = I and I.Defs[id]
-                    local rar = def and I.Rarity[def.rarity]
-                    local cat = def and def.category or "Unknown"
-                    if cat == "Weapons" then
-                        local g = guns()
-                        local gd = g and g.Defs[id]
-                        cat = (gd and gd.ammo ~= nil and not gd.melee) and "Firearms" or "Melee"
-                    end
+                    local cat, rank, def, rar = Visual.itemInfo(id)
                     r = { di = -1, label = def and def.name or (id:gsub("_", " ")), col = rar and rar.color or Visual.FIND_COL,
-                        cat = cat, rank = rar and rar.order or 0, rare = m:GetAttribute("RareFind") == true }
+                        cat = cat, rank = rank, rare = m:GetAttribute("RareFind") == true }
                     F.rows[m] = r
                 end
                 if r.rank >= CFG.FindMinRarity or r.rare or filter[r.cat] then
@@ -8723,6 +8828,29 @@ return function(_Lib, _Core)
             end)
         end
         do
+            local s = card("Main", "Left", "Auto Loot", "Takes items from an open container. Auto Decrypt opens them, or open one by hand. Hidden slots are taken once revealed.")
+            toggle(s, "Enabled", "AutoLoot")
+            rarity(s, "AutoLootMinRarity")
+            setList(s, "Categories", "AutoLootCats", CFG.AutoLootCats,
+                { "Firearms", "Melee", "Ammo", "Medical", "Armor", "Attachments", "Valuables", "Tools", "Materials", "Building", "Food", "Water", "Accessories", "Junk" })
+            choice(s, "Always Take", "AutoLootAlways", { { "Off", 7 }, { "Epic+", 4 }, { "Legendary+", 5 }, { "Limited", 6 } },
+                "Takes this rarity from any category, ignoring Categories and Min Rarity.")
+            toggle(s, "Containers I Open", "AutoLootManual", "Also takes from a container you opened by hand.")
+            keyToggle(s, "AutoLoot", "AutoLoot")
+            advanced(s, "AutoLoot", function()
+                slider(s, "Take Delay", "AutoLootDelay", 0.1, 1, 2, " s", "One take per delay. A slot the server leaves unchanged after two takes is skipped.")
+            end)
+        end
+        do
+            local s = card("Main", "Right", "Auto Armor", "Wears the best armor in your backpack by rarity tier. Empty slots are always filled.")
+            toggle(s, "Enabled", "AutoArmor")
+            toggle(s, "Body Armor", "AutoArmorBody")
+            toggle(s, "Helmet", "AutoArmorHelmet")
+            choice(s, "Mode", "AutoArmorMode", { { "Upgrade", "Upgrade" }, { "Fill Empty Only", "Empty" } })
+            toggle(s, "Not In Combat", "AutoArmorSafe", "Upgrades wait for the end of the server combat flag.")
+            keyToggle(s, "AutoArmor", "AutoArmor")
+        end
+        do
             local s = card("Main", "Left", "Kill Aura", "Uses the real sledge quick-swing path. It does not extend server melee reach.")
             toggle(s, "Enabled", "KillAura")
             choice(s, "Aim Part", "KaAim", { "Head", { "Root / torso", "HRP" } })
@@ -8772,6 +8900,12 @@ return function(_Lib, _Core)
             local s = card("GunMods", "Right", "Crouch Spoof")
             toggle(s, "Enabled", "CrouchSpoof")
             toggle(s, "While Moving", "CrouchSpoofMoving")
+            toggle(s, "A/B Test", "CrouchAB", "Alternates the spoof in random on / off blocks and tags every shot in the log. Controls Enabled while it runs.", function(v)
+                if v and not CFG.DebugFile then CFG.DebugFile = true; if Life.uiState then Life.uiState("DebugFile") end end
+            end)
+            advanced(s, "CrouchAB", function()
+                slider(s, "Shots Per Block", "CrouchABBlock", 5, 60, 0, nil, "Analyse with tools/ab_crouch.py. Needs Shot Log File on (turned on automatically).")
+            end)
             note(s, "No local crouch. Server cone benefit is unconfirmed; moving may change server speed allowances.")
         end
         do
@@ -8946,13 +9080,14 @@ return function(_Lib, _Core)
         do
             local s = card("Visuals", "Left", "Bullet Tracers")
             toggle(s, "Enabled", "BulletTracer")
-            choice(s, "Style", "TracerStyle", {
-                { "Needle", 1 }, { "Comet", 2 }, { "Beam + ring", 3 }, { "Dashes", 4 },
-                { "Helix", 5 }, { "Lightning", 6 }, { "Rail", 7 },
-            })
-            toggle(s, "Trail", "TracerTrail")
-            toggle(s, "Forked Lightning", "BoltTracer")
+            choice(s, "Style", "TracerStyle", { { "Lightning", 1 }, { "Helix", 2 }, { "Rail", 3 } })
+            toggle(s, "Rail Trail", "TracerTrail", "Comet wake along the whole path; Rail style only.")
             slider(s, "Fade Time", "TracerFade", 0.1, 3, 2, " s")
+            advanced(s, "Tracers", function()
+                head(s, "Helix")
+                slider(s, "Spin Speed", "HelixSpin", 0, 40, 1, " rad/s", "Twist runs toward the impact. 0 = frozen spiral.")
+                slider(s, "Radius", "HelixRadius", 0.05, 0.8, 2, " st")
+            end)
         end
         do
             local s = card("Visuals", "Left", "Hit Marker")
