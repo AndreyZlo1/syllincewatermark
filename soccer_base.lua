@@ -89,8 +89,6 @@ local CFG = {
 	TackleCompetitorRadius = 8,
 	CounterCompetitorRadius = 12,
 	CounterCompetitor = false, -- CounterJump stands down when a teammate is already on the enemy (CompetitorRadius); off = jump regardless
-	CounterKickChance = 0.45, -- share of counter combos that use Kick instead of the slide when both are possible
-	CounterComboChance = 0.85, -- share of counter jumps that continue into a combo at all
 	TackleReach = 16,
 	AutoGK = true,
 	AutoWall = true,
@@ -138,11 +136,14 @@ local CFG = {
 	ShotStyle = "aurora",
 	PosStyle = "phantom",
 	SightStyle = "reticle",
-	CounterJumpRange = 10,
+	CounterJumpRange = 24, -- air duel: an airborne carrier within this is planned against (we run to the take-off)
+	CounterConf = 0.6, -- share of his futures the air slide / air kick must hold
+	CounterMove = true, -- the air duel moves you to the take-off point
+	BallFlick = true, -- AutoBall plans an enemy flick's lob as a loose ball from the wind-up
 	PassAssistSync = true, -- AutoDodge x Pass Assist: a legit Lob to the safest teammate instead of the blind ball dump (homing rocket punch, or a projectile we are not sure to dodge)
 	ProjHitRadius = 5, -- homing punch -> ball contact distance (not in the client dump; 3 judged real hits as misses)
 	ProjSafeMargin = 1.0, -- dodge clearance above the item radius that counts as a sure dodge
-	GkBaitInset = 0.6, -- AutoGK: a ball path this far inside an enemy's receive box counts as received (FAKE bait)
+	GkBaitReach = 3, -- AutoGK FAKE read: how far an enemy steps into the ball path to receive it (his receive box grows by up to this)
 	GkBaitRay = 2.5, -- ...and an enemy this close to a charging shooter's aim ray before the goal cancels the charge-position read
 	MineMargin = 2.5, -- studs added to half a landmine model's footprint for its (server-side) trigger
 	BlastMargin = 1.5, -- extra studs outside ItemHitSettings.ExplosionRadius (14) that we keep from an explosion
@@ -198,7 +199,6 @@ local CFG = {
 	WallShot = true, -- wall on the replicated shot path of a charging carrier (needs barricades in hand)
 	TackleVsBlock = "block", -- block = AutoBlock first (tackle waits while it is on him) / smart = wait only for a firing kick / tackle = never wait
 	TackleHoldMax = 0.8, -- block first: the tackle waits at most this long for the block
-	CounterKickDelay = 0.08, -- air combo: the Kick goes out this long after the jump when the slide has no legal pair
 	BlockCloser = 1.6, -- AutoBlock shadow gap = kick reach - 1 - this (was 4.0 studs, now 3.0)
 	BlockGapMin = 2.0,
 	BlockMaxDepth = 9, -- AutoBlock in front of him: closes in to at most this depth (was a fixed 26: kept whatever distance we had)
@@ -208,8 +208,6 @@ local CFG = {
 	BlockCutHopeless = 1.4, -- cut-off gives up when even the best point is this many seconds late and we are far behind
 	TrendVel = true, -- long predictions follow where a zig-zag goes, not the last zig
 	TrendWindow = 0.7,
-	BlockTurnDeg = 35, -- a change of his heading over this (vs 0.3 s ago) is a turn
-	BlockTurnHedge = 0.35, -- after a turn the extrapolation horizon shrinks to this share and grows back over 0.6 s
 	BlockFarGoal = 100, -- carrier farther than this from our mouth: mark his teammate closer to our goal
 	BlockGoalRange = 70, -- carrier within BlockFarGoal and nobody of ours on him: start the block from this far
 	BlockLevelSlack = 8, -- with a teammate on the carrier: mark an enemy at most this much farther from goal than him
@@ -220,8 +218,6 @@ local CFG = {
 	BlockInterceptMargin = 0.25, -- we must reach the intercept point this much earlier than the ball
 	BlockPassMax = 130, -- receivers beyond this from the carrier are not a pass option
 	ArcMaxErr = 2.5, -- FreezeGun: accepted height error of the scanned landing point (studs)
-	JumpSlide = true, -- a lofting carrier: jump first, slide from the air
-	JumpSlideDelay = 0.16,
 	AutoKickRange = 16, -- AutoBlock starts the kick plan when the carrier is within kick reach + this (it runs to him)
 	AutoKickConf = 0.55, -- share of his possible futures the kick box must hold at the release
 	AutoKickMove = true, -- run to the kick spot first (the plan looks AutoKickLead s ahead), steer during the charge
@@ -238,7 +234,6 @@ local CFG = {
 	SlideMinHits = 3, -- of 11 samples of the live window the box must hold the ball (was 2)
 	BlockPreJump = true, -- jump for a high shot BEFORE the release, timed to the replicated charge path
 	BlockSlide = true, -- AutoBlock: slide the flying shot when the body cannot reach it (ground slide, or jump + air slide)
-	BlockSlideJump = true,
 	BlockGoal = true, -- AutoBlock: a ball flying into OUR goal is run down / jumped / slid at, whether or not AutoBall is on
 	BlockGoalTime = 3, -- ... only when it crosses the line within this many seconds
 	BarricadeAddon = true, -- projectiles: a wall on their path instead of dodge / pass when the timing allows
@@ -248,7 +243,7 @@ local CFG = {
 	WallCooldown = 0.7,
 	RouteSlideGain = 0.4, -- AutoBall route: a slide replaces the run when it touches the ball this much earlier (or the run loses the race)
 	BallRamp = 0.2, -- AutoBall: seconds to go from the current speed to full sprint (unmeasured: see "ball track" v= in the log)
-	CounterTackle = true, -- CounterJump x AutoTackle: slide the enemy at the ball when it fits (flick wind-up), jump + air slide when he leaves the ground
+	CounterTackle = true, -- air duel x AutoTackle: the slide (flick wind-up on the ground, from the air at an airborne carrier)
 	GkAutoClear = false,
 	PassAssist = true, -- Pass / Lob press while looking at a teammate -> our own lob (yaw + charge solved), see Mark.paSolve
 	PassManual = true, -- ManualButton: a UI keybind passes to the best teammate without aiming (Mark.paManual); unbound by default
@@ -3231,52 +3226,6 @@ Mark.lofting = function(ch, enemyRoot)
 	return nil
 end
 
--- jump first, slide from the air at where he (and the ball) will be: the pending press is fired by Mark.jumpSlideTick
-Mark.jumpSlideTick = function(character, root)
-	local cb = Mark.jsCombo
-	if not cb then
-		return
-	end
-	local now = os.clock()
-	if now > cb.untilT then
-		Mark.jsCombo = nil
-		return
-	end
-	if now < cb.pressAt then
-		return
-	end
-	Mark.jsCombo = nil
-	local er = cb.root
-	if not (er and er.Parent) then
-		return
-	end
-	local ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
-	local look = 0.42 + ping * 0.5
-	local E = er.Position + flat(er.AssemblyLinearVelocity) * look
-	local ballP = Renderer.GetPosition()
-	if typeof(ballP) == "Vector3" and flat(ballP - er.Position).Magnitude < 8 then
-		E = E:Lerp(ballP, 0.5)
-	end
-	local to = flat(E - root.Position)
-	local d = to.Magnitude
-	local dir = unitOrNil(to)
-	local mHi = math.max(0.4, CFG.TackleSpeed)
-	local mLo = math.min(mHi, CFG.TackleMinSpeed or 0.6)
-	if not dir then
-		return
-	end
-	local mid = -HitboxSettings.SlideTackle.CFrameOffset.Z
-	local m = (d - mid) / math.max(Mark.dumpTravel(0.42), 1)
-	if m > mHi + 0.15 then
-		logFile("jump slide", "too far", "d", string.format("%.1f", d), "need", string.format("%.2f", m))
-		return
-	end
-	m = math.clamp(m, mLo, mHi)
-	Mark.jsBypass = true
-	local sent, why = Mark.tryTackle(character, root, dir, m)
-	Mark.jsBypass = nil
-	logFile("jump slide", "air", sent and "sent" or ("no " .. tostring(why)), cb.why, "d", string.format("%.1f", d), "mult", string.format("%.2f", m))
-end
 
 tryTackle = function(character, root, dir, mult, target, skipHazard)
 	if MatchSettings.IsGoalkeeperCharacter(character) then
@@ -3301,18 +3250,13 @@ tryTackle = function(character, root, dir, mult, target, skipHazard)
 	if not dir then
 		return false, "dir"
 	end
-	-- a lofting carrier: a ground slide at him is wasted -> jump first, the slide goes from the air (Mark.jumpSlideTick)
-	if type(target) == "table" and target.char and not Mark.jsBypass and CFG.JumpSlide ~= false then
+	-- a lofting carrier (flick wind-up / ball above him): a ground slide under him is wasted. No blind jump here: the
+	-- flick is slid in time or left to AutoBall's lob plan, an airborne carrier is the air duel's (Mark.tickCounterJump).
+	if type(target) == "table" and target.char then
 		local lw = Mark.lofting(target.char, target.root)
-		if lw then
-			local humJ = character:FindFirstChildOfClass("Humanoid")
-			if humJ and CharacterControllers.IsLanded(character, humJ) then
-				if not Mark.jsCombo and Mark.doJump("jumpslide") then
-					Mark.jsCombo = { pressAt = os.clock() + (CFG.JumpSlideDelay or 0.16), untilT = os.clock() + 0.6, root = target.root, why = lw }
-					logFile("jump slide", "jump first", lw)
-				end
-				return false, "lofting"
-			end
+		local humJ = character:FindFirstChildOfClass("Humanoid")
+		if lw and humJ and CharacterControllers.IsLanded(character, humJ) and not (lw == "flick" and Mark.duelFlickOk) then
+			return false, "lofting"
 		end
 	end
 	local wallRoot = ActorTargeting.GetActorRoot(LocalPlayer)
@@ -8145,7 +8089,11 @@ Mark.gkBait = function(samples, ts, limit)
 	if not samples or #samples < 2 then
 		return nil
 	end
-	local inset = CFG.GkBaitInset or 0.6
+	-- The real receive test (Ownership: the ball CENTRE's segment against HitboxSettings.ExtendToFeet(Receive), no ball
+	-- radius) - the old version SHRANK the box by 0.6 a side for a "solid" hit: a FAKE through his teammate at 2.5 studs
+	-- (log: "gk bait ... on charge ray lat 2.5", then "gk dive ok") passed that inner box, the dive went, he received.
+	-- He also WANTS that ball and steps into it: the box grows by his run speed after a 0.15 s reaction, up to GkBaitReach.
+	local reachMax = CFG.GkBaitReach or 3
 	local rcv, air = HitboxSettings.Receive, HitboxSettings.AirReceive
 	local mates = {}
 	for _, model in Mark.models() do
@@ -8159,17 +8107,19 @@ Mark.gkBait = function(samples, ts, limit)
 				local hum = model:FindFirstChildOfClass("Humanoid")
 				local landed = not hum or CharacterControllers.IsLanded(model, hum)
 				local src0 = landed and rcv or air
+				if landed and hum and HitboxSettings.ExtendToFeet then
+					src0 = HitboxSettings.ExtendToFeet(rcv, hum, r) or rcv
+				end
+				Mark.mover = Mark.mover or require(Modules.Actions.ActionMovement)
+				local runS = Mark.mover.GetRunWalkSpeed(Mark.mover.GetBaseWalkSpeed(model), false)
 				-- the kicker cannot touch his own ball for Ownership.LaunchNoTouchSeconds (0.25): only HE gets the grace
 				-- window. It used to be skipped for everyone (t >= 0.2), so a second enemy taking the ball at once was a "shot".
 				local fa = Mark.gkFreeAt
 				local skip = (fa and fa.id == actor.UserId) and math.max(0.25 - (os.clock() - fa.at), 0) or 0
 				mates[#mates + 1] = {
 					skip = skip,
-					name = actorName(actor), pos = pos, vel = vel, dly = dly,
-					box = {
-						Size = Vector3.new(math.max(src0.Size.X - inset * 2, 1), math.max(src0.Size.Y - inset * 2, 1), math.max(src0.Size.Z - inset * 2, 1)),
-						Shape = src0.Shape, CFrameOffset = src0.CFrameOffset,
-					},
+					name = actorName(actor), pos = pos, vel = vel, dly = dly, src = src0,
+					run = (type(runS) == "number" and runS > 4) and runS or 16,
 				}
 			end
 		end
@@ -8190,7 +8140,9 @@ Mark.gkBait = function(samples, ts, limit)
 				local lead = m.dly + math.min(t, 0.5)
 				local c = m.pos + m.vel * lead
 				local hold = { CFrame = CFrame.new(c) }
-				local alpha = HitboxSettings.GetSegmentEnterAlpha(hold, m.box, samples[i - 1], samples[i])
+				local grow = math.clamp(m.run * (t - 0.15), 0, reachMax) * 2
+				local box = { Size = m.src.Size + Vector3.new(grow, 0, grow), Shape = m.src.Shape, CFrameOffset = m.src.CFrameOffset }
+				local alpha = HitboxSettings.GetSegmentEnterAlpha(hold, box, samples[i - 1], samples[i])
 				if alpha then
 					return { t = ts[i - 1] + (ts[i] - ts[i - 1]) * (type(alpha) == "number" and alpha or 1), name = m.name, dist = flat(c - samples[1]).Magnitude }
 				end
@@ -8559,6 +8511,74 @@ Mark.gkPressSolve = function(o)
 	return bestNow, bestLater, cen
 end
 
+-- Vertical state of another player's body (shared by AutoGK press and the air duel). See the note inside.
+Mark.vertState = function(model, P, baseY, airborne, now, g)
+	-- VERTICAL STATE. CharacterMotion.GetVelocity has Y = 0 for another player: vy and ay come from the history of his
+	-- displayed Y (samples >= 12 ms apart, 0.3 s kept): vy = slope of the last 0.1 s, ay = change of the slope against the
+	-- 0.1 s before. Launchers do not all fly the same way (dump):
+	--   ShotgunRecoil: AssemblyLinearVelocity = up 30 (+50 aiming down) + back 30 -> ballistic;
+	--   bazooka at the feet / explosions: server knock-back -> ballistic;
+	--   JetpackMotion: a CFrame lift rig (Mark.jetFutures); GrappleMotion: a 75 st/s pull at the hook -> powered.
+	-- "ballistic" = ay within 35 % of -gravity: the arc is known, the solver gets the measured vy. "fresh" = in the air for
+	-- < 0.1 s, the slope is not measured yet. "powered" = anything else rising / hovering: the arc is NOT known.
+	Mark.yHist = Mark.yHist or setmetatable({}, { __mode = "k" })
+	local yh = Mark.yHist[model]
+	if not yh or now - yh.last > 0.3 then
+		yh = { list = {}, last = now - 1, airAt = nil }
+		Mark.yHist[model] = yh
+	end
+	if now - yh.last >= 0.012 then
+		yh.list[#yh.list + 1] = { t = now, y = P.Y }
+		yh.last = now
+	end
+	while #yh.list > 2 and now - yh.list[1].t > 0.3 do
+		table.remove(yh.list, 1)
+	end
+	local function yAt(age)
+		local best = nil
+		for _, e in yh.list do
+			if now - e.t >= age - 0.02 then
+				best = e
+			end
+		end
+		return best
+	end
+	local yNow, yMid, yOld = yh.list[#yh.list], yAt(0.1), yAt(0.2)
+	local vyT, ayT = 0, nil
+	if yMid and yNow.t - yMid.t > 0.04 then
+		vyT = (yNow.y - yMid.y) / (yNow.t - yMid.t)
+		if yOld and yMid.t - yOld.t > 0.04 then
+			local vOld = (yMid.y - yOld.y) / (yMid.t - yOld.t)
+			ayT = (vyT - vOld) / ((yNow.t - yOld.t) * 0.5)
+		end
+	end
+	local dyNow = P.Y - baseY
+	if not airborne and dyNow > 3 then
+		airborne = true -- IsLanded lags a launch by a few frames; 3 studs over our root is not standing
+	end
+	if airborne then
+		yh.airAt = yh.airAt or now
+	else
+		yh.airAt = nil
+	end
+	local vKind = "ground"
+	if airborne then
+		if now - yh.airAt < 0.1 or not ayT then
+			vKind = "fresh"
+		elseif math.abs(ayT + g) <= g * 0.35 then
+			vKind = "ballistic"
+		elseif vyT < -4 and ayT < 0 then
+			vKind = "ballistic" -- falling and still accelerating down: a drop, the arc ends on the floor either way
+		else
+			vKind = "powered"
+		end
+	end
+	if vKind == "ballistic" and yMid then
+		vyT = vyT - g * (yNow.t - yMid.t) * 0.5 -- the slope is the speed at the middle of the window: bring it to now
+	end
+	return { vy = vyT, ay = ayT, kind = vKind, airborne = airborne, dy = dyNow }
+end
+
 Mark.gkPress = function(character, root, c)
 	Mark.gkPressStandP = nil
 	if CFG.GkPress == false then
@@ -8593,69 +8613,9 @@ Mark.gkPress = function(character, root, c)
 	local lead = math.clamp(CharacterMotion.GetDisplayDelaySeconds(model) or 0, 0, 0.25) + ping * 0.5
 	local airborne = not CharacterControllers.IsLanded(model, hum)
 	local g = workspace.Gravity
-	-- VERTICAL STATE. CharacterMotion.GetVelocity has Y = 0 for another player: vy and ay come from the history of his
-	-- displayed Y (samples >= 12 ms apart, 0.3 s kept): vy = slope of the last 0.1 s, ay = change of the slope against the
-	-- 0.1 s before. Launchers do not all fly the same way (dump):
-	--   ShotgunRecoil: AssemblyLinearVelocity = up 30 (+50 aiming down) + back 30 -> ballistic;
-	--   bazooka at the feet / explosions: server knock-back -> ballistic;
-	--   JetpackMotion: a CFrame lift rig (Mark.jetFutures); GrappleMotion: a 75 st/s pull at the hook -> powered.
-	-- "ballistic" = ay within 35 % of -gravity: the arc is known, the solver gets the measured vy. "fresh" = in the air for
-	-- < 0.1 s, the slope is not measured yet. "powered" = anything else rising / hovering: the arc is NOT known.
-	Mark.yHist = Mark.yHist or setmetatable({}, { __mode = "k" })
-	local yh = Mark.yHist[model]
-	if not yh or c.now - yh.last > 0.3 then
-		yh = { list = {}, last = c.now - 1, airAt = nil }
-		Mark.yHist[model] = yh
-	end
-	if c.now - yh.last >= 0.012 then
-		yh.list[#yh.list + 1] = { t = c.now, y = P.Y }
-		yh.last = c.now
-	end
-	while #yh.list > 2 and c.now - yh.list[1].t > 0.3 do
-		table.remove(yh.list, 1)
-	end
-	local function yAt(age)
-		local best = nil
-		for _, e in yh.list do
-			if c.now - e.t >= age - 0.02 then
-				best = e
-			end
-		end
-		return best
-	end
-	local yNow, yMid, yOld = yh.list[#yh.list], yAt(0.1), yAt(0.2)
-	local vyT, ayT = 0, nil
-	if yMid and yNow.t - yMid.t > 0.04 then
-		vyT = (yNow.y - yMid.y) / (yNow.t - yMid.t)
-		if yOld and yMid.t - yOld.t > 0.04 then
-			local vOld = (yMid.y - yOld.y) / (yMid.t - yOld.t)
-			ayT = (vyT - vOld) / ((yNow.t - yOld.t) * 0.5)
-		end
-	end
-	local dyNow = P.Y - root.Position.Y
-	if not airborne and dyNow > 3 then
-		airborne = true -- IsLanded lags a launch by a few frames; 3 studs over our root is not standing
-	end
-	if airborne then
-		yh.airAt = yh.airAt or c.now
-	else
-		yh.airAt = nil
-	end
-	local vKind = "ground"
-	if airborne then
-		if c.now - yh.airAt < 0.1 or not ayT then
-			vKind = "fresh"
-		elseif math.abs(ayT + g) <= g * 0.35 then
-			vKind = "ballistic"
-		elseif vyT < -4 and ayT < 0 then
-			vKind = "ballistic" -- falling and still accelerating down: a drop, the arc ends on the floor either way
-		else
-			vKind = "powered"
-		end
-	end
-	if vKind == "ballistic" and yMid then
-		vyT = vyT - g * (yNow.t - yMid.t) * 0.5 -- the slope is the speed at the middle of the window: bring it to now
-	end
+	local vs = Mark.vertState(model, P, root.Position.Y, airborne, c.now, g)
+	local vyT, ayT, vKind, dyNow = vs.vy, vs.ay, vs.kind, vs.dy
+	airborne = vs.airborne
 	local vy = airborne and ((math.abs(W.Y) > 0.5) and W.Y or vyT) or 0
 	-- a launcher fired by him a moment ago while he still stands: he is about to fly, the arc is unknown
 	local lr = Mark.launchRec and Mark.launchRec[pl.UserId]
@@ -10868,393 +10828,356 @@ Mark.kickHelper = function(root)
 	end
 end
 
-Mark.blockIntercept = function(character, root)
-	local _, _, samples, ts = Mark.ballPath(root)
-	if not samples then
-		return nil
+
+-- ===== CounterJump v2: AIR DUEL ======================================================================================
+-- The old CounterJump jumped on an edge ("he left the ground" / "flick: detach - rise"), rolled dice for a slide or a kick
+-- (CounterComboChance / CounterKickChance) and stood still. Now one receding-horizon planner, every tick, against the
+-- enemy carrier near us who is up in the air (bicycle kick, jump with the ball, a juggle):
+--   HIM: the weighted fan of futures (Mark.gkFutures) with the measured vertical state (Mark.vertState). Only a ballistic
+--        arc is planned against: a "fresh" take-off (slope not measured) or a "powered" flight (lift, grapple) waits.
+--   US:  run at the contact (current velocity ramping to run speed), jump at td (vJ = sqrt(2 g JumpHeight)), then
+--        SLIDE from the air - press at tp, box live [HitboxDelay, +HitboxSeconds], travel = dumpTravel * mult - or
+--        KICK from the air - press at tp, release at tp + minimum charge, HitboxSettings.Kick along the aim.
+--   A candidate counts when his main future is in the box on >= 2 samples (slide) / at the release (kick) and the fan
+--   share >= CounterConf. The earliest contact wins; slide before kick on a tie (a slide strips the ball).
+-- Execution: td ahead -> RUN to the take-off (agent mode "duel"); td now -> jump; airborne and tp now -> press. A flick
+-- wind-up: slide him before the detach when it lands in time; the lob itself is AutoBall's (Mark.tickBall plans the flick
+-- path with the run / jump / slide it needs). No dice, no fixed delays.
+Mark.duelSolve = function(o)
+	local DT = 0.025
+	local futs = o.futs
+	local main = futs[1].pts
+	local wSum = 0
+	for _, f in futs do
+		wSum += f.w
 	end
-	Mark.mover = Mark.mover or require(Modules.Actions.ActionMovement)
-	local spd = Mark.mover.GetRunWalkSpeed(Mark.mover.GetBaseWalkSpeed(character), false)
-	local rcv = HitboxSettings.Receive
-	local half = rcv.Size.X * 0.5
-	local lo = rcv.CFrameOffset.Y - rcv.Size.Y * 0.5
-	local hi = rcv.CFrameOffset.Y + rcv.Size.Y * 0.5 + (Physics.BallRadius or 1)
-	local foes = {}
-	for _, model in Mark.models() do
-		local actor = Actors.GetFromCharacter(model)
-		if actor and actor ~= LocalPlayer and not sameTeam(actor) then
-			local r = ActorTargeting.GetActorRoot(actor)
-			if r then
-				foes[#foes + 1] = { p = r.Position, s = Mark.mover.GetRunWalkSpeed(Mark.mover.GetBaseWalkSpeed(model), false) }
-			end
+	local g, vJ = o.g, o.vJ
+	local ramp = math.max(CFG.BallRamp or 0.2, 0.05)
+	local box = HitboxSettings.SlideTackle
+	local mid = -box.CFrameOffset.Z
+	local hx, hz = box.Size.X * 0.5 + 0.2, box.Size.Z * 0.5 + 0.2
+	local hLo = box.CFrameOffset.Y - box.Size.Y * 0.5 - 0.5
+	local hHi = box.CFrameOffset.Y + box.Size.Y * 0.5 + 0.5
+	local t0, t1 = C.HitboxDelaySeconds, C.HitboxDelaySeconds + C.HitboxSeconds
+	local need = CFG.CounterConf or 0.6
+	local function at(pts, t)
+		return pts[math.clamp(math.floor(t / DT + 0.5) + 1, 1, #pts)]
+	end
+	-- our root height t seconds from now for a jump at td (nil = already in the air: our own arc)
+	local function yUs(t, td)
+		if td == "ground" then
+			return o.floor
+		elseif td == nil then
+			return math.max(o.O.Y + o.vy * t - 0.5 * g * t * t, o.floor)
+		end
+		local x = t - td
+		if x <= 0 then
+			return o.floor
+		end
+		return o.floor + math.max(vJ * x - 0.5 * g * x * x, 0)
+	end
+	-- distance we cover toward u in t seconds (v0 projected, ramp to spd)
+	local function run(u, t)
+		local v0 = math.clamp(o.v0:Dot(u), 0, o.spd)
+		if t <= ramp then
+			return v0 * t + (o.spd - v0) * t * t / (2 * ramp)
+		end
+		return v0 * ramp + (o.spd - v0) * ramp * 0.5 + o.spd * (t - ramp)
+	end
+	-- "ground" first: a contact the ground slide / kick already makes needs no jump (ties keep the first = no jump)
+	local tds = o.landed and { "ground", 0, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4 } or { false }
+	local best = nil
+	local function consider(c)
+		if not best or c.T < best.T - 1e-3 or (math.abs(c.T - best.T) <= 1e-3 and c.kind == "slide" and best.kind ~= "slide") then
+			best = c
 		end
 	end
-	for i = 2, #samples do
-		local t = ts[i]
-		if t > 2.5 then
-			break
-		end
-		local p = samples[i]
-		local h = p.Y - root.Position.Y
-		local g = flat(p - root.Position).Magnitude
-		if h >= lo and h <= hi and math.max(g - half, 0) / spd + 0.05 <= t then
-			local first = true
-			for _, f in foes do
-				if f.s > 1 and math.max(flat(p - f.p).Magnitude - half, 0) / f.s < t then
-					first = false
-					break
+	for _, tdv in tds do
+		local td = tdv ~= false and tdv or nil
+		local tpS = (type(td) == "number") and (td + 0.03) or 0
+		local tp = tpS
+		while tp <= tpS + 0.42 do
+			-- SLIDE
+			if o.slideOk then
+				local tauM = (t0 + t1) * 0.5
+				local E = at(main, tp + tauM)
+				local u = unitOrNil(flat(E - o.O))
+				if u and tp + t1 <= 1.25 then
+					local dE = flat(E - o.O).Magnitude
+					local travelM = math.max(Mark.dumpTravel(tauM), 1)
+					local close = math.max(dE - mid - travelM * o.mLo, 0)
+					local Q = o.O + u * math.min(run(u, tp), close)
+					local m = (flat(E - Q).Magnitude - mid) / travelM
+					if m >= o.mLo * 0.85 and m <= o.mHi * 1.1 then
+						m = math.clamp(m, o.mLo, o.mHi)
+						local conf, mainHits, tHit = 0, 0, nil
+						for fi, f in futs do
+							local hit = false
+							for k = 0, 6 do
+								local tau = t0 + (t1 - t0) * k / 6
+								local Hp = at(f.pts, tp + tau)
+								local rel = flat(Hp - (Q + u * (Mark.dumpTravel(tau) * m + mid)))
+								local dy = Hp.Y - yUs(tp + tau, td)
+								if math.abs(rel:Dot(u)) <= hz and math.abs(rel.X * u.Z - rel.Z * u.X) <= hx and dy >= hLo and dy <= hHi then
+									hit = true
+									if fi == 1 then
+										mainHits += 1
+										tHit = tHit or (tp + tau)
+									else
+										break
+									end
+								end
+							end
+							if hit then
+								conf += f.w
+							end
+						end
+						conf /= wSum
+						if mainHits >= 2 and conf >= need then
+							consider({ kind = "slide", td = td, tp = tp, T = tHit or (tp + t0), aim = u, mult = m, conf = conf, E = E, Q = Q })
+						end
+					end
 				end
 			end
-			if first then
-				return { p = p, t = t, g = g, h = h }
+			-- KICK (released at the minimum charge: both in the air, the first legal moment)
+			if o.kickOk then
+				local R = tp + o.minRel
+				if R <= 1.25 then
+					local E = at(main, R)
+					local u = unitOrNil(flat(E - o.O))
+					if u then
+						-- run until the press, then the charge walk; stop 2.5 short of him (the box reaches 5 ahead)
+						local dE = flat(E - o.O).Magnitude
+						local s = math.min(run(u, tp) + o.chSpd * o.minRel, math.max(dE - 2.5, 0))
+						local Q = o.O + u * s
+						local aimed = AimFacing.GetAimedRoot({ Position = Vector3.new(Q.X, yUs(R, td), Q.Z) }, u)
+						local conf, mainHit = 0, false
+						for fi, f in futs do
+							if HitboxSettings.ContainsPoint(aimed, HitboxSettings.Kick, at(f.pts, R)) then
+								conf += f.w
+								if fi == 1 then
+									mainHit = true
+								end
+							end
+						end
+						conf /= wSum
+						if mainHit and conf >= need then
+							consider({ kind = "kick", td = td, tp = tp, T = R, aim = u, conf = conf, E = E, Q = Q })
+						end
+					end
+				end
 			end
+			if best and best.T <= tp then
+				break
+			end
+			tp += 0.04
 		end
 	end
-	return nil
+	return best
 end
 
--- CounterJump. An opponent at the ball leaves the ground (plain jump with the ball, jump next to an airborne ball)
--- or starts a RainbowFlick (ball detaches after BallDetachSeconds and pops up): we jump right after him, so the ball
--- meets our body / receive box in the air instead of passing over us. Plain jump: on his take-off (landed -> air
--- edge, seen through CharacterControllers.IsLanded on his model). Flick: at detach minus our rise time. Only when we
--- are close enough to matter (CFG.CounterJumpRange of him and of the ball) and do not own the ball.
--- CounterJump x AutoTackle (CFG.CounterTackle).
--- Dump facts: SlideTackleInput.HandleInputBegan never asks IsLanded, but it blocks the JUMP for the whole slide
--- (SetJumpStateBlocked("SlideTackle") until the tail), so the only order that works is jump -> slide, never slide -> jump.
--- RainbowFlick.Constants.BallDetachSeconds = 0.4: a slide lands HitboxDelaySeconds (0.27) + ping after the press, so
--- against a flick wind-up the slide FITS when it is pressed early, and the jump is what we do when it does not.
---   flick wind-up on the ground -> slide at him now if eta + ping fits in the time left (the flick never happens),
---                                  otherwise the old jump at detach minus rise;
---   he leaves the ground         -> jump (as before), then a slide from the air at him if his body is at our slide
---                                  box height when the hitbox is live (Mark.counterComboTick).
--- Never when a teammate is on him / on the slide line, he is in Dodge iframe, or the tackle is on cooldown.
-Mark.counterTackle = function(character, root, actor, model, r, flickLeft)
-	if CFG.CounterTackle == false or not CFG.AutoTackle then
-		return false, "off"
-	end
-	if os.clock() - lastTackleAt < tackleEnforced then
-		return false, "cd"
-	end
-	if Dodge.IsDribbling(model) then
-		return false, "iframe"
-	end
-	local myD = flat(root.Position - r.Position).Magnitude
-	for _, m in Mark.models() do
-		local a = Actors.GetFromCharacter(m)
-		if a and a ~= LocalPlayer and sameTeam(a) and not isGoalkeeper(a) and not Mark.mateDown(a, m) then
-			local ar = ActorTargeting.GetActorRoot(a)
-			if ar then
-				local d = flat(ar.Position - r.Position).Magnitude
-				if d < 7 and d < myD then
-					return false, "mate"
-				end
-			end
-		end
+-- flick wind-up: slide him now if the slide lands before the ball detaches (then the flick never happens)
+Mark.duelFlickTackle = function(character, root, actor, model, r, left)
+	if CFG.CounterTackle == false or not CFG.AutoTackle or os.clock() - lastTackleAt < tackleEnforced or Dodge.IsDribbling(model) then
+		return false
 	end
 	local solved = solveIntercept(root, r, model, tackleTuning())
-	if not (solved) then
-		return false, "solve"
-	end
-	if not solved.fire then
-		return false, solved.wait or "nofire"
+	if not (solved and solved.fire) then
+		return false
 	end
 	local ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
-	if flickLeft and (solved.eta or 9) + ping > flickLeft - 0.03 then
-		return false, "late"
-	end
-	-- a teammate on the slide line is knocked over by it
-	local line = solved.aim * math.min(solved.dist or 12, 20)
-	for _, m in Mark.models() do
-		local a = Actors.GetFromCharacter(m)
-		if a and a ~= LocalPlayer and sameTeam(a) then
-			local ar = ActorTargeting.GetActorRoot(a)
-			if ar then
-				local rel = flat(ar.Position - root.Position)
-				local along = rel:Dot(solved.aim)
-				if along > 0 and along < line.Magnitude and (rel - solved.aim * along).Magnitude < 2.4 then
-					return false, "mate on line"
-				end
-			end
-		end
+	if (solved.eta or 9) + ping > left - 0.03 then
+		return false
 	end
 	predict = solved
-	local sent, why = tryTackle(character, root, solved.aim, solved.mult, { char = model, root = r })
+	Mark.duelFlickOk = true
+	local sent = tryTackle(character, root, solved.aim, solved.mult, { char = model, root = r })
+	Mark.duelFlickOk = nil
 	if sent then
-		logFile("counter tackle", "ground", actorName(actor), "eta", string.format("%.2f", solved.eta or 0), "left", flickLeft and string.format("%.2f", flickLeft) or "-", "dist", string.format("%.1f", solved.dist or 0))
+		logFile("duel", "flick tackle", actorName(actor), "eta", string.format("%.2f", solved.eta or 0), "left", string.format("%.2f", left))
 	end
-	return sent, why
+	return sent
 end
 
--- After the counter jump: slide from the air. Heights are ballistic for both bodies (workspace gravity, the field is
--- flat: floor = our root Y when we left the ground), the horizontal part is the same multiplier window the ground
--- solver uses. Fires on the first frame a legal (time, multiplier) pair puts his body in our slide box.
-Mark.counterCombo = nil
-Mark.counterComboTick = function(character, root)
-	local cb = Mark.counterCombo
-	if not cb then
-		return
+Mark.duelEnd = function(why)
+	if Mark.duel then
+		logFile("duel", "end", why, Mark.duel.name or "-")
 	end
-	local now = os.clock()
-	if now > cb.untilT or not (cb.model and cb.model.Parent and cb.root and cb.root.Parent) then
-		Mark.counterCombo = nil
+	Mark.duel = nil
+	Mark.moveStop("duel")
+end
+
+Mark.tickCounterJump = function(character, root)
+	do
+		local h0 = character:FindFirstChildOfClass("Humanoid")
+		if h0 and CharacterControllers.IsLanded(character, h0) then
+			Mark.duelFloor = root.Position.Y
+		end
+	end
+	if not CFG.CounterJump or liveOwnerId() == LocalPlayer.UserId or MatchSettings.IsGoalkeeperCharacter(character) then
+		if Mark.duel then
+			Mark.duelEnd("off")
+		end
 		return
 	end
 	local hum = character:FindFirstChildOfClass("Humanoid")
-	if not hum then
-		return
-	end
-	if CharacterControllers.IsLanded(character, hum) then
-		if now - cb.at > 0.15 then
-			Mark.counterCombo = nil
+	if not hum or Ragdoll.IsActorRagdolled(LocalPlayer) or ClientSlide.IsSlideTackling() or ClientDodge.IsDribbling() then
+		if Mark.duel then
+			Mark.duelEnd("busy")
 		end
 		return
 	end
-	local chargingNow = ChargedKick.IsCharging and ChargedKick.IsCharging()
-	local tackleBusy = os.clock() - lastTackleAt < tackleEnforced or ClientSlide.IsSlideTackling() or CFG.CounterTackle == false or not CFG.AutoTackle
-	if Dodge.IsDribbling(cb.model) then
+	local now = os.clock()
+	local landed = CharacterControllers.IsLanded(character, hum)
+	if landed then
+		Mark.duelFloor = root.Position.Y
+	end
+	if Mark.duel and now - (Mark.duel.seen or Mark.duel.at) > 0.3 then
+		Mark.duelEnd("stale") -- no plan refreshed it (he flies a powered / fresh arc): do not keep AutoBlock parked
+	end
+	-- the target: the enemy carrier within range (the ball is with him)
+	local oid = liveOwnerId()
+	local actor = type(oid) == "number" and playerOf(oid) or nil
+	if not actor or sameTeam(actor) or isGoalkeeper(actor) then
+		if Mark.duel then
+			Mark.duelEnd("no carrier")
+		end
 		return
 	end
-	-- kick leg of the bundle: rolled at the jump, or the slide is on cooldown / not legal after 0.3 s in the air
-	if (cb.kind == "kick" or tackleBusy) and not chargingNow and not Mark.ak and CFG.AutoKick ~= false then
-		local okK = Mark.akTry("counter", cb.model, cb.root, true)
-		if okK then
-			Mark.counterCombo = nil
-			return
+	local model = Actors.GetCharacter(actor)
+	local r = ActorTargeting.GetActorRoot(actor)
+	local hisHum = model and model:FindFirstChildOfClass("Humanoid")
+	if not (model and r and hisHum) or flat(r.Position - root.Position).Magnitude > (CFG.CounterJumpRange or 24) then
+		if Mark.duel then
+			Mark.duelEnd("range")
+		end
+		return
+	end
+	-- a flick wind-up: the slide, if it lands before the detach; the ball after it is AutoBall's
+	if CFG.CounterCompetitor then
+		local myD = flat(r.Position - root.Position).Magnitude
+		for _, m2 in Mark.models() do
+			local a2 = Actors.GetFromCharacter(m2)
+			if a2 and a2 ~= LocalPlayer and sameTeam(a2) and not isGoalkeeper(a2) and not Mark.mateDown(a2, m2) then
+				local r2 = ActorTargeting.GetActorRoot(a2)
+				local d2 = r2 and flat(r2.Position - r.Position).Magnitude
+				if d2 and d2 <= (CFG.CounterCompetitorRadius or 12) and d2 < myD then
+					if Mark.duel then
+						Mark.duelEnd("competitor")
+					end
+					return
+				end
+			end
 		end
 	end
-	if cb.kind == "kick" or tackleBusy or chargingNow then
+	local wind, left = Mark.enemyWind(actor)
+	if wind then
+		if landed and flat(r.Position - root.Position).Magnitude <= (CFG.FlickTackleRange or 10) + 6 then
+			Mark.duelFlickTackle(character, root, actor, model, r, left)
+		end
+		if Mark.duel then
+			Mark.duelEnd("flick")
+		end
 		return
 	end
-	local pos, vel, worldVel = Mark.carrierPose(cb.root, cb.model)
-	local origin = root.Position
-	local flatNow = flat(pos - origin).Magnitude
-	if flatNow > 26 then
-		return
-	end
+	local P, V = Mark.carrierPose(r, model)
 	local g = Workspace.Gravity
 	if type(g) ~= "number" or g < 10 then
 		g = 196.2
 	end
-	local ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
-	local myVy = root.AssemblyLinearVelocity.Y
-	local hisVy = typeof(worldVel) == "Vector3" and worldVel.Y or 0
-	local boxS = HitboxSettings.SlideTackle
-	local lo = boxS.CFrameOffset.Y - boxS.Size.Y * 0.5 - 1.6
-	local hi = boxS.CFrameOffset.Y + boxS.Size.Y * 0.5 + 1.6
-	local mid = Mark.slideBox()
-	local mHi = math.max(0.4, CFG.TackleSpeed)
-	local mLo = math.min(mHi, CFG.TackleMinSpeed or 0.6)
-	local t0 = C.HitboxDelaySeconds
-	local t1 = t0 + C.HitboxSeconds
-	local bestT, bestPred, bestMult, bestDy
-	local t = t0
-	while t <= t1 + 1e-4 do
-		local yUs = math.max(cb.floor, origin.Y + myVy * t - 0.5 * g * t * t)
-		local yHim = math.max(cb.floor, pos.Y + hisVy * (t + ping * 0.5) - 0.5 * g * (t + ping * 0.5) ^ 2)
-		local dy = yHim - yUs
-		if dy >= lo and dy <= hi then
-			local pred = pos + vel * (t + ping * 0.5)
-			local d = flat(pred - origin).Magnitude
-			local mC = (d - mid) / math.max(Mark.dumpTravel(t), 1)
-			if mC >= mLo * 0.85 and mC <= mHi * 1.12 then
-				bestT, bestPred, bestMult, bestDy = t, pred, math.clamp(mC, mLo, mHi), dy
-				break
-			end
+	local floor = Mark.duelFloor or root.Position.Y
+	local vs = Mark.vertState(model, P, floor, not CharacterControllers.IsLanded(model, hisHum), now, g)
+	if not vs.airborne then
+		if Mark.duel then
+			Mark.duelEnd("he landed")
 		end
-		t += 0.02
+		return -- a grounded carrier is AutoTackle / AutoKick / AutoBlock work
 	end
-	if not bestT then
-		-- the slide has no legal (time, multiplier) pair yet: do not wait for it - the charged Kick (both bodies are in the
-		-- air, it is legal there) goes out after a short beat; the slide keeps its chance on the frames before that
-		if now - cb.at > (CFG.CounterKickDelay or 0.08) and not chargingNow and not Mark.ak and CFG.AutoKick ~= false then
-			if Mark.akTry("counter", cb.model, cb.root, true) then
-				Mark.counterCombo = nil
-			end
+	if vs.kind ~= "ballistic" then
+		return -- fresh take-off (slope not measured) or a powered flight: nothing to plan against yet
+	end
+	-- solve at ~20 Hz
+	local dm = Mark.duelMemo
+	local plan
+	if dm and dm.model == model and now - dm.at < 0.05 then
+		plan = dm.plan
+		if plan then
+			local el = now - dm.at
+			plan = table.clone(plan)
+			plan.td = type(plan.td) == "number" and math.max(plan.td - el, 0) or plan.td
+			plan.tp = math.max(plan.tp - el, 0)
+			plan.T = plan.T - el
+		end
+	else
+		local ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
+		local lead = math.clamp(CharacterMotion.GetDisplayDelaySeconds(model) or 0, 0, 0.25) + ping * 0.5
+		local goal = Mark.defendGoal()
+		local futs = Mark.gkFutures(P, V, vs.vy, true, false, floor, lead, goal and goal.Position or (P + flat(V) * 10), g, false)
+		local spd, chSpd = Mark.akSpeeds(character)
+		if hum.WalkSpeed > spd then
+			spd = hum.WalkSpeed
+		end
+		local mHi = math.max(0.4, CFG.TackleSpeed)
+		local tackleReady = CFG.CounterTackle ~= false and CFG.AutoTackle and now - lastTackleAt >= tackleEnforced
+			and not ActionLocks.HasTackleBlock(LocalPlayer) and not SlideTackle.IsRepeatBlocked(character, false)
+		local charging = ChargedKick.IsCharging and ChargedKick.IsCharging()
+		plan = Mark.duelSolve({
+			O = root.Position, v0 = flat(root.AssemblyLinearVelocity), spd = spd, chSpd = chSpd, landed = landed,
+			vy = root.AssemblyLinearVelocity.Y, floor = floor, g = g, vJ = math.sqrt(2 * g * (Mark.jumpH or 7.2)), futs = futs,
+			slideOk = tackleReady and not charging, kickOk = CFG.AutoKick ~= false and not Mark.ak and not charging,
+			mLo = math.min(mHi, CFG.TackleMinSpeed or 0.6), mHi = mHi,
+			minRel = (KickCore.GetMinimumReleaseSeconds and KickCore.GetMinimumReleaseSeconds()) or 0.2,
+		})
+		Mark.duelMemo = { model = model, at = now, plan = plan }
+	end
+	if not plan then
+		if Mark.duel and now - Mark.duel.seen > 0.2 then
+			Mark.duelEnd("no plan")
 		end
 		return
 	end
-	local aim = unitOrNil(flat(bestPred - origin))
-	if not aim then
+	local name = actorName(actor)
+	if not Mark.duel or Mark.duel.model ~= model then
+		Mark.duel = { model = model, at = now, name = name }
+		logFile("duel", "plan", plan.kind, name, "td", type(plan.td) == "number" and string.format("%.2f", plan.td) or (plan.td or "air"), "tp", string.format("%.2f", plan.tp), "T", string.format("%.2f", plan.T), "conf", string.format("%.2f", plan.conf), "d", string.format("%.1f", flat(P - root.Position).Magnitude), "h", string.format("%.1f", P.Y - floor))
+	end
+	Mark.duel.seen = now
+	-- move: to where we press, facing him (the agent; air control steers too)
+	if CFG.CounterMove ~= false then
+		local mySpd = Mark.akSpeeds(character)
+		local cmd, route = Mark.agentSteer({
+			key = "duel", us = root.Position, vUs = flat(root.AssemblyLinearVelocity), center = nil, vC = flat(V),
+			target = Vector3.new(plan.Q.X, root.Position.Y, plan.Q.Z), spd = math.max(mySpd, hum.WalkSpeed), ff = Vector3.zero,
+		})
+		if cmd.Magnitude < 0.2 then
+			cmd = unitOrNil(flat(plan.E - root.Position)) or cmd -- at the spot: lean in, the press goes out from the run
+		end
+		Mark.move.look = unitOrNil(flat(P - root.Position))
+		Mark.move.pts = route
+		Mark.move.born = Mark.move.born or now
+		Mark.moveSteer(cmd, "duel")
+	end
+	if landed and plan.td ~= "ground" then
+		if type(plan.td) == "number" and plan.td <= 0.035 and Mark.doJump("duel") then
+			Mark.duel.jumpAt = now
+			logFile("duel", "jump", plan.kind, name, "tp", string.format("%.2f", plan.tp), "conf", string.format("%.2f", plan.conf))
+		end
 		return
 	end
-	predict = {
-		dist = flatNow, distLive = flat(cb.root.Position - origin).Magnitude, delay = 0, livePos = cb.root.Position, serverPos = pos,
-		eta = bestT, spd = vel.Magnitude, hit = bestPred, iframe = 0,
-	}
-	local sent = tryTackle(character, root, aim, bestMult, { char = cb.model, root = cb.root })
+	if plan.tp > 0.035 then
+		return
+	end
+	local sent = false
+	if plan.kind == "slide" then
+		predict = { dist = flat(P - root.Position).Magnitude, eta = plan.T, hit = plan.E, spd = V.Magnitude, iframe = 0, serverPos = P, livePos = r.Position, distLive = flat(r.Position - root.Position).Magnitude, delay = 0 }
+		sent = tryTackle(character, root, plan.aim, plan.mult, { char = model, root = r })
+	else
+		sent = Mark.akTry("duel", model, r, true)
+	end
+	logFile("duel", "press", plan.kind, sent and "sent" or "refused", name, "T", string.format("%.2f", plan.T), "conf", string.format("%.2f", plan.conf), "mult", plan.mult and string.format("%.2f", plan.mult) or "-")
 	if sent then
-		logFile("counter tackle", "air", actorName(cb.actor), "eta", string.format("%.2f", bestT), "dy", string.format("%.1f", bestDy), "dist", string.format("%.1f", flatNow), "mult", string.format("%.2f", bestMult))
-		Mark.counterCombo = nil
-	end
-end
-
-Mark.airSeen = {}
--- Both in the air without our own counter jump (the player jumped, or he is mid bicycle kick): an enemy within the kick
--- reach of our airborne body gets the charged Kick at once (urgent: first legal release), when the box reaches him.
-Mark.counterAirKick = function(character, root)
-	if CFG.AutoKick == false or Mark.ak or os.clock() - (Mark.airKickAt or 0) < 0.5 then
-		return
-	end
-	local hum = character:FindFirstChildOfClass("Humanoid")
-	if not hum or CharacterControllers.IsLanded(character, hum) or liveOwnerId() == LocalPlayer.UserId then
-		return
-	end
-	if (ChargedKick.IsCharging and ChargedKick.IsCharging()) or Mark.counterCombo then
-		return
-	end
-	local reach = Mark.kickReach() + 3
-	for _, model in Mark.models() do
-		local actor = Actors.GetFromCharacter(model)
-		if actor and actor ~= LocalPlayer and not sameTeam(actor) then
-			local r = ActorTargeting.GetActorRoot(actor)
-			local h = model:FindFirstChildOfClass("Humanoid")
-			if r and h and not CharacterControllers.IsLanded(model, h) and flat(r.Position - root.Position).Magnitude <= reach and math.abs(r.Position.Y - root.Position.Y) <= 6 then
-				Mark.airKickAt = os.clock()
-				if Mark.akTry("air", model, r, true) then
-					return
-				end
-			end
-		end
-	end
-end
-
-Mark.tickCounterJump = function(character, root)
-	if not CFG.CounterJump then
-		return
-	end
-	Mark.counterComboTick(character, root)
-	Mark.counterAirKick(character, root)
-	local hum = character:FindFirstChildOfClass("Humanoid")
-	if not (hum and CharacterControllers.IsLanded(character, hum)) or liveOwnerId() == LocalPlayer.UserId then
-		return
-	end
-	if os.clock() - (Mark.counterAt or 0) < 0.6 then
-		return
-	end
-	local ball = Renderer.GetPosition() or Renderer.GetMainMatchPosition()
-	if typeof(ball) ~= "Vector3" then
-		return
-	end
-	local range = CFG.CounterJumpRange
-	if flat(ball - root.Position).Magnitude > range + 3 then
-		return
-	end
-	Mark.flick = Mark.flick or require(Modules.Actions.RainbowFlick)
-	local oid = liveOwnerId()
-	for _, model in Mark.models() do
-		local actor = Actors.GetFromCharacter(model)
-		if actor and actor ~= LocalPlayer and not sameTeam(actor) then
-			local r = ActorTargeting.GetActorRoot(actor)
-			local h = model:FindFirstChildOfClass("Humanoid")
-			local isOwner = type(oid) == "number" and actor.UserId == oid
-			if r and h and flat(r.Position - root.Position).Magnitude <= range + 2 and (isOwner or flat(ball - r.Position).Magnitude <= 9) then
-				local air = not CharacterControllers.IsLanded(model, h)
-				local was = Mark.airSeen[model]
-				Mark.airSeen[model] = air
-				-- air episode: the landed->air edge needs two polls in range (and the poll ran at half rate); an enemy who
-				-- is already rising when first seen (jumped from outside the range, or the edge fell in a skipped frame)
-				-- was ignored and AutoTackle slid at the airborne carrier instead. Treat the first sight of an episode that
-				-- is younger than 0.4 s as the edge.
-				Mark.airEp = Mark.airEp or setmetatable({}, { __mode = "k" })
-				if not air then
-					Mark.airEp[model] = nil
-				elseif not Mark.airEp[model] then
-					Mark.airEp[model] = { t = os.clock(), done = false }
-				end
-				local ep = Mark.airEp[model]
-				local why = nil
-				if (air or Mark.enemyWind(actor)) and (not Mark.ctWatchAt or os.clock() - Mark.ctWatchAt > 0.5) then
-					Mark.ctWatchAt = os.clock()
-					logFile("counter watch", actorName(actor), "air", tostring(air), "was", tostring(was), "owner", tostring(isOwner), "epAge", ep and string.format("%.2f", os.clock() - ep.t) or "-", "done", tostring(ep and ep.done), "wind", tostring(Mark.enemyWind(actor)), "d", string.format("%.1f", flat(r.Position - root.Position).Magnitude), "cd", string.format("%.2f", os.clock() - (Mark.counterAt or 0)))
-				end
-				if air and ep and not ep.done and os.clock() - ep.t < 0.4 and (was == false or was == nil or isOwner) then
-					why = "jump"
-					ep.done = true
-				elseif Mark.flickStart and not Mark.enemyWind(actor) then
-					Mark.flickStart[actor.UserId] = nil
-				end
-				if why then
-					-- already decided
-				elseif type(oid) == "number" and actor.UserId == oid and Mark.enemyWind(actor) then
-					local st = Mark.flickStart and Mark.flickStart[actor.UserId]
-					if not st then
-						Mark.flickStart = Mark.flickStart or {}
-						Mark.flickStart[actor.UserId] = os.clock()
-						st = os.clock()
-					end
-					-- tackle first: a slide that lands before the ball detaches means the flick never happens
-					if not Mark.ctAt or os.clock() - Mark.ctAt > 0.08 then
-						Mark.ctAt = os.clock()
-						local fr = Mark.flickRec and Mark.flickRec[actor.UserId]
-						local untilT = fr and fr.detachSrv
-						local left = type(untilT) == "number" and (untilT - Workspace:GetServerTimeNow()) or (Mark.flick.Constants.BallDetachSeconds - (os.clock() - st))
-						local sent, ctWhy = Mark.counterTackle(character, root, actor, model, r, left)
-						if sent then
-							Mark.counterAt = os.clock() + 0.4
-							Mark.flickStart[actor.UserId] = nil
-							return
-						elseif Mark.ctSkipFor ~= st and ctWhy ~= "off" then
-							Mark.ctSkipFor = st
-							logFile("counter tackle", "skip", tostring(ctWhy), actorName(actor), "left", string.format("%.2f", left))
-						end
-					end
-					local rise = Mark.riseT and Mark.riseT(Mark.jumpH or 7.2) or 0.27
-					-- The flick is a known lob (RainbowFlick.GetCharacterLaunch: forward 6, up 48, his own velocity): jump when the
-					-- predicted flight is at our reach at the rise time; no flight through our reach -> no jump (AutoBall runs for
-					-- the landing). Without a prediction the old fixed timing (detach - rise) stays.
-					local fs = Mark.flickShot(actor)
-					if fs then
-						Mark.mover = Mark.mover or require(Modules.Actions.ActionMovement)
-						local spdF = Mark.mover.GetRunWalkSpeed(Mark.mover.GetBaseWalkSpeed(character), false) * 1.05
-						local jt, jh = Mark.planJump(root, fs.pts, fs.ts, spdF)
-						if jt then
-							why = "flick"
-							Mark.flickStart[actor.UserId] = nil
-							logFile("counter flick path", "arrive", string.format("%.2f", jt), "h", string.format("%.1f", jh), "detach in", string.format("%.2f", fs.left))
-						end
-					elseif os.clock() - st >= Mark.flick.Constants.BallDetachSeconds - rise - LocalPlayer:GetNetworkPing() * 0.5 then
-						why = "flick"
-						Mark.flickStart[actor.UserId] = nil
-					end
-				end
-				-- Enemy HIGH: he is up in the air (a header, a jump to the ball, a flick he already started) and the ball is with him
-				-- or within reach of him: the jump above only fires on the take-off edge of the first 0.4 s, which an enemy that rose
-				-- before we were in range never gave us. Once per air episode.
-				if not why and air and ep and not ep.high and r.Position.Y - root.Position.Y >= 3 and (isOwner or flat(ball - r.Position).Magnitude <= 9) then
-					why = "high"
-					ep.high = true
-				end
-				if why and CFG.CounterCompetitor then
-					-- optional: a teammate already on him owns the duel (CompetitorRadius), as in AutoBlock
-					for _, m2 in Mark.models() do
-						local a2 = Actors.GetFromCharacter(m2)
-						if a2 and a2 ~= LocalPlayer and sameTeam(a2) and not isGoalkeeper(a2) then
-							local r2 = ActorTargeting.GetActorRoot(a2)
-							if r2 and flat(r2.Position - r.Position).Magnitude <= (CFG.CounterCompetitorRadius or CFG.CompetitorRadius) then
-								logFile("counter jump", "skip", "competitor", actorName(a2))
-								why = nil
-								break
-							end
-						end
-					end
-				end
-				if why and Mark.doJump("counter") then
-					Mark.counterAt = os.clock()
-					local canTackle = CFG.CounterTackle ~= false and CFG.AutoTackle
-					local canKick = CFG.AutoKick ~= false
-					if (canTackle or canKick) and math.random() < (CFG.CounterComboChance or 0.85) then
-						-- the bundle: a slide from the air, or a charged Kick (both bodies in the air), by roll
-						local kind = canTackle and "tackle" or "kick"
-						if canTackle and canKick and math.random() < (CFG.CounterKickChance or 0.45) then
-							kind = "kick"
-						end
-						Mark.counterCombo = { actor = actor, model = model, root = r, at = os.clock(), untilT = os.clock() + 0.75, floor = root.Position.Y, kind = kind }
-					end
-					logFile("counter jump", why, actorName(actor), string.format("%.1f", flat(r.Position - root.Position).Magnitude))
-					return
-				end
-			end
-		end
+		Mark.duelMemo = nil
+		Mark.duelEnd("pressed")
 	end
 end
 
@@ -11401,7 +11324,10 @@ Mark.blockCutTick = function(character, root, pick, P, V, chE, cr)
 	local tgt = pk.p + toG * math.max(Mark.kickReach() - 1, 2)
 	tgt = Vector3.new(tgt.X, root.Position.Y, tgt.Z)
 	local off = flat(tgt - root.Position)
-	local cmd = off.Magnitude > 0.6 and off.Unit or Vector3.zero
+	local cmd, route = Mark.agentSteer({
+		key = "cut", us = root.Position, vUs = flat(root.AssemblyLinearVelocity), center = P, vC = V,
+		target = tgt, spd = mySpd, ff = Vector3.zero, minR = HitboxSettings.Receive.Size.X * 0.5 + 2,
+	})
 	local now = os.clock()
 	if CFG.AutoKick ~= false and chE and dist <= Mark.kickReach() + (CFG.AutoKickRange or 16) then
 		Mark.akTry("block", chE, cr, false)
@@ -11411,7 +11337,7 @@ Mark.blockCutTick = function(character, root, pick, P, V, chE, cr)
 		end
 	end
 	Mark.move.look = unitOrNil(flat(P - root.Position))
-	Mark.move.pts = Mark.blockCurve(root.Position, tgt, flat(root.AssemblyLinearVelocity), V)
+	Mark.move.pts = route
 	Mark.move.born = Mark.move.born or now
 	Mark.moveSteer(cmd, "block")
 	Mark.blockHold, Mark.blockLast, Mark.blockDest, Mark.blockRoot = now, now, tgt, cr
@@ -11448,6 +11374,102 @@ Mark.blockCurve = function(from, to, vUs, vHim)
 	out[1], out[6] = from, to
 	return out
 end
+
+-- AGENT STEER (AutoBlock shadow / mark / cut-off, the air duel). The agent's way to a spot near a moving man is not a ruler:
+--   far from him (> 20 st): a Hermite curve that leaves along our momentum and arrives along his run (Mark.blockCurve);
+--     the command follows the curve a few studs ahead;
+--   near him: POLAR control around him - the angle round him and the distance to him are steered separately (gain
+--     3.5 /s each), so the body ORBITS him toward the spot (a spiral in, a tank-track turn) instead of cutting through
+--     him, never closer than minR while the angle is still wrong; the agent faces him meanwhile (Mark.move.look) = a
+--     strafe;
+--   between 10 and 20 st the two blend; his velocity (or the caller's feed-forward) is added; a 60 ms low-pass keeps
+--   the heading from snapping when his velocity jumps.
+-- Returns cmd (|cmd| <= 1, zero under the move-hook threshold) and the route: the same law integrated 1 s ahead (the
+-- agent line shows where the body will actually go).
+Mark.agentSteer = function(o)
+	local spd = math.max(o.spd or 16, 8)
+	local function law(us, vUs, center, target)
+		local off = flat(target - us)
+		local straight
+		do
+			local d = off.Magnitude
+			if d < 0.05 then
+				straight = Vector3.zero
+			else
+				local route = Mark.blockCurve(us, target, vUs, o.vC or Vector3.zero)
+				local aim = route[3] and d > 5 and flat(route[3] - us) or off
+				straight = (unitOrNil(aim) or Vector3.zero) * spd * math.clamp(d / 3, 0.3, 1)
+			end
+		end
+		if not center then
+			return straight
+		end
+		local rel = flat(us - center)
+		local r = rel.Magnitude
+		local relT = flat(target - center)
+		local rT = relT.Magnitude
+		if r < 0.5 or rT < 0.5 then
+			return straight
+		end
+		local er = rel / r
+		local et = Vector3.new(-er.Z, 0, er.X)
+		local uT = relT / rT
+		local dA = math.atan2(er.X * uT.Z - er.Z * uT.X, er:Dot(uT))
+		local vt = math.clamp(dA * r * 3.5, -spd, spd)
+		local vr = math.clamp((rT - r) * 3.5, -spd, spd)
+		local minR = o.minR or 4
+		if r < minR and math.abs(dA) > 0.5 then
+			vr = math.max(vr, (minR - r) * 4)
+		end
+		local polar = er * vr + et * vt
+		local w = math.clamp((r - 10) / 10, 0, 1)
+		return polar * (1 - w) + straight * w
+	end
+	local ff = o.ff or o.vC or Vector3.zero
+	local v = law(o.us, o.vUs, o.center, o.target) + ff
+	local cmd = v / spd
+	if cmd.Magnitude > 1 then
+		cmd = cmd.Unit
+	end
+	if cmd.Magnitude < 0.2 and flat(o.target - o.us).Magnitude < 0.8 then
+		cmd = Vector3.zero
+	end
+	Mark.steerPrev = Mark.steerPrev or {}
+	local now = os.clock()
+	local pc = Mark.steerPrev[o.key or "x"]
+	if pc and now - pc.t < 0.25 and cmd.Magnitude > 0.2 and pc.v.Magnitude > 0.2 then
+		local k = 1 - math.exp(-(now - pc.t) / 0.06)
+		local mixed = pc.v + (cmd - pc.v) * k
+		if mixed.Magnitude > 0.2 then
+			cmd = mixed.Magnitude > 1 and mixed.Unit or mixed
+		end
+	end
+	Mark.steerPrev[o.key or "x"] = { t = now, v = cmd }
+	-- route: integrate the same law (him moving with vC, the target with him), 10 x 0.1 s
+	local pts = { o.us }
+	local p, vel = o.us, o.vUs or Vector3.zero
+	local c, tg = o.center, o.target
+	local vC = o.vC or Vector3.zero
+	for _ = 1, 10 do
+		local want = law(p, vel, c, tg) + ff
+		if want.Magnitude > spd then
+			want = want.Unit * spd
+		end
+		vel = vel + (want - vel) * 0.6
+		p = p + vel * 0.1
+		if c then
+			c = c + vC * 0.1
+		end
+		tg = tg + flat(ff) * 0.1
+		pts[#pts + 1] = Vector3.new(p.X, o.us.Y, p.Z)
+		if flat(tg - p).Magnitude < 0.8 then
+			break
+		end
+	end
+	pts[#pts + 1] = Vector3.new(tg.X, o.us.Y, tg.Z)
+	return cmd, pts
+end
+
 
 -- Marking. passer: the intercept point on the lane. else: his pass lane BlockMarkGap from him toward the carrier.
 Mark.blockMarkTick = function(character, root, pick, P)
@@ -11503,13 +11525,14 @@ Mark.blockMarkTick = function(character, root, pick, P)
 	end
 	S = Vector3.new(S.X, root.Position.Y, S.Z)
 	local off = flat(S - root.Position)
-	local cmd = Vector3.zero
-	if off.Magnitude > 0.8 then
-		cmd = off.Unit * math.clamp(off.Magnitude / 3, 0.35, 1)
-	end
+	-- the carrier is the body not to run through on the way: orbit him near, curve far
+	local cmd, route = Mark.agentSteer({
+		key = "mark", us = root.Position, vUs = flat(root.AssemblyLinearVelocity), center = P, vC = flat(pick.V or Vector3.zero),
+		target = S, spd = mySpd, ff = vel * 0.6, minR = HitboxSettings.Receive.Size.X * 0.5 + 2,
+	})
 	local now = os.clock()
 	Mark.move.look = unitOrNil(flat(P - root.Position))
-	Mark.move.pts = { root.Position, S }
+	Mark.move.pts = route
 	Mark.move.born = Mark.move.born or now
 	Mark.moveSteer(cmd, "block")
 	Mark.blockMarkAt = now
@@ -11575,6 +11598,10 @@ end
 
 Mark.tickBlock = function(character, root)
 	Mark.tickCounterJump(character, root)
+	if Mark.duel or (Mark.flickBallAt and os.clock() - Mark.flickBallAt < 0.2) then
+		-- the air duel / AutoBall's flick plan owns the body this frame
+		return
+	end
 	-- idle polling at half rate when the frame budget is tight (>= ~100 fps): a started block runs every frame
 	Mark.blockFrame += 1
 	if Mark.blockFrame % 2 == 0 and (Mark.dtAvg or 1) < 0.0105 and Mark.move.mode ~= "block" then
@@ -11604,62 +11631,11 @@ Mark.tickBlock = function(character, root)
 		end
 		return
 	end
-	local ballPos = Renderer.GetPosition() or Renderer.GetTargetPosition(nil, root.Position)
-	local ballVel = Renderer.GetTargetVelocity(nil, root.Position)
-	local g0 = Mark.defendGoal()
-	if g0 and typeof(ballPos) == "Vector3" and typeof(ballVel) == "Vector3" then
-		local toGoal = flat(g0.Position - ballPos)
-		local vel = flat(ballVel)
-		local into = vel.Magnitude
-		if toGoal.Magnitude > 8 and into > 18 and vel.Unit:Dot(toGoal.Unit) > 0.45 then
-			local eta = toGoal.Magnitude / vel:Dot(toGoal.Unit)
-			if eta > 0.08 and eta < 1.2 then
-				local meetT = math.clamp(eta * 0.45, 0.1, 0.55)
-				local dest = ballPos + vel.Unit * (vel.Magnitude * meetT)
-				local gap = flat(dest - root.Position).Magnitude
-				local dir = unitOrNil(flat(dest - root.Position))
-				if dir and gap > 1.4 and gap < 16 then
-					if not Mark.blockFly or os.clock() - Mark.blockFly > 0.35 then
-						Mark.blockFly = os.clock()
-						logFile("block fly", string.format("%.2f", eta), string.format("%.1f", gap), string.format("%.1f", into))
-					end
-					Mark.move.look = unitOrNil(flat(ballPos - root.Position)) or dir
-					Mark.moveSteer(dir, "block")
-					Mark.blockHold = os.clock()
-					Mark.blockRoot = nil
-					return
-				end
-			end
-		end
-	end
 	-- a loose ball is AutoBall's once tickBall took the steering: do not fight it with the stale block hold
 	do
 		local o2 = liveOwnerId()
 		if Mark.move.mode == "ball" and not (type(o2) == "number" and o2 ~= 0) then
 			return
-		end
-	end
-	-- The carrier we were shadowing let the ball go (pass / touch away): take the ball path instead of following
-	-- his body. Earliest path sample we reach (Receive hitbox, run speed) before any opponent can.
-	do
-		local oidB = liveOwnerId()
-		local freeBall = not (type(oidB) == "number" and oidB ~= 0)
-		if freeBall and Mark.blockLast and os.clock() - Mark.blockLast < 1.5 then
-			local spot = Mark.blockIntercept(character, root)
-			if spot then
-				local to = flat(spot.p - root.Position)
-				if to.Magnitude > 0.8 then
-					if not Mark.blockIcLog or os.clock() - Mark.blockIcLog > 0.4 then
-						Mark.blockIcLog = os.clock()
-						logFile("block intercept", "t", string.format("%.2f", spot.t), "g", string.format("%.1f", spot.g), "h", string.format("%.1f", spot.h))
-					end
-					Mark.move.look = to.Unit
-					Mark.moveSteer(to.Unit, "block")
-					Mark.blockHold = os.clock()
-					Mark.blockRoot = nil
-					return
-				end
-			end
 		end
 	end
 	local held = Mark.blockHold and os.clock() - Mark.blockHold < 0.45 and (not Mark.blockRoot or Mark.blockRoot.Parent)
@@ -11747,49 +11723,7 @@ Mark.tickBlock = function(character, root)
 	local delay = chE and math.clamp(CharacterMotion.GetDisplayDelaySeconds(chE) or 0, 0, 0.25) or 0
 	-- displayed pose lags the server pose, and the packet itself lags by ping. Stand where he will be.
 	local lag = delay + math.clamp(LocalPlayer:GetNetworkPing() or 0, 0, 0.22) + 0.1
-	-- light EMA on his velocity (carrierPose differentiates positions every >= 25 ms; single-step jitter swings the spot)
-	-- He does not run straight. A sharp change of heading (> BlockTurnDeg against 0.3 s ago) means the new line is not yet a
-	-- fact: extrapolating it for the whole horizon sent us to where he would be if he kept turning (and a feint made us run
-	-- the wrong way). For 0.6 s after the turn the horizon shrinks to BlockTurnHedge of its length (the spot stays near his
-	-- body, on his line to goal) and grows back as the new heading proves itself.
-	local turnK = 1
-	do
-		local nowc = os.clock()
-		local bs = Mark.blockVs
-		if bs and bs.ch == chE and nowc - bs.t < 0.2 then
-			local k = 1 - math.exp(-(nowc - bs.t) / 0.06)
-			V = bs.v + (V - bs.v) * k
-		end
-		Mark.blockVs = { ch = chE, t = nowc, v = V }
-		local h = Mark.blockHist
-		if not (h and h.ch == chE) then
-			h = { ch = chE, list = {} }
-			Mark.blockHist = h
-		end
-		local list = h.list
-		list[#list + 1] = { t = nowc, v = V }
-		while #list > 1 and nowc - list[1].t > 0.8 do
-			table.remove(list, 1)
-		end
-		local old = nil
-		for _, e in list do
-			if nowc - e.t >= 0.3 then
-				old = e
-			end
-		end
-		if old and V.Magnitude > 4 and old.v.Magnitude > 4 then
-			local ang = math.deg(math.acos(math.clamp(V.Unit:Dot(old.v.Unit), -1, 1)))
-			if ang > (CFG.BlockTurnDeg or 35) then
-				if not h.turnAt or nowc - h.turnAt > 0.3 then
-					logFile("block turn", string.format("%.0f", ang), "deg, hedge for 0.6 s", "his", string.format("%.1f", V.Magnitude))
-				end
-				h.turnAt = nowc
-			end
-		end
-		if h.turnAt then
-			turnK = math.clamp((nowc - h.turnAt) / 0.6, CFG.BlockTurnHedge or 0.35, 1)
-		end
-	end
+	-- V is Mark.trendVel's (blockTarget): a zig-zag reads as where it goes, a stop as a stop. No extra hedge / EMA.
 	-- He is charging a kick (ActionPresentationUpdate KickChargeStarted/Updated carries his aim): stand on his
 	-- shot line instead of the goal line, so the release hits our body.
 	local shotLine = nil
@@ -11816,20 +11750,6 @@ Mark.tickBlock = function(character, root)
 			faceLine = true
 		end
 	end
-	do
-		-- KickPowerups: the Supercharge item scales the kick and PoweredUpBodyKnockbackMultiplier (1.75) the body
-		-- knock-back; the Ragdoll module has a Supercharged state with its own VFX. Nothing else in the client dump
-		-- gates a body block by ball speed (Receiving.Resolve only picks Receive / Trap / Bounce by speed).
-		Mark.kpMod = Mark.kpMod or require(Modules.Actions.KickPowerups)
-		local mult = chE and Mark.kpMod.GetMultiplier(chE) or 1
-		local powered = mult > 1
-		if powered and not Mark.poweredLogged then
-			Mark.poweredLogged = true
-			logFile("block powered", "mult", string.format("%.2f", mult), "dist", string.format("%.1f", dist))
-		elseif not powered then
-			Mark.poweredLogged = nil
-		end
-	end
 	if shotLine and not Mark.shotLineLogged then
 		Mark.shotLineLogged = true
 		logFile("block shotline", faceLine and "facing" or "charge", fmtV(shotLine), "dist", string.format("%.1f", dist))
@@ -11843,7 +11763,7 @@ Mark.tickBlock = function(character, root)
 	-- him to get there.
 	local Vc = V.Magnitude > 30 and V.Unit * 30 or V
 	local function spotAt(t)
-		local Pt = P + Vc * (math.min(t + lag, 0.5) * turnK)
+		local Pt = P + Vc * math.min(t + lag, 0.5)
 		local bis, cover = Mark.blockCone(Pt, g)
 		return Pt, shotLine or bis or unitOrNil(flat(g.Position - Pt)) or u, cover
 	end
@@ -11855,7 +11775,6 @@ Mark.tickBlock = function(character, root)
 	local Pf, uf, coverD = spotAt(lead)
 	local dest = Pf + uf * gap
 	local target = dest
-	local around = false
 	-- Between him and the goal: the old spot ran back toward the carrier (gap 4 in front of him) = into his dribble
 	-- and tackle range while he winds up. The ball meets us anywhere on the line, so stand ON the line at the depth
 	-- we already have (clamped gap..26): a sideways step is the shortest move and the one the wind-up leaves time for.
@@ -11871,28 +11790,17 @@ Mark.tickBlock = function(character, root)
 			target = dest
 		end
 	end
-	if not ahead and rel:Dot(uf) < gap * 0.5 then
-		-- level with him or behind: go round his body to the shot/goal side instead of running through him
-		local perp = Vector3.new(-uf.Z, 0, uf.X)
-		local s = (rel:Dot(perp) >= 0) and 1 or -1
-		local body = HitboxSettings.Receive.Size.X * 0.5 + 1.5
-		local wp = Pf + perp * (s * body) + uf * 1
-		if flat(wp - root.Position).Magnitude > 1.5 then
-			target = wp
-			around = true
-		end
-	end
-	-- The target keeps at least `gap` on the GOAL side of where he is now, whatever the prediction says. A target at or
-	-- behind his body is what made the shadow run round him and end up at his back. (Only when we are not already
-	-- level/behind: that case has its own go-round waypoint above.)
-	if not around then
-		local Pc = P + Vc * math.min(lag, 0.35)
+	-- The target keeps at least `gap` on the GOAL side of where he is now, whatever the prediction says (going round
+	-- his body from behind is the agent steer's orbit, not a waypoint).
+	local Pc = P + Vc * math.min(lag, 0.35)
+	do
 		local aT = flat(target - Pc):Dot(uf)
 		if aT < gap then
 			target = target + uf * (gap - aT)
 			dest = target
 		end
 	end
+	local around = rel:Dot(uf) < gap * 0.5 and not ahead
 	-- The replicated charge gives the real shot (ChargePathVelocity at full charge + the game's ball physics): stand on the
 	-- path sample we reach with the most time to spare, whatever the geometry of the guessed line says.
 	local pathSpot = nil
@@ -11911,52 +11819,23 @@ Mark.tickBlock = function(character, root)
 		end
 	end
 	local off = flat(target - root.Position)
-	-- ControllerManager.MovingDirection = unit * min(|MoveCommand|, 1): command his velocity plus the spot error, as a fraction of our run speed
-	local desired = V + off * 4
+	-- the shot path spot: straight there; standing in line ("ahead"): follow only his sideways drift; else his velocity
+	local ff = V
 	if pathSpot then
-		desired = off * 4
+		ff = Vector3.zero
 	elseif ahead then
-		-- stand-in-line: follow only his sideways drift, not the run toward us
-		desired = (V - uf * V:Dot(uf)) + off * 4
+		ff = V - uf * V:Dot(uf)
 	end
-	local cmd = Vector3.zero
-	if off.Magnitude > 0.6 or V.Magnitude > 2 then
-		cmd = desired / mySpd
-		if cmd.Magnitude > 1 then
-			cmd = cmd.Unit
-		end
-		-- Move hooks only override input above 0.2 (GetMoveCommand/SetMoveCommand): below that, stand
-		if cmd.Magnitude < 0.2 then
-			cmd = Vector3.zero
-		end
-	end
+	local cmd, route = Mark.agentSteer({
+		key = "block", us = root.Position, vUs = flat(root.AssemblyLinearVelocity), center = (not pathSpot) and Pc or nil,
+		vC = Vc, target = target, spd = mySpd, ff = ff, minR = HitboxSettings.Receive.Size.X * 0.5 + 1.5,
+	})
 	-- AutoKick plan (run at him / steer through the charge) owns the direction while it is fresh
 	do
 		local ap = Mark.akApproach
 		if ap and os.clock() - ap.at < 0.12 then
 			cmd = ap.dir
 		end
-	end
-	-- the line of the agent is a curve, not a ruler: it leaves along our own velocity (momentum) and bends to the spot, the
-	-- command follows it a little ahead, and a light low-pass keeps the heading from snapping when his velocity jumps
-	local route = Mark.blockCurve(root.Position, target, flat(root.AssemblyLinearVelocity), V)
-	if not pathSpot and not ahead and off.Magnitude > 5 and cmd.Magnitude > 0.2 and route[3] then
-		local dc = unitOrNil(flat(route[3] - route[1]))
-		if dc then
-			cmd = (cmd.Unit * 0.45 + dc * 0.55).Unit * cmd.Magnitude
-		end
-	end
-	do
-		local nowS = os.clock()
-		local pc = Mark.blockCmdPrev
-		if pc and nowS - pc.t < 0.25 and cmd.Magnitude > 0.2 and pc.v.Magnitude > 0.2 then
-			local k = 1 - math.exp(-(nowS - pc.t) / 0.06)
-			local mixed = pc.v + (cmd - pc.v) * k
-			if mixed.Magnitude > 0.2 then
-				cmd = mixed.Magnitude > 1 and mixed.Unit or mixed
-			end
-		end
-		Mark.blockCmdPrev = { t = nowS, v = cmd }
 	end
 	if not Mark.blockLogged then
 		Mark.blockLogged = true
@@ -13944,9 +13823,15 @@ Mark.akCtx = function(root, model, r)
 	if type(g) ~= "number" or g < 10 then
 		g = 196.2
 	end
+	-- CharacterMotion.GetVelocity has Y = 0 for another player: his vertical speed is the measured one (Mark.vertState)
+	local hisAir = hisHum ~= nil and not CharacterControllers.IsLanded(model, hisHum)
+	local vyM = (typeof(worldVel) == "Vector3") and worldVel.Y or 0
+	if hisAir and math.abs(vyM) < 0.5 then
+		vyM = Mark.vertState(model, pos, root.Position.Y, true, os.clock(), g).vy
+	end
 	return {
 		root = root, ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25),
-		pos = pos, vel = vel, vy = (typeof(worldVel) == "Vector3") and worldVel.Y or 0,
+		pos = pos, vel = vel, vy = vyM,
 		dly = math.clamp(CharacterMotion.GetDisplayDelaySeconds(model) or 0, 0, 0.25),
 		hisAir = hisHum ~= nil and not CharacterControllers.IsLanded(model, hisHum),
 		usAir = hum ~= nil and not CharacterControllers.IsLanded(character, hum),
@@ -14005,7 +13890,8 @@ Mark.akShare = function(ctx, futs, mySpd, chSpd, tp, rr)
 	local DT = 0.025
 	local px, pz = Mark.akSim(ctx, futs[1].pts, mySpd, chSpd, tp, rr)
 	local tot = tp + rr
-	local us = Vector3.new(px, ctx.usAir and (ctx.root.Position.Y + ctx.vyUs * tot - 0.5 * ctx.g * tot * tot) or ctx.root.Position.Y, pz)
+	-- airborne: our arc, never below the floor we left (Mark.duelFloor = our root Y the last frame we stood)
+	local us = Vector3.new(px, ctx.usAir and math.max(ctx.root.Position.Y + ctx.vyUs * tot - 0.5 * ctx.g * tot * tot, Mark.duelFloor or -math.huge) or ctx.root.Position.Y, pz)
 	local k = math.min(math.floor(tot / DT + 0.5) + 1, #futs[1].pts)
 	local m = futs[1].pts[k]
 	local aim = unitOrNil(flat(m - us)) or unitOrNil(flat(ctx.root.CFrame.LookVector))
@@ -14046,7 +13932,7 @@ Mark.akPlan = function(ctx, futs, character, urgent)
 	local minRel = (KickCore.GetMinimumReleaseSeconds and KickCore.GetMinimumReleaseSeconds()) or 0.2
 	local maxC = KickCore.Constants.MaximumChargeSeconds or 0.4
 	local fullT = (KickCore.GetFullChargeSeconds and KickCore.GetFullChargeSeconds()) or (maxC - 0.05)
-	local rrs = (CFG.AutoKickFull ~= false) and { fullT } or { minRel, (minRel + fullT) * 0.5, fullT }
+	local rrs = urgent and { minRel } or ((CFG.AutoKickFull ~= false) and { fullT } or { minRel, (minRel + fullT) * 0.5, fullT })
 	local need = urgent and 0.35 or (CFG.AutoKickConf or 0.55)
 	local tpMax = (urgent or CFG.AutoKickMove == false or ctx.usAir) and 0 or (CFG.AutoKickLead or 0.5)
 	local bestConf = 0
@@ -14213,7 +14099,7 @@ Mark.akTick = function(character, root)
 	local minRel = (KickCore.GetMinimumReleaseSeconds and KickCore.GetMinimumReleaseSeconds()) or 0.2
 	local maxC = KickCore.Constants.MaximumChargeSeconds or 0.4
 	local fullAt = KickCore.GetFullChargeSeconds and KickCore.GetFullChargeSeconds() or (maxC - 0.05)
-	local full = CFG.AutoKickFull ~= false
+	local full = CFG.AutoKickFull ~= false and not ak.urgent -- urgent (air duel): the first legal release
 	local actor = Actors.GetFromCharacter(ak.model)
 	local ctx = Mark.akCtx(root, ak.model, ak.root) -- we are already slowed by the charge: vUs is the real one
 	local drec = dribbleSeen[ak.model] or (actor and dribbleSeen[actor.UserId])
@@ -14248,7 +14134,7 @@ Mark.akTick = function(character, root)
 	elseif held >= minRel - 0.004 then
 		-- early release only while the share is good and would not get better by waiting for more power
 		local confFull = Mark.akShare(ctx, futs, mySpd, chSpd, 0, math.max(fullAt - held, 0))
-		releaseNow = (conf >= (CFG.AutoKickConf or 0.55) and confFull < conf - 0.05) or held >= fullAt or held >= maxC - 0.03
+		releaseNow = ak.urgent or (conf >= (CFG.AutoKickConf or 0.55) and confFull < conf - 0.05) or held >= fullAt or held >= maxC - 0.03
 	end
 	if releaseNow then
 		if conf < (CFG.AutoKickCancel or 0.25) then
@@ -14673,7 +14559,7 @@ end
 
 -- AutoBlock x TACKLE. The block stands where the replicated charge says; when the shot is out and the body cannot get to it
 -- in time, a slide can: ~36 studs/s for the first second against 27 for a run, and the box (5x5x5, 3 ahead) stops the ball.
--- Ground slide first; a ball above the box but inside jump reach -> jump, then the slide from the air (Mark.blockCombo,
+-- Ground slide only (the old blind "jump first, slide from the air" is gone: a ball over the box is Defend Goal's jump /
 -- server acceptance of an air slide is not confirmed: `block slide air` + the tackle verdict decide). A body that reaches the
 -- ball in time keeps the slide in the pocket (cooldown 3 s, ~1 s of lock).
 Mark.blockSlide = function(character, root)
@@ -14693,12 +14579,7 @@ Mark.blockSlide = function(character, root)
 		return
 	end
 	local landed = CharacterControllers.IsLanded(character, hum)
-	local combo = Mark.blockCombo
-	if combo and now > combo.untilT then
-		Mark.blockCombo = nil
-		combo = nil
-	end
-	if not landed and not combo then
+	if not landed then
 		return
 	end
 	local _, vel, samples, ts = Mark.ballPath(root)
@@ -14721,13 +14602,11 @@ Mark.blockSlide = function(character, root)
 	local lo = rcv.CFrameOffset.Y - rcv.Size.Y * 0.5
 	local hi = rcv.CFrameOffset.Y + rcv.Size.Y * 0.5 + (Physics.BallRadius or 1)
 	-- the body gets there first: nothing to add
-	if not combo then
-		for i = 2, ci do
-			local p = samples[i]
-			local h = p.Y - root.Position.Y
-			if h >= lo and h <= hi and (math.max(flat(p - root.Position).Magnitude - bodyHalf, 0) / spd + ping * 0.5 + 0.06) <= ts[i] then
-				return
-			end
+	for i = 2, ci do
+		local p = samples[i]
+		local h = p.Y - root.Position.Y
+		if h >= lo and h <= hi and (math.max(flat(p - root.Position).Magnitude - bodyHalf, 0) / spd + ping * 0.5 + 0.06) <= ts[i] then
+			return
 		end
 	end
 	local box = HitboxSettings.SlideTackle
@@ -14783,27 +14662,9 @@ Mark.blockSlide = function(character, root)
 	end
 	if best then
 		Mark.blockSlideAt = now
-		Mark.blockCombo = nil
 		local sent, why = Mark.tryTackle(character, root, best.aim, best.mult)
 		logFile("block slide", landed and "ground" or "air", sent and "sent" or ("no " .. tostring(why)), "hits", best.hits, "mult", string.format("%.2f", best.mult), "cross", string.format("%.2f", crossT), "speed", string.format("%.0f", vel.Magnitude))
 		return
-	end
-	-- nothing on the ground: a ball above the box but inside jump reach, close to us -> jump now, slide from the air
-	if landed and not combo and CFG.BlockSlideJump ~= false then
-		for i = 2, ci do
-			local p = samples[i]
-			local t = ts[i]
-			local h = p.Y - O.Y
-			local d = flat(p - O).Magnitude
-			if t >= 0.22 and t <= 0.9 and h > yHi and h <= yHi + 4 and d <= boxMid + hz + spd * 0.15 then
-				if Mark.doJump("blockslide") then
-					Mark.blockCombo = { at = now, untilT = now + 0.55 }
-					Mark.blockSlideAt = now - 0.45
-					logFile("block slide", "jump first", "t", string.format("%.2f", t), "h", string.format("%.1f", h), "d", string.format("%.1f", d))
-				end
-				return
-			end
-		end
 	end
 end
 
@@ -15253,7 +15114,23 @@ Mark.tickBall = function(character, root)
 	if Mark.move.mode == "dodge" or Mark.move.mode == "dribble" or Mark.move.mode == "flee" or Mark.aerial then
 		return
 	end
-	if Mark.move.mode == "block" then
+	-- FLICK: an enemy carrier winding up a RainbowFlick still owns the ball, but its lob is already known (Mark.flickShot:
+	-- GetCharacterLaunch + the ball physics, detach in BallDetachSeconds). It is a loose ball with a fixed path from that
+	-- moment: plan it like any other (run / jump / slide, raced against the foes), the flicker himself a racer only after
+	-- the detach + Ownership.LaunchNoTouchSeconds. The old code returned on "owner" and ignored every flick.
+	local flick = nil
+	do
+		local o = liveOwnerId()
+		local fa = type(o) == "number" and o ~= LocalPlayer.UserId and playerOf(o) or nil
+		if fa and not sameTeam(fa) and CFG.BallFlick ~= false and CFG.AutoBall then
+			local wind = Mark.enemyWind(fa)
+			local fs = wind and Mark.flickShot(fa)
+			if fs then
+				flick = { actor = fa, fs = fs }
+			end
+		end
+	end
+	if Mark.move.mode == "block" and not flick then
 		-- Block shadows a CARRIER. The moment he loses the ball nothing owned it for ~0.45 s (block hold) because this
 		-- tick returned on mode == "block": that dead zone is where the enemy got to the loose ball first.
 		local o = liveOwnerId()
@@ -15279,7 +15156,7 @@ Mark.tickBall = function(character, root)
 		end
 	end
 	local oid = liveOwnerId()
-	if type(oid) == "number" and oid ~= 0 then
+	if type(oid) == "number" and oid ~= 0 and not flick then
 		local a = playerOf(oid)
 		if a and a ~= LocalPlayer and sameTeam(a) then
 			Mark.allyKickUntil = os.clock() + 1.5
@@ -15296,6 +15173,19 @@ Mark.tickBall = function(character, root)
 	if not pos then
 		Mark.ballStop("no ball")
 		return
+	end
+	if flick then
+		local fs = flick.fs
+		samples, ts = { pos }, { 0 }
+		for i = 1, #fs.pts do
+			samples[#samples + 1] = fs.pts[i]
+			ts[#ts + 1] = fs.ts[i]
+		end
+		vel, rest = fs.vel, false
+		if not Mark.flickBallLog or os.clock() - Mark.flickBallLog > 0.5 then
+			Mark.flickBallLog = os.clock()
+			logFile("ball flick", actorName(flick.actor), "detach in", string.format("%.2f", fs.left), "n", #samples)
+		end
 	end
 	-- Goal guard: the path is cut at our goal line (a contact point behind it / in the net is worthless), the enemy field
 	-- players are no racers for a ball that is going in, and AutoBall may be off - the guard needs no other switch.
@@ -15355,6 +15245,10 @@ Mark.tickBall = function(character, root)
 				-- racer for that long (it was: killer slides and "foe near" boosts at men who could not walk)
 				local down, left = Mark.mateDown(actor, model)
 				local delay = (down) and math.max(left or 0, 0.5) or 0
+				if flick and actor == flick.actor then
+					-- the flicker cannot touch his own lob before detach + LaunchNoTouchSeconds
+					delay = math.max(delay, flick.fs.left + 0.25) -- Ownership.LaunchNoTouchSeconds
+				end
 				local humF = model:FindFirstChildOfClass("Humanoid")
 				if delay == 0 and humF and humF.WalkSpeed < 2 then
 					delay = 0.5
@@ -15407,6 +15301,9 @@ Mark.tickBall = function(character, root)
 		slideReady = readyB, mLo = mLoB, mHi = mHiB,
 	})
 		Mark.routeMemo = { at = nowR, plan = plan, tp0 = plan and plan.tp, ready = readyB and true or false }
+	end
+	if flick and plan then
+		Mark.flickBallAt = os.clock() -- AutoBlock yields the body to the flick plan
 	end
 	local wayP = nil
 	local slideP, slideT, slidePress = nil, nil, nil
@@ -17507,7 +17404,6 @@ Mark.tickHazard = function(character, root)
 	Mark.slideAudit(root)
 	Mark.tickKickDodge(root, own)
 	Mark.slideTrackTick(root)
-	Mark.jumpSlideTick(character, root)
 	if not CFG.AutoDodge then
 		return
 	end
@@ -17585,7 +17481,7 @@ Mark.moveSteer = function(dir, mode, replay)
 		end
 		local rot = (m.mode == "dodge" or m.mode == "block")
 		origSetMove(ch, dir, face, rot)
-		if m.mode == "ball" or m.mode == "walk" or m.mode == "dodge" or m.mode == "dribble" or m.mode == "take" or m.mode == "block" or m.mode == "gk" or m.mode == "kick" or m.mode == "flee" then
+		if m.mode == "ball" or m.mode == "walk" or m.mode == "dodge" or m.mode == "dribble" or m.mode == "take" or m.mode == "block" or m.mode == "gk" or m.mode == "kick" or m.mode == "flee" or m.mode == "duel" then
 			Mark.agentHold(true, m.mode)
 		end
 		if m.mode == "dodge" then
@@ -19370,8 +19266,6 @@ return function(_Lib, _Core)
 			head(s, "Charging Carrier")
 			tog(s, "Charge Guard", "ChargeTackleGuard", "Slide only if it lands before his release.")
 			tog(s, "Slide Across The Shot", "ChargeSlideBlock")
-			head(s, "Lofting Carrier")
-			tog(s, "Jump Slide", "JumpSlide", "Jump first, then slide from the air.")
 			head(s, "Manual Tackle")
 			tog(s, "Manual Tackle", "ManualTackle", "Your own tackle press is aimed at the carrier.")
 			bind(s, "Manual Tackle Key", "KB_ManualTackle", function()
@@ -19386,7 +19280,6 @@ return function(_Lib, _Core)
 				sld(s, "Track Radius", "TrackStuds", 30, 160, { suffix = " st" })
 				sld(s, "Min Slide Power", "TackleMinSpeed", 0.3, 1.2, { prec = 2, suffix = "x" })
 				sld(s, "Charge Range", "ChargeTackleRange", 4, 20, { suffix = " st" })
-				sld(s, "Jump Delay", "JumpSlideDelay", 50, 400, { scale = 1000, suffix = " ms" })
 				sld(s, "Manual Radius", "ManualRadius", 8, 50, { suffix = " st" })
 			end)
 
@@ -19402,14 +19295,11 @@ return function(_Lib, _Core)
 			tog(b, "Pre-Release Jump", "BlockPreJump", "Jumps before the release, timed to his charge.")
 			tog(b, "Slide Block", "BlockSlide")
 			tog(b, "Defend Goal", "BlockGoal", "Blocks a ball flying into our goal with the body: run, jump or slide into its path.")
-			tog(b, "Jump + Air Slide", "BlockSlideJump")
 			tog(b, "Pass Solver", "BlockSmart", "If he cannot score, cuts the pass to his teammate.")
 			tog(b, "Show Marking", "DrawBlock", "The pass lane and where you cut it.")
 			tog(b, "Behind Logic", "BlockBehindLogic", "Behind the carrier: take the next attacker, else cut him off.")
 			advanced(b, "Block", function()
 				sld(b, "Far From Goal", "BlockFarGoal", 40, 200, { suffix = " st" })
-				sld(b, "Turn Hedge", "BlockTurnHedge", 0.15, 1, { prec = 2, text = "How far ahead to trust a fresh change of direction." })
-				sld(b, "Turn Angle", "BlockTurnDeg", 15, 90, { suffix = "°" })
 				sld(b, "Behind Receiver Gap", "BlockBehindRcv", 6, 40, { suffix = " st" })
 				sld(b, "Near Goal Range", "BlockGoalRange", 30, 120, { suffix = " st" })
 				sld(b, "Mark Gap", "BlockMarkGap", 2, 10, { prec = 1, suffix = " st" })
@@ -19474,15 +19364,14 @@ return function(_Lib, _Core)
 			local c = card(tab, "Right")
 			head(c, "CounterJump")
 			feature(c, "CounterJump", "CounterJump")
-			note(c, "Jumps when an enemy goes airborne with the ball.")
-			tog(c, "Counter Tackle", "CounterTackle", "Slides at the ball during a flick wind-up.")
+			note(c, "Catches an enemy in the air (bicycle, jump with the ball) with a jump + slide or kick.")
+			tog(c, "Move To Him", "CounterMove", "Runs you to the take-off point.")
+			tog(c, "Counter Tackle", "CounterTackle", "Slides him: from the air, or before his flick lets go.")
 			tog(c, "Competitor Check", "CounterCompetitor", "Stops when a teammate is already on him.")
 			sld(c, "Competitor Radius", "CounterCompetitorRadius", 4, 30, { suffix = " st" })
 			advanced(c, "Counter", function()
-				sld(c, "Range", "CounterJumpRange", 4, 20, { suffix = " st" })
-				sld(c, "Combo Chance", "CounterComboChance", 0, 100, { scale = 100, suffix = "%" })
-				sld(c, "Kick Share", "CounterKickChance", 0, 100, { scale = 100, suffix = "%" })
-				sld(c, "Kick Delay", "CounterKickDelay", 0, 0.4, { prec = 2, suffix = " s" })
+				sld(c, "Range", "CounterJumpRange", 8, 40, { suffix = " st" })
+				sld(c, "Confidence", "CounterConf", 0.3, 0.95, { prec = 2 })
 			end)
 		end)
 
@@ -19503,7 +19392,7 @@ return function(_Lib, _Core)
 				sld(g, "Reaction", "GkReactSeconds", 0.05, 0.4, { prec = 2, suffix = " s" })
 				sld(g, "Walk Slack", "GkWalkSlack", 0, 0.3, { prec = 2, suffix = " s" })
 				sld(g, "Intercept Radius", "GkInterceptEnemy", 4, 30, { suffix = " st", text = "Free ball with an enemy this close: no run." })
-				sld(g, "Bait Inset", "GkBaitInset", 0, 2, { prec = 1, suffix = " st" })
+				sld(g, "Bait Reach", "GkBaitReach", 0, 6, { prec = 1, suffix = " st", text = "How far an enemy can step to take a fake." })
 				sld(g, "Bait Ray", "GkBaitRay", 0.5, 6, { prec = 1, suffix = " st" })
 				sld(g, "Lost-Path Share", "GkLostDiveFrac", 0.3, 1, { prec = 2 })
 			end)
@@ -19584,6 +19473,7 @@ return function(_Lib, _Core)
 			head(ba, "AutoBall")
 			feature(ba, "AutoBall", "AutoBall")
 			tog(ba, "Competitor Check", "BallCompetitor", "Stops when a teammate is clearly closer to the ball.")
+			tog(ba, "Catch Flicks", "BallFlick", "Goes for an enemy flick's lob as soon as he starts it.")
 			sld(ba, "Competitor Gap", "BallYieldGap", 2, 20, { suffix = " st", text = "How much closer he must be." })
 			head(ba, "Rival Slide")
 			tog(ba, "Enabled", "CandidateKiller", "Slides an enemy who runs for the same ball.")
