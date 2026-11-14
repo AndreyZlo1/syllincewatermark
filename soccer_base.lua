@@ -169,6 +169,7 @@ local CFG = {
 	GkPressHome = true, -- steer the dive at him while it runs (what turning the camera does)
 	GkPressTurn = 6, -- rad/s of that steering
 	LobBodyRange = 9, -- flick lob catch: a contact this close goes with the body (receive), farther with a jump-slide
+	GkPressSlip = 0.03, -- s of his server-pose jitter on top of ping/2 that a press contact with a flier must survive
 	GkWalkMargin = 0.08, -- AutoGK: a walk / jump save with less spare time than this does not hold the dive back (s)
 	GkLauncherReact = 0.2, -- AutoGK press: an enemy holding a launcher fires this fast after seeing our dash (s)
 	GkPressMaxT = 0.36, -- no press dive for a contact later than this (s) unless he is at the mouth / flying
@@ -186,18 +187,12 @@ local CFG = {
 	KillerReach = 28, -- ...and this close to us
 	KillerMargin = 0.5, -- he counts as a threat when he reaches the ball within this many seconds of us (or is within 8 studs of it)
 	KillerAngle = 50, -- the killer slide may leave our route direction by at most this many degrees (searched from 0 outward)
-	WallLatency = 0.08, -- press -> wall exists on the server, on top of ping (NOT in the client dump: calibrate from "wall placed dt" in the log)
-	WallMin = 3.2, -- predicted distance window the wall can land on a target (it spawns 5 studs ahead: PlacementForwardDistance)
-	WallMax = 6.8,
-	WallAmbush = true, -- also place it early on an enemy running into the wall's spot
+	WallLatency = 0.06, -- the wall exists this long after the press reaches the server (ping/2); seen 0.11-0.14 s after the press at ping 0.08
 	WallEquip = false, -- Auto Use: AutoWall takes the barricades out itself (item slot press) when a threat is coming; off = only when already in hand
-	WallLead = "away", -- where the wall is aimed: "never" = at his current spot, "away" = led only when he runs away from us, "always" = always led
 	WallEquipDelay = 0.3, -- extra time the equip needs before the wall can be placed
-	WallEquipDist = 26,
 	WallEquipHold = 3.5, -- put the unused barricades away after this long
-	WallReach = 18, -- ambush: an enemy this far away that closes on the wall's spot gets it placed early
-	WallAmbushV = 4.5, -- closing speed from which an ambush wall is considered (was 6)
-	WallAmbushT = 0.6, -- ... and he reaches the spot within this many seconds (was 1.0: the wall stood there long before he came and he turned)
+	WallReach = 18, -- a chaser (our ball) / the carrier within this gets a wall across his run
+	WallWindow = 0.45, -- ... only if he reaches it within this after it appears (earlier and he walks around it)
 	WallShot = true, -- wall on the replicated shot path of a charging carrier (needs barricades in hand)
 	TackleVsBlock = "block", -- block = AutoBlock first (tackle waits while it is on him) / smart = wait only for a firing kick / tackle = never wait
 	TackleHoldMax = 0.8, -- block first: the tackle waits at most this long for the block
@@ -222,7 +217,6 @@ local CFG = {
 	BlockPassSpeed = 80, -- assumed pass speed for the intercept timing
 	BlockInterceptMargin = 0.25, -- we must reach the intercept point this much earlier than the ball
 	BlockPassMax = 130, -- receivers beyond this from the carrier are not a pass option
-	ArcMaxErr = 2.5, -- FreezeGun: accepted height error of the scanned landing point (studs)
 	AutoKickRange = 16, -- AutoBlock starts the kick plan when the carrier is within kick reach + this (it runs to him)
 	AutoKickConf = 0.55, -- share of his possible futures the kick box must hold at the release
 	AutoKickMove = true, -- run to the kick spot first (the plan looks AutoKickLead s ahead), steer during the charge
@@ -242,10 +236,19 @@ local CFG = {
 	BlockGoal = true, -- AutoBlock: a ball flying into OUR goal is run down / jumped / slid at, whether or not AutoBall is on
 	BlockGoalTime = 3, -- ... only when it crosses the line within this many seconds
 	BarricadeAddon = true, -- projectiles: a wall on their path instead of dodge / pass when the timing allows
-	WallMargin = 0.12, -- the path must reach the wall circle this much later than press + ping + WallLatency
-	WallHeight = 6, -- wall height estimate for the projectile-height test
-	WallHalf = 4, -- half width of the wall for the ambush test until a placed one is measured
+	WallMargin = 0.05, -- on top of WallLatency before the path may cross the wall
+	WallHeight = 6.4, -- measured barricade height (log: size 11.5, 6.4, 1.5-3.4)
+	WallHalf = 5.75, -- measured half width
 	WallCooldown = 0.7,
+	BlockPassRead = true, -- AutoBlock reads the replicated charge: a pass gets cut on its path
+	BlockPassRcvRadius = 14, -- the receiver of a read pass is the enemy within this of its flight
+	BlockShade = true, -- opposition leans toward the carrier's best pass lane (cover shadow)
+	BlockOppDepth = 7, -- opposition depth in front of the carrier before we close in
+	PassMinCharge = 0.1, -- shortest lob charge (Pass: 0.1..0.3)
+	ProjPassMargin = 0.1, -- a forced pass must be released this long before the punch / projectile reaches us (+ ping/2)
+	HazPassMargin = 0.1, -- same before a blast
+	HazPassSlack = 2, -- with the ball, a blast we escape by less than this (studs) still passes the ball first
+	DrawHazard = true, -- enemy blast zones on the ground (grenade hop path, bazooka impact, hammer slam)
 	BallJumpGain = 0.12, -- AutoBall route: a jump is used when it meets the ball this much earlier than a plain run (s)
 	RouteSlideGain = 0.3,
 	BallContestLate = 0.15, -- AutoBall: losing the ball race by more than this (s) -> run at the enemy's touch point instead
@@ -311,7 +314,8 @@ local CFG = {
 	ShootQuick = true, -- AutoShoot: solve candidates one by one in weighted order and stop at the first open shot (weak devices); false = the old full enumeration
 	ShootSliceMs = 0.9,
 	SilentAim = true,
-	SilentFov = 140, -- px radius around the gun reticle
+	SilentFov = 140,
+	FreezeRadius = 8, -- freeze gun blast radius on the ground (not in the dump; `silent area freeze` logs who froze at what distance) -- px radius around the gun reticle
 	AerialJumpLead = 0.3, -- jump when arrival <= this: the whole ~0.27 s rise sits inside the 0.4 s volley window
 	GkWalkSlack = 0.12, -- humanoid accel/turn before full WalkSpeed (not from dump)
 	GkReactSeconds = 0.15, -- keeper reaction after release; he sees GoalCrossingPreview (not from dump)
@@ -538,6 +542,7 @@ shotDbg.Visible = false
 
 -- One table, not a pile of chunk locals. Executor register cap is 200.
 local Mark = {
+	hazEv = {}, -- enemy blast zones (Mark.hazAdd); read by GetMoveCommand / RenderStepped from the first frame
 	GhostSpeed = 0.55,
 	CatchSpeed = 3.1,
 	LagSpeed = 1.35,
@@ -584,7 +589,8 @@ Mark.playLive = function()
 		end
 		return true
 	end
-	return require(Client.Gameplay.KickoffFreeze).IsPlayLive() == true
+	Mark.kickoffMod = Mark.kickoffMod or require(Client.Gameplay.KickoffFreeze)
+	return Mark.kickoffMod.IsPlayLive() == true
 end
 Mark.try(function()
 	local remote = Remotes.Get("Match", "State")
@@ -2666,10 +2672,13 @@ Mark.segPool = function(lines)
 		ln.From, ln.To, ln.Color, ln.Transparency, ln.Thickness, ln.ZIndex, ln.Visible =
 			Vector2.new(pa.X, pa.Y), Vector2.new(pb.X, pb.Y), color, alpha, thick, z, true
 	end
+	-- hide only what the previous frame drew past this one (pool.hw): an idle overlay costs nothing per frame
+	pool.hw = #lines
 	pool.finish = function()
-		for n = pool.i, #lines do
+		for n = pool.i, pool.hw do
 			lines[n].Visible = false
 		end
+		pool.hw = pool.i - 1
 		pool.i = 1
 	end
 	return pool
@@ -2950,10 +2959,21 @@ CharacterControllers.GetMoveCommand = function(ch)
 	if ch == LocalPlayer.Character and ClientSlide.IsSlideTackling() then
 		return origGetMove(ch)
 	end
-	if ch == LocalPlayer.Character and Mark.hazEv and next(Mark.hazEv) ~= nil and not Mark.moveLive(Mark.move) then
-		local cc = Mark.blastClamp(ch, origGetMove(ch))
-		if typeof(cc) == "Vector3" then
-			return cc
+	-- the player's own stick (no agent mode live): AutoDodge keeps it out of a blast about to go off and off mines
+	if ch == LocalPlayer.Character and CFG.AutoDodge and not Mark.moveLive(Mark.move) then
+		local haz, mines = next(Mark.hazEv) ~= nil, Mark.mines ~= nil and #Mark.mines() > 0
+		if haz or mines then
+			local cc = origGetMove(ch)
+			if haz then
+				cc = Mark.blastClamp(ch, cc)
+			end
+			local root = mines and typeof(cc) == "Vector3" and cc.Magnitude > 0.2 and ActorTargeting.GetActorRoot(LocalPlayer)
+			if root then
+				cc = Mark.mineDir(root, cc)
+			end
+			if typeof(cc) == "Vector3" then
+				return cc
+			end
 		end
 	end
 	local move = Mark.move
@@ -3308,7 +3328,7 @@ tryTackle = function(character, root, dir, mult, target, skipHazard)
 	elseif Mark.oilSlide and not skipHazard then
 		return false, "oil-pending"
 	end
-	if Mark.hazEv and next(Mark.hazEv) ~= nil then
+	if next(Mark.hazEv) ~= nil then
 		local O0 = wallRoot and wallRoot.Position or root.Position
 		local hzEv = Mark.hazardHits(function(t)
 			return O0 + dir * Mark.dumpTravel(t)
@@ -6665,8 +6685,9 @@ Mark.wallParts = function()
 		Mark.wallCache = list
 		return list
 	end
-	local place = require(Modules.Items.PlaceDownPlacement)
-	local dest = require(Modules.Gameplay.DestructionSettings)
+	Mark.placeMod = Mark.placeMod or require(Modules.Items.PlaceDownPlacement)
+	Mark.destMod = Mark.destMod or require(Modules.Gameplay.DestructionSettings)
+	local place, dest = Mark.placeMod, Mark.destMod
 	for _, inst in world:GetChildren() do
 		if inst:GetAttribute("PlacedItemId") == "barricades" and not dest.IsBoundaryDestroyed(inst) then
 			models[#models + 1] = inst
@@ -6792,33 +6813,17 @@ local function onProjectile(kind, proj)
 		Mark.projSpeed = Mark.projSpeed or {}
 		Mark.projSpeed[id] = proj.Velocity.Magnitude
 		logFile("proj speed", id, string.format("%.1f", proj.Velocity.Magnitude))
-		-- SilentAim calibration: what pitch did the server really launch with? Compared with the ballistic direction we wanted
-		-- and with the pitch of the ray we sent: ~wanted -> the peak solve works (the ray is only a landing marker); ~ray ->
-		-- the server flies along the sent direction (switch to sending the ballistic direction itself).
-		local al = Mark.arcLast
-		if id == "freezeGun" and al and os.clock() - al.at < 0.7 and proj.Velocity.Magnitude > 1 then
+		if type(proj.Gravity) == "number" then
+			Mark.projGrav = Mark.projGrav or {}
+			Mark.projGrav[id] = proj.Gravity
+		end
+		-- SilentAim area check: the launch the server really used against the one we planned (Mark.areaLast)
+		local al = Mark.areaLast
+		if al and al.id == id and os.clock() - al.at < 0.7 and proj.Velocity.Magnitude > 1 then
 			local v = proj.Velocity
-			local pitch = math.deg(math.asin(math.clamp(v.Y / v.Magnitude, -1, 1)))
-			local fl, dl = unitOrNil(flat(v)), unitOrNil(flat(al.desDir))
-			local yawErr = (fl and dl) and math.deg(math.acos(math.clamp(fl:Dot(dl), -1, 1))) or -1
-			do
-				local sp = proj.Position or Vector3.zero
-				local fv = flat(v)
-				if al.P and fv.Magnitude > 1 then
-					local Dp = flat(al.P - sp):Dot(fv.Unit)
-					local tt = Dp / fv.Magnitude
-					local yAt = sp.Y + v.Y * tt - 0.5 * (al.g or 58.9) * tt * tt
-					local ptY = al.P.Y + (al.bias or 0)
-					local errY = yAt - ptY
-					local lat = flat(al.P - sp):Dot(Vector3.new(-fv.Unit.Z, 0, fv.Unit.X)) -- target's side offset from his own flight line
-					if Dp > 8 and tt < 2 then
-						local nb = math.clamp((al.bias or 0) + errY * (CFG.ArcBiasGain or 0.7), -9, 9)
-						logFile("silent shot err", "Y", string.format("%.2f", errY), "side", string.format("%.2f", -lat), "t", string.format("%.2f", tt), "D", string.format("%.1f", Dp), "bias", string.format("%.2f", al.bias or 0), "->", string.format("%.2f", nb))
-					end
-				end
-			end
-			logFile("silent shot", al.mode, "pitch", string.format("%.1f", pitch), "wanted", string.format("%.1f", al.des), "ray", string.format("%.1f", al.ray), "yawErr", string.format("%.1f", yawErr), "D", string.format("%.1f", al.D), "start", fmtV(proj.Position or Vector3.zero), "muzzle", fmtV(al.muzzle))
-
+			local ang = al.launch and math.deg(math.acos(math.clamp(v.Unit:Dot(al.launch), -1, 1))) or -1
+			logFile("silent area shot", id, "launch err", string.format("%.1f", ang), "deg grav", tostring(proj.Gravity), "plan G", fmtV(al.G), "t", string.format("%.2f", al.t), "D", string.format("%.1f", al.D))
+			Mark.areaShot = { id = id, G = al.G, tLand = Workspace:GetServerTimeNow() + al.t, model = al.model, logged = false }
 		end
 	end
 	local shooter = playerOf(proj.SourceUserId)
@@ -6922,10 +6927,10 @@ local function onProjectile(kind, proj)
 		}
 		do
 			local stN = Mark.projLive[proj.Id]
-			stN.pos0, stN.vel0 = stN.pos, stN.vel
+			stN.fp, stN.fv, stN.ft = stN.pos, stN.vel, stN.born
 			Mark.hazAdd(stN)
 		end
-		logFile("proj start", tostring(id), "from", tostring(shooter and actorName(shooter) or proj.SourceUserId), "dist", string.format("%.1f", flat(pos - root.Position).Magnitude), "spd", string.format("%.0f", typeof(vel) == "Vector3" and vel.Magnitude or 0), "own", tostring(own))
+		logFile("proj start", tostring(id), "from", tostring(shooter and actorName(shooter) or proj.SourceUserId), "dist", string.format("%.1f", flat(pos - root.Position).Magnitude), "spd", string.format("%.0f", typeof(vel) == "Vector3" and vel.Magnitude or 0), "grav", tostring(proj.Gravity), "own", tostring(own))
 		return
 	end
 	-- no id: old one-shot reaction
@@ -6937,11 +6942,12 @@ end
 -- ProjectileMovement also sends (serverTime, rows) after the start: row = {Id, Sequence, Position, Velocity, Steering, DetonatesAt}
 -- (ProjectileVfx.MovementFields). The old handler ignored everything but ProjectileStart, so a grenade arc and a boomerang
 -- return were dodged once from the muzzle and never again.
-Mark.projBatch = function(rows)
+Mark.projBatch = function(rows, batchAt)
 	if type(rows) ~= "table" or not Mark.projLive then
 		return
 	end
 	local nowS = Workspace:GetServerTimeNow()
+	local rowAt = type(batchAt) == "number" and batchAt or nowS
 	for i = 1, #rows do
 		local row = rows[i]
 		if type(row) == "table" then
@@ -6954,9 +6960,12 @@ Mark.projBatch = function(rows)
 				st.steer = typeof(row[5]) == "Vector3" and row[5] or st.steer
 				if type(row[6]) == "number" and row[6] > 0 then
 					st.det = row[6]
-					local ev = Mark.hazEv and Mark.hazEv[st.id]
-					if ev and ev.kind == "blast" and st.item == "grenade" then
-						ev.t = row[6] -- the server's own detonation time
+				end
+				-- explosives: the zone follows every correction (a grenade bounces off bodies and the server re-sends it)
+				if (st.item == "grenade" or st.item == "bazooka") and Mark.hazEv[st.id] then
+					st.fp, st.fv, st.ft = p, st.vel, rowAt
+					if os.clock() - (st.hazAt or 0) > 0.12 or st.det ~= st.hazDet then
+						Mark.hazAdd(st)
 					end
 				end
 			end
@@ -6988,7 +6997,7 @@ Remotes.Get("Items", "ProjectileMovement").OnClientEvent:Connect(function(kind, 
 			Mark.projLive[proj.Id] = nil
 		end
 	elseif type(kind) == "number" and type(proj) == "table" then
-		Mark.projBatch(proj)
+		Mark.projBatch(proj, kind)
 	end
 end)
 Remotes.Get("Items", "Effect").OnClientEvent:Connect(function(pkt)
@@ -6996,6 +7005,25 @@ Remotes.Get("Items", "Effect").OnClientEvent:Connect(function(pkt)
 		Mark.projSnapshot(pkt)
 	elseif type(pkt) == "table" and pkt.Kind == "ProjectileStart" then
 		onProjectile(pkt.Kind, pkt.Projectile or pkt)
+	elseif type(pkt) == "table" and pkt.Kind == "Explosion" and typeof(pkt.Position) == "Vector3" then
+		-- the real blast (Items_Script showExplosion: Position, Radius, SourceUserId). Ours: where it went off against the
+		-- ground point SilentAim planned and where the target really was (calibration of the area aim)
+		local sh = Mark.areaShot
+		local mine = pkt.SourceUserId == LocalPlayer.UserId
+		local tgt = mine and sh and sh.model and sh.model:FindFirstChild("HumanoidRootPart")
+		logFile("blast real", "from", tostring(pkt.SourceUserId), "at", fmtV(pkt.Position), "r", tostring(pkt.Radius),
+			"mine", tostring(mine), "vs plan", (mine and sh) and string.format("%.1f", flat(pkt.Position - sh.G).Magnitude) or "-",
+			"target", tgt and string.format("%.1f", (tgt.Position - pkt.Position).Magnitude) or "-")
+		if mine and sh then
+			sh.logged = true
+		end
+		-- an enemy blast we predicted: it went off here and now (the overlay plays its shock ring, then drops it)
+		for _, ev in Mark.hazEv do
+			if ev.kind == "blast" and not ev.boomAt and flat(ev.p - pkt.Position).Magnitude < 8 then
+				ev.boomAt, ev.p, ev.t = os.clock(), pkt.Position, Workspace:GetServerTimeNow()
+				break
+			end
+		end
 	elseif type(pkt) == "table" and pkt.Kind == "PlacedModelEntrance" then
 		-- Items_Script routes this packet to PlacedModelEntrance.Show: {EntranceId, ItemId, PlacerUserId, Model, StartedAt}.
 		-- It is the only place the client learns WHO placed a model (the model carries PlacementEntranceId only).
@@ -7119,6 +7147,9 @@ Mark.silentArt = function(seg, muzzle, chest, feet, col, t)
 		local f2 = math.min(f + 0.06, 1)
 		seg(muzzle:Lerp(chest, f), muzzle:Lerp(chest, f2), hot:Lerp(col, f), 1, 2.6, 46)
 	end
+	if not feet then
+		return
+	end
 	local R = 2.2
 	for arc = 0, 2 do
 		local a0 = t * 2.4 + arc * (math.pi * 2 / 3)
@@ -7134,9 +7165,103 @@ Mark.silentArt = function(seg, muzzle, chest, feet, col, t)
 	end
 end
 
+-- Area target art: the blast footprint on the grass where the shot goes off. A filled disc of the real radius (16-piece
+-- Triangle fan, projected once per frame), an inked rim, a shock ring running out from the centre every 0.8 s and three
+-- turning rim ticks. Appears scaling up from 60 % (0.18 s ease-out), fades out over 0.25 s when the solve is gone;
+-- the centre glides to a new point instead of jumping. hide = drop everything at once (item put away).
+Mark.areaNew = function()
+	local A = { a = 0, at = os.clock(), tris = {}, lines = makeLines(84, 1.4, 44) }
+	A.pool = Mark.segPool(A.lines)
+	for k = 1, 16 do
+		A.tris[k] = newTri(43)
+	end
+	return A
+end
+Mark.areaDraw = function(G, R, col, hide, A)
+	if not A then
+		A = Mark.areaFx or Mark.areaNew()
+		Mark.areaFx = A
+	end
+	local now = os.clock()
+	local dt = math.clamp(now - A.at, 0, 0.1)
+	A.at = now
+	if hide then
+		A.a, A.G = 0, nil
+	elseif G then
+		if not A.G or A.a <= 0.01 then
+			A.G, A.born = G, now
+		else
+			A.G = A.G:Lerp(G, math.min(1, dt * 14))
+		end
+		A.R, A.col = R, col
+		A.a = math.min(1, A.a + dt / 0.18)
+	else
+		A.a = math.max(0, A.a - dt / 0.25)
+	end
+	local pool = A.pool
+	pool.i = 1
+	local nTri = 0
+	if A.a > 0.01 and A.G and (A.gal or CFG.DrawSilent ~= false) then
+		local cam = Mark.frameCam or Workspace.CurrentCamera
+		local grow = 1 - (1 - math.clamp((now - (A.born or now)) / 0.18, 0, 1)) ^ 3
+		local r = A.R * (G and (0.6 + 0.4 * grow) or (1 + 0.1 * (1 - A.a)))
+		local c, cl, a = A.G + Vector3.new(0, 0.15, 0), A.col, A.a
+		local cs = cam:WorldToViewportPoint(c)
+		local prev, prevOk = nil, false
+		for k = 0, 16 do
+			local ang = k / 16 * math.pi * 2
+			local p = cam:WorldToViewportPoint(c + Vector3.new(math.cos(ang) * r, 0, math.sin(ang) * r))
+			local ok = p.Z > 0.2
+			if k > 0 and ok and prevOk and cs.Z > 0.2 then
+				nTri += 1
+				local tri = A.tris[nTri]
+				tri.PointA, tri.PointB, tri.PointC = Vector2.new(cs.X, cs.Y), Vector2.new(prev.X, prev.Y), Vector2.new(p.X, p.Y)
+				tri.Color, tri.Transparency, tri.Visible = cl, 0.16 * a, true
+			end
+			prev, prevOk = p, ok
+		end
+		local seg = pool.seg
+		local ink = Color3.fromRGB(12, 14, 18)
+		local function ring(rr, colr, al, th, n)
+			local last = nil
+			for k = 0, n do
+				local ang = k / n * math.pi * 2
+				local p = c + Vector3.new(math.cos(ang) * rr, 0, math.sin(ang) * rr)
+				if last then
+					seg(last, p, colr, al, th, 45)
+				end
+				last = p
+			end
+		end
+		ring(r, ink, 0.5 * a, 3.6, 24)
+		ring(r, cl, 0.95 * a, 1.6, 24)
+		local f = (now % 0.8) / 0.8
+		ring(r * (1 - (1 - f) ^ 2), Color3.new(1, 1, 1):Lerp(cl, f), (1 - f) * 0.8 * a, 1.4, 18)
+		for q = 0, 2 do
+			local a0 = now * 1.8 + q * (math.pi * 2 / 3)
+			local last = nil
+			for s = 0, 3 do
+				local ang = a0 + s / 3 * 0.55
+				local p = c + Vector3.new(math.cos(ang) * (r + 0.9), 0, math.sin(ang) * (r + 0.9))
+				if last then
+					seg(last, p, Color3.new(1, 1, 1), a, 2.4, 46)
+				end
+				last = p
+			end
+		end
+	end
+	for k = nTri + 1, 16 do
+		A.tris[k].Visible = false
+	end
+	pool.finish()
+end
+
 Mark.saHide = function()
 	if Mark.saPool then
 		Mark.saPool.finish()
+	end
+	if Mark.areaFx then
+		Mark.areaDraw(nil, 0, nil, true)
 	end
 	if Mark.saCircle then
 		Mark.saCircle.Visible = false
@@ -7153,148 +7278,174 @@ end
 -- full lead, a strafer a fraction of it. The flight time is iterated against the lead point; the target is also seen
 -- display-delay + one-way ping behind the server pose.
 Mark.projSeed = { freezeGun = 77.8 } -- measured muzzle speed (log "proj speed freezeGun 77.6-77.9"); used until we shoot
--- Freeze gun is NOT a straight shot. ProjectileVfx getLaunchVelocity: FreezeGun -> ProjectileAim.GetPeakVelocity(
--- muzzle, payload, Speed 78, Gravity = workspace.Gravity * 0.3, FieldSettings.GetGroundYAt(muzzle)): the game picks
--- the launch angle so the ice LANDS (reaches ground height) where the aim ray points on screen (endpoint screen
--- ratios vs payload.CameraCFrame). Aiming the ray at his body put the landing point behind him, the arc over him.
--- So: lead his position with the ARC flight time (analytic low arc from the muzzle), then bisect the landing point
--- along muzzle -> him with the game's own GetPeakDirection until the arc is at his HRP height over his spot.
--- Returns the ray direction to send (camera -> landing point) and the led target, or nil (out of range / no solve).
-Mark.arcAim = function(id, pick, cam, ping)
-	if id ~= "freezeGun" then
-		return nil
+-- AREA WEAPONS (bazooka, freeze gun). These hit a spot on the ground, not a body: aimed at his chest the shot flies on
+-- past him when he steps and goes off far behind. So the aim point is the GROUND under where he will be.
+--   bazooka: ProjectileVfx.getLaunchVelocity = unit(TargetPosition - muzzle) * Speed, Gravity = workspace.Gravity;
+--            TargetPosition is the game's own aim hit of our ray (Reticle.GetAimHit on the Map + hitboxes), or
+--            Origin + Direction * 1000 when the ray hits nothing. Blast = ItemHitSettings.ExplosionRadius (14, the
+--            server sends it in the "Explosion" effect) where it touches the ground or the first body.
+--   freeze gun: ProjectileAim.GetPeakVelocity puts the LANDING (ground height) on the screen point of the ray, Speed 78,
+--            Gravity 0.3 g. The freeze radius is not in the dump (CFG.FreezeRadius, unconfirmed).
+-- Returns the ray to send, the ground point G, the flight time, the launch we expect and the radius - or nil (out of
+-- reach, or G so close that the blast takes us too: then the player's own aim stays).
+Mark.areaItems = { bazooka = true, freezeGun = true }
+Mark.areaRadius = function(id)
+	if id == "bazooka" then
+		return Mark.blastR()
 	end
+	return CFG.FreezeRadius or 8
+end
+Mark.areaAim = function(id, pick, cam, ping, root)
 	Mark.projVfx = Mark.projVfx or require(Modules.Items.ProjectileVfx)
 	local cfg = Mark.projVfx.PredictionConfigs[id]
-	if not (cfg and cfg.Speed and (cfg.Gravity or 0) > 0) then
+	if not (cfg and cfg.Speed) then
 		return nil
 	end
 	Mark.projAimMod = Mark.projAimMod or require(Modules.Items.ProjectileAim)
 	Mark.fieldMod = Mark.fieldMod or require(Modules.Gameplay.FieldSettings)
 	Mark.heldItems = Mark.heldItems or require(Modules.Items.HeldItems)
-	local ch = LocalPlayer.Character
-	local muzzle = nil
-	local att = Mark.heldItems.FindMuzzle(ch, id)
-	muzzle = att and att.WorldPosition
-	local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
-	muzzle = muzzle or (hrp and hrp.Position)
-	if not muzzle then
-		return nil
-	end
-	local spd, g = cfg.Speed, cfg.Gravity
-	local groundY = Mark.fieldMod.GetGroundYAt(muzzle)
-	if type(groundY) ~= "number" then
-		groundY = muzzle.Y - 3
-	end
-	local function flight(P)
-		local D = flat(P - muzzle).Magnitude
-		local dy = P.Y - muzzle.Y
-		local v2 = spd * spd
-		local disc = v2 * v2 - g * (g * D * D + 2 * dy * v2)
-		if disc < 0 or D < 0.5 then
-			return D / spd
-		end
-		local th = math.atan((v2 - math.sqrt(disc)) / (g * D))
-		return D / (spd * math.cos(th))
-	end
-	local P = Mark.silentLead(pick, cam.CFrame.Position, spd, ping, flight)
-	-- self-calibrated vertical bias: after every shot of ours the REAL launch velocity says where the flight crosses the
-	-- target's distance (`silent shot ... errY`); the aim point is moved by the measured miss
+	Mark.hitScan = Mark.hitScan or require(Modules.Items.HitScan)
+	local att = Mark.heldItems.FindMuzzle(LocalPlayer.Character, id)
+	local muzzle = att and att.WorldPosition or (root.Position + Vector3.new(0, 1.2, 0))
 	local camCF = cam.CFrame
 	local camPos = camCF.Position
-	local toP = flat(P - muzzle)
-	local D = toP.Magnitude
-	local u = unitOrNil(toP)
-	if not u or D < 3 then
-		return nil
+	local spd = (Mark.projSpeed and Mark.projSpeed[id]) or cfg.Speed
+	local g = (Mark.projGrav and Mark.projGrav[id]) or cfg.Gravity or 0
+	local function groundAt(p)
+		local gy = Mark.fieldMod.GetGroundYAt(p)
+		return type(gy) == "number" and gy or root.Position.Y - 3
 	end
-	-- the launch direction we WANT: the low ballistic arc muzzle -> led point (speed, 0.3 g)
-	local desired = nil
-	do
-		local v2 = spd * spd
-		local dyP = P.Y - muzzle.Y
-		local disc = v2 * v2 - g * (g * D * D + 2 * dyP * v2)
-		if disc >= 0 then
-			local th = math.atan((v2 - math.sqrt(disc)) / (g * D))
-			desired = u * math.cos(th) + Vector3.new(0, math.sin(th), 0)
-		end
-	end
-	if not desired then
-		if os.clock() - (Mark.arcFailAt or 0) > 1 then
-			Mark.arcFailAt = os.clock()
-			logFile("silent arc", "out of range", "D", string.format("%.1f", D), "dy", string.format("%.1f", P.Y - muzzle.Y), "max", string.format("%.0f", spd * spd / g))
-		end
-		return nil
-	end
-	-- The server (and the game's own prediction) launches with ProjectileAim.GetPeakDirection on the ray we send: the shot
-	-- LANDS (at groundY) on the screen point of that ray; a flat/ballistic direction sent as a ray becomes a 33 degree lob
-	-- (the log: fallback pitch 9.4 sent, launch pitch 33.3, 23 studs over). So the only knob is the landing point L on the
-	-- ground; scan it with the REAL game function, simulate the real flight, take the L whose flight crosses the target's
-	-- distance at the target's height. Nothing is learned from shots: the model is the game's own code.
-	local function shoot(s)
-		local L = Vector3.new(muzzle.X + u.X * s, groundY, muzzle.Z + u.Z * s)
-		local d = unitOrNil(L - camPos)
-		if not d then
+	-- the low arc muzzle -> G: launch unit vector and flight time (nil = out of reach)
+	local function lowArc(G)
+		local toG = flat(G - muzzle)
+		local D = toG.Magnitude
+		local u = unitOrNil(toG)
+		if not u then
 			return nil
 		end
-		local dir = Mark.projAimMod.GetPeakDirection(muzzle, { Origin = camPos, Direction = d, CameraCFrame = camCF }, spd, g, groundY)
-		if not (typeof(dir) == "Vector3") then
+		if g <= 0 then
+			local L = unitOrNil(G - muzzle)
+			return L, (G - muzzle).Magnitude / spd
+		end
+		local v2, dy = spd * spd, G.Y - muzzle.Y
+		local disc = v2 * v2 - g * (g * D * D + 2 * dy * v2)
+		if disc < 0 then
 			return nil
 		end
-		local h = flat(dir)
-		local hv = h.Magnitude * spd
-		if hv < 1e-3 then
-			return nil
-		end
-		local t = toP:Dot(h.Unit) / hv
-		if t <= 0 then
-			return nil
-		end
-		local y = muzzle.Y + dir.Y * spd * t - 0.5 * g * t * t
-		return y - P.Y, d, t, dir
+		local th = math.atan((v2 - math.sqrt(disc)) / (g * D))
+		return u * math.cos(th) + Vector3.new(0, math.sin(th), 0), D / (spd * math.cos(th))
 	end
-	local sMax = spd * spd / g - 2
-	local bestS, bestF, bestDir, bestT = nil, math.huge, nil, nil
-	local s = math.max(D - 12, 3)
-	while s <= math.min(D + 50, sMax) do
-		local f, d, t = shoot(s)
-		if f and math.abs(f) < bestF then
-			bestS, bestF, bestDir, bestT = s, math.abs(f), d, t
+	-- the ray that makes the game launch along L, checked with the game's own aim hit (TargetPosition)
+	local function rayFor(L)
+		local Q
+		if L.Y < -0.02 then
+			Q = muzzle + L * ((groundAt(muzzle + flat(L) * 10) - muzzle.Y) / L.Y)
+		else
+			Q = muzzle + L * 600
 		end
-		s += 3
+		local dd = unitOrNil(Q - camPos)
+		if not dd then
+			return nil
+		end
+		local hit = Reticle.GetAimHit(Ray.new(Mark.hitScan.GetForwardAimOrigin(camPos, dd, root.Position), dd))
+		local T = hit and hit.Position or (camPos + dd * 1000)
+		return dd, unitOrNil(T - muzzle)
 	end
-	if bestS then
-		local s2 = math.max(bestS - 3, 3)
-		while s2 <= math.min(bestS + 3, sMax) do
-			local f, d, t = shoot(s2)
-			if f and math.abs(f) < bestF then
-				bestS, bestF, bestDir, bestT = s2, math.abs(f), d, t
+	-- where a launch along Lr comes down
+	local function landOf(Lr)
+		local t = 0
+		while t < 3 do
+			t += 0.01
+			local q = muzzle + Lr * (spd * t) + Vector3.new(0, -0.5 * g * t * t, 0)
+			if q.Y <= groundAt(q) + 0.3 then
+				return q, t
 			end
-			s2 += 0.5
+		end
+		return nil
+	end
+	local flightFn
+	if id == "freezeGun" then
+		flightFn = function(P)
+			local G = Vector3.new(P.X, groundAt(P), P.Z)
+			local dd = unitOrNil(G - camPos)
+			local dir = dd and Mark.projAimMod.GetPeakDirection(muzzle, { Origin = camPos, Direction = dd, CameraCFrame = camCF }, spd, g, groundAt(muzzle))
+			local h = typeof(dir) == "Vector3" and flat(dir).Magnitude * spd or 0
+			if h < 1e-3 then
+				return flat(G - muzzle).Magnitude / spd
+			end
+			return flat(G - muzzle).Magnitude / h
+		end
+	else
+		flightFn = function(P)
+			local _, t = lowArc(Vector3.new(P.X, groundAt(P), P.Z))
+			return t or flat(P - muzzle).Magnitude / spd
 		end
 	end
-	local maxErr = CFG.ArcMaxErr or 2.5
-	if bestDir and bestF <= maxErr then
-		Mark.arcLast = { at = os.clock(), mode = "peak", des = math.deg(math.asin(desired.Y)), ray = math.deg(math.asin(bestDir.Y)), D = D, muzzle = muzzle, desDir = desired, P = P, bias = 0, g = g }
-		if os.clock() - (Mark.arcLogAt or 0) > 2 then
-			Mark.arcLogAt = os.clock()
-			logFile("silent arc", id, "D", string.format("%.1f", D), "land", string.format("%.1f", bestS), "t", string.format("%.2f", bestT or 0), "err", string.format("%.2f", bestF), "rayPitch", string.format("%.1f", Mark.arcLast.ray), "groundY", string.format("%.1f", groundY), "muzzle", fmtV(muzzle), "targetY", string.format("%.1f", P.Y))
+	local P = Mark.silentLead(pick, camPos, spd, ping, flightFn)
+	local G = Vector3.new(P.X, groundAt(P), P.Z)
+	local R = Mark.areaRadius(id)
+	if flat(G - root.Position).Magnitude < R + 1.5 then
+		return nil -- the blast would take us: the player's own aim (a rocket jump at his feet is his call)
+	end
+	if id == "freezeGun" then
+		local dd = unitOrNil(G - camPos)
+		local dir = dd and Mark.projAimMod.GetPeakDirection(muzzle, { Origin = camPos, Direction = dd, CameraCFrame = camCF }, spd, g, groundAt(muzzle))
+		if typeof(dir) ~= "Vector3" then
+			return nil
 		end
-		return bestDir, P
+		return dd, G, { t = flightFn(P), launch = dir.Unit, R = R, D = flat(G - muzzle).Magnitude }
 	end
-	-- no landing point puts the flight through the target: aim at his FEET (the shot lands there, the descending ice passes
-	-- the body just before it) - never a ballistic direction used as a ray
-	local feet = Vector3.new(P.X, groundY, P.Z)
-	local dF = unitOrNil(feet - camPos)
-	if os.clock() - (Mark.arcFailAt or 0) > 1 then
-		Mark.arcFailAt = os.clock()
-		logFile("silent arc", "no solve - feet", "D", string.format("%.1f", D), "best err", bestF == math.huge and "-" or string.format("%.1f", bestF), "muzzleY", string.format("%.1f", muzzle.Y), "targetY", string.format("%.1f", P.Y), "groundY", string.format("%.1f", groundY))
+	local L, t = lowArc(G)
+	if not L then
+		return nil
 	end
-	if dF then
-		Mark.arcLast = { at = os.clock(), mode = "feet", des = math.deg(math.asin(desired.Y)), ray = math.deg(math.asin(dF.Y)), D = D, muzzle = muzzle, desDir = desired, P = P, bias = 0, g = g }
-		return dF, P
+	-- the game's aim hit can differ from the point we meant (a wall, a hitbox on the line): steer the ray by the miss
+	local aimG, dd, Lr, land = G, nil, nil, nil
+	for _ = 1, 3 do
+		dd, Lr = rayFor(L)
+		if not (dd and Lr) then
+			return nil
+		end
+		land = landOf(Lr)
+		local miss = land and flat(G - land) or nil
+		if not miss or miss.Magnitude < 1.5 then
+			break
+		end
+		aimG = aimG + miss
+		L = lowArc(Vector3.new(aimG.X, groundAt(aimG), aimG.Z))
+		if not L then
+			return nil
+		end
 	end
-	return nil
+	if not land or flat(land - G).Magnitude > R * 0.5 then
+		return nil
+	end
+	return dd, G, { t = t, launch = Lr, R = R, D = flat(G - muzzle).Magnitude, land = land }
+end
+
+-- after our freeze shot lands: who is frozen and how far from the landing point (calibration of CFG.FreezeRadius)
+Mark.areaCheck = function()
+	local sh = Mark.areaShot
+	if not sh or sh.logged or Workspace:GetServerTimeNow() < sh.tLand + 0.35 then
+		return
+	end
+	sh.logged = true
+	if sh.id ~= "freezeGun" then
+		return
+	end
+	local parts = {}
+	for _, model in Mark.models() do
+		local actor = Actors.GetFromCharacter(model)
+		local r = actor and actor ~= LocalPlayer and ActorTargeting.GetActorRoot(actor)
+		if r then
+			local dG = flat(r.Position - sh.G).Magnitude
+			if dG < 25 then
+				local fu = model:GetAttribute("FrozenUntil") or actor:GetAttribute("FrozenUntil")
+				parts[#parts + 1] = string.format("%s %.1f %s", actorName(actor), dG, (type(fu) == "number" and fu > Workspace:GetServerTimeNow()) and "FROZEN" or "-")
+			end
+		end
+	end
+	logFile("silent area freeze", "at", fmtV(sh.G), #parts > 0 and table.concat(parts, " | ") or "nobody within 25")
 end
 
 Mark.silentLead = function(pick, camPos, spd, ping, flightFn)
@@ -7373,14 +7524,17 @@ Mark.silentLead = function(pick, camPos, spd, ping, flightFn)
 	return Vector3.new(P.X, pick.Position.Y, P.Z)
 end
 
--- AutoWall. A barricade appears PlacementForwardDistance (5, PlaceDownPlacement.Configs.barricades) ahead of our HRP
--- along the flat aim ray. The old trigger waited for the target to be 3.5..6.5 studs away NOW, with no lead: by the time
--- the press reached the server he had run 2-3 studs on, so the wall was late. Two triggers now, both on where he will be
--- when the wall exists (ping + WallLatency):
---   overlap - his predicted position is 3.2..6.8 studs from our predicted position: the wall lands on him;
---   ambush  - he closes on the wall's spot and his path crosses the wall's width before he reaches it: place it early.
--- Own ball: any closing enemy. No ball: the enemy carrier only. The server's stun rule is not in the client dump, so every
--- press is followed up in the log ("wall placed dt .. size .. / wall result .. off .. stun yes|no") to calibrate.
+-- AutoWall. What the dump says a barricade is (PlaceDownPlacement, BarricadeStrikes, Physics, CollisionGroups):
+--   * it spawns PlacementForwardDistance 5 ahead of the HRP the SERVER has when the press arrives, along the flat aim
+--     direction, facing it (CFrame.lookAt(ground, ground + Forward)), clamped into the field and pushed out of the goals
+--     (PlaceDownPlacement.Resolve with PlacementContain). Logs: 11.5 wide, 6.4 high, 1.5-3.4 thick; seen 0.11-0.14 s
+--     after the press at ping ~0.08, landing 4.2-5.1 from where we stood at the press. The old code aimed from our
+--     position LED by our velocity * (ping + 0.08): every wall landed 3.7-5 studs off its plan ("aimed" in the log).
+--   * it is a solid: the ball bounces off it (Physics BarricadeNormalRetention), players collide with it, a kick box
+--     breaks it (BarricadeStrikes), a slide into it is a BarricadeHit. No stun anywhere in the dump and none in the logs
+--     ("stun false" every time): placing it ON a man does nothing, the "overlap" trigger is gone.
+-- So a wall is a plane segment, and one solver (Mark.wallSolve) finds the aim yaw whose segment the threat's path crosses
+-- after the wall exists: a shot into our goal, a projectile, a slide at us, the man chasing our ball, the carrier's run.
 Mark.wallWatch = function()
 	local p = Mark.wallPend
 	if not p then
@@ -7401,7 +7555,6 @@ Mark.wallWatch = function()
 		for _, inst in world:GetChildren() do
 			if inst:GetAttribute("PlacedItemId") == "barricades" and not p.before[inst] then
 				p.seenAt = now
-				p.inst = inst
 				local pos, size
 				if inst:IsA("Model") then
 					local cf, sz = inst:GetBoundingBox()
@@ -7410,31 +7563,28 @@ Mark.wallWatch = function()
 					pos, size = inst.Position, inst.Size
 				end
 				p.wallPos = pos
-				Mark.wallHalfSeen = math.clamp(math.max(size.X, size.Z) * 0.5, 2, 12)
 				logFile("wall placed", "dt", string.format("%.2f", now - p.at), "kind", p.kind, "size", fmtV(size), "fromUs", string.format("%.1f", flat(pos - p.us).Magnitude), "aimed", string.format("%.1f", flat(p.W - pos).Magnitude))
 				break
 			end
 		end
 		return
 	end
-	if p.proj and now - p.seenAt >= 0.45 then
-		Mark.wallPend = nil
+	if now - p.seenAt < 0.45 then
+		return
+	end
+	Mark.wallPend = nil
+	if not p.model then
 		local alive = 0
 		for _ in Mark.projLive or {} do
 			alive += 1
 		end
-		logFile("wall result", "block", p.kind, "projectiles still live", alive, "ball", fmtV(Renderer.GetPosition() or Vector3.zero))
+		logFile("wall result", p.kind, "projectiles still live", alive, "ball", fmtV(Renderer.GetPosition() or Vector3.zero))
 		return
 	end
-	if now - p.seenAt >= 0.45 then
-		local tp = CharacterMotion.GetPosition(p.model) or p.root.Position
-		local off = flat(tp - p.wallPos)
-		local vu = unitOrNil(p.vel)
-		local along = vu and off:Dot(vu) or 0
-		local down = Mark.mateDown(p.actor, p.model)
-		logFile("wall result", p.kind, p.name, "off", string.format("%.1f", off.Magnitude), "alongHisRun", string.format("%.1f", along), "stun", tostring(down))
-		Mark.wallPend = nil
-	end
+	-- a man: still on his side of the wall plane = it held him
+	local tp = CharacterMotion.GetPosition(p.model) or p.wallPos
+	local side = flat(tp - p.wallPos):Dot(p.u)
+	logFile("wall result", p.kind, p.name, "side", string.format("%.1f", side), "dist", string.format("%.1f", flat(tp - p.wallPos).Magnitude), side > 0 and "held" or "passed")
 end
 
 -- BarricadeAddon: a wall placed so that an incoming projectile / charged shot hits IT. The wall spawns exactly 5 studs ahead of
@@ -7454,6 +7604,10 @@ Mark.itemSlots = function()
 		Items = mod
 		Mark.itemsMod = mod
 	end
+	local sc = Mark.slotsCache
+	if sc and os.clock() - sc.at < 0.2 then
+		return sc.slots
+	end
 	local okU, slots = Mark.try(upvalue, Items.UpdateState, 3)
 	if okU and type(slots) == "table" then
 		if not Mark.slotsLogged or os.clock() - Mark.slotsLogged > 20 then
@@ -7469,6 +7623,7 @@ Mark.itemSlots = function()
 			end
 			Mark.slotsLogged = os.clock()
 		end
+		Mark.slotsCache = { at = os.clock(), slots = slots }
 		return slots
 	end
 	return nil
@@ -7538,141 +7693,114 @@ Mark.equipWall = function(tag)
 	return ok
 end
 
--- Not equipped yet and a closing enemy carrier / a charging shot is coming: take the barricades out in time
-Mark.wallEquipTick = function(root, oid, own)
-	if not CFG.AutoWall or CFG.WallEquip == false then
-		return
-	end
-	local use = Mark.itemUse
-	if not (use and use.ActivateEquipped) then
-		return
-	end
-	local now = os.clock()
-	local isWall = use.IsEquipped and use.IsEquipped() and Mark.equippedId() == "barricades"
-	if isWall then
-		-- unequip what we took out and did not use (an equipped item blocks ball controls)
-		if Mark.wallEquipAt and now - Mark.wallEquipAt > (CFG.WallEquipHold or 3.5) and now - (Mark.skillAt or 0) > (CFG.WallEquipHold or 3.5) then
-			Mark.wallEquipAt = nil
-			local slot = Mark.wallEquipSlot or Mark.slotOfItem("barricades")
-			if slot then
-				Mark.pressSlot(slot)
-				logFile("wall equip", "idle - put away", "slot", slot)
-			end
-		end
-		return
-	end
-	if own or not Mark.slotOfItem("barricades") then
-		return
-	end
-	if use.IsEquipped and use.IsEquipped() then
-		return -- some other item is in hand: leave it
-	end
-	-- 1) a shot that is being charged goes into our mouth
-	if CFG.WallShot ~= false and Mark.wallVsShot(root) then
-		return
-	end
-	-- 2) the enemy carrier closes on us
-	if type(oid) ~= "number" or oid == 0 then
-		return
-	end
-	for _, model in Mark.models() do
-		local actor = Actors.GetFromCharacter(model)
-		if actor and actor ~= LocalPlayer and actor.UserId == oid and not sameTeam(actor) and not isGoalkeeper(actor) then
-			local r = ActorTargeting.GetActorRoot(actor)
-			if r then
-				local pos, vel = Mark.carrierPose(r, model)
-				local rel = flat(pos - root.Position)
-				local d = rel.Magnitude
-				if d > 6 and d <= (CFG.WallEquipDist or 26) then
-					local closeV = -(vel - flat(root.AssemblyLinearVelocity)):Dot(rel / d)
-					if closeV >= (CFG.WallAmbushV or 4.5) and d / closeV <= 1.6 then
-						Mark.equipWall("carrier " .. string.format("d %.1f closeV %.1f", d, closeV))
+-- One aim for every wall. pts[i] = the threat's position at (i-1)*dtS s from now (nil = not there yet). For 48 aim yaws the
+-- wall is the segment centre O + u*5, normal u, half width WallHalf, height WallHeight above our ground; the first
+-- crossing of its plane AFTER `ready` (the wall exists) counts when it falls inside the width minus the threat's radius and
+-- inside the height. window: a man must reach the wall within it after it appears (earlier and he walks around it).
+-- Best = the widest margin, then the earliest crossing. Returns { u, C, t, lat, q } or nil.
+Mark.wallSolve = function(O, pts, dtS, ready, rad, window)
+	local hw = CFG.WallHalf or 5.75
+	local H = CFG.WallHeight or 6.4
+	local floorY = O.Y - 3
+	local i0 = math.floor(ready / dtS) + 1
+	local best = nil
+	for k = 0, 47 do
+		local ang = k / 48 * math.pi * 2
+		local u = Vector3.new(math.cos(ang), 0, math.sin(ang))
+		local C = Vector3.new(O.X + u.X * 5, floorY, O.Z + u.Z * 5)
+		local pv = Vector3.new(-u.Z, 0, u.X)
+		local sPrev, pPrev, iPrev = nil, nil, 0
+		for i = i0, #pts do
+			local p = pts[i]
+			if p then
+				local s = (p.X - C.X) * u.X + (p.Z - C.Z) * u.Z
+				if sPrev and (sPrev > 0) ~= (s > 0) then
+					local f = sPrev / (sPrev - s)
+					local q = pPrev:Lerp(p, f)
+					local t = (iPrev - 1 + (i - iPrev) * f) * dtS
+					local lat = (q.X - C.X) * pv.X + (q.Z - C.Z) * pv.Z
+					local margin = hw - rad - math.abs(lat)
+					local h = q.Y - floorY
+					if margin > 0.3 and h > -1 and h < H + rad and (not window or t - ready <= window) then
+						if not best or margin > best.margin + 0.25 or (margin > best.margin - 0.25 and t < best.t) then
+							best = { u = u, C = C, t = t, lat = lat, q = q, margin = margin }
+						end
 					end
+					break
 				end
+				sPrev, pPrev, iPrev = s, p, i
 			end
 		end
 	end
+	return best
 end
 
-Mark.wallVsPath = function(root, pathFn, tEnd, tag)
-	if CFG.BarricadeAddon == false or not CFG.AutoWall then
+-- Threat path -> wall. tag names it in the log; o = { rad, window, model, actor, equip }. Returns true (placed),
+-- "equip" (barricades coming out, place on a later tick) or false + why.
+Mark.wallVsPath = function(root, pathFn, tEnd, tag, o)
+	o = o or {}
+	if not CFG.AutoWall or (o.proj and CFG.BarricadeAddon == false) then
 		return false
 	end
 	local use = Mark.itemUse
 	if not (use and use.ActivateEquipped) then
 		return false
 	end
+	local now = os.clock()
+	if now - (Mark.skillAt or 0) < (CFG.WallCooldown or 0.7) then
+		return false
+	end
+	if Mark.wallPend and Mark.wallPend.seenAt == nil and now - Mark.wallPend.at < 0.5 then
+		return false -- the last one has not appeared yet
+	end
 	local equipped = use.IsEquipped and use.IsEquipped() and Mark.equippedId() == "barricades"
-	if not equipped and not Mark.slotOfItem("barricades") then
-		return false
-	end
-	if os.clock() - (Mark.skillAt or 0) < (CFG.WallCooldown or 0.7) then
-		return false
-	end
-	if Mark.wallPend and Mark.wallPend.seenAt == nil and os.clock() - Mark.wallPend.at < 0.5 then
+	local canEquip = o.equip ~= false and not equipped and Mark.slotOfItem("barricades") ~= nil
+	if not equipped and not canEquip then
 		return false
 	end
 	local ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
-	local lat = ping + (CFG.WallLatency or 0.08)
-	local ready = lat + (CFG.WallMargin or 0.12)
-	local us = root.Position + flat(root.AssemblyLinearVelocity) * lat
-	local FWD = 5
-	local half = Mark.wallHalfSeen or CFG.WallHalf or 4
-	local floorY = root.Position.Y - 3
-	local hMax = CFG.WallHeight or 6
-	local prevD, prevQ, prevT = nil, nil, nil
-	local hit = nil
-	local t = 0
-	while t <= tEnd + 0.25 do
-		local q = pathFn(t)
-		if q then
-			local d = flat(q - us).Magnitude
-			if prevD and prevD > FWD and d <= FWD then
-				local k = (prevD - FWD) / math.max(prevD - d, 1e-3)
-				hit = { q = prevQ:Lerp(q, k), t = prevT + (t - prevT) * k }
-				break
-			elseif not prevD and d <= FWD then
-				return false -- already inside the circle: nothing left to place
-			end
-			prevD, prevQ, prevT = d, q, t
-		end
-		t += 0.02
+	-- the press reaches the server after ping/2, the wall exists WallLatency later (seen 0.11-0.14 s after the press at
+	-- ping 0.08 = round trip + ~0.04); equipping first costs WallEquipDelay more
+	local ready = ping * 0.5 + (CFG.WallLatency or 0.06) + (CFG.WallMargin or 0.05) + (equipped and 0 or (CFG.WallEquipDelay or 0.3))
+	local dtS = 0.02
+	local pts = Mark.wallPts or {}
+	Mark.wallPts = pts
+	local n = math.floor(tEnd / dtS) + 2
+	for i = 1, n do
+		pts[i] = pathFn((i - 1) * dtS)
 	end
-	if not hit then
-		return false
+	for i = n + 1, #pts do
+		pts[i] = nil
 	end
-	if hit.t < ready then
-		return false, "late"
+	local O = root.Position
+	local best = Mark.wallSolve(O, pts, dtS, ready, o.rad or 1, o.window)
+	if not best then
+		return false, "no line"
 	end
 	if not equipped then
-		-- take the barricades out first (the key press + the server's echo take WallEquipDelay), place on the next tick
-		if hit.t < ready + (CFG.WallEquipDelay or 0.3) then
-			return false, "late equip"
-		end
 		if Mark.equipWall(tag) then
 			return "equip", "equip"
 		end
 		return false, "equip failed"
 	end
-	local qy = hit.q.Y - floorY
-	if qy < -1.5 or qy > hMax + 1 then
-		return false, "height"
+	local u = best.u
+	-- where the game really puts it (field clamp, pushed out of a goal): the plan must survive that
+	Mark.placeMod = Mark.placeMod or require(Modules.Items.PlaceDownPlacement)
+	Mark.placeContain = Mark.placeContain or require(Client.Gameplay.ItemEffects.PlacementContain)
+	local res = Mark.placeMod.Resolve(root, { AimRay = { Direction = u } }, Mark.placeMod.Configs.barricades, Mark.placeContain.Get(LocalPlayer.Team and LocalPlayer.Team.Name or "Home"))
+	local W = res and res.GroundPosition or best.C
+	if flat(W - best.C).Magnitude > 1.5 then
+		return false, "moved by the field"
 	end
-	local to = unitOrNil(flat(hit.q - us))
-	if not to then
-		return false
-	end
-	local W = us + to * FWD
 	for _, model in Mark.models() do
 		local actor = Actors.GetFromCharacter(model)
 		if actor and actor ~= LocalPlayer and sameTeam(actor) then
 			local ar = ActorTargeting.GetActorRoot(actor)
-			if ar and flat(ar.Position - W).Magnitude < 3.5 then
+			if ar and math.abs(flat(ar.Position - W):Dot(u)) < 2.5 and math.abs(flat(ar.Position - W):Dot(Vector3.new(-u.Z, 0, u.X))) < (CFG.WallHalf or 5.75) + 1 then
 				return false, "mate"
 			end
 		end
 	end
-	local o = root.Position + Vector3.new(0, 1.6, 0)
 	local before = {}
 	local world = workspace:FindFirstChild("Misc")
 	world = world and world:FindFirstChild("Items")
@@ -7683,16 +7811,17 @@ Mark.wallVsPath = function(root, pathFn, tEnd, tag)
 			end
 		end
 	end
-	Mark.skillRay = { Origin = o, Direction = to, CameraCFrame = CFrame.lookAt(o, o + to) }
-	Mark.skillAt = os.clock()
+	local org = O + Vector3.new(0, 1.6, 0)
+	Mark.skillRay = { Origin = org, Direction = u, CameraCFrame = CFrame.lookAt(org, org + u) }
+	Mark.skillAt = now
 	use.ActivateEquipped()
-	Mark.wallPend = { at = os.clock(), proj = true, name = tag, kind = tag, us = root.Position, W = W, before = before }
-	logFile("skill wall", "block", tag, "hitIn", string.format("%.2f", hit.t), "ready", string.format("%.2f", ready), "q", fmtV(hit.q), fmtV(to))
+	Mark.wallPend = { at = now, kind = tag, name = o.actor and actorName(o.actor) or tag, model = o.model, us = O, W = W, u = u, before = before }
+	logFile("skill wall", tag, o.actor and actorName(o.actor) or "-", "cross", string.format("%.2f", best.t), "ready", string.format("%.2f", ready), "lat", string.format("%.1f", best.lat), "margin", string.format("%.1f", best.margin), "q", fmtV(best.q), fmtV(u))
 	return true
 end
 
 -- the replicated charge as a path: the shot that is being charged crosses the circle around us -> wall on it
-Mark.wallVsShot = function(root)
+Mark.wallVsShot = function(root, equip)
 	local oid = liveOwnerId()
 	if type(oid) ~= "number" or oid == 0 or oid == LocalPlayer.UserId then
 		return false
@@ -7738,109 +7867,99 @@ Mark.wallVsShot = function(root)
 			return nil
 		end
 		return Mark.chargeAt(cs, t - tRel)
-	end, tRel + 1.2, "shot")
+	end, tRel + 1.2, "shot", { rad = Physics.BallRadius or 1, equip = equip })
 end
 
-Mark.wallTick = function(root, oid, own, use, ping)
+-- Every tick (barricades in hand or in a slot): the threats a wall can stop, most urgent first. Not in hand = only with
+-- Auto Use (WallEquip). Bodies: the server pose, a short straight path (a chaser runs at where we will be), and the wall
+-- must appear at most WallWindow before he reaches it, or he steps around it.
+Mark.wallTick = function(root, oid, own)
 	Mark.wallWatch()
-	if not CFG.AutoWall or os.clock() - (Mark.skillAt or 0) < (CFG.WallCooldown or 0.7) or not use.ActivateEquipped then
+	if not CFG.AutoWall then
 		return
 	end
-	if Mark.wallPend and Mark.wallPend.seenAt == nil and os.clock() - Mark.wallPend.at < 0.5 then
-		return -- the last one has not appeared yet
-	end
-	-- the shot that is being charged flies through the circle the wall can reach: block it with the wall
-	if not own and CFG.WallShot ~= false and Mark.wallVsShot(root) then
+	local use = Mark.itemUse
+	if not (use and use.ActivateEquipped) then
 		return
 	end
-	local FWD = 5
-	local lat = ping + (CFG.WallLatency or 0.08)
+	local now = os.clock()
+	local inHand = use.IsEquipped and use.IsEquipped()
+	local isWall = inHand and Mark.equippedId() == "barricades"
+	if isWall and Mark.wallEquipAt and now - Mark.wallEquipAt > (CFG.WallEquipHold or 3.5) and now - (Mark.skillAt or 0) > (CFG.WallEquipHold or 3.5) then
+		-- put away what we took out and did not use (an equipped item blocks ball controls)
+		Mark.wallEquipAt = nil
+		local slot = Mark.wallEquipSlot or Mark.slotOfItem("barricades")
+		if slot then
+			Mark.pressSlot(slot)
+			logFile("wall equip", "idle - put away", "slot", slot)
+		end
+		return
+	end
+	if inHand and not isWall then
+		return -- another item in hand: leave it
+	end
+	if not isWall and (CFG.WallEquip == false or not Mark.slotOfItem("barricades")) then
+		return
+	end
+	-- no equip while we hold the ball: an item in hand blocks the ball controls
+	local equip = CFG.WallEquip ~= false and not own
+	-- 1) the shot being charged goes into our mouth
+	if not own and CFG.WallShot ~= false and Mark.wallVsShot(root, equip) then
+		return
+	end
+	-- 2) a slide at us while we hold the ball: its box path (origin + heading * the dump's slide travel)
+	local dd = dribbleDanger
+	if own and dd and dd.heading and dd.origin and dd.fire then
+		local el0 = dd.elapsed or 0
+		local o0, hd = dd.origin, dd.heading
+		if Mark.wallVsPath(root, function(t)
+			return o0 + hd * Mark.dumpTravel(el0 + t)
+		end, 0.6, "slide", { rad = 1.5, equip = equip, actor = dd.actor, model = dd.character }) then
+			return
+		end
+	end
+	-- 3) bodies: a chaser on our ball, or the carrier's run when we do not have it
+	local reach = CFG.WallReach or 18
 	local ourV = flat(root.AssemblyLinearVelocity)
-	local us = root.Position + ourV * lat
-	local half = Mark.wallHalfSeen or CFG.WallHalf or 4
-	local best = nil
+	local us0 = root.Position
 	for _, model in Mark.models() do
 		local actor = Actors.GetFromCharacter(model)
-		if actor and actor ~= LocalPlayer and not sameTeam(actor) and not isGoalkeeper(actor) then
-			local isOwner = type(oid) == "number" and actor.UserId == oid
-			if own or isOwner then
-				local r = ActorTargeting.GetActorRoot(actor)
-				if r then
-					local pos, vel = Mark.carrierPose(r, model)
-					if vel.Magnitude > 32 then
-						vel = vel.Unit * 32
+		if actor and actor ~= LocalPlayer and not sameTeam(actor) and not isGoalkeeper(actor) and (own or actor.UserId == oid) then
+			local r = ActorTargeting.GetActorRoot(actor)
+			if r and flat(r.Position - us0).Magnitude <= reach then
+				local pos, vel = Mark.carrierPose(r, model)
+				local spd = math.min(vel.Magnitude, 32)
+				local path
+				if own then
+					path = function(t)
+						local to = unitOrNil(flat(us0 + ourV * t - pos))
+						return to and (pos + to * (spd * t)) or pos
 					end
-					local leadMode = CFG.WallLead or "away"
-					local rel0 = flat(pos - us)
-					local fleeing = rel0.Magnitude > 0.5 and (vel - ourV):Dot(rel0.Unit) > 0.5
-					local P = (leadMode == "always" or (leadMode == "away" and fleeing)) and (pos + vel * lat) or pos
-					local rel = flat(P - us)
-					local d = rel.Magnitude
-					if d > 0.5 then
-						local toward = rel / d
-						local rv = vel - ourV
-						local closeV = -rv:Dot(toward) -- > 0: he is closing on us
-						local kind, score = nil, nil
-						if d >= (CFG.WallMin or 3.2) and d <= (CFG.WallMax or 6.8) and (not own or closeV > 1) and closeV > -3 then
-							kind, score = "overlap", math.abs(d - FWD)
-						elseif CFG.WallAmbush ~= false and d > (CFG.WallMax or 6.8) and d <= (CFG.WallReach or 28) and closeV >= (CFG.WallAmbushV or 4.5) then
-							local tHit = (d - FWD) / closeV
-							local q = rel + rv * tHit
-							local latOff = (q - toward * q:Dot(toward)).Magnitude
-							if tHit >= 0.05 and tHit <= (CFG.WallAmbushT or 1.0) and latOff <= half * 0.8 then
-								kind, score = "ambush", 10 + tHit
-							end
-						end
-						if kind and (not best or score < best.score) then
-							best = { actor = actor, model = model, root = r, toward = toward, d = d, closeV = closeV, kind = kind, score = score, vel = vel, P = P }
-						end
+				else
+					local v = spd > 0.5 and vel.Unit * spd or Vector3.zero
+					path = function(t)
+						return pos + v * t
 					end
+				end
+				if spd > 4 and Mark.wallVsPath(root, path, 0.9, own and "chaser" or "carrier", { rad = 1.5, window = CFG.WallWindow or 0.45, equip = equip, actor = actor, model = model }) then
+					return
 				end
 			end
 		end
 	end
-	if not best then
-		return
-	end
-	local W = us + best.toward * FWD
-	for _, model in Mark.models() do
-		local actor = Actors.GetFromCharacter(model)
-		if actor and actor ~= LocalPlayer and sameTeam(actor) then
-			local ar = ActorTargeting.GetActorRoot(actor)
-			if ar and flat(ar.Position - W).Magnitude < 3.5 then
-				return -- a teammate would be walled in
-			end
-		end
-	end
-	local to = best.toward
-	local o = root.Position + Vector3.new(0, 1.6, 0)
-	local before = {}
-	local world = workspace:FindFirstChild("Misc")
-	world = world and world:FindFirstChild("Items")
-	if world then
-		for _, inst in world:GetChildren() do
-			if inst:GetAttribute("PlacedItemId") == "barricades" then
-				before[inst] = true
-			end
-		end
-	end
-	Mark.skillRay = { Origin = o, Direction = to, CameraCFrame = CFrame.lookAt(o, o + to) }
-	Mark.skillAt = os.clock()
-	use.ActivateEquipped()
-	Mark.wallPend = { at = os.clock(), actor = best.actor, model = best.model, root = best.root, name = actorName(best.actor), kind = best.kind, us = root.Position, W = W, vel = best.vel, before = before }
-	logFile("skill wall", own and "own" or "carrier", best.kind, actorName(best.actor), "predD", string.format("%.1f", best.d), "closeV", string.format("%.1f", best.closeV), "lat", string.format("%.2f", lat), fmtV(to))
 end
 
 Mark.tickSkill = function(character, root)
 	Mark.skillRay = nil
 	Mark.silentRay = nil
+	Mark.areaCheck()
 	for i = 1, 8 do
 		fovLines[i].Visible = false
 		resLines[i].Visible = false
 	end
 	local use = Mark.itemUse
 	local cam = Workspace.CurrentCamera
-	Mark.wallEquipTick(root, liveOwnerId(), liveOwnerId() == LocalPlayer.UserId)
+	Mark.wallTick(root, liveOwnerId(), liveOwnerId() == LocalPlayer.UserId)
 	if not (use and use.IsEquipped and use.IsEquipped() and cam) then
 		Mark.saHide()
 		return
@@ -7854,14 +7973,9 @@ Mark.tickSkill = function(character, root)
 	end
 	local ping = LocalPlayer:GetNetworkPing()
 	local oid = liveOwnerId()
-	local own = oid == LocalPlayer.UserId
 
-	-- AutoWall. Barricades land PlacementDistance 5 ahead along the placement (camera) direction
-	-- (PlaceDownPlacement.GetPlacementPosition). Own ball: wall the nearest closing opponent; no ball: wall the enemy
-	-- carrier only. Current pose, no lead.
 	if placeWall then
-		Mark.wallTick(root, oid, own, use, ping)
-		return
+		return -- AutoWall ran above (Mark.wallTick)
 	end
 	if not aimGun then
 		return
@@ -7920,14 +8034,28 @@ Mark.tickSkill = function(character, root)
 		if Mark.saPool then
 			Mark.saPool.finish()
 		end
+		if Mark.areaFx then
+			Mark.areaDraw(nil)
+		end
 		return
 	end
 	local aimP = pick.Position
 	local spd = (Mark.projSpeed and Mark.projSpeed[id]) or Mark.projSeed[id]
 	local camPos = cam.CFrame.Position
-	local arcDir, arcP = Mark.arcAim(id, pick, cam, ping)
-	if arcDir then
-		aimP = arcP
+	local areaDir, areaG, areaInfo = nil, nil, nil
+	if Mark.areaItems[id] then
+		areaDir, areaG, areaInfo = Mark.areaAim(id, pick, cam, ping, root)
+	end
+	if areaDir then
+		aimP = areaG + Vector3.new(0, 2.9, 0)
+		Mark.areaLast = { id = id, at = os.clock(), G = areaG, t = areaInfo.t, launch = areaInfo.launch, D = areaInfo.D, model = pick.Parent }
+		if os.clock() - (Mark.areaLogAt or 0) > 2 then
+			Mark.areaLogAt = os.clock()
+			local si = Mark.silentInfo
+			logFile("silent area", id, "D", string.format("%.1f", areaInfo.D), "t", string.format("%.2f", areaInfo.t), "lead", si and string.format("%.1f", si.lead) or "-", "R", string.format("%.1f", areaInfo.R), "G", fmtV(areaG))
+		end
+	elseif Mark.areaItems[id] then
+		Mark.areaLast = nil
 	elseif spd and spd > 10 then
 		-- projectile: lead by its measured muzzle speed (our ProjectileStart events, seeded for the freeze gun)
 		aimP = Mark.silentLead(pick, camPos, spd, ping)
@@ -7937,7 +8065,8 @@ Mark.tickSkill = function(character, root)
 			logFile("silent lead", id, "tau", string.format("%.2f", si.tau), "flips", si.flips, "T", string.format("%.2f", si.T), "lead", string.format("%.1f", si.lead), "v", string.format("%.1f", si.speed))
 		end
 	end
-	local dir = arcDir or unitOrNil(aimP - camPos)
+	-- an area weapon with no ground solve (out of reach, blast on us) keeps the player's own aim
+	local dir = areaDir or (not Mark.areaItems[id] and unitOrNil(aimP - camPos)) or nil
 	if dir then
 		Mark.silentRay = Ray.new(camPos, dir)
 	end
@@ -7954,8 +8083,19 @@ Mark.tickSkill = function(character, root)
 	Mark.saLines = Mark.saLines or makeLines(48, 1.4, 46)
 	Mark.saPool = Mark.saPool or Mark.segPool(Mark.saLines)
 	local pool = Mark.saPool
-	if CFG.DrawSilent ~= false then
-		Mark.silentArt(pool.seg, muzzle, chest, Vector3.new(aimP.X, aimP.Y - 2.9, aimP.Z), col, os.clock())
+	if areaG then
+		-- area weapon: the beam ends on the blast spot, the footprint replaces the feet ring
+		if CFG.DrawSilent ~= false then
+			Mark.silentArt(pool.seg, muzzle, areaG + Vector3.new(0, 0.2, 0), nil, col, os.clock())
+		end
+		Mark.areaDraw(areaG, areaInfo.R, col)
+	else
+		if CFG.DrawSilent ~= false and not Mark.areaItems[id] then
+			Mark.silentArt(pool.seg, muzzle, chest, Vector3.new(aimP.X, aimP.Y - 2.9, aimP.Z), col, os.clock())
+		end
+		if Mark.areaFx then
+			Mark.areaDraw(nil)
+		end
 	end
 	pool.finish()
 	hideLines(Mark.saBox)
@@ -8537,7 +8677,22 @@ Mark.gkPressSolve = function(o)
 						local ky = op.jump and (yBase + v0 * tau - 0.5 * gd * tau * tau) or (o.root.Y + D.GetVerticalTravel(tau))
 						ky = math.max(ky, o.root.Y)
 						local dx, dz = Kf.X - E.X, Kf.Z - E.Z
-						if dx * dx + dz * dz <= R2 and math.abs(ky - E.Y) <= o.H then
+						local touch = dx * dx + dz * dz <= R2 and math.abs(ky - E.Y) <= o.H
+						-- a flier crosses our height at up to ~100 st/s (bazooka jump coming down): the overlap lasts a few
+						-- server frames and his server pose is ahead of our estimate by up to ping/2 + jitter (o.slip). The
+						-- contact must still hold with him that much further along his arc, or it is a coin toss (log: jump +
+						-- dive, closest 0.1 flat, no stun). This pushes the plan to where he moves slowly: apex or landing.
+						if touch and o.slip then
+							for _, off in { o.slip * 0.5, o.slip } do
+								local E2 = pts[math.floor((tAbs + off) / DT + 0.5) + 1] or pts[#pts]
+								local ex, ez = Kf.X - E2.X, Kf.Z - E2.Z
+								if ex * ex + ez * ez > R2 or math.abs(ky - E2.Y) > o.H then
+									touch = false
+									break
+								end
+							end
+						end
+						if touch then
 							conf += f.w
 							hits = hits or {}
 							hits[fi] = tAbs
@@ -8820,6 +8975,7 @@ Mark.gkPress = function(character, root, c)
 			RF = CFG.GkPressReachFrac or 0.85,
 			mouth = mouth, fwd = fwd, g = g, jumpH = Mark.jumpH or 7.2, air = airborne or jet,
 			exact = CFG.GkPressExact ~= false, camCF = cam and cam.CFrame or root.CFrame,
+			slip = (airborne or jet) and (ping * 0.5 + (CFG.GkPressSlip or 0.03)) or nil,
 			facing = unitOrNil(flat(root.CFrame.LookVector)) or fwd,
 		})
 		Mark.gkSolveCache = { model = model, at = c.now, best = best, later = later, cen = cen }
@@ -9117,12 +9273,18 @@ Mark.gkPressWatch = function(root)
 	local now = os.clock()
 	local er = rec.model and rec.model:FindFirstChild("HumanoidRootPart")
 	if er then
-		rec.minD = math.min(rec.minD, flat(er.Position - root.Position).Magnitude)
+		-- flat AND height: a flat 0.1 with him 6 studs over our head is not a contact (log: "closest 0.1", no stun)
+		local d = flat(er.Position - root.Position).Magnitude
+		local dy = er.Position.Y - root.Position.Y
+		local d3 = math.sqrt(d * d + dy * dy)
+		if d3 < (rec.min3 or math.huge) then
+			rec.min3, rec.minD, rec.minY = d3, d, dy
+		end
 	end
 	if now - rec.at >= 1.0 then
 		Mark.gkPressRec = nil
 		local down, left = Mark.mateDown(rec.pl, rec.model)
-		logFile("gk press result", rec.name, "stunned", tostring(down), "left", string.format("%.2f", left or 0), "closest", string.format("%.1f", rec.minD))
+		logFile("gk press result", rec.name, "stunned", tostring(down), "left", string.format("%.2f", left or 0), "closest", string.format("%.1f", rec.minD), "dy", string.format("%.1f", rec.minY or 0))
 	end
 end
 
@@ -9279,7 +9441,8 @@ Mark.tickGk = function(character, root)
 	local acts = Mark.gkActs or require(Modules.Actions.GoalkeeperActions)
 	local role = Mark.gkRole
 	if not role then
-		local role = require(Client.Gameplay.Player.GoalkeeperRole)
+		Mark.gkRoleMod = Mark.gkRoleMod or require(Client.Gameplay.Player.GoalkeeperRole)
+		local role = Mark.gkRoleMod
 		Mark.gkRole = role
 	end
 	Mark.gkPos, Mark.gkPred, Mark.gkActs = posMod, pred, acts
@@ -9438,7 +9601,8 @@ Mark.tickGk = function(character, root)
 	end
 	local assist = Mark.gkAssist
 	if assist == nil then
-		assist = require(Modules.Actions.GoalkeeperDiveAssist)
+		Mark.diveAssistMod = Mark.diveAssistMod or require(Modules.Actions.GoalkeeperDiveAssist)
+		assist = Mark.diveAssistMod
 		Mark.gkAssist = assist
 	end
 	local react = math.clamp(LocalPlayer:GetNetworkPing(), 0, 0.3) + 0.05
@@ -10208,6 +10372,12 @@ RunService.RenderStepped:Connect(function()
 		Mark.frameCam = nil
 	end
 	paintWorld()
+	if next(Mark.hazEv) ~= nil or (Mark.hazFx and not Mark.hazFx.empty) then
+		Mark.hazDraw()
+	end
+	if Mark.gal and Mark.gal.on then
+		Mark.galDraw()
+	end
 	local t1 = os.clock()
 	paintHud()
 	Mark.frameCam = nil -- Heartbeat-side draws read the live camera
@@ -10693,7 +10863,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v140")
+	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v142")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -11182,14 +11352,13 @@ Mark.duelEnd = function(why)
 end
 
 -- ===== AIR DUEL / LOB overlay ========================================================================================
--- THE ZIPPER. An air duel is two arcs that must meet: his (the airborne man / the lob) and ours (run to the take-off,
--- the jump). Both are drawn as rails hanging a curtain of stitches to the grass every 0.05 s (the stitches make the
--- arc read in 3D and count the time). Equal-time TIES join his rail to ours every 0.1 s: they shrink to nothing at the
--- contact - you see the meeting close like a zipper, or see it stay open.
+-- STRIKE. An air duel is two arcs that must meet: his (the airborne man / the lob) and ours (run to the take-off, the
+-- jump), drawn as thin rails. Lightning discharges fall from his arc onto the grass and ricochet (Mark.duelBolts): with a
+-- plan they strike our take-off spot and bounce into the contact knot, so the bolt itself draws who meets whom where.
 --   steel = SEEN: his rail only (no contact we can make);
 --   mint  = PLAN: our rail, the ties, the take-off squircle, the contact knot (a small 3D cross) and its ripple;
 --   white = committed (we jumped / pressed).
--- The future burns down: stitches and ties thin out with their time ahead, the past is not drawn.
+-- Only the future is drawn: the rails start at now.
 -- One renderer: Mark.duelArt(seg, v, gy, t). Mark.duelSee feeds it from Mark.tickCounterJump and Mark.tickLob.
 Mark.duelSee = function(key, P, o)
 	local v = o or {}
@@ -11201,10 +11370,102 @@ Mark.duelSee = function(key, P, o)
 	Mark.duelViz = v
 end
 
+-- Lightning bolt between two world points (after HUSH Visual.boltTracer): a jagged line whose zigzag is smooth noise
+-- re-rolled 24 times a second, envelope sin^0.6 (pinned at both ends), a wide soft glow under a paper-hot core.
+-- grow 0..1 draws the bolt from A toward B (the strike runs down). Returns nothing; lines only (segPool).
+Mark.hn = function(i, k, s)
+	local x = math.sin(i * 12.9898 + k * 78.233 + s * 37.719) * 43758.5453
+	return (x - math.floor(x)) * 2 - 1
+end
+Mark.boltLine = function(seg, A, B, t, seed, col, a, w, grow)
+	local D = B - A
+	local L = D.Magnitude
+	if L < 0.4 or a <= 0.02 then
+		return
+	end
+	local look = Mark.frameLook or Workspace.CurrentCamera.CFrame.LookVector
+	local side = D:Cross(look)
+	side = side.Magnitude > 1e-3 and side.Unit or Vector3.new(1, 0, 0)
+	local up2 = (D / L):Cross(side)
+	local n = math.clamp(math.floor(L / 2.2), 5, 12)
+	local rate = t * 24 + seed * 3.1
+	local blk = math.floor(rate)
+	local f = rate - blk
+	local e = f * f * (3 - 2 * f)
+	local hn = Mark.hn
+	local amp = math.clamp(L * 0.07, 0.3, 1.5)
+	local hot = Color3.new(1, 1, 1):Lerp(col, 0.3)
+	local prev = A
+	local last = math.max(1, math.floor(n * (grow or 1) + 0.5))
+	for i = 1, last do
+		local u = i / n
+		local env = i == n and 0 or math.sin(math.pi * u) ^ 0.6
+		local a1, a2 = hn(i, blk, seed), hn(i, blk, seed + 4.1)
+		local n1 = a1 + (hn(i, blk + 1, seed) - a1) * e
+		local n2 = a2 + (hn(i, blk + 1, seed + 4.1) - a2) * e
+		local p = A + D * u + side * (amp * env * n1) + up2 * (amp * 0.6 * env * n2)
+		seg(prev, p, col, 0.2 * a, w + 4, 39)
+		seg(prev, p, hot, a, w, 43)
+		prev = p
+	end
+	-- one fork off the middle, re-rolled with the body
+	if last == n and L > 5 and math.abs(hn(7, blk, seed)) > 0.3 then
+		local m = A + D * (0.35 + 0.3 * math.abs(hn(3, blk, seed)))
+		local fd = (D / L) * 0.5 + side * hn(5, blk, seed) + up2 * hn(6, blk, seed) * 0.5
+		local fl = math.clamp(L * 0.22, 1.2, 3.5)
+		local q = m + (fd.Magnitude > 1e-3 and fd.Unit or side) * fl
+		seg(m, q, hot, 0.6 * a, math.max(w - 0.6, 1), 42)
+	end
+end
+
+-- Discharges of the duel overlay: a strike is born every `gap` s (seen 0.5, plan 0.3, committed 0.16), lives 0.3 s:
+-- the first leg runs from his arc to the grass in 0.05 s, the second (the ricochet) leaves the impact 0.05 s later,
+-- a 4-ray spark at the impact, then both thin and fade with the rest of the life. pick(rnd) -> S, I, E.
+Mark.duelBolts = function(seg, t, key, col, gy, pick, st)
+	if not st then
+		st = Mark.duelBoltSt or { list = {}, nextAt = 0, n = 0 }
+		Mark.duelBoltSt = st
+	end
+	local gap = key == "live" and 0.16 or (key == "armed" and 0.3 or 0.5)
+	if t >= st.nextAt then
+		st.nextAt = math.max(st.nextAt + gap, t)
+		st.n += 1
+		local rnd = (math.sin(st.n * 91.7) * 43758.5453) % 1
+		local S, I, E = pick(rnd)
+		if S and I and E then
+			table.insert(st.list, { born = t, seed = st.n % 97, S = S, I = I, E = E })
+			if #st.list > 3 then
+				table.remove(st.list, 1)
+			end
+		end
+	end
+	local c = key == "live" and Color3.new(1, 1, 1):Lerp(col, 0.15) or col
+	for k = #st.list, 1, -1 do
+		local b = st.list[k]
+		local age = t - b.born
+		if age > 0.3 or age < 0 then
+			table.remove(st.list, k)
+		else
+			local fade = 1 - math.clamp((age - 0.1) / 0.2, 0, 1)
+			local w = 1.2 + 1.4 * fade
+			Mark.boltLine(seg, b.S, b.I, t, b.seed, c, fade, w, math.clamp(age / 0.05, 0, 1))
+			if age > 0.05 then
+				Mark.boltLine(seg, b.I, b.E, t, b.seed + 13, c, fade * 0.9, w * 0.85, math.clamp((age - 0.05) / 0.05, 0, 1))
+				local sp = 0.6 + 1.6 * math.clamp((age - 0.05) / 0.12, 0, 1)
+				for q = 0, 3 do
+					local ang = b.seed + q * 1.5708
+					local dir = Vector3.new(math.cos(ang), 0.35, math.sin(ang))
+					seg(b.I, b.I + dir * sp, Color3.new(1, 1, 1), 0.8 * fade, 1.4, 44)
+				end
+			end
+		end
+	end
+end
+
 Mark.duelArt = function(seg, v, gy, t)
 	local key = (v.liveUntil and t < v.liveUntil) and "live" or v.key
 	local pal = Mark.defPalette[key]
-	local col, col2 = pal[1], pal[2]
+	local col = pal[1]
 	local pl = v.plan
 	local el = t - v.at
 	local T = pl and math.max(pl.T - el, 0) or 1.0
@@ -11259,33 +11520,36 @@ Mark.duelArt = function(seg, v, gy, t)
 					seg(prev, p, COL.Ink, 0.35 * a, w + 2, 39)
 					seg(prev, p, c, a, w, 42)
 				end
-				if p.Y - gy > 0.8 then
-					local fade = 1 - 0.65 * (tau / math.max(H, 0.1))
-					seg(Vector3.new(p.X, gy + 0.05, p.Z), p, c, 0.5 * a * fade, 1, 40)
-				end
 			end
 			prev = p
 			tau += 0.05
 		end
 	end
 	rail(hisAt, pl and COL.Paper or col, pl and 1.3 or 1.6, pl and 0.85 or 0.9)
+	-- LIGHTNING: discharges fall from his arc, hit the grass and ricochet. Seen: they skim on along his heading. Plan: they
+	-- strike our take-off spot and bounce up into the contact knot (where we meet him). Committed: white, twice as often.
+	local P = v.P
+	local ahead = nil
 	if not pl then
-		local P = v.P
+		local h1 = hisAt(0.3)
+		ahead = h1 and unitOrNil(flat(h1 - P)) or nil
+	end
+	Mark.duelBolts(seg, t, key, col, gy, function(rnd)
+		local S = hisAt(rnd * (pl and math.min(T * 0.7, 0.6) or 0.6)) or P
+		if not pl then
+			local I = Vector3.new(S.X, gy + 0.05, S.Z) + Vector3.new(rnd - 0.5, 0, (rnd * 7.3) % 1 - 0.5) * 3
+			local fw = ahead or unitOrNil(flat(I - (v.us or I))) or Vector3.new(0, 0, 1)
+			return S, I, I + fw * (4 + 3 * rnd) + Vector3.new(0, 1.2 + rnd, 0)
+		end
+		local spot = (v.landed and type(pl.td) == "number") and pl.Q or pl.E
+		local I = Vector3.new(spot.X, gy + 0.05, spot.Z) + Vector3.new(rnd - 0.5, 0, (rnd * 5.1) % 1 - 0.5) * 1.6
+		return S, I, pl.E
+	end, v.boltSt)
+	if not pl then
 		Mark.kickRipple(seg, Vector3.new(P.X, gy, P.Z), 2.2, pal, Mark.rippleStep("duel-foot", Mark.rippleRates[key]), t, 2)
 		return
 	end
 	rail(ourAt, col, 1.8, 1)
-	-- the zipper: ties at equal time, every 0.1 s up to the contact
-	local tau = 0.1
-	while tau < T - 0.02 do
-		local h, o = hisAt(tau), ourAt(tau)
-		if h and o then
-			local a = 0.35 + 0.55 * (1 - tau / math.max(T, 0.1))
-			seg(h, o, COL.Ink, 0.3 * a, 2.6, 39)
-			seg(h, o, col2, a, 1.1, 41)
-		end
-		tau += 0.1
-	end
 	-- the contact knot: a 3D cross at E (three axes), its plumb and ripple on the grass
 	local E = pl.E
 	local kr = 1.1 + 0.6 * math.clamp(T / 0.6, 0, 1) -- tightens as the contact comes
@@ -11317,7 +11581,7 @@ Mark.duelArt = function(seg, v, gy, t)
 end
 
 Mark.drawDuel = function(gy)
-	Mark.duelLines = Mark.duelLines or makeLines(340, 1.4, 41)
+	Mark.duelLines = Mark.duelLines or makeLines(440, 1.4, 41)
 	Mark.duelPool = Mark.duelPool or Mark.segPool(Mark.duelLines)
 	local v = Mark.duelViz
 	local now = os.clock()
@@ -11825,6 +12089,122 @@ end
 --           carrier -> receiver: the one nearest the receiver that we reach before the ball (pass speed + wind-up) by a
 --           margin, else the one we get closest to. Pick has hysteresis so two receivers do not flip it every frame.
 -- nil = the old carrier block.
+-- PASS READ (AutoBlock). The carrier's charge is replicated and Mark.chargeShot replays it with the game's own solve
+-- (ChargePathVelocity at full charge + ball physics). A flight that does NOT end in our mouth is a pass: the receiver is
+-- the enemy closest to the flight. Spot = the EARLIEST flight sample (body height, past his kick reach) we reach before
+-- the ball AND before the receiver: early samples hold for any charge length (only the length of the pass changes with
+-- the charge, not its line). Returns { p, t, slack, rcv } or nil (no charge, a shot, or no sample we beat).
+Mark.passSpot = function(character, root, uid)
+	local rec = Mark.charges and Mark.charges[uid]
+	if not (rec and rec.live and os.clock() - (rec.seen or 0) < 0.6) then
+		return nil
+	end
+	local cs = Mark.chargeShot(uid)
+	local g = Mark.defendGoal()
+	if not (cs and g) or #cs.pts < 3 then
+		return nil
+	end
+	local lb, lt, rb = goalMouthCorners(g)
+	if lb and lt and rb then
+		local mouth = (lb + rb) * 0.5
+		local sideV = unitOrNil(flat(rb - lb))
+		if sideV then
+			local out = Vector3.new(-sideV.Z, 0, sideV.X)
+			if flat(cs.launch - mouth):Dot(out) < 0 then
+				out = -out
+			end
+			local half = flat(rb - lb).Magnitude * 0.5
+			for i = 2, #cs.pts do
+				local p = cs.pts[i]
+				if flat(p - mouth):Dot(out) <= 0.3 then
+					if math.abs(flat(p - mouth):Dot(sideV)) <= half + 2.5 then
+						return nil -- a shot: the shot block owns it
+					end
+					break
+				end
+			end
+		end
+	end
+	-- the receiver: the enemy (not the carrier) nearest to the flight
+	local rcv, rcvPos, rcvMin = nil, nil, CFG.BlockPassRcvRadius or 14
+	for _, model in Mark.models() do
+		local actor = Actors.GetFromCharacter(model)
+		if actor and actor.UserId ~= uid and actor ~= LocalPlayer and not sameTeam(actor) then
+			local r = ActorTargeting.GetActorRoot(actor)
+			if r then
+				local pos = CharacterMotion.GetPosition(model) or r.Position
+				for i = 3, #cs.pts, 2 do
+					local dd = flat(cs.pts[i] - pos).Magnitude
+					if dd < rcvMin then
+						rcv, rcvPos, rcvMin = actor, pos, dd
+					end
+				end
+			end
+		end
+	end
+	Mark.mover = Mark.mover or require(Modules.Actions.ActionMovement)
+	local spd = Mark.mover.GetRunWalkSpeed(Mark.mover.GetBaseWalkSpeed(character), false)
+	if type(spd) ~= "number" or spd < 8 then
+		spd = 16
+	end
+	local rcvBox = HitboxSettings.Receive
+	local bodyHalf = rcvBox.Size.X * 0.5
+	local lo = rcvBox.CFrameOffset.Y - rcvBox.Size.Y * 0.5
+	local hi = rcvBox.CFrameOffset.Y + rcvBox.Size.Y * 0.5 + (Physics.BallRadius or 1)
+	local ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
+	local minRel = KickCore.GetMinimumReleaseSeconds and KickCore.GetMinimumReleaseSeconds() or 0.2
+	local tRel = math.max(minRel - (os.clock() - rec.at), 0)
+	local reach = Mark.kickReach() + 0.8
+	local best = nil
+	for i = 2, #cs.pts do
+		local p = cs.pts[i]
+		local h = p.Y - root.Position.Y
+		if h >= lo and h <= hi and flat(p - cs.launch).Magnitude >= reach then
+			local d = flat(p - root.Position).Magnitude
+			local need = math.max(d - bodyHalf, 0) / spd + ping * 0.5 + 0.06
+			local slack = tRel + cs.ts[i] - need
+			local rcvNeed = rcvPos and math.max(flat(p - rcvPos).Magnitude - bodyHalf, 0) / 24 or math.huge
+			if slack >= 0.05 and need < rcvNeed then
+				return { p = p, t = cs.ts[i], slack = slack, rcv = rcv, ok = true }
+			end
+			if not best or slack > best.slack then
+				best = { p = p, t = cs.ts[i], slack = slack, rcv = rcv, ok = false }
+			end
+		end
+	end
+	return best
+end
+
+-- The pass lane a defender in opposition leans toward (cover shadow): the open enemy ahead of the carrier (nearer our
+-- goal, or level within 10) with the best goal progress, 8..60 studs from him, no teammate of ours on him.
+Mark.blockShadeLane = function(P, carrier, g)
+	local memo = Mark.shadeMemo
+	if memo and memo.who == carrier and os.clock() - memo.at < 0.15 then
+		return memo.dir
+	end
+	local best, bestV = nil, -math.huge
+	local dC = flat(g.Position - P).Magnitude
+	for _, model in Mark.models() do
+		local actor = Actors.GetFromCharacter(model)
+		if actor and actor ~= LocalPlayer and actor ~= carrier and not sameTeam(actor) and not isGoalkeeper(actor) and not Mark.mateDown(actor, model) then
+			local r = ActorTargeting.GetActorRoot(actor)
+			if r then
+				local pos = CharacterMotion.GetPosition(model) or r.Position
+				local L = flat(pos - P).Magnitude
+				local dG = flat(g.Position - pos).Magnitude
+				if L > 8 and L < 60 and dG < dC + 10 and not Mark.mateNear(pos, CFG.BlockCoverRadius or 8) then
+					local v = (dC - dG) - L * 0.2
+					if v > bestV then
+						best, bestV = unitOrNil(flat(pos - P)), v
+					end
+				end
+			end
+		end
+	end
+	Mark.shadeMemo = { who = carrier, at = os.clock(), dir = best }
+	return best
+end
+
 Mark.blockChoose = function(root, carrier, cr, P, V, g, danger)
 	if CFG.BlockSmart == false then
 		return nil
@@ -12324,6 +12704,33 @@ Mark.tickBlock = function(character, root)
 		end
 		return
 	end
+	-- PASS READ: his charge says where the ball goes. A pass we can cut: stand on its path now, whatever we were doing
+	if CFG.BlockPassRead ~= false then
+		local ps = Mark.passSpot(character, root, carrier.UserId)
+		if ps and ps.ok then
+			Mark.mover = Mark.mover or require(Modules.Actions.ActionMovement)
+			local sp = Mark.mover.GetRunWalkSpeed(Mark.mover.GetBaseWalkSpeed(character), false)
+			local S = Vector3.new(ps.p.X, root.Position.Y, ps.p.Z)
+			local cmd, route = Mark.agentSteer({
+				key = "block", us = root.Position, vUs = flat(root.AssemblyLinearVelocity), center = P, vC = Vector3.zero,
+				target = S, spd = (type(sp) == "number" and sp >= 8) and sp or 16, ff = Vector3.zero, minR = HitboxSettings.Receive.Size.X * 0.5 + 1.5,
+			})
+			local now = os.clock()
+			Mark.move.look = unitOrNil(flat(P - root.Position))
+			Mark.move.pts = route
+			Mark.move.born = Mark.move.born or now
+			Mark.moveSteer(cmd, "block")
+			Mark.blockHold, Mark.blockLast, Mark.blockDest, Mark.blockRoot = now, now, S, cr
+			-- the marking overlay draws the read pass: his flight line to the cut spot, live palette (the ball is coming)
+			local endP = ps.rcv and ps.rcv.Character and ActorTargeting.GetActorRoot(ps.rcv)
+			Mark.blkViz = { at = now, pick = { lane = { from = P, to = endP and endP.Position or ps.p, spot = S, ok = true, slack = ps.slack } }, S = S, carrier = P }
+			if not Mark.passReadLog or now - Mark.passReadLog > 0.4 then
+				Mark.passReadLog = now
+				logFile("block pass read", actorName(carrier), "to", ps.rcv and actorName(ps.rcv) or "space", "t", string.format("%.2f", ps.t), "slack", string.format("%.2f", ps.slack), "move", string.format("%.1f", flat(S - root.Position).Magnitude))
+			end
+			return
+		end
+	end
 	local rel = flat(root.Position - P)
 	local dist = rel.Magnitude
 	-- (air duels are handled by Mark.tickCounterJump)
@@ -12473,10 +12880,29 @@ Mark.tickBlock = function(character, root)
 	-- him to get there.
 	local Vc = V.Magnitude > 30 and V.Unit * 30 or V
 	local openBis = pick and pick.danger and pick.danger.bis
+	-- GOAL-DIRECTED future (user: "his job is to reach our goal"). His server pose now = displayed + V * (display delay +
+	-- ping); beyond that only his run TOWARD our goal is carried forward (<= 0.4 s). A sideways run is not extrapolated
+	-- into "he flies off left": we mirror it with the sideways feed-forward and stay on his goal line. The old spot carried
+	-- the full velocity 0.5 s ahead and swung 15 studs with every side step.
+	local lagNow = lag - 0.1
+	local Pnow = P + Vc * lagNow
+	local shade = (not shotLine and not openBis and CFG.BlockShade ~= false) and Mark.blockShadeLane(P, carrier, g) or nil
 	local function spotAt(t)
-		local Pt = P + Vc * math.min(t + lag, 0.5)
+		local ug = unitOrNil(flat(g.Position - Pnow)) or u
+		local Pt = Pnow + ug * (math.max(Vc:Dot(ug), 0) * math.min(t, 0.4))
 		local bis, cover = Mark.blockCone(Pt, g)
-		return Pt, shotLine or openBis or bis or unitOrNil(flat(g.Position - Pt)) or u, cover
+		local line = shotLine or openBis or bis or unitOrNil(flat(g.Position - Pt)) or u
+		if shade and not shotLine and not openBis then
+			-- OPPOSITION with a cover shadow: lean the stance toward his best pass lane, never so far that our body leaves
+			-- the shot line at the depth we stand (atan(body half / depth))
+			local sa = math.atan2(line.X * shade.Z - line.Z * shade.X, line:Dot(shade))
+			if math.abs(sa) < math.rad(80) then
+				local lim = math.atan((HitboxSettings.Receive.Size.X * 0.5 + 0.8) / math.max(CFG.BlockOppDepth or 7, 1))
+				local a = math.clamp(sa * 0.5, -lim, lim)
+				line = Vector3.new(line.X * math.cos(a) - line.Z * math.sin(a), 0, line.X * math.sin(a) + line.Z * math.cos(a))
+			end
+		end
+		return Pt, line, cover
 	end
 	local lead = 0.1
 	for _ = 1, 4 do
@@ -12484,7 +12910,11 @@ Mark.tickBlock = function(character, root)
 		lead = math.clamp(flat(Pt + ut * gap - root.Position).Magnitude / mySpd, 0.05, 0.8)
 	end
 	local Pf, uf, coverD = spotAt(lead)
-	local dest = Pf + uf * gap
+	-- OPPOSITION first: from the side / behind we go for the goal-side point at BlockOppDepth on his (shaded) line, not
+	-- for the tight spot in front of his feet; the agent steer curves round him on the way.
+	local maxDepth = math.max(gap, (shotLine and not faceLine) and (CFG.BlockMaxDepth or 9) or math.min(CFG.BlockMaxDepth or 9, coverD or math.huge))
+	local oppD = math.clamp(CFG.BlockOppDepth or 7, gap, maxDepth)
+	local dest = Pf + uf * oppD
 	local target = dest
 	-- Between him and the goal: the old spot ran back toward the carrier (gap 4 in front of him) = into his dribble
 	-- and tackle range while he winds up. The ball meets us anywhere on the line, so stand ON the line at the depth
@@ -12495,9 +12925,23 @@ Mark.tickBlock = function(character, root)
 		local dAlong = relL:Dot(uf)
 		if dAlong >= gap * 0.5 then
 			ahead = true
-			-- no deeper than the depth where our width still spans the post-to-post cone (shot line known: any depth)
-			local maxDepth = math.max(gap, (shotLine and not faceLine) and (CFG.BlockMaxDepth or 9) or math.min(CFG.BlockMaxDepth or 9, coverD or math.huge))
-			dest = Pf + uf * math.clamp(dAlong, gap, maxDepth)
+			-- in opposition: hold the depth we have (no deeper than the depth where our width still spans the
+			-- post-to-post cone). Established (on his line for 0.3 s) and he stalls (goalward < 4 st/s): step in to
+			-- the kick spot - a pro closes a man who stops, and contains one who runs.
+			local latE = math.abs(relL:Dot(Vector3.new(-uf.Z, 0, uf.X)))
+			local opp = Mark.blkOpp
+			if latE < 1.6 then
+				if not (opp and opp.id == carrier.UserId) then
+					opp = { id = carrier.UserId, at = os.clock() }
+					Mark.blkOpp = opp
+				end
+			else
+				Mark.blkOpp = nil
+				opp = nil
+			end
+			local ugN = unitOrNil(flat(g.Position - Pnow)) or u
+			local press = opp and os.clock() - opp.at > 0.3 and Vc:Dot(ugN) < 4
+			dest = Pf + uf * (press and gap or math.clamp(dAlong, gap, maxDepth))
 			target = dest
 		end
 	end
@@ -13008,7 +13452,7 @@ Mark.paRay = function(live)
 end
 
 -- The press: replaced by a script-held Lob whose aim ray the Reticle/packet overrides carry (live.ray).
-Mark.paPress = function(forceSel, forceSol, tag)
+Mark.paPress = function(forceSel, forceSol, tag, maxCharge)
 	local pa = Mark.pa
 	local char = LocalPlayer.Character
 	if liveOwnerId() ~= LocalPlayer.UserId or not char or MatchSettings.IsGoalkeeperCharacter(char) then
@@ -13030,7 +13474,9 @@ Mark.paPress = function(forceSel, forceSol, tag)
 		logFile("pass assist", "press", "no solution", sel.name)
 		return false
 	end
-	local live = { sel = sel, sol = sol, at = os.clock(), charge = sol.charge, dir = sol.dir, forced = forceSel ~= nil }
+	-- maxCharge: a forced pass under a deadline (blast, punch) charges as long as the time allows, not the full solve
+	local charge = maxCharge and math.max(math.min(sol.charge, maxCharge), CFG.PassMinCharge or 0.1) or sol.charge
+	local live = { sel = sel, sol = sol, at = os.clock(), charge = charge, dir = sol.dir, forced = forceSel ~= nil }
 	Mark.paRay(live)
 	pa.live = live
 	pa.injecting = true
@@ -13043,7 +13489,7 @@ Mark.paPress = function(forceSel, forceSol, tag)
 	end
 	logFile("pass assist", "press", tag or "user", sel.name, "status", sol.status, "charge", string.format("%.3f", sol.charge), "dist", string.format("%.1f", sol.D), "along", string.format("%.1f", sol.along), "lat", string.format("%.1f", sol.lat), "apex", string.format("%.1f", sol.apex - sol.origin.Y), "t", string.format("%.2f", sol.t))
 	task.spawn(function()
-		local due = live.at + sol.charge - 0.004
+		local due = live.at + live.charge - 0.004
 		while os.clock() < due and pa.live == live do
 			local cam = Workspace.CurrentCamera
 			local rr = live.sel and live.sel.root
@@ -17131,17 +17577,19 @@ Mark.userInputDir = function()
 	if not cam then
 		return nil
 	end
-	local mv = nil
-	Mark.try(function()
-		if Mark.ctrls == nil then
-			local pm = LocalPlayer.PlayerScripts:FindFirstChild("PlayerModule")
-			Mark.ctrls = pm and require(pm):GetControls() or false
+	-- PlayerModule controls: looked up once (a custom / missing PlayerModule is expected on some executors), then
+	-- read directly every call (the old per-call xpcall + closure ran every frame)
+	if Mark.ctrls == nil then
+		local pm = LocalPlayer.PlayerScripts:FindFirstChild("PlayerModule")
+		local ok, c = false, nil
+		if pm then
+			ok, c = Mark.try(function()
+				return require(pm):GetControls()
+			end)
 		end
-		if not Mark.ctrls then
-			return
-		end
-		mv = Mark.ctrls:GetMoveVector()
-	end)
+		Mark.ctrls = (ok and c) or false
+	end
+	local mv = Mark.ctrls and Mark.ctrls:GetMoveVector() or nil
 	if not (mv and mv.Magnitude > 0.1) then
 		local UIS = game:GetService("UserInputService")
 		local x, z = 0, 0
@@ -17289,6 +17737,10 @@ Mark.onItemActivate = function(pkt)
 			strike = land + look * 6.1 - right * 0.7,
 			name = actorName(actor),
 		}
+		-- the slam is a zone like a blast: flee / pass / stick clamp / overlay all read Mark.hazEv (the hammer's own jump
+		-- and flick stay in tickHazard, so no blast step for it)
+		local h = Mark.hammers[uid]
+		Mark.hazEv["hammer" .. uid] = { kind = "blast", t = h.slamAt, p = h.strike, r = CFG.HammerRadius or 9, item = "sledgehammer", noStep = true, id = "hammer" .. uid, srcName = h.name, seen = Workspace:GetServerTimeNow() }
 	end
 end
 
@@ -17687,7 +18139,6 @@ end
 -- first body on the way. Freeze gun: not a blast but a contact path (sampled), used by the chase gate.
 -- Consumers: Mark.hazFlee (run out of the radius / pass the ball when we cannot), Mark.hazardGate (AutoBall never walks
 -- into a zone before it fires), GetMoveCommand clamp (the player's own stick cannot carry us into it), tryTackle.
-Mark.hazEv = Mark.hazEv or {}
 Mark.blastR = function()
 	if CFG.BlastRadius then
 		return CFG.BlastRadius
@@ -17706,56 +18157,59 @@ Mark.hazAdd = function(st)
 	if st.src == LocalPlayer.UserId or (who and sameTeam(who)) then
 		return
 	end
+	st.hazAt, st.hazDet = os.clock(), st.det
 	local nowS = Workspace:GetServerTimeNow()
+	local old = Mark.hazEv[st.id]
 	local ev = nil
 	if item == "grenade" then
+		-- GrenadeEffects.refreshFlight: Flight = NewFlight(row Position, Velocity, UpdatedAt), DetonatesAt from the row or
+		-- GetDetonationTime (bounces with the movement world, TimeScale 0.7, the fuse starts at the first contact)
 		Mark.grenMod = Mark.grenMod or require(Modules.Items.Grenade)
 		local _, world = Renderer.GetMovementState()
 		if not world then
 			return
 		end
-		local flight = Mark.grenMod.NewFlight(st.pos0, st.vel0, st.born)
-		local tDet = Mark.grenMod.GetDetonationTime(flight, world, nil)
-		if type(st.det) == "number" then
-			tDet = st.det
-		end
+		local flight = Mark.grenMod.NewFlight(st.fp, st.fv, st.ft)
+		local tDet = type(st.det) == "number" and st.det or Mark.grenMod.GetDetonationTime(flight, world, nil)
 		local s = Mark.grenMod.GetStateAtTime(flight, tDet, world)
-		local res = { kind = "blast", t = tDet, p = s.Position }
-		if typeof(res.p) == "Vector3" then
-			ev = res
+		if typeof(s.Position) ~= "Vector3" then
+			return
 		end
+		ev = old or {}
+		ev.kind, ev.t, ev.p = "blast", tDet, s.Position
+		-- the hop path from now to the blast, for the overlay (12 samples, rebuilt with each correction)
+		local path = ev.path or {}
+		local n = 12
+		for i = 0, n do
+			local ts = nowS + (tDet - nowS) * i / n
+			local si = Mark.grenMod.GetStateAtTime(flight, math.max(ts, st.ft), world)
+			path[i + 1] = si.Position
+		end
+		ev.path = path
 	elseif item == "bazooka" then
 		local g = st.grav or 196.2
-		local dt0 = math.max(nowS - st.at, 0)
-		local p = st.pos + st.vel * dt0 + Vector3.new(0, -0.5 * g * dt0 * dt0, 0)
-		local v = st.vel + Vector3.new(0, -g * dt0, 0)
+		local dt0 = math.max(nowS - st.ft, 0)
+		local p = st.fp + st.fv * dt0 + Vector3.new(0, -0.5 * g * dt0 * dt0, 0)
+		local v = st.fv + Vector3.new(0, -g * dt0, 0)
 		Mark.fieldMod = Mark.fieldMod or require(Modules.Gameplay.FieldSettings)
-		local bodies = {}
-		for _, model in Mark.models() do
-			local a = Actors.GetFromCharacter(model)
-			local r = a and ActorTargeting.GetActorRoot(a)
-			if r and a.UserId ~= st.src then
-				bodies[#bodies + 1] = r
-			end
-		end
 		local t = 0
-		while t < 4 do
+		while t < 4 and not ev do
 			local q = p + v * t + Vector3.new(0, -0.5 * g * t * t, 0)
 			local gy = Mark.fieldMod.GetGroundYAt(q)
 			if type(gy) == "number" and q.Y <= gy + 0.8 then
-				ev = { kind = "blast", t = nowS + dt0 * 0 + t, p = q }
-				break
-			end
-			local hit = false
-			for _, br in bodies do
-				if flat(q - br.Position).Magnitude < 3.8 and math.abs(q.Y - br.Position.Y) < 4.5 then
-					ev = { kind = "blast", t = nowS + t, p = q }
-					hit = true
-					break
+				ev = old or {}
+				ev.kind, ev.t, ev.p = "blast", nowS + t, q
+			else
+				-- the first body on the way (any but the shooter) sets it off
+				for _, model in Mark.models() do
+					local a = Actors.GetFromCharacter(model)
+					local r = a and a.UserId ~= st.src and ActorTargeting.GetActorRoot(a)
+					if r and flat(q - r.Position).Magnitude < 3.8 and math.abs(q.Y - r.Position.Y) < 4.5 then
+						ev = old or {}
+						ev.kind, ev.t, ev.p = "blast", nowS + t, q
+						break
+					end
 				end
-			end
-			if hit then
-				break
 			end
 			t += 0.03
 		end
@@ -17775,8 +18229,9 @@ Mark.hazAdd = function(st)
 	if ev then
 		ev.id, ev.item, ev.srcName = st.id, item, who and actorName(who) or "?"
 		ev.r = ev.r or Mark.blastR()
+		ev.seen = ev.seen or nowS
 		Mark.hazEv[st.id] = ev
-		if ev.kind == "blast" then
+		if ev.kind == "blast" and not old then
 			logFile("blast event", item, "from", ev.srcName, "in", string.format("%.2f", ev.t - nowS), "at", fmtV(ev.p), "r", string.format("%.1f", ev.r))
 		end
 	end
@@ -17798,7 +18253,8 @@ Mark.hazardHits = function(posAt, tMax)
 			if ta < -0.6 then
 				list[id] = nil
 			elseif ta <= tMax then
-				for _, tt in { ta - 0.05, ta, ta + 0.2 } do
+				for k = 0, 2 do
+					local tt = ta + (k == 0 and -0.05 or (k == 1 and 0 or 0.2))
 					if tt >= -0.05 then
 						local pp = posAt(math.max(tt - ping * 0.5, 0))
 						if flat(pp - ev.p).Magnitude < ev.r + margin then
@@ -17828,7 +18284,7 @@ end
 
 -- AutoBall: do not run into a zone / projectile corridor before it is over (the ball is not worth the stun)
 Mark.hazardGate = function(root, aimP, steerT, spd)
-	if not Mark.hazEv or next(Mark.hazEv) == nil then
+	if next(Mark.hazEv) == nil then
 		return nil
 	end
 	local O = root.Position
@@ -17845,15 +18301,11 @@ Mark.hazardGate = function(root, aimP, steerT, spd)
 	end, 4)
 end
 
--- run out of a blast / pass the ball when we cannot
+-- Run out of a blast; with the ball and no clean way out, give it to a teammate first (a stun takes it otherwise).
+-- The pass is charged as long as the time allows, not to the full solve: the release packet must reach the server before
+-- the blast (ta - ping/2 - HazPassMargin). A lob needs PassMinCharge; under that the ball is dumped away from the zone.
 Mark.hazFlee = function(character, root)
 	local list = Mark.hazEv
-	if not list or next(list) == nil then
-		if Mark.move.mode == "flee" then
-			Mark.moveStop("flee")
-		end
-		return
-	end
 	local nowS = Workspace:GetServerTimeNow()
 	local ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
 	local O = flat(root.Position)
@@ -17863,7 +18315,9 @@ Mark.hazFlee = function(character, root)
 	for id, ev in list do
 		if ev.kind == "blast" then
 			local ta = ev.t - nowS
-			if ta > -0.15 and ta < 3.5 then
+			if ta < -0.6 then
+				list[id] = nil
+			elseif ta > -0.15 and ta < 3.5 and not ev.boomAt then
 				local d = flat(O + ourV * math.max(ta - ping * 0.5, 0) - ev.p).Magnitude
 				if d < ev.r + margin and (not worst or ta < worst.ta) then
 					worst = { ev = ev, ta = ta, d = d }
@@ -17878,8 +18332,9 @@ Mark.hazFlee = function(character, root)
 		return
 	end
 	local ev, ta = worst.ev, worst.ta
-	local d0 = flat(O - ev.p).Magnitude
-	local away = unitOrNil(flat(O - ev.p)) or unitOrNil(flat(root.CFrame.LookVector)) or Vector3.new(0, 0, 1)
+	local P = flat(ev.p)
+	local d0 = (O - P).Magnitude
+	local away = unitOrNil(O - P) or unitOrNil(flat(root.CFrame.LookVector)) or Vector3.new(0, 0, 1)
 	local hum = character:FindFirstChildOfClass("Humanoid")
 	Mark.mover = Mark.mover or require(Modules.Actions.ActionMovement)
 	local spd = Mark.mover.GetRunWalkSpeed(Mark.mover.GetBaseWalkSpeed(character), false) or 24
@@ -17888,28 +18343,42 @@ Mark.hazFlee = function(character, root)
 	end
 	local gain = spd * math.max(ta - ping * 0.5 - 0.05, 0)
 	local need = ev.r + margin
-	local byRun = d0 + gain >= need
-	local byStep = d0 + gain + 5 >= need
+	local slack = d0 + gain - need
+	local byRun = slack >= 0
+	local byStep = slack + 5 >= 0 and not ev.noStep
 	local own = liveOwnerId() == LocalPlayer.UserId
 	if not ev.logged then
 		ev.logged = true
 		logFile("blast flee", ev.item, "ta", string.format("%.2f", ta), "d", string.format("%.1f", d0), "need", string.format("%.1f", need), "gain", string.format("%.1f", gain), "run", tostring(byRun), "step", tostring(byStep), "own", tostring(own))
 	end
-	-- cannot get out: give the ball to a teammate legitimately (the stun takes it otherwise)
-	if own and not byRun and not ev.passed and CFG.PassAssistSync ~= false and Mark.paList and not (Mark.pa and Mark.pa.live) then
-		local pick, pickSol, pickScore = nil, nil, -1
-		for _, sel in Mark.paList(root) do
-			local sol = Mark.paSolve(sel)
-			if sol and not sol.contested and (sol.charge or 0.3) + ping * 0.5 + 0.03 < ta - 0.03 then
-				local far = flat(sol.land - ev.p).Magnitude
-				if far > pickScore then
-					pick, pickSol, pickScore = sel, sol, far
+	-- with the ball: out by a thin margin or not at all -> the ball goes to a mate now
+	if own and slack < (CFG.HazPassSlack or 2) and not ev.passed and not (Mark.pa and Mark.pa.live) and os.clock() >= (ev.passTry or 0) then
+		ev.passTry = os.clock() + 0.1
+		local budget = ta - ping * 0.5 - (CFG.HazPassMargin or 0.1)
+		local minC = CFG.PassMinCharge or 0.1
+		local pick, pickSol, pickFar = nil, nil, -1
+		if budget >= minC and CFG.PassAssistSync ~= false and Mark.paList then
+			for _, sel in Mark.paList(root) do
+				local sol = Mark.paSolve(sel)
+				if sol and not sol.contested then
+					local far = flat(sol.land - ev.p).Magnitude
+					if far > ev.r and far > pickFar then
+						pick, pickSol, pickFar = sel, sol, far
+					end
 				end
 			end
 		end
-		ev.passed = true
-		if pick and Mark.paPress(pick, pickSol, "blast") then
-			logFile("blast pass", ev.item, "to", pick.name, "ta", string.format("%.2f", ta), "land", string.format("%.1f", pickScore))
+		if pick then
+			local c = math.min(pickSol.charge or 0.3, budget)
+			if Mark.paPress(pick, pickSol, "blast", c) then
+				ev.passed = true
+				logFile("blast pass", ev.item, "to", pick.name, "ta", string.format("%.2f", ta), "charge", string.format("%.2f", c), "of", string.format("%.2f", pickSol.charge or 0.3), "slack", string.format("%.1f", slack))
+			end
+		elseif budget < minC and ta > ping * 0.5 then
+			-- no time even for the shortest lob: the ball leaves us away from the zone instead of dying with us
+			ev.passed = true
+			Mark.dumpBall(root, away)
+			logFile("blast dump", ev.item, "ta", string.format("%.2f", ta), "slack", string.format("%.1f", slack))
 		end
 	end
 	if Mark.move.mode == "dodge" or Mark.move.mode == "dribble" then
@@ -17931,6 +18400,9 @@ end
 
 -- the player's own stick cannot carry us into a zone that is about to go off
 Mark.blastClamp = function(ch, cmd)
+	if not CFG.AutoDodge then
+		return cmd
+	end
 	local list = Mark.hazEv
 	if not list or next(list) == nil or typeof(cmd) ~= "Vector3" or cmd.Magnitude < 0.2 then
 		return cmd
@@ -17950,17 +18422,18 @@ Mark.blastClamp = function(ch, cmd)
 	local margin = CFG.BlastMargin or 1.5
 	local out = c
 	for _, ev in list do
-		if ev.kind == "blast" then
+		if ev.kind == "blast" and not ev.boomAt then
 			local ta = ev.t - nowS
 			if ta > 0 and ta < 3.5 then
-				local rel = O - ev.p
+				local P = flat(ev.p)
+				local rel = O - P
 				local d = rel.Magnitude
 				local radial = rel / math.max(d, 1e-3)
-				local inward = -cu:Dot(radial)
-				-- outside now, and the straight run would be inside the zone when it goes off
-				if d > ev.r + margin - 0.2 and inward > 0.05 and flat(O + cu * spd * ta - ev.p).Magnitude < ev.r + margin then
-					out = out - radial * (out:Dot(radial) * 1) -- keep only the tangential part
-					out = out + radial * 0 -- never pushed outward, the player decides how far to turn away
+				local inward = -out:Dot(radial)
+				-- inside already (deeper is worse), or the straight run would be inside when it goes off: no inward part.
+				-- Only the inward component goes, the player keeps the tangent and decides how far to turn away.
+				if inward > 0.05 and (d < ev.r + margin or flat(O + cu * spd * ta - P).Magnitude < ev.r + margin) then
+					out = out + radial * inward
 				end
 			end
 		end
@@ -17973,6 +18446,140 @@ Mark.blastClamp = function(ch, cmd)
 		return Vector3.new(out.X, cmd.Y, out.Z)
 	end
 	return cmd
+end
+
+-- ===== Enemy blast zones (overlay) =====================================================================================
+-- FUSE. The zone is the threat ripple the user picked for enemy charges (rings born at the centre, growing to the real
+-- radius, amber -> red as it nears), over a faint filled disc, and the time left is a FUSE burning around the rim: the
+-- remaining arc is the remaining time, its head a flickering white spark. A grenade also shows its hop path (dashed, from
+-- where it is now to where it goes off). The detonation itself: one white shock ring running out past the rim.
+-- One renderer for live and gallery: Mark.hazArt(seg, tris, n0, ev, now, clk) -> triangles used. now = ev.t's clock.
+Mark.hazArt = function(seg, tris, n0, ev, now, clk)
+	local cam = Mark.frameCam or Workspace.CurrentCamera
+	local c = ev.p
+	local R = ev.r
+	if ev.boomAt then
+		local age = clk - ev.boomAt
+		if age < 0.3 then
+			local u = age / 0.3
+			local rr = R * (1 + 0.35 * (1 - (1 - u) ^ 2))
+			local prev = nil
+			for s = 0, 28 do
+				local a = s / 28 * math.pi * 2
+				local p = c + Vector3.new(math.cos(a) * rr, 0.2, math.sin(a) * rr)
+				if prev then
+					seg(prev, p, Color3.new(1, 1, 1):Lerp(Mark.kickPalette.live[1], u), 1 - u, 3.2 * (1 - u) + 1, 46)
+				end
+				prev = p
+			end
+		end
+		return 0
+	end
+	local left = ev.t - now
+	if left < -0.1 then
+		return 0
+	end
+	local T0 = math.max(ev.t - (ev.seen or now), 0.3)
+	local f = math.clamp(left / T0, 0, 1)
+	local pal = left > 0.5 and Mark.kickPalette.armed or Mark.kickPalette.live
+	local cl = pal[1]
+	-- the faint floor of the zone
+	local used = 0
+	local cs = cam:WorldToViewportPoint(c + Vector3.new(0, 0.1, 0))
+	if cs.Z > 0.2 then
+		local prev, prevOk = nil, false
+		for k = 0, 16 do
+			local a = k / 16 * math.pi * 2
+			local p = cam:WorldToViewportPoint(c + Vector3.new(math.cos(a) * R, 0.1, math.sin(a) * R))
+			local ok = p.Z > 0.2
+			if k > 0 and ok and prevOk and n0 + used < #tris then
+				used += 1
+				local tri = tris[n0 + used]
+				tri.PointA, tri.PointB, tri.PointC = Vector2.new(cs.X, cs.Y), Vector2.new(prev.X, prev.Y), Vector2.new(p.X, p.Y)
+				tri.Color, tri.Transparency, tri.Visible = cl, 0.1 + 0.12 * (1 - f), true
+			end
+			prev, prevOk = p, ok
+		end
+	end
+	-- ripples: faster as the fuse burns down (per-zone phase accumulator, never os.clock / a changing period)
+	local dt = math.clamp(clk - (ev.phAt or clk), 0, 0.1)
+	ev.phAt = clk
+	ev.ph = (ev.ph or 0) + dt * (1 / 0.7 + (1 / 0.22 - 1 / 0.7) * (1 - f))
+	Mark.kickRipple(seg, c + Vector3.new(0, 0.15, 0), R, pal, ev.ph, clk, 2)
+	-- the fuse: the remaining arc, starting on the side facing the camera so the head is easy to read
+	local look = Mark.frameLook or cam.CFrame.LookVector
+	local a0 = math.atan2(-look.Z, -look.X)
+	local n = math.max(math.floor(32 * f + 0.5), 1)
+	local ink = COL.Ink
+	local prev = nil
+	local head = nil
+	for s = 0, n do
+		local a = a0 + (s / 32) * math.pi * 2
+		local p = c + Vector3.new(math.cos(a) * R, 0.25, math.sin(a) * R)
+		if prev then
+			seg(prev, p, ink, 0.55, 5, 44)
+			seg(prev, p, Color3.new(1, 1, 1):Lerp(cl, 0.35), 0.95, 2.2, 45)
+		end
+		prev, head = p, p
+	end
+	if head and left > 0 then
+		local blk = math.floor(clk * 30)
+		for q = 0, 2 do
+			local ang = Mark.hn(q, blk, 3) * math.pi
+			local dir = Vector3.new(math.cos(ang), 0.6 + 0.4 * Mark.hn(q + 3, blk, 3), math.sin(ang))
+			seg(head, head + dir * (0.8 + 0.6 * math.abs(Mark.hn(q + 6, blk, 3))), Color3.new(1, 1, 1), 0.9, 1.6, 46)
+		end
+	end
+	-- grenade: the hop path, dashed
+	local path = ev.path
+	if path and #path > 1 then
+		local dc = pal[3]
+		for i = 1, #path - 1, 1 do
+			if i % 2 == 1 then
+				seg(path[i], path[i + 1], dc, 0.85, 2, 44)
+			end
+		end
+		local g0 = path[1]
+		seg(g0 - Vector3.new(0.6, 0, 0), g0 + Vector3.new(0.6, 0, 0), COL.Paper, 1, 2, 46)
+		seg(g0 - Vector3.new(0, 0, 0.6), g0 + Vector3.new(0, 0, 0.6), COL.Paper, 1, 2, 46)
+	end
+	return used
+end
+
+Mark.hazDraw = function()
+	local H = Mark.hazFx
+	if not H then
+		H = { lines = makeLines(500, 1.4, 44), tris = {} }
+		H.pool = Mark.segPool(H.lines)
+		for k = 1, 48 do
+			H.tris[k] = newTri(42)
+		end
+		Mark.hazFx = H
+	end
+	local pool = H.pool
+	pool.i = 1
+	local used = 0
+	if CFG.Draw and CFG.DrawHazard ~= false then
+		local nowS = Workspace:GetServerTimeNow()
+		local clk = os.clock()
+		local drawn = 0
+		for id, ev in Mark.hazEv do
+			if ev.kind == "blast" then
+				if (ev.boomAt and clk - ev.boomAt > 0.4) or ev.t < nowS - 0.6 then
+					Mark.hazEv[id] = nil
+				elseif drawn < 3 then
+					drawn += 1
+					used += Mark.hazArt(pool.seg, H.tris, used, ev, nowS, clk)
+				end
+			end
+		end
+	end
+	for k = used + 1, H.triHw or #H.tris do
+		H.tris[k].Visible = false
+	end
+	H.triHw = used
+	pool.finish()
+	H.empty = used == 0 and pool.hw == 0
 end
 
 -- Projectiles, every frame on the live state (Mark.projLive: ProjectileStart + ProjectileMovement rows).
@@ -18104,7 +18711,7 @@ Mark.projTick = function(character, root)
 						return nil
 					end
 					return trail[i]:Lerp(trail[i + 1], f - math.floor(f))
-				end, tKeep, "rocketPunch")
+				end, tKeep, "rocketPunch", { proj = true, rad = 1.5 })
 				if okW == "equip" then
 					st.wallUntil = os.clock() + 0.12 -- barricades coming out: hold the dodge a moment, place on the next tick
 					continue
@@ -18117,16 +18724,19 @@ Mark.projTick = function(character, root)
 					logFile("proj wall", st.item, "no", wWhy, "keepHit", string.format("%.2f", tKeep))
 				end
 			end
-			-- options: a lob to each teammate
+			-- options: a lob to each teammate, charged as long as the time allows (the release packet must reach the server
+			-- before the punch reaches the ball: tKeep - ping/2 - ProjPassMargin), never waiting for the full solve
+			local budget = tKeep - ping * 0.5 - (CFG.ProjPassMargin or 0.1)
+			local minC = CFG.PassMinCharge or 0.1
 			local best, bestSel, bestSol, tried = nil, nil, nil, {}
-			if CFG.PassAssistSync ~= false and Mark.paList and Mark.paSolve and Mark.paPress then
+			if budget >= minC and CFG.PassAssistSync ~= false and Mark.paList and Mark.paSolve and Mark.paPress then
 				for _, sel in Mark.paList(root) do
 					if #tried >= 4 then
 						break
 					end
 					local sol = Mark.paSolve(sel)
 					if sol and sol.pts and sol.times and #sol.pts >= 2 then
-						local charge = sol.charge or 0.1
+						local charge = math.max(math.min(sol.charge or 0.1, budget), minC)
 						local release = charge + ping * 0.5 + 0.03
 						local pts, ts = sol.pts, sol.times
 						local function lobFn(t)
@@ -18166,12 +18776,12 @@ Mark.projTick = function(character, root)
 			end
 			if Mark.pa and Mark.pa.live then
 				logFile("proj", st.item, "pass already live")
-			elseif bestSel and Mark.paPress(bestSel, bestSol, unsafe and "projectile-unsafe" or "projectile") then
-				logFile("proj pass", unsafe and "UNSAFE" or "safe", st.item, "to", bestSel.name, "keepHit", string.format("%.2f", tKeep), "clear", string.format("%.1f", best), "tried", table.concat(tried, " | "))
+			elseif bestSel and Mark.paPress(bestSel, bestSol, unsafe and "projectile-unsafe" or "projectile", budget) then
+				logFile("proj pass", unsafe and "UNSAFE" or "safe", st.item, "to", bestSel.name, "keepHit", string.format("%.2f", tKeep), "charge", string.format("%.2f", math.max(math.min(bestSol.charge or 0.1, budget), minC)), "clear", string.format("%.1f", best), "tried", table.concat(tried, " | "))
 			else
 				local fly = ball - st.pos
 				Mark.dumpBall(root, Vector3.new(-fly.Z, 0, fly.X))
-				logFile("proj dump", st.item, "keepHit", string.format("%.2f", tKeep), "keepClose", string.format("%.1f", cKeep), "tried", #tried > 0 and table.concat(tried, " | ") or "no mates")
+				logFile("proj dump", st.item, "keepHit", string.format("%.2f", tKeep), "keepClose", string.format("%.1f", cKeep), "budget", string.format("%.2f", budget), "tried", #tried > 0 and table.concat(tried, " | ") or "no mates")
 			end
 		else
 			if Mark.move.mode == "dribble" or (st.lastDodge and os.clock() - st.lastDodge < 0.4) then
@@ -18208,7 +18818,7 @@ Mark.projTick = function(character, root)
 			if st.item ~= "bazooka" and st.item ~= "grenade" and not st.wallTried then
 				local okW, wWhy = Mark.wallVsPath(root, function(t)
 					return p0 + v0 * t + Vector3.new(0, -0.5 * g * t * t, 0)
-				end, tImp, st.item)
+				end, tImp, st.item, { proj = true, rad = 1.5 })
 				if okW == "equip" then
 					st.wallUntil = os.clock() + 0.12 -- barricades coming out: hold the dodge a moment, place on the next tick
 					continue
@@ -18240,14 +18850,14 @@ Mark.projTick = function(character, root)
 				local pick, pickSol, pickD = nil, nil, -1
 				for _, sel in Mark.paList(root) do
 					local sol = Mark.paSolve(sel)
-					if sol and not sol.contested and (sol.charge or 0.3) + ping * 0.5 + 0.03 < tImp then
+					if sol and not sol.contested and (CFG.PassMinCharge or 0.1) + ping * 0.5 + (CFG.ProjPassMargin or 0.1) < tImp then
 						local dAway = flat(sol.land - (p0 + v0 * tImp)).Magnitude
 						if dAway > pickD then
 							pick, pickSol, pickD = sel, sol, dAway
 						end
 					end
 				end
-				if pick and Mark.paPress(pick, pickSol, "projectile") then
+				if pick and Mark.paPress(pick, pickSol, "projectile", tImp - ping * 0.5 - (CFG.ProjPassMargin or 0.1)) then
 					logFile("proj pass", st.item, "to", pick.name, "stay", string.format("%.1f", stay), "bestStep", string.format("%.1f", bestC), "rad", string.format("%.1f", rad), "tImp", string.format("%.2f", tImp))
 				end
 			end
@@ -18286,7 +18896,7 @@ Mark.tickHazard = function(character, root)
 			local d = flat(at - h.strike).Magnitude
 			if d <= R then
 				local act = "-"
-				if own then
+				if own and not (Mark.pa and Mark.pa.live) then -- a blast pass (Mark.hazFlee) is already taking the ball out
 					local flickReady = os.clock() - (Mark.hazardFlickAt or 0) > 1.5
 					if flickReady and left >= 0.5 then
 						Mark.plainFlick()
@@ -19615,7 +20225,199 @@ Mark.agentSpot = function(seg, center, style, key, t)
 	seg(center + Vector3.new(0, 0, -0.18), center + Vector3.new(0, 0, 0.18), pal[1], 0.9, 2, 43)
 end
 
+-- ===== VISUAL TEST GALLERY (key P, no UI) ===========================================================================
+-- Every new overlay as a station frozen in the world: placed once when P turns it on (14 studs ahead of us, stations
+-- along the camera's right), never re-anchored to the character. Each station runs the REAL renderer of its overlay on a
+-- scripted loop that walks through its states. P again hides it.
+Mark.galToggle = function()
+	local G = Mark.gal
+	if G and G.on then
+		G.on = false
+		G.pool.finish()
+		for _, tri in G.tris or {} do
+			tri.Visible = false
+		end
+		for _, st in G.st do
+			if st.area then
+				Mark.areaDraw(nil, 0, nil, true, st.area)
+			end
+		end
+		for _, tx in G.text do
+			tx.Visible = false
+		end
+		return
+	end
+	local root = ActorTargeting.GetActorRoot(LocalPlayer)
+	local cam = Workspace.CurrentCamera
+	if not (root and cam) then
+		return
+	end
+	if not G then
+		G = { lines = makeLines(900, 1.4, 41), text = {}, st = {} }
+		G.pool = Mark.segPool(G.lines)
+		Mark.gal = G
+	end
+	local fw = unitOrNil(flat(cam.CFrame.LookVector)) or Vector3.new(0, 0, -1)
+	G.right = Vector3.new(-fw.Z, 0, fw.X)
+	G.fw = fw
+	G.gy = root.Position.Y - 3.15
+	G.O = Vector3.new(root.Position.X, G.gy, root.Position.Z) + fw * 26
+	G.t0 = os.clock()
+	G.on = true
+	for _, st in G.st do
+		st.path = nil -- built from the old anchor
+	end
+	logFile("gallery on", "at", fmtV(G.O))
+end
+
+-- stations: x = offset along G.right, art(seg, C, t, st, G) with C the station's ground centre
+Mark.galStations = {
+	{ name = "SilentAim bazooka: blast area", x = -40, art = function(seg, C, t, st)
+		st.area = st.area or Mark.areaNew()
+		st.area.gal = true
+		-- 3.2 s loop: appears, the aim point glides (he moves), solve lost -> fade out
+		local ph = t % 3.2
+		local G = ph < 2.4 and (C + Vector3.new(math.cos(t * 1.3) * 3, 0, math.sin(t * 0.9) * 2)) or nil
+		Mark.areaDraw(G, 14, Color3.fromRGB(255, 150, 50), false, st.area)
+	end },
+	{ name = "SilentAim freeze gun: freeze area", x = -10, art = function(seg, C, t, st)
+		st.area = st.area or Mark.areaNew()
+		st.area.gal = true
+		local ph = (t + 1.1) % 3.2
+		local G = ph < 2.4 and (C + Vector3.new(math.sin(t * 1.1) * 2.5, 0, 0)) or nil
+		Mark.areaDraw(G, CFG.FreezeRadius or 8, Color3.fromRGB(90, 220, 255), false, st.area)
+	end },
+	{ name = "CounterJump: seen / plan / jumped", x = 20, art = function(seg, C, t, st, G)
+		-- 6 s loop: 2 s each state. His arc crosses the station; ours leaves from the near side.
+		local ph = t % 6
+		local k = ph < 2 and "safe" or "armed"
+		local p0 = t - ph % 2
+		local A0 = C - G.right * 9 + G.fw * 4 + Vector3.new(0, 3, 0)
+		if not st.path then
+			st.path = {}
+			for i = 0, 60 do
+				local s = i * 0.025
+				st.path[i + 1] = A0 + G.right * (14 * s) + Vector3.new(0, 26 * s - 0.5 * 40 * s * s, 0)
+			end
+		end
+		local path = st.path
+		st.v = st.v or { boltSt = { list = {}, nextAt = 0, n = 0 } }
+		local v = st.v
+		v.key, v.P, v.path, v.pathAt, v.at = k, A0, path, p0, p0
+		v.us = C - G.fw * 6 + Vector3.new(0, 3, 0)
+		v.landed, v.vJ, v.g, v.vy = true, 30, 196.2, 0
+		v.liveUntil = ph >= 4 and (p0 + 2) or nil
+		if k == "safe" then
+			v.plan = nil
+		else
+			local E = A0 + G.right * (14 * 0.8) + Vector3.new(0, 26 * 0.8 - 0.5 * 40 * 0.64, 0)
+			v.plan = { T = 0.8, td = 0.45, Q = v.us:Lerp(Vector3.new(E.X, v.us.Y, E.Z), 0.7), E = E }
+		end
+		-- the loop replays his flight from its start every state; the art reads time relative to v.at
+		Mark.duelArt(seg, v, G.gy, p0 + (ph % 2) * 0.5)
+	end },
+	{ name = "AutoDodge: grenade (hop path + fuse)", x = 52, art = function(seg, C, t, st, G)
+		-- 3.4 s loop: thrown, hops toward the spot, fuse burns down, goes off, a short pause
+		local ph = t % 3.4
+		local T = 2.6
+		local function at(s)
+			local u = math.clamp(s / 1.8, 0, 1)
+			local h = math.abs(math.sin(u * math.pi * 3)) * 4 * (1 - u) ^ 1.5
+			return C - G.right * (10 * (1 - u)) + Vector3.new(0, 0.45 + h, 0)
+		end
+		st.ev = st.ev or { kind = "blast", r = 14, path = {} }
+		local ev = st.ev
+		ev.p, ev.t, ev.seen = C, T, 0
+		if ph < T then
+			ev.boomAt = nil
+			for i = 0, 12 do
+				ev.path[i + 1] = at(ph + (T - ph) * i / 12)
+			end
+		elseif not ev.boomAt then
+			ev.boomAt = os.clock()
+		end
+		if ph < 3.1 then
+			st.used = Mark.hazArt(seg, G.tris, G.triN, ev, ph, os.clock())
+		end
+	end },
+	{ name = "AutoDodge: bazooka impact / hammer slam", x = 84, art = function(seg, C, t, st, G)
+		local ph = t % 2.2
+		st.ev = st.ev or { kind = "blast", r = 14 }
+		local ev = st.ev
+		ev.p, ev.t, ev.seen = C, 1.2, 0
+		if ph < 1.2 then
+			ev.boomAt = nil
+		elseif not ev.boomAt then
+			ev.boomAt = os.clock()
+		end
+		st.ev2 = st.ev2 or { kind = "blast", r = 9 }
+		local e2 = st.ev2
+		e2.p, e2.t, e2.seen = C + G.fw * 22, 0.7, 0
+		local ph2 = t % 1.4
+		if ph2 < 0.7 then
+			e2.boomAt = nil
+		elseif not e2.boomAt then
+			e2.boomAt = os.clock()
+		end
+		local n = 0
+		if ph < 1.6 then
+			n += Mark.hazArt(seg, G.tris, G.triN, ev, ph, os.clock())
+		end
+		if ph2 < 1.1 then
+			n += Mark.hazArt(seg, G.tris, G.triN + n, e2, ph2, os.clock())
+		end
+		st.used = n
+	end },
+}
+
+Mark.galDraw = function()
+	local G = Mark.gal
+	if not (G and G.on) then
+		return
+	end
+	local pool = G.pool
+	pool.i = 1
+	if not G.tris then
+		G.tris = {}
+		for k = 1, 64 do
+			G.tris[k] = newTri(42)
+		end
+	end
+	G.triN = 0
+	local t = os.clock() - G.t0
+	local cam = Mark.frameCam or Workspace.CurrentCamera
+	for i, s in Mark.galStations do
+		local C = G.O + G.right * s.x
+		G.st[i] = G.st[i] or {}
+		local sti = G.st[i]
+		sti.used = 0
+		s.art(pool.seg, C, t, sti, G)
+		G.triN += sti.used
+		local tx = G.text[i]
+		if not tx then
+			tx = newDraw("Text", 46)
+			tx.Size, tx.Center, tx.Outline, tx.Font, tx.Color = 14, true, true, FONT, COL.Paper
+			tx.Text = s.name
+			G.text[i] = tx
+		end
+		local p = cam:WorldToViewportPoint(C - G.fw * 16 + Vector3.new(0, 0.2, 0))
+		tx.Position = Vector2.new(p.X, p.Y)
+		tx.Visible = p.Z > 0.5
+	end
+	for k = G.triN + 1, #G.tris do
+		G.tris[k].Visible = false
+	end
+	if pool.i > #G.lines and os.clock() - (G.fullAt or 0) > 5 then
+		G.fullAt = os.clock()
+		logFile("gallery lines full", #G.lines)
+	end
+	pool.finish()
+end
+
 UserInputService.InputBegan:Connect(function(input, gp)
+	if not gp and input.KeyCode == Enum.KeyCode.P then
+		Mark.galToggle()
+	end
 	if Controls.IsInput("Kick", input) then
 		Mark.realKick = { down = true, at = os.clock(), input = input }
 	end
@@ -20160,10 +20962,13 @@ return function(_Lib, _Core)
 			tog(b, "Slide Block", "BlockSlide")
 			tog(b, "Defend Goal", "BlockGoal", "Blocks a ball flying into our goal with the body: run, jump or slide into its path.")
 			tog(b, "Pass Solver", "BlockSmart", "If he cannot score, cuts the pass to his teammate.")
+			tog(b, "Read His Charge", "BlockPassRead", "When he charges a pass, runs onto its path before the ball gets there.")
+			tog(b, "Cover Shadow", "BlockShade", "Stands between him and the goal leaning toward his best pass.")
 			tog(b, "Shot Danger", "BlockDanger", "Near our goal: blocks him when he has an open shot past our keeper, from any side.")
 			tog(b, "Show Marking", "DrawBlock", "The pass lane and where you cut it.")
 			tog(b, "Behind Logic", "BlockBehindLogic", "Behind the carrier: take the next attacker, else cut him off.")
 			advanced(b, "Block", function()
+				sld(b, "Opposition Depth", "BlockOppDepth", 3, 12, { prec = 1, suffix = " st", text = "How far in front of him you first set up." })
 				sld(b, "Far From Goal", "BlockFarGoal", 40, 200, { suffix = " st" })
 				sld(b, "Behind Receiver Gap", "BlockBehindRcv", 6, 40, { suffix = " st" })
 				sld(b, "Near Goal Range", "BlockGoalRange", 30, 120, { suffix = " st" })
@@ -20218,15 +21023,17 @@ return function(_Lib, _Core)
 			local dg = card(tab, "Right")
 			head(dg, "AutoDodge")
 			feature(dg, "AutoDodge", "AutoDodge")
-			note(dg, "Last resort when the dribble is on cooldown.")
+			note(dg, "Last resort when the dribble is on cooldown. Keeps you out of grenade, bazooka and hammer zones and off mines.")
 			pick(dg, "Dodge Mode", "DodgeTeleport", { { "Teleport + Movement", true }, { "Movement Only", false } }, "Movement Only never moves the character by CFrame.")
-			tog(dg, "Pass Instead", "PassAssistSync", "Lobs to the safest teammate when a dodge is unsure.")
+			tog(dg, "Pass Instead", "PassAssistSync", "Lobs to the safest teammate when a dodge is unsure or a blast will catch you.")
+			tog(dg, "Show Danger Zones", "DrawHazard", "Enemy blast zones on the ground: burning fuse = time left, dashed line = grenade path.")
 			advanced(dg, "Dodge", function()
 				head(dg, "Projectiles")
 				sld(dg, "Safe Margin", "ProjSafeMargin", 0, 4, { prec = 1, suffix = " st" })
 				sld(dg, "Punch Radius", "ProjHitRadius", 2, 10, { prec = 1, suffix = " st" })
 				head(dg, "Hazards")
 				sld(dg, "Blast Margin", "BlastMargin", 0, 5, { prec = 1, suffix = " st" })
+				sld(dg, "Pass Before Blast", "HazPassSlack", 0, 6, { prec = 1, suffix = " st", text = "With the ball, pass even when you escape by less than this." })
 				sld(dg, "Mine Margin", "MineMargin", 0, 6, { prec = 1, suffix = " st" })
 			end)
 
@@ -20235,7 +21042,7 @@ return function(_Lib, _Core)
 			head(c, "CounterJump")
 			feature(c, "CounterJump", "CounterJump")
 			note(c, "Catches an enemy in the air (bicycle, jump with the ball) with a jump + slide or kick.")
-			tog(c, "Show Plan", "DrawDuel", "His arc and yours, tied at equal time: the ties close where you meet. Steel = out of reach, mint = going, white = committed.")
+			tog(c, "Show Plan", "DrawDuel", "His arc and yours. Lightning falls from him, hits your take-off spot and bounces into the meeting point. Steel = out of reach, mint = going, white = committed.")
 			tog(c, "Move To Him", "CounterMove", "Runs you to the take-off point.")
 			tog(c, "Counter Tackle", "CounterTackle", "Slides him: from the air, or before his flick lets go.")
 			tog(c, "Competitor Check", "CounterCompetitor", "Stops when a teammate is already on him.")
@@ -20308,29 +21115,25 @@ return function(_Lib, _Core)
 			local sa = card(tab, "Left")
 			head(sa, "SilentAim")
 			feature(sa, "SilentAim", "SilentAim")
-			note(sa, "Item aim: leads the target, arcs the freeze gun.")
+			note(sa, "Item aim: leads the target. Bazooka and freeze gun aim at the ground under him and show the blast area.")
 			sld(sa, "FOV", "SilentFov", 30, 400, { suffix = " px" })
 			tog(sa, "Show FOV Circle", "DrawSilentFov")
 			tog(sa, "Show Tracer", "DrawSilent")
 			advanced(sa, "Silent", function()
-				sld(sa, "Freeze Gun Tolerance", "ArcMaxErr", 0.5, 6, { prec = 1, suffix = " st", text = "Arc error accepted. Beyond it, aims at the feet." })
+				sld(sa, "Freeze Radius", "FreezeRadius", 3, 20, { prec = 1, suffix = " st", text = "Freeze gun area on the ground." })
 			end)
 
 			local w = card(tab, "Right")
 			head(w, "AutoWall")
 			feature(w, "AutoWall", "AutoWall")
-			tog(w, "Auto Use", "WallEquip", "Takes the barricades out by itself. Off: only when already in hand.")
-			pick(w, "Aim Ahead", "WallLead", { { "Never", "never" }, { "Only When He Runs Away", "away" }, { "Always", "always" } })
+			tog(w, "Auto Use", "WallEquip", "Takes the barricades out by itself when a threat comes. Off: only when already in hand.")
 			tog(w, "Block Projectiles", "BarricadeAddon", "Puts a wall on a projectile's path.")
-			tog(w, "Wall On Shot Path", "WallShot", "Walls a charged shot.")
-			tog(w, "Ambush", "WallAmbush", "Places early on an enemy running into the spot.")
+			tog(w, "Wall On Shot Path", "WallShot", "Walls a shot charged at our goal.")
 			advanced(w, "Wall", function()
-				sld(w, "Equip Distance", "WallEquipDist", 8, 50, { suffix = " st" })
+				sld(w, "Body Reach", "WallReach", 8, 40, { suffix = " st", text = "Walls a chaser or the carrier within this distance." })
+				sld(w, "Body Window", "WallWindow", 0.15, 1, { prec = 2, suffix = " s", text = "He must hit the wall this soon after it appears." })
 				sld(w, "Put Away After", "WallEquipHold", 1, 10, { prec = 1, suffix = " s" })
 				sld(w, "Cooldown", "WallCooldown", 0.2, 3, { prec = 1, suffix = " s" })
-				sld(w, "Ambush Reach", "WallReach", 8, 50, { suffix = " st" })
-				sld(w, "Min Closing Speed", "WallAmbushV", 1, 12, { prec = 1, suffix = " st/s" })
-				sld(w, "Ambush Time", "WallAmbushT", 0.2, 2, { prec = 2, suffix = " s" })
 			end)
 		end)
 
@@ -20543,8 +21346,7 @@ return function(_Lib, _Core)
 			head(ag, "Wall")
 			sld(ag, "Latency", "WallLatency", 0, 300, { scale = 1000, suffix = " ms" })
 			sld(ag, "Margin", "WallMargin", 0, 0.5, { prec = 2, suffix = " s" })
-			sld(ag, "Min Distance", "WallMin", 1, 8, { prec = 1, suffix = " st" })
-			sld(ag, "Max Distance", "WallMax", 3, 14, { prec = 1, suffix = " st" })
+			sld(ag, "Half Width", "WallHalf", 3, 8, { prec = 2, suffix = " st" })
 		end)
 
 		task.defer(function()
