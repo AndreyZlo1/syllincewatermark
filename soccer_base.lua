@@ -169,6 +169,7 @@ local CFG = {
 	GkPressHome = true, -- steer the dive at him while it runs (what turning the camera does)
 	GkPressTurn = 6, -- rad/s of that steering
 	LobBodyRange = 9, -- flick lob catch: a contact this close goes with the body (receive), farther with a jump-slide
+	GkWalkMargin = 0.08, -- AutoGK: a walk / jump save with less spare time than this does not hold the dive back (s)
 	GkLauncherReact = 0.2, -- AutoGK press: an enemy holding a launcher fires this fast after seeing our dash (s)
 	GkPressMaxT = 0.36, -- no press dive for a contact later than this (s) unless he is at the mouth / flying
 	GkPress = true, -- AutoGK: forward dive into a carrier who runs / flies into the goal (stuns him)
@@ -394,6 +395,10 @@ Log.flush = function()
 		appendfile(Log.file, text)
 	else
 		Log.started = true
+		-- the previous session's log is kept (a restart used to wipe the very episode the user wanted to show)
+		if isfile(Log.file) then
+			writefile("illegalsoccerlog_prev.txt", readfile(Log.file))
+		end
 		writefile(Log.file, text)
 	end
 end
@@ -7988,8 +7993,22 @@ Mark.gkOwnDive = function(root, td)
 	local delay = math.clamp(LocalPlayer:GetNetworkPing(), 0, 0.3) * 0.5 + 0.03
 	local win = D.Constants.SaveWindowSeconds
 	local best = nil
+	-- the 8 camera choices first (no turn needed when one of them saves); with Any-Angle Dive also a fan every 7.5 deg:
+	-- a diagonal shot between two choices (45 deg apart) had no save at all -> "gk dive none" frame after frame, the
+	-- keeper stood until it was too late. An exact direction is flown by the GetWorldDirection hook (Mark.gkDiveAim).
+	local dirs = {}
 	for name, choice in Mark.actionMotion.DirectionChoices do
-		local wd = D.GetWorldDirection(choice, cam.CFrame, facing)
+		dirs[#dirs + 1] = { name = name, wd = (Mark.gkAimOrig or D.GetWorldDirection)(choice, cam.CFrame, facing) }
+	end
+	if CFG.GkPressExact ~= false and Mark.gkFwd then
+		local f = Mark.gkFwd
+		for k = -20, 20 do
+			local a = math.rad(k * 7.5)
+			dirs[#dirs + 1] = { name = "exact", wd = f * math.cos(a) + Vector3.new(-f.Z, 0, f.X) * math.sin(a), exact = true }
+		end
+	end
+	for _, dv in dirs do
+		local name, wd = dv.name, dv.wd
 		-- no backward dives: the backward dive arches the body back and lowers the save box (user: the ball went over
 		-- the head on a "B" dive); our box model does not have that pose
 		if typeof(wd) == "Vector3" and (not Mark.gkFwd or wd:Dot(Mark.gkFwd) > -0.3) then
@@ -8015,8 +8034,9 @@ Mark.gkOwnDive = function(root, td)
 					hold.CFrame = CFrame.lookAlong(pos, wd)
 					-- segment test: path samples are ~6 studs apart at shot speed, a point test skips through the box
 					if HitboxSettings.GetSegmentEnterAlpha(hold, box, samples[i - 1], samples[i]) then
-						if not best or t < best.t then
-							best = { name = name, wd = wd, t = t, miss = 0, own = true, td = td }
+						-- a camera choice wins ties (no turn); an exact one must be clearly earlier
+						if not best or t < best.t - ((dv.exact and not best.exact) and 0.03 or 0) then
+							best = { name = name, wd = wd, t = t, miss = 0, own = true, td = td, exact = dv.exact }
 						end
 						break
 					end
@@ -9507,13 +9527,13 @@ Mark.tickGk = function(character, root)
 					local h = p.Y - root.Position.Y
 					local walkT = math.max(g - bodyR, 0) / spd + react + CFG.GkWalkSlack
 					if h >= -3 and h <= groundTop and walkT <= t then
-						plan = { kind = "walk", p = p, t = t, h = h, g = g }
+						plan = { kind = "walk", p = p, t = t, h = h, g = g, slack = t - walkT }
 						break
 					end
 					if h > groundTop and h - airTop <= jumpH then
 						local rise = Mark.riseT(math.max(h - airTop + 0.5, 0.3))
 						if walkT + rise <= t then
-							plan = { kind = "jump", p = p, t = t, h = h, g = g, rise = rise }
+							plan = { kind = "jump", p = p, t = t, h = h, g = g, rise = rise, slack = t - walkT - rise }
 							break
 						end
 					end
@@ -9759,7 +9779,10 @@ Mark.tickGk = function(character, root)
 			local jumped = Mark.doJump("gk")
 			logFile("gk jump", jumped and "ok" or "no", "h", string.format("%.1f", jp.h), "t", string.format("%.2f", jp.t), "rise", string.format("%.2f", jp.rise))
 		end
-	elseif shot and (not plan or plan.kind == "dive") and not (moveHeld and (crossT or 0) > 0.18) and role and role.Dive and landed and now - (Mark.gkDive or 0) > diveMod.Constants.RepeatDelaySeconds then
+	elseif shot and (not plan or plan.kind == "dive" or (plan.slack or 1) < (CFG.GkWalkMargin or 0.08)) and role and role.Dive and landed and now - (Mark.gkDive or 0) > diveMod.Constants.RepeatDelaySeconds then
+		-- (the old gate: no dive while a walk / jump plan was seen in the last 0.2 s and the cross was > 0.18 s away. A
+		-- walk that is only just in time flips to "no plan" a frame later, the gate held the dive for 0.2 s more and the
+		-- dive was too late = the keeper "froze". Now a walk / jump with less than GkWalkMargin to spare does not block.)
 		-- no walk / jump save: dive only in a direction the game's dive + assist actually connects with
 		local dState, dWorld = state, gkWorld
 		if not Mark.ballSrcId and Renderer.GetAuthoritativeMovementState then
@@ -9777,7 +9800,7 @@ Mark.tickGk = function(character, root)
 					Mark.actionMotion = Mark.actionMotion or require(Modules.Actions.ActionMotion)
 					if Mark.doJump("gk") then
 						Mark.gkJump = now
-						Mark.gkCombo = { diveAt = now + td, untilT = now + td + 0.25, choice = Mark.actionMotion.DirectionChoices[h2.name], fwd = fwd, role = role, name = "shot " .. h2.name }
+						Mark.gkCombo = { diveAt = now + td, untilT = now + td + 0.25, choice = Mark.actionMotion.DirectionChoices[h2.name], wd = h2.exact and h2.wd or nil, dir = h2.exact and h2.wd or nil, fwd = fwd, role = role, name = "shot " .. h2.name }
 						logFile("gk dive", "jump + dive", "choice", h2.name, "dive in", td, "contact", string.format("%.2f", h2.t), "eta", string.format("%.2f", crossT or -1))
 						hit = false
 					end
@@ -9789,12 +9812,26 @@ Mark.tickGk = function(character, root)
 			end
 		end
 		if hit then
-			TurnControl.LockAutoRotate("Goalkeeper", fwd)
-			Mark.diveSet(character, hit.wd, fwd)
+			-- a camera choice saves: dive as the game would, body untouched. Only an exact (between-choices) save turns the
+			-- body: the dash + "F" animation go along it (gkDiveAim, GetWorldDirection hook) and gkAimTick gives the
+			-- rotation back when the dive ends.
+			local face = hit.exact and hit.wd or fwd
+			TurnControl.LockAutoRotate("Goalkeeper", face)
+			if hit.exact then
+				Mark.gkDiveAim = { dir = hit.wd, at = now, untilT = now + diveMod.Constants.DurationSeconds + 0.05, fwd = fwd, faceF = true }
+			end
+			Mark.diveSet(character, hit.wd, face)
 			Mark.gkDive = now
 			local ok = role.Dive()
 			Mark.diveRestore(character, hit.wd)
-			TurnControl.ReleaseAutoRotate("Goalkeeper")
+			if ok and hit.exact then
+				Mark.gkDiveAim.faceLock = true
+			else
+				if hit.exact then
+					Mark.gkDiveAim = nil
+				end
+				TurnControl.ReleaseAutoRotate("Goalkeeper")
+			end
 			logFile("gk dive", ok and "ok" or "no", "model", hit.own and "own" or "assist", "choice", hit.name, "miss", string.format("%.2f", hit.miss), "t", string.format("%.2f", hit.t or -1), "assist", tostring(hit.assisted), "eta", string.format("%.2f", crossT or -1), "dir", fmtV(hit.wd))
 		elseif not Mark.gkNoDiveLog or now - Mark.gkNoDiveLog > 0.3 then
 			Mark.gkNoDiveLog = now
@@ -10639,7 +10676,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v137")
+	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v138")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -19994,7 +20031,7 @@ return function(_Lib, _Core)
 				sld(p, "Come Out Max", "GkPressOut", 2, 60, { suffix = " st" })
 				sld(p, "Come Out Zone", "GkPressMoveZone", 15, 120, { suffix = " st" })
 				sld(p, "Gap To Him", "GkPressGap", 4, 24, { suffix = " st" })
-				tog(p, "Any-Angle Dive", "GkPressExact")
+				tog(p, "Any-Angle Dive", "GkPressExact", "Dives at the exact angle (press and shots), turning your body only for that dive.")
 				tog(p, "Steer Dive", "GkPressHome")
 			end)
 
