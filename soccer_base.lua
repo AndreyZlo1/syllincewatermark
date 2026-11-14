@@ -211,7 +211,10 @@ local CFG = {
 	TrendVel = true, -- long predictions follow where a zig-zag goes, not the last zig
 	TrendWindow = 0.7,
 	BlockFarGoal = 100, -- carrier farther than this from our mouth: mark his teammate closer to our goal
-	BlockGoalRange = 70, -- carrier within BlockFarGoal and nobody of ours on him: start the block from this far
+	BlockGoalRange = 70,
+	BlockDanger = true, -- AutoBlock near our goal: block only a carrier who has an open shot past our keeper
+	BlockOpenAngle = 5, -- degrees of open mouth (past the keeper) that make him a shooter
+	BlockShotSpeed = 90, -- shot speed assumed before his charge is replicated (st/s) -- carrier within BlockFarGoal and nobody of ours on him: start the block from this far
 	BlockLevelSlack = 8, -- with a teammate on the carrier: mark an enemy at most this much farther from goal than him
 	BlockCoverRadius = 8, -- an enemy with one of ours this close is already marked
 	BlockMarkGap = 4, -- marking: stand this far from him toward the carrier (the pass lane)
@@ -244,7 +247,9 @@ local CFG = {
 	WallHalf = 4, -- half width of the wall for the ambush test until a placed one is measured
 	WallCooldown = 0.7,
 	BallJumpGain = 0.12, -- AutoBall route: a jump is used when it meets the ball this much earlier than a plain run (s)
-	RouteSlideGain = 0.3, -- AutoBall route: a slide replaces the run when it touches the ball this much earlier (or the run loses the race)
+	RouteSlideGain = 0.3,
+	BallContestLate = 0.15, -- AutoBall: losing the ball race by more than this (s) -> run at the enemy's touch point instead
+	BallSlideNeed = 0.35, -- AutoBall slides only when the run beats the first enemy by less than this (s), or nothing else reaches -- AutoBall route: a slide replaces the run when it touches the ball this much earlier (or the run loses the race)
 	BallRamp = 0.2, -- AutoBall: seconds to go from the current speed to full sprint (unmeasured: see "ball track" v= in the log)
 	CounterTackle = true, -- air duel x AutoTackle: the slide (flick wind-up on the ground, from the air at an airborne carrier)
 	GkAutoClear = false,
@@ -8611,9 +8616,19 @@ Mark.vertState = function(model, P, baseY, airborne, now, g)
 	if not airborne and dyNow > 3 then
 		airborne = true -- IsLanded lags a launch by a few frames; 3 studs over our root is not standing
 	end
+	-- IsLanded of ANOTHER player flaps (a step on the ball, a slope, a dodge hop): "in the air" with no rise is not a
+	-- take-off. Log: "duel plan kick ... h -0.0" then "he landed" 26 ms later - we jumped at a man standing on the grass
+	-- and slid from the air (short slide, miss, goal). A take-off is confirmed by the body itself: 0.5 stud over the Y he
+	-- last stood at, or a rising slope. Until then airAt follows the clock, so a real jump is timed from its last frame.
+	if not airborne then
+		yh.gY = P.Y
+	elseif dyNow <= 3 and P.Y - (yh.gY or baseY) < 0.5 and vyT < 6 then
+		airborne = false
+		yh.airAt = now
+	end
 	if airborne then
 		yh.airAt = yh.airAt or now
-	else
+	elseif not (yh.airAt == now) then
 		yh.airAt = nil
 	end
 	local vKind = "ground"
@@ -10678,7 +10693,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v139")
+	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v140")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -11167,13 +11182,14 @@ Mark.duelEnd = function(why)
 end
 
 -- ===== AIR DUEL / LOB overlay ========================================================================================
--- What the script sees and whether it acts. A plumb-line diagram, read by geometry and state colour (Mark.defPalette):
---   steel = SEEN, no contact yet: a plumb line from the target (the airborne man / the lob) to the ground, height ticks
---           every 2 studs, a ripple at its foot;
---   mint  = PLAN: + the FUSE - his / the ball's path from now to the contact, it burns down as the contact nears; the
---           contact ring in the air with its own plumb; OUR path: run to the take-off squircle, the jump arc up to the
---           contact (a straight ground line for a slide / kick without a jump);
+-- THE ZIPPER. An air duel is two arcs that must meet: his (the airborne man / the lob) and ours (run to the take-off,
+-- the jump). Both are drawn as rails hanging a curtain of stitches to the grass every 0.05 s (the stitches make the
+-- arc read in 3D and count the time). Equal-time TIES join his rail to ours every 0.1 s: they shrink to nothing at the
+-- contact - you see the meeting close like a zipper, or see it stay open.
+--   steel = SEEN: his rail only (no contact we can make);
+--   mint  = PLAN: our rail, the ties, the take-off squircle, the contact knot (a small 3D cross) and its ripple;
 --   white = committed (we jumped / pressed).
+-- The future burns down: stitches and ties thin out with their time ahead, the past is not drawn.
 -- One renderer: Mark.duelArt(seg, v, gy, t). Mark.duelSee feeds it from Mark.tickCounterJump and Mark.tickLob.
 Mark.duelSee = function(key, P, o)
 	local v = o or {}
@@ -11188,102 +11204,120 @@ end
 Mark.duelArt = function(seg, v, gy, t)
 	local key = (v.liveUntil and t < v.liveUntil) and "live" or v.key
 	local pal = Mark.defPalette[key]
-	local col = pal[1]
-	local function plumb(top, a)
-		local foot = Vector3.new(top.X, gy, top.Z)
-		if top.Y - gy < 0.6 then
-			return foot
-		end
-		seg(foot, top, COL.Ink, 0.3 * a, 2.6, 39)
-		seg(foot, top, col, 0.75 * a, 1.1, 41)
-		local n = math.min(math.floor((top.Y - gy) / 2), 9)
-		for i = 1, n do
-			local y = gy + i * 2
-			seg(Vector3.new(top.X - 0.35, y, top.Z), Vector3.new(top.X + 0.35, y, top.Z), COL.Paper, 0.55 * a, 1, 41)
-		end
-		return foot
-	end
-	local function ring(c, r, shape, color, a, th)
-		Mark.squircleLut = Mark.squircleLut or {}
-		local lut = Mark.squircleLut[shape] or Mark.squircleLut[2] -- [2] is built by the foot ripple just before
-		if not lut then
-			return
-		end
-		local prev = nil
-		for s = 0, 28, 2 do
-			local p = c + lut[s] * r
-			if prev then
-				seg(prev, p, color, a, th, 42)
-			end
-			prev = p
-		end
-	end
-	local foot = plumb(v.P, 1)
-	Mark.kickRipple(seg, foot, 2.2, pal, Mark.rippleStep("duel-foot", Mark.rippleRates[key]), t, 2)
+	local col, col2 = pal[1], pal[2]
 	local pl = v.plan
-	if not pl then
-		return
-	end
-	local left = math.max(pl.T - (t - v.at), 0)
-	-- the fuse: his / the ball's path, from now to the contact
-	if v.path then
-		local i0 = math.floor((t - v.pathAt) / 0.025) + 1
-		local i1 = math.min(math.floor((t - v.pathAt + left) / 0.025) + 1, #v.path)
-		local prev = nil
-		for i = math.max(i0, 1), i1, 2 do
-			local p = v.path[i]
-			if p.Y - gy < 200 then -- (the lob path is lifted out of reach before its no-touch moment)
-				if prev then
-					seg(prev, p, COL.Ink, 0.3, 3.0, 39)
-					seg(prev, p, pal[2], 0.9, 1.5, 41)
-				end
-				prev = p
-			end
+	local el = t - v.at
+	local T = pl and math.max(pl.T - el, 0) or 1.0
+	-- his position tau seconds from now (the path is sampled every 0.025 s from v.pathAt)
+	local path = v.path
+	local function hisAt(tau)
+		if not path then
+			return nil
 		end
+		local x = (t - (v.pathAt or v.at) + tau) / 0.025 + 1
+		local i = math.clamp(math.floor(x), 1, #path)
+		local j = math.min(i + 1, #path)
+		local p = path[i]:Lerp(path[j], math.clamp(x - i, 0, 1))
+		return (p.Y - gy < 200) and p or nil -- (a lob path is lifted out of reach before its no-touch moment)
 	end
-	-- the contact
-	plumb(pl.E, 0.6)
-	ring(pl.E, 1.5, 4, COL.Ink, 0.35, 3.2)
-	ring(pl.E, 1.5, 4, COL.Paper, 0.95, 1.3)
-	-- our path: ground run to the take-off, then the arc
-	local us = v.us
-	local Q = Vector3.new(pl.Q.X, gy, pl.Q.Z)
-	local Ef = Vector3.new(pl.E.X, gy, pl.E.Z)
-	local function lip(a, b)
-		seg(a, b, COL.Ink, 0.35, 3.2, 39)
-		seg(a, b, col, 0.95, 1.4, 42)
-	end
-	if v.landed then
-		lip(Vector3.new(us.X, gy, us.Z), Q)
-		if type(pl.td) == "number" then
-			ring(Q, 1.6, 4, col, 0.9, 1.6)
-			-- the jump: rises vJ x - g x^2 / 2 from the take-off, drawn up to the contact
-			local dur = math.max(pl.T - pl.td, 0.05)
-			local prev = Q
-			for k = 1, 8 do
-				local x = dur * k / 8
-				local p = Q:Lerp(Ef, k / 8) + Vector3.new(0, math.max(v.vJ * x - 0.5 * v.g * x * x, 0), 0)
-				lip(prev, p)
-				prev = p
+	-- ours: run to the take-off (td), then the jump arc to the contact; airborne: our own arc
+	local ourAt = nil
+	if pl then
+		local us, Q, E = v.us, pl.Q, pl.E
+		if v.landed and type(pl.td) == "number" then
+			local td = math.max(pl.td - el, 0)
+			local Qg = Vector3.new(Q.X, us.Y, Q.Z)
+			ourAt = function(tau)
+				if tau <= td then
+					return us:Lerp(Qg, td > 1e-3 and tau / td or 1)
+				end
+				local x, dur = tau - td, math.max(T - td, 0.05)
+				local p = Qg:Lerp(Vector3.new(E.X, us.Y, E.Z), math.clamp(x / dur, 0, 1))
+				return p + Vector3.new(0, math.max(v.vJ * x - 0.5 * v.g * x * x, 0), 0)
+			end
+		elseif v.landed then
+			ourAt = function(tau)
+				return us:Lerp(Vector3.new(E.X, us.Y, E.Z), T > 1e-3 and math.clamp(tau / T, 0, 1) or 1)
 			end
 		else
-			lip(Q, Ef)
+			local floor = v.floorY or gy + 3
+			ourAt = function(tau)
+				local p = us:Lerp(Vector3.new(E.X, us.Y, E.Z), T > 1e-3 and math.clamp(tau / T, 0, 1) or 1)
+				return Vector3.new(p.X, math.max(us.Y + v.vy * tau - 0.5 * v.g * tau * tau, floor), p.Z)
+			end
 		end
-	else
-		-- airborne: our own arc from here
-		local prev = us
-		local base = us.Y - gy
-		for k = 1, 8 do
-			local x = left * k / 8
-			local p = Vector3.new(us.X, gy, us.Z):Lerp(Ef, k / 8) + Vector3.new(0, math.max(base + v.vy * x - 0.5 * v.g * x * x, 0), 0)
-			lip(prev, p)
+	end
+	local H = pl and T or 1.0
+	-- a rail: ink bed + coloured line, the curtain of stitches down to the grass, thinning with time ahead
+	local function rail(at, c, w, a)
+		local prev = nil
+		local tau = 0
+		while tau <= H + 1e-6 do
+			local p = at(tau)
+			if p then
+				if prev then
+					seg(prev, p, COL.Ink, 0.35 * a, w + 2, 39)
+					seg(prev, p, c, a, w, 42)
+				end
+				if p.Y - gy > 0.8 then
+					local fade = 1 - 0.65 * (tau / math.max(H, 0.1))
+					seg(Vector3.new(p.X, gy + 0.05, p.Z), p, c, 0.5 * a * fade, 1, 40)
+				end
+			end
+			prev = p
+			tau += 0.05
+		end
+	end
+	rail(hisAt, pl and COL.Paper or col, pl and 1.3 or 1.6, pl and 0.85 or 0.9)
+	if not pl then
+		local P = v.P
+		Mark.kickRipple(seg, Vector3.new(P.X, gy, P.Z), 2.2, pal, Mark.rippleStep("duel-foot", Mark.rippleRates[key]), t, 2)
+		return
+	end
+	rail(ourAt, col, 1.8, 1)
+	-- the zipper: ties at equal time, every 0.1 s up to the contact
+	local tau = 0.1
+	while tau < T - 0.02 do
+		local h, o = hisAt(tau), ourAt(tau)
+		if h and o then
+			local a = 0.35 + 0.55 * (1 - tau / math.max(T, 0.1))
+			seg(h, o, COL.Ink, 0.3 * a, 2.6, 39)
+			seg(h, o, col2, a, 1.1, 41)
+		end
+		tau += 0.1
+	end
+	-- the contact knot: a 3D cross at E (three axes), its plumb and ripple on the grass
+	local E = pl.E
+	local kr = 1.1 + 0.6 * math.clamp(T / 0.6, 0, 1) -- tightens as the contact comes
+	for _, ax in { Vector3.new(kr, 0, 0), Vector3.new(0, kr, 0), Vector3.new(0, 0, kr) } do
+		seg(E - ax, E + ax, COL.Ink, 0.45, 4, 39)
+		seg(E - ax, E + ax, COL.Paper, 1, 1.8, 43)
+	end
+	local Eg = Vector3.new(E.X, gy, E.Z)
+	if E.Y - gy > 1 then
+		seg(Eg, E, col, 0.6, 1, 40)
+	end
+	Mark.kickRipple(seg, Eg, 2.2, pal, Mark.rippleStep("duel-foot", Mark.rippleRates[key]), t, 2)
+	-- the take-off: a still squircle (n = 4) where we leave the grass, tighter as the take-off comes
+	if v.landed and type(pl.td) == "number" then
+		local Qg = Vector3.new(pl.Q.X, gy + 0.05, pl.Q.Z)
+		local r = 0.9 + 0.8 * math.clamp((pl.td - el) / 0.5, 0, 1)
+		local prev = nil
+		for s = 0, 16 do
+			local a = s / 16 * math.pi * 2
+			local c, sn = math.cos(a), math.sin(a)
+			local p = Qg + Vector3.new(math.sign(c) * math.sqrt(math.abs(c)), 0, math.sign(sn) * math.sqrt(math.abs(sn))) * r
+			if prev then
+				seg(prev, p, COL.Ink, 0.4, 3.4, 39)
+				seg(prev, p, col, 1, 1.5, 42)
+			end
 			prev = p
 		end
 	end
 end
 
 Mark.drawDuel = function(gy)
-	Mark.duelLines = Mark.duelLines or makeLines(260, 1.4, 41)
+	Mark.duelLines = Mark.duelLines or makeLines(340, 1.4, 41)
 	Mark.duelPool = Mark.duelPool or Mark.segPool(Mark.duelLines)
 	local v = Mark.duelViz
 	local now = os.clock()
@@ -11443,7 +11477,7 @@ Mark.tickLob = function(character, root)
 	end
 	local ballP = Renderer.GetPosition() or root.Position
 	if not plan then
-		Mark.duelSee("safe", ballP)
+		Mark.duelSee("safe", ballP, Mark.lobMemo and { path = Mark.lobMemo.path, pathAt = Mark.lobMemo.at } or nil)
 		if Mark.lobPlan and now - Mark.lobPlan.seen > 0.2 then
 			Mark.lobEnd("no contact")
 		end
@@ -11451,7 +11485,7 @@ Mark.tickLob = function(character, root)
 	end
 	Mark.duelSee("armed", ballP, {
 		plan = plan, path = Mark.lobMemo and Mark.lobMemo.path, pathAt = Mark.lobMemo and Mark.lobMemo.at or now,
-		us = root.Position, landed = landed, vy = root.AssemblyLinearVelocity.Y, vJ = math.sqrt(2 * g * (Mark.jumpH or 7.2)), g = g,
+		us = root.Position, landed = landed, floorY = Mark.duelFloor, vy = root.AssemblyLinearVelocity.Y, vJ = math.sqrt(2 * g * (Mark.jumpH or 7.2)), g = g,
 	})
 	Mark.lobPlan = Mark.lobPlan or { at = now }
 	Mark.lobPlan.kind, Mark.lobPlan.seen = plan.kind, now
@@ -11609,7 +11643,8 @@ Mark.tickCounterJump = function(character, root)
 		return -- a grounded carrier is AutoTackle / AutoKick / AutoBlock work
 	end
 	local function skip(why)
-		Mark.duelSee("safe", P)
+		local dmS = Mark.duelMemo
+		Mark.duelSee("safe", P, dmS and dmS.model == model and now - dmS.at < 0.1 and { path = dmS.path, pathAt = dmS.at } or nil)
 		if not Mark.duelSkipLog or now - Mark.duelSkipLog > 0.4 then
 			Mark.duelSkipLog = now
 			logFile("duel skip", why, actorName(actor), "d", string.format("%.1f", flat(P - root.Position).Magnitude), "h", string.format("%.1f", P.Y - floor), "vk", vs.kind, "vy", string.format("%.1f", vs.vy))
@@ -11710,7 +11745,7 @@ Mark.tickCounterJump = function(character, root)
 	Mark.duel.seen = now
 	Mark.duelSee("armed", P, {
 		plan = plan, path = Mark.duelMemo and Mark.duelMemo.path, pathAt = Mark.duelMemo and Mark.duelMemo.at or now,
-		us = root.Position, landed = landed, vy = root.AssemblyLinearVelocity.Y, vJ = math.sqrt(2 * g * (Mark.jumpH or 7.2)), g = g,
+		us = root.Position, landed = landed, floorY = Mark.duelFloor, vy = root.AssemblyLinearVelocity.Y, vJ = math.sqrt(2 * g * (Mark.jumpH or 7.2)), g = g,
 	})
 	-- move: to where we press, facing him (the agent; air control steers too)
 	if CFG.CounterMove ~= false then
@@ -11790,7 +11825,7 @@ end
 --           carrier -> receiver: the one nearest the receiver that we reach before the ball (pass speed + wind-up) by a
 --           margin, else the one we get closest to. Pick has hysteresis so two receivers do not flip it every frame.
 -- nil = the old carrier block.
-Mark.blockChoose = function(root, carrier, cr, P, V, g)
+Mark.blockChoose = function(root, carrier, cr, P, V, g, danger)
 	if CFG.BlockSmart == false then
 		return nil
 	end
@@ -11810,7 +11845,9 @@ Mark.blockChoose = function(root, carrier, cr, P, V, g)
 			behind = flat(root.Position - P):Dot(eg0) < -3 and flat(V):Dot(eg0) > 3
 		end
 	end
-	local passer = far or behind or (dC > 40 and width < (CFG.BlockShotAngle or 9))
+	-- near our goal the mouth he has past our keeper decides (Mark.shotOpen): closed = no shot, he passes
+	local closedNear = danger ~= nil and not danger.on and dC <= 40
+	local passer = far or behind or closedNear or (dC > 40 and width < (CFG.BlockShotAngle or 9))
 	local comp = nil
 	if not passer and CFG.BlockCompetitor ~= false and not Mark.atHomeGoal(root, P) then
 		comp = Mark.mateNear(P, CFG.CompetitorRadius or 12)
@@ -11853,7 +11890,7 @@ Mark.blockChoose = function(root, carrier, cr, P, V, g)
 						val = 3 - (dG + flat(pos - root.Position).Magnitude * 0.3 + ang * 0.15) / 30
 					end
 					if not best or val > best.val then
-						best = { kind = "mark", actor = actor, model = model, root = r, pos = pos, dG = dG, dC = dC, val = val, ang = ang, L = L, covered = covered, passer = passer, width = width, why = passer and (far and "far" or "wide") or "mate", comp = comp, mouth = mouth, P = P, V = V }
+						best = { kind = "mark", actor = actor, model = model, root = r, pos = pos, dG = dG, dC = dC, val = val, ang = ang, L = L, covered = covered, passer = passer, width = width, why = passer and (far and "far" or closedNear and "closed" or "wide") or "mate", comp = comp, mouth = mouth, P = P, V = V }
 					end
 				end
 			end
@@ -12155,6 +12192,62 @@ end
 
 -- Coverage cone: the ball can go anywhere between the posts, so the body must sit on the bisector of the lines to both
 -- posts, no deeper than where its width (Receive box + ball radius) still spans the whole cone. Returns bisector, depth.
+
+-- How much of OUR mouth a shot from P really has: rays from P to 17 points across the mouth; a ray is closed when our
+-- keeper (or a teammate standing in it) gets to it before the ball. Keeper reach along a ray = SaveReachStuds + the dive
+-- travel (GoalkeeperDive: 20 st, cubic-out over 0.875 s) in the ball's flight time to the closest point, after 0.25 s of
+-- reaction (a human keeper; the dive itself is not free either). Shot speed: the replicated charge's (Mark.chargeShot), else CFG.BlockShotSpeed. From a tight angle near the
+-- post the keeper closes the whole mouth (open 0): no shot - the pass is the danger. Centre: open sides on both posts.
+-- { open = deg, width = deg, bis = unit to the middle of the open part (nil when none), dist, keeper = bool }
+Mark.shotOpen = function(P, g, uid)
+	local lb, _, rb = goalMouthCorners(g)
+	if not (lb and rb) then
+		return nil
+	end
+	local cs = uid and Mark.charges and Mark.charges[uid] and Mark.charges[uid].live and Mark.chargeShot(uid)
+	local spd = (cs and cs.speed and cs.speed > 20) and cs.speed or (CFG.BlockShotSpeed or 90)
+	local Pf = Vector3.new(P.X, 0, P.Z)
+	local keepers = {}
+	Mark.gkDiveMod = Mark.gkDiveMod or require(Modules.Actions.GoalkeeperDive)
+	local DC = Mark.gkDiveMod.Constants
+	for _, model in Mark.models() do
+		local actor = Actors.GetFromCharacter(model)
+		if actor and sameTeam(actor) and isGoalkeeper(actor) and not Mark.mateDown(actor, model) then
+			local r = ActorTargeting.GetActorRoot(actor)
+			if r then
+				keepers[#keepers + 1] = Vector3.new(r.Position.X, 0, r.Position.Z)
+			end
+		end
+	end
+	local N, open, sum = 17, 0, Vector3.zero
+	local a1, a2 = unitOrNil(flat(lb - P)), unitOrNil(flat(rb - P))
+	local width = (a1 and a2) and math.deg(math.acos(math.clamp(a1:Dot(a2), -1, 1))) or 0
+	for k = 0, N - 1 do
+		local m = lb:Lerp(rb, (k + 0.5) / N)
+		local seg = Vector3.new(m.X, 0, m.Z) - Pf
+		local L = seg.Magnitude
+		local closed = false
+		if L > 1e-3 then
+			local u = seg / L
+			for _, K in keepers do
+				local s = math.clamp((K - Pf):Dot(u), 0, L)
+				local off = (Pf + u * s - K).Magnitude
+				local e = math.clamp((s / spd - 0.25) / DC.DurationSeconds, 0, 1)
+				if off <= DC.SaveReachStuds + 1 + DC.Distance * (1 - (1 - e) ^ 3) then
+					closed = true
+					break
+				end
+			end
+			if not closed then
+				open += 1
+				sum += u
+			end
+		end
+	end
+	local mouth = (lb + rb) * 0.5
+	return { open = width * open / N, width = width, bis = open > 0 and unitOrNil(sum) or nil, dist = flat(mouth - P).Magnitude, keeper = #keepers > 0, mouth = mouth, n = open }
+end
+
 Mark.blockCone = function(Pt, g)
 	local lb, _, rb = goalMouthCorners(g)
 	if not (lb and rb) then
@@ -12240,7 +12333,35 @@ Mark.tickBlock = function(character, root)
 	end
 	local u = eg.Unit
 	local along = rel:Dot(u)
-	local pick = Mark.blockChoose(root, carrier, cr, P, V, g)
+	-- DANGER near our goal (Mark.shotOpen): the mouth he really has past our keeper. Open -> he is blocked, from behind
+	-- too (cut him off), and a teammate near him is no reason to stand aside unless one stands IN the open lane.
+	-- Closed (tight angle, the keeper has it) -> no shot: the pass solver takes his receiver, the carrier block is the
+	-- fallback. Far from goal the old logic stands.
+	local danger = nil
+	if CFG.BlockDanger ~= false then
+		local so = Mark.shotOpen(P, g, carrier.UserId)
+		if so and so.dist <= (CFG.BlockGoalRange or 70) then
+			so.on = so.open >= (CFG.BlockOpenAngle or 5)
+			danger = so
+			local key = (so.on and "open" or "closed") .. tostring(carrier.UserId)
+			if Mark.dangerKey ~= key or os.clock() - (Mark.dangerLog or 0) > 1 then
+				Mark.dangerKey, Mark.dangerLog = key, os.clock()
+				logFile("block danger", so.on and "OPEN" or "closed", actorName(carrier), "open", string.format("%.1f", so.open), "of", string.format("%.1f", so.width), "goal d", string.format("%.1f", so.dist), "keeper", tostring(so.keeper))
+			end
+		end
+	end
+	Mark.blockDanger = danger
+	local pick
+	if danger and danger.on then
+		pick = { kind = "carrier", dC = danger.dist, width = danger.width, danger = danger, mouth = danger.mouth }
+		local eg0 = unitOrNil(flat(danger.mouth - P))
+		if CFG.BlockBehindLogic ~= false and eg0 and flat(root.Position - P):Dot(eg0) < -3 and flat(V):Dot(eg0) > 3
+			and Mark.blockCutTick(character, root, pick, P, V, chE, cr) then
+			return
+		end
+	else
+		pick = Mark.blockChoose(root, carrier, cr, P, V, g, danger)
+	end
 	if pick and pick.kind == "mark" then
 		Mark.blockMarkTick(character, root, pick, P)
 		return
@@ -12251,7 +12372,7 @@ Mark.tickBlock = function(character, root)
 	local active = Mark.move.mode == "block"
 	local goalSide = along > -1
 	local range = goalSide and ((CFG.BlockRange or 28) + (active and 6 or 0)) or ((CFG.BlockBehind or 14) + (active and 4 or 0))
-	if pick and pick.kind == "carrier" and goalSide then
+	if pick and pick.kind == "carrier" and (goalSide or pick.danger) then
 		range = math.max(range, (CFG.BlockGoalRange or 70) + (active and 6 or 0))
 	end
 	if dist > range then
@@ -12262,11 +12383,25 @@ Mark.tickBlock = function(character, root)
 		Mark.blockSkip(goalSide and "far" or "behind", string.format("dist %.1f range %.1f along %.1f", dist, range, along))
 		return
 	end
+	local dangerOn = pick and pick.danger ~= nil
 	for _, model in Mark.models() do
 		local actor = Actors.GetFromCharacter(model)
 		if CFG.BlockCompetitor ~= false and not Mark.atHomeGoal(root, P) and actor and actor ~= LocalPlayer and sameTeam(actor) and not isGoalkeeper(actor) and not Mark.mateDown(actor, model) then
 			local ar = ActorTargeting.GetActorRoot(actor)
-			if ar then
+			if ar and dangerOn then
+				-- an open shot: only a mate standing IN the open lane (goal side of him, within 3 studs of it) owns it
+				local bis = pick.danger.bis
+				local rM = flat(ar.Position - P)
+				local s = bis and rM:Dot(bis) or -1
+				if s > 1 and (rM - bis * s).Magnitude <= 3 then
+					if active then
+						logFile("block stop", "mate in lane", actorName(actor), string.format("%.1f", s))
+						Mark.moveStop("block")
+					end
+					Mark.blockSkip("mate in lane", actorName(actor))
+					return
+				end
+			elseif ar then
 				-- CompetitorCheck: a teammate (keeper excluded above) already within CompetitorRadius of the carrier owns
 				-- this duel; we only take carriers nobody is on. A stunned / ragdolled / frozen mate owns nothing
 				-- (Mark.mateDown), and one who is about to get up is not counted either while he is also behind us
@@ -12337,10 +12472,11 @@ Mark.tickBlock = function(character, root)
 	-- put the spot 35 studs away along his velocity and, running AWAY from our goal, past his own back: we ran through
 	-- him to get there.
 	local Vc = V.Magnitude > 30 and V.Unit * 30 or V
+	local openBis = pick and pick.danger and pick.danger.bis
 	local function spotAt(t)
 		local Pt = P + Vc * math.min(t + lag, 0.5)
 		local bis, cover = Mark.blockCone(Pt, g)
-		return Pt, shotLine or bis or unitOrNil(flat(g.Position - Pt)) or u, cover
+		return Pt, shotLine or openBis or bis or unitOrNil(flat(g.Position - Pt)) or u, cover
 	end
 	local lead = 0.1
 	for _ = 1, 4 do
@@ -15624,12 +15760,27 @@ Mark.routePlan = function(c)
 			tp += 0.05
 		end
 	end
+	-- The slide costs 3 s of cooldown and the ball after it is a scramble: it is spent when it WINS something - no run
+	-- reaches the ball, the race is tight (run margin under BallSlideNeed against the first foe) or the ball is going
+	-- into our goal (c.urgent). An uncontested ball is run to (log: a 90 st/s ball, run margin 0.74, slide by the body
+	-- with 3 hits picked for being 0.3 s earlier - MISS by 6 studs).
 	local pick = run
 	if slide then
 		local runMargin = run and (foeFirst - run.t) or -math.huge
 		local slideMargin = foeFirst - slide.tc
-		if not run or slide.tc < run.t - (CFG.RouteSlideGain or 0.3) or (runMargin < 0.15 and slideMargin > runMargin + 0.05) then
+		local need = c.urgent or runMargin < (CFG.BallSlideNeed or 0.35)
+		if not run or (need and (slide.tc < run.t - (CFG.RouteSlideGain or 0.3) or slideMargin > runMargin + 0.05)) then
 			pick = slide
+		end
+	end
+	-- CONTEST: the race is lost by more than BallContestLate (the foe's reaction is not modelled, a small loss can still be
+	-- won). Chasing the ball to OUR earliest sample then leaves us past him when he touches it. Run at HIS touch point
+	-- instead: when he receives, we are on him (AutoTackle / AutoKick take it from there). Not for a ball going into
+	-- our goal (c.urgent): there every touch on the path counts.
+	if pick and not c.urgent and foeFirst < math.huge and foeFirst - pick.t < -(CFG.BallContestLate or 0.15) then
+		local fp = ballAt(foeFirst)
+		if fp then
+			pick = { kind = "contest", p = fp, t = foeFirst, way = fp, tUs = arriveT(fp, c.half), lost = pick.t - foeFirst }
 		end
 	end
 	if not pick then
@@ -16026,7 +16177,7 @@ Mark.tickBall = function(character, root)
 	plan = Mark.routePlan({
 		O = root.Position, v0 = flat(root.AssemblyLinearVelocity), spd = spd, samples = samples, ts = ts, rest = rest, foes = foes,
 		half = receiveHalf, recvLo = recvLo, recvHi = recvHi, jumpH = jumpH, ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25),
-		slideReady = readyB, mLo = mLoB, mHi = mHiB,
+		slideReady = readyB, mLo = mLoB, mHi = mHiB, urgent = threat ~= nil,
 		g = Workspace.Gravity, vJ = math.sqrt(2 * Workspace.Gravity * jumpH), air = airB, vy = root.AssemblyLinearVelocity.Y,
 		floorY = airB and (Mark.duelFloor or root.Position.Y) or root.Position.Y,
 		airLo = HitboxSettings.AirReceive.CFrameOffset.Y - HitboxSettings.AirReceive.Size.Y * 0.5,
@@ -16084,6 +16235,14 @@ Mark.tickBall = function(character, root)
 				logFile("block goal", "best effort", "late", string.format("%.2f", bestL), "t", string.format("%.2f", bestT))
 			end
 		end
+	end
+	-- a plan that drops out for a frame (a bounce, a sample at the edge of the band) keeps its aim for 0.15 s: it used
+	-- to stop and restart the chase ("ball stop no aim" then "ball start" 0.1 s later)
+	if aimP then
+		Mark.ballAimKeep = { p = aimP, t = steerT, how = how, way = wayP, at = os.clock() }
+	elseif Mark.ballAimKeep and os.clock() - Mark.ballAimKeep.at < 0.15 and Mark.move.mode == "ball" then
+		local k = Mark.ballAimKeep
+		aimP, steerT, how, wayP = k.p, k.t and math.max(k.t - (os.clock() - k.at), 0), k.how, k.way
 	end
 	if not aimP then
 		Mark.ballStop("no aim")
@@ -20001,6 +20160,7 @@ return function(_Lib, _Core)
 			tog(b, "Slide Block", "BlockSlide")
 			tog(b, "Defend Goal", "BlockGoal", "Blocks a ball flying into our goal with the body: run, jump or slide into its path.")
 			tog(b, "Pass Solver", "BlockSmart", "If he cannot score, cuts the pass to his teammate.")
+			tog(b, "Shot Danger", "BlockDanger", "Near our goal: blocks him when he has an open shot past our keeper, from any side.")
 			tog(b, "Show Marking", "DrawBlock", "The pass lane and where you cut it.")
 			tog(b, "Behind Logic", "BlockBehindLogic", "Behind the carrier: take the next attacker, else cut him off.")
 			advanced(b, "Block", function()
@@ -20009,6 +20169,8 @@ return function(_Lib, _Core)
 				sld(b, "Near Goal Range", "BlockGoalRange", 30, 120, { suffix = " st" })
 				sld(b, "Mark Gap", "BlockMarkGap", 2, 10, { prec = 1, suffix = " st" })
 				sld(b, "No-Shot Angle", "BlockShotAngle", 3, 25, { suffix = "°" })
+				sld(b, "Open Goal Angle", "BlockOpenAngle", 1, 20, { suffix = "°", text = "How much open goal past our keeper makes him a shooter." })
+				sld(b, "Shot Speed", "BlockShotSpeed", 50, 150, { suffix = " st/s", text = "Shot speed assumed before his charge is seen." })
 				sld(b, "Pass Speed", "BlockPassSpeed", 40, 140, { suffix = " st/s" })
 				sld(b, "Cut Margin", "BlockInterceptMargin", 0, 0.8, { prec = 2, suffix = " s" })
 				sld(b, "Marked Radius", "BlockCoverRadius", 3, 16, { suffix = " st" })
@@ -20073,7 +20235,7 @@ return function(_Lib, _Core)
 			head(c, "CounterJump")
 			feature(c, "CounterJump", "CounterJump")
 			note(c, "Catches an enemy in the air (bicycle, jump with the ball) with a jump + slide or kick.")
-			tog(c, "Show Plan", "DrawDuel", "The target, where you meet it and your jump. Steel = seen, mint = going, white = committed.")
+			tog(c, "Show Plan", "DrawDuel", "His arc and yours, tied at equal time: the ties close where you meet. Steel = out of reach, mint = going, white = committed.")
 			tog(c, "Move To Him", "CounterMove", "Runs you to the take-off point.")
 			tog(c, "Counter Tackle", "CounterTackle", "Slides him: from the air, or before his flick lets go.")
 			tog(c, "Competitor Check", "CounterCompetitor", "Stops when a teammate is already on him.")
