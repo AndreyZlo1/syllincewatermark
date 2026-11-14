@@ -3287,6 +3287,16 @@ tryTackle = function(character, root, dir, mult, target, skipHazard)
 	if SlideTackle.IsRepeatBlocked(character, false) then
 		return false, "repeat"
 	end
+	-- the two checks of SlideTackleInput.HandleInputBegan this function did not mirror: we hold the ball (u6 == our id) and
+	-- Sprint.SpendStamina(StaminaCost). Log 7125.15: walk speed 7.2 = no stamina, "tackle reject game-reject" EVERY frame, and
+	-- each of them stopped the ball chase below.
+	if liveOwnerId() == LocalPlayer.UserId then
+		return false, "own ball"
+	end
+	Mark.sprint = Mark.sprint or require(Client.Gameplay.Player.Sprint)
+	if Mark.sprint.CanSpendStamina(SlideTackle.Constants.StaminaCost, true) == false then
+		return false, "stamina"
+	end
 	if not dir then
 		return false, "dir"
 	end
@@ -3337,9 +3347,6 @@ tryTackle = function(character, root, dir, mult, target, skipHazard)
 			return false, "blast"
 		end
 	end
-	if Mark.moveStop then
-		Mark.moveStop()
-	end
 	Mark.yieldKick()
 	local hi = math.max(0.4, CFG.TackleSpeed)
 	local mul = (type(mult) == "number") and math.clamp(mult, math.min(hi, CFG.TackleMinSpeed or 0.6), hi) or hi
@@ -3351,6 +3358,12 @@ tryTackle = function(character, root, dir, mult, target, skipHazard)
 	SlideTackle.SetSpeedMultiplier(CFG.TackleSpeed)
 	if ClientSlide.IsSlideTackling() then
 		lastTackleAt = os.clock()
+		-- the slide took the body: the chase / block order ends NOW, not before the game had accepted the input (a rejected
+		-- slide used to drop the chase every frame)
+		if Mark.moveStop then
+			Mark.moveStop()
+		end
+		origSetMove(character, dir, dir, true)
 		Mark.slideTrack = { at = os.clock(), O = root.Position, dir = dir, m = mul, tag = (type(target) == "table" and target.char) and "carrier" or "ball" }
 		Mark.slideHome = (type(target) == "table" and target.char) and {
 			at = os.clock(),
@@ -9270,6 +9283,50 @@ Mark.drawGk = function(gy)
 end
 
 -- closest approach + his state ~1 s after a press (calibration of PressReach / the stun rule)
+-- Outcome of every keeper dive (the log had only "gk dive ok" and nothing after it, so a miss could not be told from a save):
+-- closest approach of the ball to our body during the dive window, who has it 1.1 s after, and whether it crossed our mouth.
+Mark.gkDiveWatch = function(root)
+	local r = Mark.gkDiveRec
+	if not r then
+		return
+	end
+	local now = os.clock()
+	local ball = Renderer.GetPosition()
+	if typeof(ball) == "Vector3" then
+		local d = (ball - root.Position).Magnitude
+		if d < r.minD then
+			r.minD, r.minAt = d, now - r.at
+		end
+		if not r.goal then
+			local g = Mark.defendGoal()
+			local lb, rb = nil, nil
+			if g then
+				lb, _, rb = goalMouthCorners(g)
+			end
+			if lb and rb then
+				local mouth = (lb + rb) * 0.5
+				local sideV = unitOrNil(flat(rb - lb))
+				if sideV then
+					local out = Vector3.new(-sideV.Z, 0, sideV.X)
+					if flat(root.Position - mouth):Dot(out) < 0 then
+						out = -out
+					end
+					-- out points into the field: the ball behind the mouth plane and inside the posts = in
+					local rel = flat(ball - mouth)
+					if rel:Dot(out) < -0.5 and math.abs(rel:Dot(sideV)) < flat(rb - lb).Magnitude * 0.5 then
+						r.goal = now - r.at
+					end
+				end
+			end
+		end
+	end
+	if now - r.at >= 1.1 then
+		Mark.gkDiveRec = nil
+		local o = liveOwnerId()
+		logFile("gk dive result", r.name, "closest", string.format("%.1f", r.minD), "at", string.format("%.2f", r.minAt or -1), "goal", r.goal and string.format("%.2f", r.goal) or "no", "owner", o == LocalPlayer.UserId and "us" or (type(o) == "number" and o ~= 0 and "enemy/other" or "free"), "eta", string.format("%.2f", r.eta))
+	end
+end
+
 Mark.gkPressWatch = function(root)
 	local rec = Mark.gkPressRec
 	if not rec then
@@ -9943,6 +10000,7 @@ Mark.tickGk = function(character, root)
 	end
 
 	Mark.gkPressWatch(root)
+	Mark.gkDiveWatch(root)
 	-- walk / jump plans flip frame to frame on noisy h (log: jump, walk, jump, walk...), so neither the jump press
 	-- nor the "no movement plan -> dive" test held for two frames. Keep the last movement plan for 0.2 s and the jump
 	-- press time for 0.25 s.
@@ -10017,6 +10075,9 @@ Mark.tickGk = function(character, root)
 					Mark.gkDiveAim = nil
 				end
 				TurnControl.ReleaseAutoRotate("Goalkeeper")
+			end
+			if ok then
+				Mark.gkDiveRec = { at = os.clock(), name = hit.name, minD = math.huge, eta = crossT or -1 }
 			end
 			logFile("gk dive", ok and "ok" or "no", "model", hit.own and "own" or "assist", "choice", hit.name, "miss", string.format("%.2f", hit.miss), "t", string.format("%.2f", hit.t or -1), "assist", tostring(hit.assisted), "eta", string.format("%.2f", crossT or -1), "dir", fmtV(hit.wd))
 		elseif not Mark.gkNoDiveLog or now - Mark.gkNoDiveLog > 0.3 then
@@ -10868,7 +10929,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v143")
+	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v144")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
