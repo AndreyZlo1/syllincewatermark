@@ -129,10 +129,9 @@ local CFG = {
 	AutoBall = true,
 	BlockRange = 40,
 	BlockBehind = 22,
-	NearGoal = 100, -- "near the goal" in studs: the zone the goal-side rules below use (this field is large)
-	TackleGoalZone = 100,
+	TackleGoalZone = 40,
 	CompetitorRadius = 12,
-	CompetitorGoalZone = 100, -- AutoBlock / AutoBall: ball and we both this close to OUR goal -> Competitor Check is ignored (0 = always apply)
+	CompetitorGoalZone = 45, -- AutoBlock / AutoBall: ball and we both this close to OUR goal -> Competitor Check is ignored (0 = always apply)
 	CounterJump = true,
 	ShootMaxDist = 160,
 	-- Perf probe: on in the raw file (testers send the perf lines), OFF in an obfuscated build (LPH_OBFUSCATED folds to true
@@ -194,7 +193,7 @@ local CFG = {
 	PressVert = 4, -- vertical contact window
 	ChargeTackleRange = 10, -- slide at a kick-charging carrier / his shot line only within this many studs of him
 	KillerGuard = true, -- ball near OUR goal and we are close to it: slide the enemy nearest to the ball first, keep chasing
-	KillerGuardGoal = 100, -- ball this close to our goal (studs)
+	KillerGuardGoal = 55, -- ball this close to our goal (studs)
 	KillerGuardNear = 22, -- we are this close to the ball
 	KillerGuardFoe = 40, -- the enemy must be this close to the ball
 	CandidateKiller = true, -- AutoBall x AutoTackle: slide an enemy who runs for the same loose ball (stun him, and the slide is faster than a run)
@@ -225,7 +224,7 @@ local CFG = {
 	TrendVel = true, -- long predictions follow where a zig-zag goes, not the last zig
 	TrendWindow = 0.7,
 	BlockFarGoal = 100, -- carrier farther than this from our mouth: mark his teammate closer to our goal
-	BlockGoalRange = 100,
+	BlockGoalRange = 70,
 	BlockDanger = true, -- AutoBlock near our goal: block only a carrier who has an open shot past our keeper
 	BlockOpenAngle = 5, -- degrees of open mouth (past the keeper) that make him a shooter
 	BlockShotSpeed = 90, -- shot speed assumed before his charge is replicated (st/s) -- carrier within BlockFarGoal and nobody of ours on him: start the block from this far
@@ -270,7 +269,7 @@ local CFG = {
 	HazPassMargin = 0.1, -- same before a blast
 	HazPassSlack = 2, -- with the ball, a blast we escape by less than this (studs) still passes the ball first
 	DrawHazard = true, -- enemy blast zones on the ground (grenade hop path, bazooka impact, hammer slam)
-	BallJumpGain = 0.12, -- AutoBall route: a jump is used when it meets the ball this much earlier than a plain run (s)
+	BallJumpGain = 0.3, -- AutoBall: a jump is used only when it meets the ball this much earlier than standing / a plain run (s); 0.12 = the old rule
 	RouteSlideGain = 0.3,
 	BallContestLate = 0.15, -- AutoBall: losing the ball race by more than this (s) -> run at the enemy's touch point instead
 	BallSlideNeed = 0.35, -- AutoBall slides only when the run beats the first enemy by less than this (s), or nothing else reaches -- AutoBall route: a slide replaces the run when it touches the ball this much earlier (or the run loses the race)
@@ -282,7 +281,7 @@ local CFG = {
 	PassManualNear = 16, -- a teammate closer than this is only chosen when nobody farther is passable
 	PassShow = true, -- lime trajectory + brackets on the selected teammate
 	PassFov = 9, -- new lock: crosshair within this many degrees of his chest
-	PassNearGoal = 100, -- within this many studs of their goal (ball or target) the pass goes ON the teammate, not ahead of him (0 = off)
+	PassNearGoal = 80, -- within this many studs of their goal (ball or target) the pass goes ON the teammate, not ahead of him (0 = off)
 	PassNearLead = 3, -- ... the lead is capped at this many studs there
 	PassGoalLead = 34, -- the predicted receive point never gets closer than this to the enemy goal (the keeper takes it there)
 	PassKeeperRadius = 14, -- keeper this close to the landing point -> contested
@@ -293,7 +292,7 @@ local CFG = {
 	PassToKeeper = false,
 	PassGoalBias = 0.3, -- the receive point leads along his speed turned this share toward their goal (0 = straight extrapolation)
 	PassCross = true, -- a mate in the box area: the lob is aimed to where he catches it in a jump
-	PassCrossZone = 100, -- cross when he is this close to their goal (and farther than PassCrossMin) ...
+	PassCrossZone = 60, -- cross when he is this close to their goal (and farther than PassCrossMin) ...
 	PassCrossMin = 12,
 	PassCrossAhead = 2, -- ... and the ball ends this many studs beyond him toward the goal
 	PassCrossJump = 0.6, -- catch height as a share of the jump (0 = standing receive height)
@@ -344,6 +343,7 @@ local CFG = {
 	SilentFov = 140,
 	FreezeRadius = 8, -- freeze gun blast radius on the ground (not in the dump; `silent area freeze` logs who froze at what distance) -- px radius around the gun reticle
 	AerialJumpLead = 0.3, -- jump when arrival <= this: the whole ~0.27 s rise sits inside the 0.4 s volley window
+	CounterAirSlide = 11, -- CounterJump: longest slide from the air at a raised target (st)
 	GkDiveLate = 0.07, -- dive only when a dive started this much later would miss (s)
 	GkWalkSlack = 0.12, -- humanoid accel/turn before full WalkSpeed (not from dump)
 	GkReactSeconds = 0.15, -- keeper reaction after release; he sees GoalCrossingPreview (not from dump)
@@ -11491,7 +11491,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v164")
+	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v165")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -16498,7 +16498,7 @@ Mark.akTry = function(tag, model, r, urgent)
 	local goal = Mark.defendGoal()
 	if ball and goal and flat(ball - r.Position).Magnitude < 7 then
 		local own = unitOrNil(flat(goal.Position - root.Position))
-		if own and own:Dot(plan.aim) > 0.5 and flat(goal.Position - root.Position).Magnitude < (CFG.NearGoal or 100) then
+		if own and own:Dot(plan.aim) > 0.5 and flat(goal.Position - root.Position).Magnitude < 70 then
 			Mark.akApproach = nil
 			return false, "ownside"
 		end
@@ -22278,7 +22278,9 @@ return function(_Lib, _Core)
 			sld(b, "Max Distance To Goal", "BounceFakeRange", 30, 160, { suffix = " st" })
 			advanced(b, "BounceFake", function()
 				sld(b, "Run Allowance", "BounceFakeRun", 4, 24, { suffix = " st", text = "How far you may run for the returning ball." })
+				sld(b, "Return Slack", "BounceFakeSlack", 0.5, 8, { prec = 1, suffix = " st" })
 				sld(b, "Walls Tried", "BounceFakeMaxSim", 2, 20, { text = "Higher finds more, delays the preview." })
+				sld(b, "Flight Steps", "BounceFakeSteps", 20, 90)
 			end)
 
 			local v = card(tab, "Left")
@@ -22329,6 +22331,7 @@ return function(_Lib, _Core)
 				sld(f, "Max Distance To Goal", "FakeMaxDepth", 30, 160, { suffix = " st" })
 				sld(f, "Defender Clearance", "FakeFoeRadius", 2, 14, { suffix = " st", text = "An enemy this close to him takes the ball." })
 				sld(f, "Side Tolerance", "FakeLatMul", 1, 3, { prec = 1, suffix = "x", text = "How far off the goal his line may be. Curves bend it back." })
+				sld(f, "Slack", "FakeSlop", 1, 12, { suffix = " st" })
 				sld(f, "Fallback Chance", "FakeChance", 0, 100, { scale = 100, suffix = "%", text = "Used when FAKE is not tried first." })
 			end)
 
@@ -22380,6 +22383,8 @@ return function(_Lib, _Core)
 				sld(s, "Goal Zone", "TackleGoalZone", 0, 80, { suffix = " st", text = "Near our goal, tackle without waiting for AutoBlock." })
 				sld(s, "Max Block Wait", "TackleHoldMax", 0.2, 2, { prec = 1, suffix = " s", text = "Block First: longest the tackle waits for the block." })
 				sld(s, "Track Radius", "TrackStuds", 30, 160, { suffix = " st" })
+				sld(s, "Min Slide Power", "TackleMinSpeed", 0.3, 1.2, { prec = 2, suffix = "x" })
+				sld(s, "Charge Range", "ChargeTackleRange", 4, 20, { suffix = " st" })
 				sld(s, "Manual Radius", "ManualRadius", 8, 50, { suffix = " st" })
 			end)
 
@@ -22408,11 +22413,17 @@ return function(_Lib, _Core)
 				sld(b, "Far From Goal", "BlockFarGoal", 40, 200, { suffix = " st" })
 				sld(b, "Behind Receiver Gap", "BlockBehindRcv", 6, 40, { suffix = " st" })
 				sld(b, "Near Goal Range", "BlockGoalRange", 30, 120, { suffix = " st" })
+				sld(b, "Mark Gap", "BlockMarkGap", 2, 10, { prec = 1, suffix = " st" })
 				sld(b, "No-Shot Angle", "BlockShotAngle", 3, 25, { suffix = "°" })
 				sld(b, "Open Goal Angle", "BlockOpenAngle", 1, 20, { suffix = "°", text = "How much open goal past our keeper makes him a shooter." })
 				sld(b, "Shot Speed", "BlockShotSpeed", 50, 150, { suffix = " st/s", text = "Shot speed assumed before his charge is seen." })
 				sld(b, "Pass Speed", "BlockPassSpeed", 40, 140, { suffix = " st/s" })
+				sld(b, "Cut Margin", "BlockInterceptMargin", 0, 0.8, { prec = 2, suffix = " s" })
+				sld(b, "Marked Radius", "BlockCoverRadius", 3, 16, { suffix = " st" })
 				sld(b, "Behind Limit", "BlockBehind", 8, 40, { suffix = " st", text = "How far behind the carrier it may still start." })
+				sld(b, "Stand Closer By", "BlockCloser", -1, 3, { prec = 1, suffix = " st" })
+				sld(b, "Min Gap", "BlockGapMin", 1, 6, { prec = 1, suffix = " st" })
+				sld(b, "Close In To", "BlockMaxDepth", 3, 26, { suffix = " st" })
 				sld(b, "Goal Threat Window", "BlockGoalTime", 1, 5, { prec = 1, suffix = " s", text = "How early Defend Goal reacts." })
 			end)
 
@@ -22427,6 +22438,8 @@ return function(_Lib, _Core)
 			sld(k, "Range", "AutoKickRange", 2, 30, { prec = 1, suffix = " st" })
 			advanced(k, "Kick", function()
 				sld(k, "Cooldown", "AutoKickCooldown", 0.2, 2, { prec = 2, suffix = " s" })
+				sld(k, "Run-Up", "AutoKickLead", 0.1, 1, { prec = 2, suffix = " s" })
+				sld(k, "Cancel Under", "AutoKickCancel", 0.05, 0.6, { prec = 2 })
 			end)
 
 			-- Kick Helper -----------------------------------------------------------------------------------
@@ -22444,6 +22457,7 @@ return function(_Lib, _Core)
 			advanced(d, "Dribble", function()
 				sld(d, "React Range", "DribbleReact", 10, 40, { suffix = " st" })
 				sld(d, "Close Range", "DribbleClose", 5, 25, { suffix = " st" })
+				sld(d, "Margin", "DribbleSlop", 1, 8, { prec = 1, suffix = " st" })
 			end)
 
 			-- AutoDodge ------------------------------------------------------------------------------------
@@ -22457,9 +22471,11 @@ return function(_Lib, _Core)
 			advanced(dg, "Dodge", function()
 				head(dg, "Projectiles")
 				sld(dg, "Safe Margin", "ProjSafeMargin", 0, 4, { prec = 1, suffix = " st" })
+				sld(dg, "Punch Radius", "ProjHitRadius", 2, 10, { prec = 1, suffix = " st" })
 				head(dg, "Hazards")
 				sld(dg, "Blast Margin", "BlastMargin", 0, 5, { prec = 1, suffix = " st" })
 				sld(dg, "Pass Before Blast", "HazPassSlack", 0, 6, { prec = 1, suffix = " st", text = "Passes if the escape is this close." })
+				sld(dg, "Mine Margin", "MineMargin", 0, 6, { prec = 1, suffix = " st" })
 			end)
 
 			-- CounterJump ----------------------------------------------------------------------------------
@@ -22474,6 +22490,7 @@ return function(_Lib, _Core)
 			sld(c, "Competitor Radius", "CounterCompetitorRadius", 4, 30, { suffix = " st" })
 			advanced(c, "Counter", function()
 				sld(c, "Range", "CounterJumpRange", 8, 40, { suffix = " st" })
+				sld(c, "Air Slide Range", "CounterAirSlide", 4, 60, { suffix = " st", text = "From the air, a slide at a raised target only inside this range. 60 = the old rule." })
 			end)
 		end)
 
@@ -22496,6 +22513,8 @@ return function(_Lib, _Core)
 				sld(g, "Dive Late", "GkDiveLate", 0, 0.2, { prec = 2, suffix = " s", text = "Waits for the last moment to dive; 0 dives as soon as a save exists." })
 				sld(g, "Intercept Radius", "GkInterceptEnemy", 4, 30, { suffix = " st", text = "Free ball with an enemy this close: no run." })
 				sld(g, "Bait Reach", "GkBaitReach", 0, 6, { prec = 1, suffix = " st", text = "How far an enemy can step to take a fake." })
+				sld(g, "Bait Ray", "GkBaitRay", 0.5, 6, { prec = 1, suffix = " st" })
+				sld(g, "Lost-Path Share", "GkLostDiveFrac", 0.3, 1, { prec = 2 })
 			end)
 
 			local p = card(tab, "Right")
@@ -22509,6 +22528,9 @@ return function(_Lib, _Core)
 			sld(p, "Confidence", "GkPressConf", 0.3, 0.95, { prec = 2, text = "How sure the dive must be." })
 			advanced(p, "GkPress", function()
 				sld(p, "Press Zone", "GkPressZone", 20, 140, { suffix = " st" })
+				sld(p, "Hit Margin", "GkPressRadiusFrac", 0.4, 1, { prec = 2 })
+				sld(p, "Dive Reach Share", "GkPressReachFrac", 0.5, 1, { prec = 2 })
+				sld(p, "Last-Second Confidence", "GkPressConfLate", 0.1, 0.9, { prec = 2 })
 				sld(p, "Last Second", "GkPressLate", 0.3, 1.5, { prec = 2, suffix = " s" })
 				sld(p, "Max Contact Time", "GkPressMaxT", 0.2, 0.6, { prec = 2, suffix = " s" })
 				sld(p, "Launcher Reaction", "GkLauncherReact", 0.05, 0.5, { prec = 2, suffix = " s", text = "Against item users: the latest dive allowed." })
@@ -22516,6 +22538,7 @@ return function(_Lib, _Core)
 				sld(p, "Come Out Zone", "GkPressMoveZone", 15, 120, { suffix = " st" })
 				sld(p, "Gap To Him", "GkPressGap", 4, 24, { suffix = " st" })
 				tog(p, "Any-Angle Dive", "GkPressExact", "Dives at any angle, not only 8 directions.")
+				tog(p, "Steer Dive", "GkPressHome")
 			end)
 
 			local r = card(tab, "Right")
@@ -22540,6 +22563,7 @@ return function(_Lib, _Core)
 			tog(sa, "Show FOV Circle", "DrawSilentFov")
 			tog(sa, "Show Tracer", "DrawSilent")
 			advanced(sa, "Silent", function()
+				sld(sa, "Freeze Radius", "FreezeRadius", 3, 20, { prec = 1, suffix = " st", text = "Size of the freeze area." })
 			end)
 
 			local w = card(tab, "Right")
@@ -22578,10 +22602,14 @@ return function(_Lib, _Core)
 			head(ba, "Goal Guard")
 			tog(ba, "Enabled", "KillerGuard", "Ball near our goal: slide the closest enemy first.")
 			advanced(ba, "Ball", function()
+				sld(ba, "Jump Gain", "BallJumpGain", 0, 0.6, { prec = 2, suffix = " s", text = "Jumps only if it gets the ball this much sooner than standing. 0.12 = the old rule." })
+				sld(ba, "Slide Gain", "RouteSlideGain", 0, 1.5, { prec = 2, suffix = " s", text = "A slide replaces the run if it gets there this much sooner." })
 				head(ba, "Rival Slide")
 				sld(ba, "Ball Radius", "KillerRadius", 8, 40, { suffix = " st" })
 				sld(ba, "Our Reach", "KillerReach", 10, 50, { suffix = " st" })
+				sld(ba, "Threat Margin", "KillerMargin", 0, 1.5, { prec = 2, suffix = " s" })
 				sld(ba, "Max Turn", "KillerAngle", 10, 90, { suffix = "°" })
+				sld(ba, "Intent Radius", "IntentTackleRadius", 20, 120, { suffix = " st" })
 				head(ba, "Goal Guard")
 				sld(ba, "Goal Distance", "KillerGuardGoal", 20, 100, { suffix = " st" })
 				sld(ba, "Ball Distance", "KillerGuardNear", 8, 40, { suffix = " st" })
@@ -22717,12 +22745,18 @@ return function(_Lib, _Core)
 				sld(p, "Lock Angle", "PassFov", 3, 25, { suffix = "°" })
 				sld(p, "Min Distance", "PassMinDist", 3, 30, { suffix = " st" })
 				sld(p, "Max Distance", "PassMaxDist", 40, 200, { suffix = " st" })
+				sld(p, "Manual Near Limit", "PassManualNear", 4, 40, { suffix = " st" })
 				head(p, "Landing")
 				sld(p, "Exact Pass Zone", "PassNearGoal", 0, 130, { suffix = " st", text = "Near their goal, pass to him, not ahead. 0 = off." })
+				sld(p, "Exact Pass Lead", "PassNearLead", 0, 10, { suffix = " st" })
 				sld(p, "Goal Lead", "PassGoalLead", 10, 60, { suffix = " st", text = "Receive point stays this far from their goal." })
+				sld(p, "Keeper Radius", "PassKeeperRadius", 4, 30, { suffix = " st" })
+				sld(p, "Goal Angle", "PassGoalSep", 2, 25, { suffix = "°" })
+				sld(p, "Run Toward Goal", "PassGoalBias", 0, 0.8, { prec = 2, text = "How much his run is expected to turn to their goal." })
 				sld(p, "Cross Zone", "PassCrossZone", 20, 100, { suffix = " st" })
 				sld(p, "Cross Past Him", "PassCrossAhead", 0, 6, { prec = 1, suffix = " st" })
 				sld(p, "Cross Catch Height", "PassCrossJump", 0, 1, { prec = 2, text = "Share of a jump: 0 = standing, 1 = top of the jump." })
+				sld(p, "Goal Zone", "PassGoalZone", 10, 70, { suffix = " st" })
 			end)
 		end)
 
@@ -22752,10 +22786,16 @@ return function(_Lib, _Core)
 			local ag = card(tab, "Right")
 			head(ag, "Agent Estimates")
 			note(ag, "Guessed values. Change only if something misses.")
+			head(ag, "Hazards")
+			sld(ag, "Oil Radius", "OilRadius", 2, 8, { prec = 1, suffix = " st" })
+			sld(ag, "Hammer Radius", "HammerRadius", 4, 16, { suffix = " st" })
 			head(ag, "Slide")
 			sld(ag, "Slide Lag", "SlideLag", 0, 120, { scale = 1000, suffix = " ms" })
 			sld(ag, "Min Ball Hits", "SlideMinHits", 1, 8, { text = "Of 11 samples the slide must hold the ball." })
 			sld(ag, "Run Ramp-Up", "BallRamp", 0, 0.6, { prec = 2, suffix = " s" })
+			head(ag, "Keeper Press")
+			sld(ag, "Contact Radius", "PressReach", 1, 5, { prec = 1, suffix = " st" })
+			sld(ag, "Contact Height", "PressVert", 1, 8, { prec = 1, suffix = " st" })
 			head(ag, "Wall")
 			sld(ag, "Latency", "WallLatency", 0, 300, { scale = 1000, suffix = " ms" })
 			sld(ag, "Margin", "WallMargin", 0, 0.5, { prec = 2, suffix = " s" })
