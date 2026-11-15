@@ -7491,61 +7491,71 @@ end
 -- Boomerang aim art = the SilentAim tracer bent along the throw: ink bed + core from the muzzle down the real loop to the
 -- meeting point, hot pulses running out along it at the throw's own pace (one pass = its flight time to him), the
 -- SilentAim split ring at his feet, and the rest of the loop (the way back) as a faint dashed ghost.
-Mark.boomArt = function(seg, f, info, col, now, muzzle)
-	local tab, S = info.tab, info.S
-	local side = Vector3.new(f.Z, 0, -f.X)
-	local iT = math.clamp(math.floor(info.t / tab.dt + 0.5), 1, tab.n)
-	local pts, L = {}, { 0 }
-	if muzzle then
-		pts[1] = muzzle
+-- COMET (SilentAim boomerang): one bead with a tapering tail flies the real loop to the interception point every 1.3 s;
+-- on arrival the tail is drawn into the head and a pin drops onto the point and stays until the next throw.
+-- pts: 1-based world points, from the muzzle to the meeting point.
+Mark.cometArt = function(seg, pts, col, now)
+	local n = #pts
+	if n < 2 then
+		return
 	end
-	for i = 0, iT do
-		pts[#pts + 1] = S + f * tab.a[i] + side * tab.b[i] + Vector3.new(0, tab.h[i], 0)
-	end
-	for k = 2, #pts do
+	local L = { 0 }
+	for k = 2, n do
 		L[k] = L[k - 1] + (pts[k] - pts[k - 1]).Magnitude
 	end
-	local total = L[#pts]
+	local total = L[n]
+	if total < 1 then
+		return
+	end
+	local hint = 2
+	local function at(s)
+		s = math.clamp(s, 0, total)
+		hint = 2
+		while hint < n and L[hint] < s do
+			hint += 1
+		end
+		local a, b = L[hint - 1], L[hint]
+		return pts[hint - 1]:Lerp(pts[hint], b > a and (s - a) / (b - a) or 0)
+	end
 	local ink = Color3.fromRGB(12, 14, 18)
-	for k = 2, #pts do
-		seg(pts[k - 1], pts[k], ink, 0.55, 3.2, 44)
-		seg(pts[k - 1], pts[k], col, 0.75, 1.2, 45)
+	local white = Color3.new(1, 1, 1)
+	local ph = now % 1.3
+	local fly = 0.8
+	local u = math.clamp(ph / fly, 0, 1)
+	u = 1 - (1 - u) ^ 1.4
+	local head = u * total
+	local tail = math.min(total * 0.35, 14)
+	local age = math.max(ph - fly, 0)
+	if age > 0 then
+		tail *= 1 - math.clamp(age / 0.25, 0, 1)
 	end
-	if total > 1 then
-		local hint = 2
-		local function at(s)
-			if s <= 0 then
-				hint = 2
-				return pts[1]
-			end
-			if hint > #pts or L[hint - 1] > s then
-				hint = 2
-			end
-			while hint < #pts and L[hint] < s do
-				hint += 1
-			end
-			local a, b = L[hint - 1], L[hint]
-			return pts[hint - 1]:Lerp(pts[hint], b > a and math.clamp((s - a) / (b - a), 0, 1) or 0)
-		end
-		local hot = Color3.fromRGB(255, 255, 255)
-		local period = math.clamp(info.t, 0.35, 0.9)
-		for n = 0, 3 do
-			local u = ((now / period) + n / 4) % 1
-			local s0, s1 = u * total, math.min(u + 0.07, 1) * total
-			local m = at((s0 + s1) * 0.5)
-			local c = hot:Lerp(col, u)
-			seg(at(s0), m, c, 1, 2.6, 46)
-			seg(m, at(s1), c, 1, 2.6, 46)
+	if tail > 0.3 then
+		local prev = at(head)
+		for k = 1, 8 do
+			local p = at(head - tail * k / 8)
+			seg(prev, p, ink, 0.5 * (1 - k / 9), 3.2 * (1 - k / 9) + 1, 44)
+			seg(prev, p, white:Lerp(col, k / 8), 1 - k / 10, 3 * (1 - k / 9) + 0.4, 46 - (k > 4 and 1 or 0))
+			prev = p
 		end
 	end
-	-- the way back: every other sample, faint
-	for i = iT + 2, tab.n, 2 do
-		local p0 = S + f * tab.a[i - 1] + side * tab.b[i - 1] + Vector3.new(0, tab.h[i - 1], 0)
-		local p1 = S + f * tab.a[i] + side * tab.b[i] + Vector3.new(0, tab.h[i], 0)
-		seg(p0, p1, col, 0.28, 1, 44)
+	if age > 0 then
+		local P = pts[n]
+		local up = Vector3.new(0, 1, 0)
+		local drop = 1 - (1 - math.clamp(age / 0.2, 0, 1)) ^ 3
+		local top = P + up * (3.2 - 0.9 * drop)
+		local look = Mark.frameLook or Workspace.CurrentCamera.CFrame.LookVector
+		local side = unitOrNil(Vector3.new(-look.Z, 0, look.X)) or Vector3.new(1, 0, 0)
+		seg(P, top, ink, 0.6, 4.2, 44)
+		seg(P, top, col, 1, 1.8, 45)
+		for _, sg in { -1, 1 } do
+			local w = top + side * (0.55 * sg) + up * 0.7
+			seg(top, w, ink, 0.6, 3.6, 44)
+			seg(top, w, white, 1, 1.4, 46)
+		end
 	end
-	Mark.silentRing(seg, Vector3.new(info.P.X, info.P.Y - 2.9, info.P.Z), col, now)
+	seg(at(head) - Vector3.new(0, 0.25, 0), at(head) + Vector3.new(0, 0.25, 0), white, 1, 2.4, 46)
 end
+
 
 -- the SilentAim target ring: three split arcs turning at his feet
 Mark.silentRing = function(seg, feet, col, t)
@@ -8650,8 +8660,18 @@ Mark.tickSkill = function(character, root)
 		end
 		Mark.areaDraw(areaG, areaInfo.R, col)
 	else
-		-- (the boomerang loop art lives in the P gallery as variants until one is picked: the plain tracer here)
-		if CFG.DrawSilent ~= false and not Mark.areaItems[id] then
+		if CFG.DrawSilent ~= false and boomInfo then
+			-- comet along the real loop to the meeting point
+			local tab, S0 = boomInfo.tab, boomInfo.S
+			local fb = boomDir
+			local side = Vector3.new(fb.Z, 0, -fb.X)
+			local iT = math.clamp(math.floor(boomInfo.t / tab.dt + 0.5), 1, tab.n)
+			local cp = { muzzle }
+			for i = 0, iT do
+				cp[#cp + 1] = S0 + fb * tab.a[i] + side * tab.b[i] + Vector3.new(0, tab.h[i], 0)
+			end
+			Mark.cometArt(pool.seg, cp, col, os.clock())
+		elseif CFG.DrawSilent ~= false and not Mark.areaItems[id] and id ~= "boomerang" then
 			Mark.silentArt(pool.seg, muzzle, chest, Vector3.new(aimP.X, aimP.Y - 2.9, aimP.Z), col, os.clock())
 		end
 		if Mark.areaFx then
@@ -11507,7 +11527,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v158")
+	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v159")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -14748,77 +14768,53 @@ end
 -- The decoy as a lock-on on the goal: a broken ring turning round the point, a diamond that breathes, four inward ticks,
 -- and an outer arc that burns down with the time the aim may still lie (when it is gone the aim is real again). From the
 -- ball a dashed line of chevrons runs to it. The threat tint of kickPalette.armed, never the real-shot line colour.
-Mark.spoofArt = function(seg, q, along, ball, clk, frac)
+
+-- SPRING BRACKETS (Direction Spoof fake aim point): four corners chase the decoy on a spring (overshoot, settle); every
+-- arm is a lightning line, now and then a bolt arcs across an edge; the top fuse is the time the aim may still lie.
+-- st = per-overlay state ({}), right = the goal's along axis, left = 0..1 of the lie left.
+Mark.bracketArt = function(seg, q, right, left, t, st)
 	local up = Vector3.new(0, 1, 0)
-	local pal = Mark.kickPalette.armed
-	local core, hi = pal[1], Color3.new(1, 1, 1)
-	local ph = clk * 1.3
-	local breathe = 0.85 + 0.15 * math.sin(clk * 9)
-	-- broken ring (3 arcs, 2 gaps) turning
-	local R = 1.9
-	for arc = 0, 2 do
-		local a0 = ph + arc * math.pi * 2 / 3
-		local prev
-		for k = 0, 5 do
-			local th = a0 + k * 0.17 * math.pi * 2 / 5 * 2.4
-			local p = q + along * (math.cos(th) * R) + up * (math.sin(th) * R)
-			if prev then
-				seg(prev, p, COL.Ink, 0.5, 3.8, 44)
-				seg(prev, p, core, 0.95, 1.6, 45)
-			end
-			prev = p
+	local dt = math.clamp(t - (st.lastT or t), 0, 0.1)
+	st.lastT = t
+	if not st.bq or (st.bq - q).Magnitude > 40 then
+		st.bq, st.bv = q, Vector3.zero
+	end
+	st.bv = st.bv + ((q - st.bq) * 260 - st.bv * 18) * dt
+	st.bq = st.bq + st.bv * dt
+	local p = st.bq
+	local s, e = 1.5, 0.75
+	local ice = { Color3.fromRGB(150, 220, 255), Color3.fromRGB(215, 242, 255), Color3.fromRGB(90, 170, 255) }
+	local corners = {}
+	local seed = 0
+	for _, sx in { -1, 1 } do
+		for _, sy in { -1, 1 } do
+			local cn = p + right * (sx * s) + up * (sy * s)
+			corners[#corners + 1] = cn
+			seed += 1
+			Mark.boltLine(seg, cn, cn - right * (sx * e), t, seed, ice[2], 1, 1.5, 1)
+			Mark.boltLine(seg, cn, cn - up * (sy * e), t, seed + 11, ice[2], 1, 1.5, 1)
 		end
 	end
-	-- diamond
-	local r = 0.8 * breathe
-	local d = { q + up * r, q + along * r, q - up * r, q - along * r }
-	for i = 1, 4 do
-		local p0, p1 = d[i], d[i % 4 + 1]
-		seg(p0, p1, COL.Ink, 0.55, 3.4, 44)
-		seg(p0, p1, hi, 1, 1.4, 46)
-	end
-	-- ticks
-	for i = 1, 4 do
-		local dir = (i % 2 == 1) and up or along
-		local sgn = i > 2 and -1 or 1
-		seg(q + dir * sgn * (R + 0.15), q + dir * sgn * (R - 0.45), core, 0.9, 1.6, 45)
-	end
-	-- the time the aim may still lie: an arc round the ring that shortens
-	frac = math.clamp(frac or 1, 0, 1)
-	if frac > 0.02 then
-		local prev
-		local n = math.max(2, math.floor(frac * 18))
-		for k = 0, n do
-			local th = math.pi / 2 + (k / n) * frac * math.pi * 2
-			local p = q + along * (math.cos(th) * (R + 0.7)) + up * (math.sin(th) * (R + 0.7))
-			if prev then
-				seg(prev, p, hi:Lerp(core, 1 - frac), 0.9, 1.2, 46)
-			end
-			prev = p
+	-- an arc across one edge, a new one every ~0.12 s, short-lived
+	local slot = math.floor(t * 8)
+	local edge = slot % 4
+	local f = (t * 8) % 1
+	if f < 0.5 then
+		local a = corners[edge + 1]
+		local b = corners[(edge + 1) % 4 + 1]
+		if edge == 1 or edge == 3 then
+			b = corners[edge == 1 and 4 or 1]
 		end
+		Mark.boltLine(seg, a, b, t, slot, ice[1], 1 - f * 1.6, 1.2, math.clamp(f * 5, 0, 1))
 	end
-	-- the line from the ball: chevrons running to the point
-	if ball then
-		local dv = q - ball
-		local len = dv.Magnitude
-		local dir = unitOrNil(dv)
-		if dir then
-			local sideV = unitOrNil(dir:Cross(up)) or along
-			local gap = 4.5
-			local s = (clk * 40) % gap
-			seg(ball, q - dir * (R + 0.2), core, 0.22, 1, 43)
-			while s < len - R - 0.5 do
-				local p = ball + dir * s
-				local c = hi:Lerp(core, s / len)
-				seg(p - dir * 1.1 + sideV * 0.7, p, c, 0.9, 1.6, 45)
-				seg(p - dir * 1.1 - sideV * 0.7, p, c, 0.9, 1.6, 45)
-				s += gap
-			end
-		end
-	end
+	local a0 = p + up * (s + 0.45) - right * s
+	local a1 = a0 + right * (2 * s * math.clamp(left, 0, 1))
+	seg(a0, a1, COL.Ink, 0.5, 3.6, 44)
+	seg(a0, a1, ice[1], 0.95, 1.6, 46)
+	seg(a1 - up * 0.2, a1 + up * 0.2, Color3.new(1, 1, 1), 0.9, 1.4, 46)
 end
 
-Mark.spoofDraw = function(pen, ball)
+Mark.spoofDraw = function(pen)
 	local sp = Mark.sp
 	local q = sp and sp.q
 	if not (pen and q and Mark.spoofDir()) then
@@ -14830,8 +14826,10 @@ Mark.spoofDraw = function(pen, ball)
 		local x1, y1, d1 = pen.P(b)
 		pen.L(x0, y0, d0, x1, y1, d1, col, alpha, thick, z)
 	end
-	Mark.spoofArt(seg, q, sp.along, ball, now, (sp.endAt - now) / math.max(sp.endAt - sp.t0, 0.05))
+	sp.br = sp.br or {}
+	Mark.bracketArt(seg, q, sp.along, (sp.endAt - now) / math.max(sp.endAt - sp.t0, 0.05), now, sp.br)
 end
+
 
 -- PreSimulation: the controller turns the root during the physics step and CharacterReplication samples it in
 -- PostSimulation; a Heartbeat write alone races that. Re-apply the facing right before the step.
@@ -19765,47 +19763,63 @@ end
 -- Incoming projectile = a wire coming at you: ink bed + thin threat-coloured core along its predicted flight, chevrons
 -- riding it at the projectile's real speed (they arrive when it arrives), and the threat ripple where it meets you.
 -- v = { pts, len (cumulative), speed, hit (point or nil), key }. One renderer for the live overlay and the gallery.
-Mark.projArt = function(seg, v, clk)
-	local pts, L = v.pts, v.len
+-- FUSE RAIL (incoming projectile): the remaining path as dashes running at us, a spark on the projectile, and the impact
+-- rim burning down with the time left. v = { pts (1-based, from the projectile), hit (point on the floor or nil),
+-- frac (0..1 time left) , speed }.
+Mark.fuseArt = function(seg, v, clk)
+	local pts = v.pts
 	local n = #pts
 	if n < 2 then
 		return
 	end
-	local pal = v.hit and Mark.kickPalette.live or Mark.kickPalette.armed
-	local core = pal[1]
+	local pal = Mark.kickPalette.armed
+	local hot = Color3.new(1, 1, 1)
+	local L = { 0 }
 	for k = 2, n do
-		seg(pts[k - 1], pts[k], COL.Ink, 0.4, 3.6, 44)
-		seg(pts[k - 1], pts[k], core, 0.6, 1.2, 45)
+		L[k] = L[k - 1] + (pts[k] - pts[k - 1]).Magnitude
 	end
 	local total = L[n]
-	local gap = 7
-	local off = (clk * v.speed) % gap
 	local hint = 2
-	local s = off
-	while s < total do
+	local function at(s)
+		s = math.clamp(s, 0, total)
+		hint = 2
 		while hint < n and L[hint] < s do
 			hint += 1
 		end
 		local a, b = L[hint - 1], L[hint]
-		local p0, p1 = pts[hint - 1], pts[hint]
-		local dir = unitOrNil(p1 - p0)
-		if dir then
-			local p = p0:Lerp(p1, b > a and (s - a) / (b - a) or 0)
-			local sideV = unitOrNil(dir:Cross(Vector3.new(0, 1, 0))) or Vector3.new(1, 0, 0)
-			local c = Color3.new(1, 1, 1):Lerp(core, 1 - s / total)
-			seg(p - dir * 1.2 + sideV * 0.9, p, c, 0.95, 2, 46)
-			seg(p - dir * 1.2 - sideV * 0.9, p, c, 0.95, 2, 46)
-		end
+		return pts[hint - 1]:Lerp(pts[hint], b > a and (s - a) / (b - a) or 0)
+	end
+	local gap, dash = 3.4, 1.7
+	local s = (clk * math.max(v.speed or 40, 20) * 0.35) % gap
+	while s < total - 0.5 do
+		local a, b = at(s), at(math.min(s + dash, total))
+		seg(a, b, COL.Ink, 0.5, 3.4, 44)
+		seg(a, b, Color3.new(1, 1, 1):Lerp(pal[1], math.clamp(s / total + 0.2, 0, 1)), 0.9, 1.3, 45)
 		s += gap
 	end
-	if v.hit then
-		Mark.projPh = Mark.projPh or {}
-		local dt = math.clamp(clk - (Mark.projPh[v.key .. "t"] or clk), 0, 0.1)
-		Mark.projPh[v.key .. "t"] = clk
-		Mark.projPh[v.key] = (Mark.projPh[v.key] or 0) + dt / 0.3
-		Mark.kickRipple(seg, v.hit, 3.4, pal, Mark.projPh[v.key], clk, 2)
+	local p = pts[1]
+	local hn = (math.sin(clk * 97.3) * 43758.5) % 1
+	for k = 0, 2 do
+		local a = hn * 6.28 + k * 2.09
+		seg(p, p + Vector3.new(math.cos(a), 0.5, math.sin(a)) * (0.5 + hn * 0.5), hot, 0.9, 1.3, 46)
+	end
+	local hit = v.hit
+	if hit then
+		local left = math.clamp(v.frac or 1, 0, 1)
+		local m = math.max(2, math.floor(left * 24))
+		local prev
+		for k = 0, m do
+			local a = math.pi / 2 + k / m * left * math.pi * 2
+			local q = hit + Vector3.new(math.cos(a) * 3.2, 0.1, math.sin(a) * 3.2)
+			if prev then
+				seg(prev, q, COL.Ink, 0.5, 3.6, 44)
+				seg(prev, q, pal[2], 0.95, 1.4, 45)
+			end
+			prev = q
+		end
 	end
 end
+
 
 -- live state -> projArt input: its flight for up to 1.4 s (to the ground for ballistic ones), the homing punch as the
 -- line to the ball it homes on, and the contact point when it comes within its radius of where we will be
@@ -19882,12 +19896,37 @@ Mark.hazDraw = function()
 		-- incoming projectiles (the grenade's hops are already in its zone)
 		local root = ActorTargeting.GetActorRoot(LocalPlayer)
 		local np = 0
+		if not (Mark.projLive and next(Mark.projLive)) then
+			Mark.projInit = nil
+		end
 		if root and Mark.projLive then
 			for _, st in Mark.projLive do
 				local who = st.src and playerOf(st.src)
 				if np < 3 and st.item ~= "grenade" and st.src ~= LocalPlayer.UserId and not (who and sameTeam(who)) and nowS - st.at < 1.2 then
-					-- (projectile art: P gallery variants until one is picked)
-					np += 1
+					local v = Mark.projViz(st, nowS, root)
+					if v then
+						np += 1
+						-- time left to the impact: the path length to the point nearest the hit over the projectile speed
+						v.frac = 1
+						if v.hit then
+							local bi, bd = #v.pts, math.huge
+							for k = 1, #v.pts do
+								local dd = flat(v.pts[k] - v.hit).Magnitude
+								if dd < bd then
+									bi, bd = k, dd
+								end
+							end
+							Mark.projInit = Mark.projInit or {}
+							local tHit = v.len[bi] / math.max(v.speed, 1)
+							local t0 = Mark.projInit[v.key]
+							if not t0 or tHit > t0 then
+								t0 = tHit
+								Mark.projInit[v.key] = t0
+							end
+							v.frac = t0 > 0.02 and math.clamp(tHit / t0, 0, 1) or 0
+						end
+						Mark.fuseArt(pool.seg, v, clk)
+					end
 				end
 			end
 		end
@@ -21609,471 +21648,60 @@ end
 
 -- stations: x = offset along G.right, art(seg, C, t, st, G) with C the station's ground centre
 
--- VISUAL VARIANTS (gallery P only, pick one to wire live). Three subjects, three directions each:
---   fake aim point (Direction Spoof): mirage rings / bolt hop / spring brackets
---   boomerang throw (SilentAim): time thread / comet / ghost loop + silent tracer
---   incoming projectile (AutoDodge): impact ripple / bolt / fuse rail
--- Strokes: LIP (ink bed under a paper line). Our own deceit uses an ice family; enemy threats the kick threat palette.
-Mark.vPal = {
-	ice = { Color3.fromRGB(150, 220, 255), Color3.fromRGB(215, 242, 255), Color3.fromRGB(90, 170, 255) },
-}
-Mark.vLip = function(seg, a, b, col, al, w)
-	seg(a, b, COL.Ink, 0.55 * al, w + 2.4, 44)
-	seg(a, b, col, al, w, 45)
-end
-Mark.vGrad = function(pal, f)
-	local x = (f % 1) * 3
-	local i = math.floor(x)
-	local u = x - i
-	u = u * u * (3 - 2 * u)
-	return pal[i + 1]:Lerp(pal[(i + 1) % 3 + 1], u)
-end
--- ring in the plane (ax, ay): the ripple of kickRipple stood up on the goal mouth
-Mark.vRing = function(seg, c, ax, ay, r, pal, flow, al, w, n)
-	n = n or 20
-	local prev
-	for s = 0, n do
-		local a = s / n * math.pi * 2
-		local p = c + ax * (math.cos(a) * r) + ay * (math.sin(a) * r)
-		if prev then
-			seg(prev, p, Mark.vGrad(pal, s / n + flow), al, w, 44)
-		end
-		prev = p
-	end
-end
-Mark.vStep = function(st, t)
-	local dt = math.clamp(t - (st.lastT or t), 0, 0.1)
-	st.lastT = t
-	return dt
-end
-
--- the station's fake goal and the decoy script: 3 hops inside 0.6 s, then the lie is over (0.6..1.6 s)
-Mark.vSpoofScene = function(seg, C, t, st, G)
-	local up = Vector3.new(0, 1, 0)
-	local m0 = C + G.fw * 6
-	local W, H = 16, 7
-	local lb, rb = m0 - G.right * (W / 2), m0 + G.right * (W / 2)
-	seg(lb, lb + up * H, COL.Chalk, 0.35, 1, 43)
-	seg(rb, rb + up * H, COL.Chalk, 0.35, 1, 43)
-	seg(lb + up * H, rb + up * H, COL.Chalk, 0.35, 1, 43)
-	local ph = t % 1.6
-	local spots = { { -0.75, 0.75 }, { 0.7, 0.25 }, { -0.6, 0.3 } }
-	local real = m0 + G.right * (0.55 * W / 2) + up * (0.7 * H)
-	local idx = ph < 0.6 and (math.floor(ph / 0.2) + 1) or nil
-	local q = idx and (m0 + G.right * (spots[idx][1] * W / 2) + up * (spots[idx][2] * H)) or nil
-	-- the truth: a small paper tick
-	seg(real - G.right * 0.35, real + G.right * 0.35, COL.Paper, 0.6, 1.2, 45)
-	seg(real - up * 0.35, real + up * 0.35, COL.Paper, 0.6, 1.2, 45)
-	return q, idx, real, 1 - math.clamp(ph / 0.6, 0, 1), up
-end
-
--- A. MIRAGE: rings born at the decoy on the goal plane, a tether of dashes running from the truth to the lie
-Mark.vSpoofMirage = function(seg, C, t, st, G)
-	local dt = Mark.vStep(st, t)
-	local q, _, real, left, up = Mark.vSpoofScene(seg, C, t, st, G)
-	if not q then
-		st.ph = nil
-		return
-	end
-	st.ph = (st.ph or 0) + dt * 3
-	local pal = Mark.vPal.ice
-	local born = math.floor(st.ph)
-	for k = 0, 2 do
-		local u = math.clamp((st.ph - (born - k)) / 3, 0, 1)
-		local r = 0.3 + 2.1 * (1 - (1 - u) ^ 3)
-		local al = (1 - u) ^ 1.6
-		if al > 0.04 then
-			Mark.vRing(seg, q, G.right, up, r, pal, t * 0.35 + k * 0.17, al, 1 + 2 * (1 - u), 18)
-		end
-	end
-	local D = q - real
-	local L = D.Magnitude
-	if L > 1 then
-		local dir = D / L
-		local s = (t * 14) % 1.6
-		while s < L - 0.8 do
-			Mark.vLip(seg, real + dir * s, real + dir * math.min(s + 0.7, L), pal[2], 0.35 + 0.5 * left, 1.1)
-			s += 1.6
-		end
-	end
-end
-
--- B. BOLT HOP: every hop of the decoy is a bolt from the old spot to the new, sparks where it lands
-Mark.vSpoofBolt = function(seg, C, t, st, G)
-	local q, idx, _, left, up = Mark.vSpoofScene(seg, C, t, st, G)
-	if idx ~= st.idx then
-		if q and st.q then
-			st.bolt = { A = st.q, B = q, born = t, seed = (idx or 0) * 7 + math.floor(t) }
-		end
-		st.idx, st.q = idx, q
-	end
-	local pal = Mark.vPal.ice
-	local b = st.bolt
-	if b then
-		local age = t - b.born
-		if age > 0.35 then
-			st.bolt = nil
-		else
-			local fade = 1 - math.clamp((age - 0.1) / 0.25, 0, 1)
-			Mark.boltLine(seg, b.A, b.B, t, b.seed, pal[1], fade, 1.2 + 1.4 * fade, math.clamp(age / 0.06, 0, 1))
-			if age > 0.06 then
-				local sp = 0.5 + 1.4 * math.clamp((age - 0.06) / 0.15, 0, 1)
-				for k = 0, 3 do
-					local a = b.seed + k * 1.5708
-					seg(b.B, b.B + (G.right * math.cos(a) + up * math.sin(a)) * sp, Color3.new(1, 1, 1), 0.8 * fade, 1.3, 46)
-				end
-			end
-		end
-	end
-	if q then
-		local r = 0.55 + 0.25 * left
-		local d = { q + up * r, q + G.right * r, q - up * r, q - G.right * r }
-		for i = 1, 4 do
-			Mark.vLip(seg, d[i], d[i % 4 + 1], pal[2], 0.9, 1.3)
-		end
-	end
-end
-
--- C. SPRING BRACKETS: four corners chase the decoy on a spring (overshoot, settle); the top edge is the fuse of the
--- time the aim may still lie
-Mark.vSpoofBrackets = function(seg, C, t, st, G)
-	local dt = Mark.vStep(st, t)
-	local q, _, _, left, up = Mark.vSpoofScene(seg, C, t, st, G)
-	if not q then
-		st.bq, st.bv = nil, nil
-		return
-	end
-	if not st.bq then
-		st.bq, st.bv = q, Vector3.zero
-	end
-	local k, c = 260, 18
-	st.bv = st.bv + ((q - st.bq) * k - st.bv * c) * dt
-	st.bq = st.bq + st.bv * dt
-	local p = st.bq
-	local s, e = 1.5, 0.6
-	local pal = Mark.vPal.ice
-	for _, sx in { -1, 1 } do
-		for _, sy in { -1, 1 } do
-			local cn = p + G.right * (sx * s) + up * (sy * s)
-			Mark.vLip(seg, cn, cn - G.right * (sx * e), pal[2], 0.95, 1.4)
-			Mark.vLip(seg, cn, cn - up * (sy * e), pal[2], 0.95, 1.4)
-		end
-	end
-	local a0 = p + up * (s + 0.45) - G.right * s
-	local a1 = a0 + G.right * (2 * s * left)
-	seg(a0, a1, pal[1], 0.9, 1.6, 46)
-	seg(a1 - up * 0.2, a1 + up * 0.2, Color3.new(1, 1, 1), 0.9, 1.4, 46)
-end
-
--- boomerang station scene: the loop of Boomerang.GetPosition's kind, the throw from S, the target on it
-Mark.vBoomScene = function(st, C, t, G)
-	if not st.tab then
-		local tab = { a = {}, b = {}, h = {}, dt = 0.025, n = 76 }
-		for i = 0, 76 do
-			local th = i / 76 * math.pi * 2
-			tab.a[i], tab.b[i], tab.h[i] = 30 * math.sin(th), -18 * (1 - math.cos(th)), 1.2 * math.sin(th * 0.5)
-		end
-		st.tab = tab
-	end
-	local tab = st.tab
-	local f = G.fw
-	local side = Vector3.new(f.Z, 0, -f.X)
-	local S = C - f * 14 + Vector3.new(0, 3.5, 0)
-	local iT = 22
-	local pts = {}
-	for i = 0, iT do
-		pts[i] = S + f * tab.a[i] + side * tab.b[i] + Vector3.new(0, tab.h[i], 0)
-	end
-	return pts, iT, S
-end
-
--- A. TIME THREAD: only ticks every 0.1 s of flight (the rhythm of the throw), a bead running it, ripple at his feet
-Mark.vBoomThread = function(seg, C, t, st, G)
-	local dt = Mark.vStep(st, t)
-	local pts, iT = Mark.vBoomScene(st, C, t, G)
-	local col = Color3.fromRGB(90, 220, 255)
-	local u = (t % 1.1) / 0.8
-	local head = math.min(u, 1) * iT
-	for i = 0, iT - 2, 4 do
-		local a, b = pts[i], pts[i + 1]
-		local past = i < head
-		Mark.vLip(seg, a, b, past and COL.Chalk or col, past and 0.35 or 0.9, 1.4)
-	end
-	if u < 1 then
-		local i = math.floor(head)
-		local p = pts[i]:Lerp(pts[math.min(i + 1, iT)], head - i)
-		seg(p - G.fw * 0.4, p + G.fw * 0.4, Color3.new(1, 1, 1), 1, 2.4, 46)
-	end
-	local P = pts[iT]
-	st.ph = (st.ph or 0) + dt * (1 / 0.6)
-	Mark.kickRipple(seg, Vector3.new(P.X, G.gy + 0.1, P.Z), 2.4, { col, col:Lerp(Color3.new(1, 1, 1), 0.5), Color3.fromRGB(60, 140, 255) }, st.ph, t, 4)
-end
-
--- B. COMET: nothing but a bead with a tapering tail flying the real loop to him, a burst where it meets him
-Mark.vBoomComet = function(seg, C, t, st, G)
-	local pts, iT = Mark.vBoomScene(st, C, t, G)
-	local col = Color3.fromRGB(90, 220, 255)
-	local ph = t % 1.2
-	local u = math.min(ph / 0.8, 1)
-	u = 1 - (1 - u) ^ 1.4
-	local head = u * iT
-	local function at(x)
-		x = math.clamp(x, 0, iT)
-		local i = math.floor(x)
-		return pts[i]:Lerp(pts[math.min(i + 1, iT)], x - i)
-	end
-	if ph < 0.8 then
-		local prev = at(head)
-		for k = 1, 8 do
-			local p = at(head - k * 0.5)
-			local w = 3 * (1 - k / 9)
-			seg(prev, p, Color3.new(1, 1, 1):Lerp(col, k / 8), 1 - k / 10, w, 46 - (k > 4 and 1 or 0))
-			prev = p
-		end
-	else
-		local age = ph - 0.8
-		local P = pts[iT]
-		local sp = 0.5 + 2.2 * math.clamp(age / 0.15, 0, 1)
-		local fade = 1 - math.clamp(age / 0.4, 0, 1)
-		for k = 0, 5 do
-			local a = k * math.pi / 3
-			seg(P, P + Vector3.new(math.cos(a), 0.3, math.sin(a)) * sp, col, fade, 1.4, 46)
-		end
-	end
-	local P = pts[iT]
-	local g = Vector3.new(P.X, G.gy + 0.1, P.Z)
-	local d = { g + G.fw * 0.8, g + G.right * 0.8, g - G.fw * 0.8, g - G.right * 0.8 }
-	for i = 1, 4 do
-		Mark.vLip(seg, d[i], d[i % 4 + 1], col, 0.8, 1.2)
-	end
-end
-
--- C. GHOST LOOP: the usual silent tracer to his chest; the loop only as a faint ghost line (it reads, it does not shout)
-Mark.vBoomGhost = function(seg, C, t, st, G)
-	local pts, iT, S = Mark.vBoomScene(st, C, t, G)
-	local col = Color3.fromRGB(90, 220, 255)
-	for i = 1, iT do
-		seg(pts[i - 1], pts[i], col, 0.18, 1, 43)
-	end
-	local P = pts[iT]
-	if Mark.silentArt then
-		Mark.silentArt(seg, S, P + Vector3.new(0, 0.6, 0), Vector3.new(P.X, G.gy, P.Z), col, os.clock())
-	end
-end
-
--- projectile scene: an arc from an enemy 40 st out to the impact at C, the projectile running it every 1.4 s
-Mark.vProjScene = function(st, C, t, G)
-	if not st.pts then
-		local pts = {}
-		local A = C + G.fw * 40 + G.right * 8 + Vector3.new(0, 4, 0)
-		for k = 0, 20 do
-			local s = k / 20
-			pts[k] = A:Lerp(C + Vector3.new(0, 1, 0), s) + Vector3.new(0, 6 * math.sin(s * math.pi), 0)
-		end
-		st.pts = pts
-	end
-	local u = (t % 1.4) / 1.1
-	return st.pts, math.min(u, 1) * 20, u < 1
-end
-
--- A. IMPACT RIPPLE: the threat ripple where it will land, a thin line from the projectile to it, nothing else
-Mark.vProjRipple = function(seg, C, t, st, G)
-	local dt = Mark.vStep(st, t)
-	local pts, head, flying = Mark.vProjScene(st, C, t, G)
-	local pal = Mark.kickPalette.live
-	if flying then
-		local i = math.floor(head)
-		local p = pts[i]:Lerp(pts[math.min(i + 1, 20)], head - i)
-		local prev = p
-		for k = i + 1, 20 do
-			Mark.vLip(seg, prev, pts[k], pal[1], 0.55, 1)
-			prev = pts[k]
-		end
-		seg(p - G.fw * 0.5, p + G.fw * 0.5, Color3.new(1, 1, 1), 1, 2.6, 46)
-	end
-	st.ph = (st.ph or 0) + dt * (flying and 2 or 0.6)
-	Mark.kickRipple(seg, Vector3.new(C.X, G.gy + 0.1, C.Z), 3.4, pal, st.ph, t, 2)
-end
-
--- B. BOLT: a bolt from the projectile to the impact every 0.16 s (the language of the air duel)
-Mark.vProjBolt = function(seg, C, t, st, G)
-	local pts, head, flying = Mark.vProjScene(st, C, t, G)
-	if not flying then
-		return
-	end
-	local i = math.floor(head)
-	local p = pts[i]:Lerp(pts[math.min(i + 1, 20)], head - i)
-	st.bs = st.bs or { list = {}, nextAt = 0, n = 0 }
-	if st.bs.nextAt > t + 1 then
-		st.bs.nextAt = 0
-	end
-	local hit = Vector3.new(C.X, G.gy + 0.2, C.Z)
-	Mark.duelBolts(seg, t, "live", Mark.kickPalette.live[1], G.gy, function()
-		return p, p:Lerp(hit, 0.55) + Vector3.new(0, 1.2, 0), hit
-	end, st.bs)
-	seg(p - G.fw * 0.5, p + G.fw * 0.5, Color3.new(1, 1, 1), 1, 2.6, 46)
-end
-
--- C. FUSE RAIL: the remaining path as dashes running at us, a spark on the projectile, the impact rim burning down
-Mark.vProjFuse = function(seg, C, t, st, G)
-	local pts, head, flying = Mark.vProjScene(st, C, t, G)
-	local pal = Mark.kickPalette.armed
-	local hit = Vector3.new(C.X, G.gy + 0.1, C.Z)
-	if flying then
-		local i = math.floor(head)
-		local off = (t * 6) % 1
-		for k = i + 1, 19 do
-			local a = pts[k]:Lerp(pts[k + 1], off * 0.5)
-			local b = pts[k]:Lerp(pts[k + 1], off * 0.5 + 0.5)
-			Mark.vLip(seg, a, b, pal[1], 0.8, 1.2)
-		end
-		local p = pts[i]:Lerp(pts[math.min(i + 1, 20)], head - i)
-		local hn = (math.sin(t * 97.3) * 43758.5) % 1
-		for k = 0, 2 do
-			local a = hn * 6.28 + k * 2.09
-			seg(p, p + Vector3.new(math.cos(a), 0.5, math.sin(a)) * (0.5 + hn * 0.5), Color3.new(1, 1, 1), 0.9, 1.3, 46)
-		end
-		local left = 1 - head / 20
-		local prev
-		local n = math.max(2, math.floor(left * 24))
-		for s = 0, n do
-			local a = math.pi / 2 + s / n * left * math.pi * 2
-			local q = hit + G.right * (math.cos(a) * 3) + G.fw * (math.sin(a) * 3)
-			if prev then
-				Mark.vLip(seg, prev, q, pal[2], 0.9, 1.4)
-			end
-			prev = q
-		end
-	else
-		local age = (t % 1.4) - 1.1
-		local r = 3 + age * 14
-		Mark.vRing(seg, hit, G.right, G.fw, r, pal, 0, math.max(0, 1 - age / 0.3), 2, 22)
-	end
-end
-
 Mark.galStations = {
-	{ name = "Fake aim A: mirage rings", x = 116, art = function(seg, C, t, st, G)
-		Mark.vSpoofMirage(seg, C, t, st, G)
-	end },
-	{ name = "Fake aim B: bolt hop", x = 148, art = function(seg, C, t, st, G)
-		Mark.vSpoofBolt(seg, C, t, st, G)
-	end },
-	{ name = "Fake aim C: spring brackets", x = 180, art = function(seg, C, t, st, G)
-		Mark.vSpoofBrackets(seg, C, t, st, G)
-	end },
-	{ name = "Boomerang A: time thread", x = 212, art = function(seg, C, t, st, G)
-		Mark.vBoomThread(seg, C, t, st, G)
-	end },
-	{ name = "Boomerang B: comet", x = 244, art = function(seg, C, t, st, G)
-		Mark.vBoomComet(seg, C, t, st, G)
-	end },
-	{ name = "Boomerang C: ghost loop", x = 276, art = function(seg, C, t, st, G)
-		Mark.vBoomGhost(seg, C, t, st, G)
-	end },
-	{ name = "Projectile A: impact ripple", x = 308, art = function(seg, C, t, st, G)
-		Mark.vProjRipple(seg, C, t, st, G)
-	end },
-	{ name = "Projectile B: bolt", x = 340, art = function(seg, C, t, st, G)
-		Mark.vProjBolt(seg, C, t, st, G)
-	end },
-	{ name = "Projectile C: fuse rail", x = 372, art = function(seg, C, t, st, G)
-		Mark.vProjFuse(seg, C, t, st, G)
-	end },
-	{ name = "SilentAim bazooka: blast area", x = -40, art = function(seg, C, t, st)
-		st.area = st.area or Mark.areaNew()
-		st.area.gal = true
-		-- 3.2 s loop: appears, the aim point glides (he moves), solve lost -> fade out
-		local ph = t % 3.2
-		local G = ph < 2.4 and (C + Vector3.new(math.cos(t * 1.3) * 3, 0, math.sin(t * 0.9) * 2)) or nil
-		Mark.areaDraw(G, 14, Color3.fromRGB(255, 150, 50), false, st.area)
-	end },
-	{ name = "SilentAim freeze gun: freeze area", x = -10, art = function(seg, C, t, st)
-		st.area = st.area or Mark.areaNew()
-		st.area.gal = true
-		local ph = (t + 1.1) % 3.2
-		local G = ph < 2.4 and (C + Vector3.new(math.sin(t * 1.1) * 2.5, 0, 0)) or nil
-		Mark.areaDraw(G, CFG.FreezeRadius or 8, Color3.fromRGB(90, 220, 255), false, st.area)
-	end },
-	{ name = "CounterJump: seen / plan / jumped", x = 20, art = function(seg, C, t, st, G)
-		-- 6 s loop: 2 s each state. His arc crosses the station; ours leaves from the near side.
-		local ph = t % 6
-		local k = ph < 2 and "safe" or "armed"
-		local p0 = t - ph % 2
-		local A0 = C - G.right * 9 + G.fw * 4 + Vector3.new(0, 3, 0)
-		if not st.path then
-			st.path = {}
-			for i = 0, 60 do
-				local s = i * 0.025
-				st.path[i + 1] = A0 + G.right * (14 * s) + Vector3.new(0, 26 * s - 0.5 * 40 * s * s, 0)
-			end
-		end
-		local path = st.path
-		st.v = st.v or { boltSt = { list = {}, nextAt = 0, n = 0 } }
-		local v = st.v
-		v.key, v.P, v.path, v.pathAt, v.at = k, A0, path, p0, p0
-		v.us = C - G.fw * 6 + Vector3.new(0, 3, 0)
-		v.landed, v.vJ, v.g, v.vy = true, 30, 196.2, 0
-		v.liveUntil = ph >= 4 and (p0 + 2) or nil
-		if k == "safe" then
-			v.plan = nil
+	{ name = "Fake aim: spring brackets", x = -30, art = function(seg, C, t, st, G)
+		local up = Vector3.new(0, 1, 0)
+		local m0 = C + G.fw * 6
+		local W, H = 16, 7
+		local lb, rb = m0 - G.right * (W / 2), m0 + G.right * (W / 2)
+		seg(lb, lb + up * H, COL.Chalk, 0.35, 1, 43)
+		seg(rb, rb + up * H, COL.Chalk, 0.35, 1, 43)
+		seg(lb + up * H, rb + up * H, COL.Chalk, 0.35, 1, 43)
+		local ph = t % 1.6
+		if ph < 0.6 then
+			local spots = { { -0.75, 0.75 }, { 0.7, 0.25 }, { -0.6, 0.3 } }
+			local sp = spots[math.floor(ph / 0.2) + 1]
+			local q = m0 + G.right * (sp[1] * W / 2) + up * (sp[2] * H)
+			Mark.bracketArt(seg, q, G.right, 1 - ph / 0.6, os.clock(), st)
 		else
-			local E = A0 + G.right * (14 * 0.8) + Vector3.new(0, 26 * 0.8 - 0.5 * 40 * 0.64, 0)
-			v.plan = { T = 0.8, td = 0.45, Q = v.us:Lerp(Vector3.new(E.X, v.us.Y, E.Z), 0.7), E = E }
+			st.bq = nil
 		end
-		-- the loop replays his flight from its start every state; the art reads time relative to v.at
-		Mark.duelArt(seg, v, G.gy, p0 + (ph % 2) * 0.5)
 	end },
-	{ name = "AutoDodge: grenade (hop path + fuse)", x = 52, art = function(seg, C, t, st, G)
-		-- 3.4 s loop: thrown, hops toward the spot, fuse burns down, goes off, a short pause
-		local ph = t % 3.4
-		local T = 2.6
-		local function at(s)
-			local u = math.clamp(s / 1.8, 0, 1)
-			local h = math.abs(math.sin(u * math.pi * 3)) * 4 * (1 - u) ^ 1.5
-			return C - G.right * (10 * (1 - u)) + Vector3.new(0, 0.45 + h, 0)
+	{ name = "Boomerang: comet", x = 10, art = function(seg, C, t, st, G)
+		local f = G.fw
+		local side = Vector3.new(f.Z, 0, -f.X)
+		local S = C - f * 14 + Vector3.new(0, 3.5, 0)
+		local pts = { S - side * 1.2 - f * 1.5 }
+		for i = 0, 22 do
+			local th = i / 76 * math.pi * 2
+			pts[#pts + 1] = S + f * (30 * math.sin(th)) + side * (-18 * (1 - math.cos(th))) + Vector3.new(0, 1.2 * math.sin(th * 0.5), 0)
 		end
-		st.ev = st.ev or { kind = "blast", r = 14, path = {} }
-		local ev = st.ev
-		ev.p, ev.t, ev.seen = C, T, 0
-		if ph < T then
-			ev.boomAt = nil
-			for i = 0, 12 do
-				ev.path[i + 1] = at(ph + (T - ph) * i / 12)
+		Mark.cometArt(seg, pts, Color3.fromRGB(90, 220, 255), os.clock())
+	end },
+	{ name = "Projectile: fuse rail", x = 50, art = function(seg, C, t, st, G)
+		local A = C + G.fw * 40 + G.right * 8 + Vector3.new(0, 4, 0)
+		local u = (t % 1.4) / 1.1
+		local hit = Vector3.new(C.X, G.gy + 0.1, C.Z)
+		if u < 1 then
+			local pts = {}
+			for k = math.floor(u * 20), 20 do
+				local s = k / 20
+				pts[#pts + 1] = A:Lerp(C + Vector3.new(0, 1, 0), s) + Vector3.new(0, 6 * math.sin(s * math.pi), 0)
 			end
-		elseif not ev.boomAt then
-			ev.boomAt = os.clock()
+			Mark.fuseArt(seg, { pts = pts, hit = hit, frac = 1 - u, speed = 60 }, os.clock())
+		else
+			local age = (t % 1.4) - 1.1
+			local pal = Mark.kickPalette.armed
+			local r, prev = 3.2 + age * 14, nil
+			for k = 0, 22 do
+				local a = k / 22 * math.pi * 2
+				local p = hit + Vector3.new(math.cos(a) * r, 0, math.sin(a) * r)
+				if prev then
+					seg(prev, p, pal[1], math.max(0, 1 - age / 0.3), 2, 44)
+				end
+				prev = p
+			end
 		end
-		if ph < 3.1 then
-			st.used = Mark.hazArt(seg, G.tris, G.triN, ev, ph, os.clock())
-		end
-	end },
-	{ name = "AutoDodge: bazooka impact / hammer slam", x = 84, art = function(seg, C, t, st, G)
-		local ph = t % 2.2
-		st.ev = st.ev or { kind = "blast", r = 14 }
-		local ev = st.ev
-		ev.p, ev.t, ev.seen = C, 1.2, 0
-		if ph < 1.2 then
-			ev.boomAt = nil
-		elseif not ev.boomAt then
-			ev.boomAt = os.clock()
-		end
-		st.ev2 = st.ev2 or { kind = "blast", r = 9 }
-		local e2 = st.ev2
-		e2.p, e2.t, e2.seen = C + G.fw * 22, 0.7, 0
-		local ph2 = t % 1.4
-		if ph2 < 0.7 then
-			e2.boomAt = nil
-		elseif not e2.boomAt then
-			e2.boomAt = os.clock()
-		end
-		local n = 0
-		if ph < 1.6 then
-			n += Mark.hazArt(seg, G.tris, G.triN, ev, ph, os.clock())
-		end
-		if ph2 < 1.1 then
-			n += Mark.hazArt(seg, G.tris, G.triN + n, e2, ph2, os.clock())
-		end
-		st.used = n
 	end },
 }
 
