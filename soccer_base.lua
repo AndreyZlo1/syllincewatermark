@@ -200,6 +200,8 @@ local CFG = {
 	WallEquipDelay = 0.3, -- extra time the equip needs before the wall can be placed
 	WallEquipHold = 3.5,
 	WallTrap = true, -- Keeper Trap: a barricade between us and the enemy keeper's dive
+	WallTrapCome = 5, -- keeper closing speed on us before the barricades are armed
+	WallTrapArm = 1, -- armed barricades are put away after this long without a dive
 	WallTrapBait = true, -- put it up before he dives when we close in on him
 	WallReach = 18, -- a chaser (our ball) / the carrier within this gets a wall across his run
 	WallWindow = 0.45, -- ... only if he reaches it within this after it appears (earlier and he walks around it)
@@ -6557,6 +6559,12 @@ ChargePathVelocity.Get = function(char, secs, kind, aim, origin, reported, kickD
 			curve = if Mark.flickStrike then nil else Shoot.curve -- was `and nil or`: the flick kept the curve
 		end
 	end
+	-- Direction Spoof: the game's trajectory preview (the one that is replicated to the other clients as the charge path)
+	-- is drawn from the same aim as the packets: the decoy while it runs, never the solved shot
+	local decoy = Mark.sp and Mark.spoofRay()
+	if decoy then
+		aim, curve, target = decoy, nil, nil
+	end
 	return oldPathGet(char, secs, kind, aim, origin, reported, kickDir, target, boundary, curve)
 end
 
@@ -8206,16 +8214,20 @@ Mark.wallTrap = function(root, diving)
 		if k.d > dHi or k.d > reach + 5 or k.d < math.max(dLo - 2, 8) then
 			return false
 		end
-		-- he stands between us and his goal and we close in on each other
-		local g = enemyGoalPart()
-		local toK = unitOrNil(flat(k.r.Position - root.Position))
-		if not (g and toK) or flat(g.Position - root.Position):Dot(toK) <= 0 then
+		-- he must be coming for us: closing on us, not standing on his line
+		local toKk = unitOrNil(flat(k.r.Position - root.Position))
+		local kv = toKk and -flat(k.r.AssemblyLinearVelocity):Dot(toKk) or 0
+		if kv < (CFG.WallTrapCome or 5) then
 			return false
 		end
-		local close = flat(root.AssemblyLinearVelocity):Dot(toK) - flat(k.r.AssemblyLinearVelocity):Dot(toK)
-		if close < 3 and k.d > 11 then
-			return false
+		-- ARM only: the wall itself goes down on his real dive (the dive event / the NPC burst), never on a guess.
+		-- Armed = barricades in hand, put away if he does not dive within WallTrapArm seconds.
+		Mark.trapArm = os.clock()
+		local equipped = Mark.itemUse and Mark.itemUse.IsEquipped and Mark.itemUse.IsEquipped() and Mark.equippedId() == "barricades"
+		if not equipped and Mark.slotOfItem("barricades") then
+			Mark.equipWall("trap arm")
 		end
+		return false
 	end
 	local O, ourV = root.Position, flat(root.AssemblyLinearVelocity)
 	local base = D.GetTravel(el0, reach)
@@ -8260,6 +8272,15 @@ Mark.wallTick = function(root, oid, own)
 		if own and Mark.wallTrap(root, false) then
 			return
 		end
+	end
+	if isWall and Mark.trapArm and now - Mark.trapArm > (CFG.WallTrapArm or 1) and not (Mark.trapDive and now - Mark.trapDive.at < 0.6) and Mark.wallEquipAt then
+		Mark.trapArm, Mark.wallEquipAt = nil, nil
+		local s0 = Mark.wallEquipSlot or Mark.slotOfItem("barricades")
+		if s0 then
+			Mark.pressSlot(s0)
+			logFile("wall trap", "no dive - put away")
+		end
+		return
 	end
 	local wp0 = Mark.wallPend
 	if isWall and Mark.wallEquipAt and wp0 and wp0.at >= Mark.wallEquipAt and now - wp0.at > 0.12 then
@@ -11348,7 +11369,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v150")
+	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v151")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
