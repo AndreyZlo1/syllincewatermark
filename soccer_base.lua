@@ -201,9 +201,6 @@ local CFG = {
 	WallEquipHold = 3.5,
 	WallTrap = true, -- Keeper Trap: a barricade between us and the enemy keeper's dive
 	WallTrapBait = true, -- put it up before he dives when we close in on him
-	WallTrapDist = 16, -- bait: keeper this close
-	WallTrapEquip = true, -- hold the barricades while the keeper is near
-	WallTrapEquipDist = 24, -- put the unused barricades away after this long
 	WallReach = 18, -- a chaser (our ball) / the carrier within this gets a wall across his run
 	WallWindow = 0.45, -- ... only if he reaches it within this after it appears (earlier and he walks around it)
 	WallShot = true, -- wall on the replicated shot path of a charging carrier (needs barricades in hand)
@@ -8111,7 +8108,7 @@ end
 -- GetDistance * 1.3 + 3 (DiveAssist travel scale + bonus), re-locked on the ball = on us every update. The wall (11.5 wide,
 -- 6.4 high, thin, 5 studs in front of our server root along the aim) is solved by Mark.wallSolve against that path.
 --   dive  the GoalkeeperDiveStarted packet: solved at once and every frame for 0.5 s (no 15 Hz throttle)
---   bait  he has his dive and we close in within WallTrapDist: the wall goes up before he commits
+--   bait  he has his dive and we are inside the window where a reactive wall is too late (his dive front arrives sooner than equip + latency): equip, place, put away
 Mark.foeKeeper = function(root, maxD)
 	local best, bd = nil, maxD
 	for _, model in Mark.models() do
@@ -8191,7 +8188,22 @@ Mark.wallTrap = function(root, diving)
 	else
 		local wp = Mark.wallPend
 		local td = Mark.trapDive
-		if (td and td.uid == k.key and os.clock() - td.at < 2) or CFG.WallTrapBait == false or Mark.foeDiveLeft() > 0 or k.d > (CFG.WallTrapDist or 16) or k.d < 7 or (wp and wp.trap and os.clock() - wp.at < 3) then
+		if (td and td.uid == k.key and os.clock() - td.at < 2) or CFG.WallTrapBait == false or Mark.foeDiveLeft() > 0 or (wp and wp.trap and os.clock() - wp.at < 3) then
+			return false
+		end
+		-- The dive's limit and speed (GetTravel: cubic out, v0 = 3 reach / T). Its front reaches the wall plane (5 st ahead
+		-- of us) at tFront(d). A dive seen at the start can still be answered while tFront > equip + latency (reactive, no
+		-- need to be early); the bait is for the window where it cannot: tFront below that, but still above the press-only
+		-- latency (the wall must exist before it arrives). Outside it: wait.
+		local Tm = dur
+		local function front(t)
+			return reach * (1 - (1 - math.min(t / Tm, 1)) ^ 3) + 5
+		end
+		local ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
+		local lat = ping * 0.5 + (CFG.WallLatency or 0.06) + (CFG.WallMargin or 0.05)
+		local dHi = front(lat + (CFG.WallEquipDelay or 0.3) + 0.12)
+		local dLo = front(lat)
+		if k.d > dHi or k.d > reach + 5 or k.d < math.max(dLo - 2, 8) then
 			return false
 		end
 		-- he stands between us and his goal and we close in on each other
@@ -8243,32 +8255,22 @@ Mark.wallTick = function(root, oid, own)
 	Mark.wallTickAt = now
 	local inHand = use.IsEquipped and use.IsEquipped()
 	local isWall = inHand and Mark.equippedId() == "barricades"
-	-- Keeper Trap: barricades in hand while the keeper is near and we carry the ball (placing then costs no equip time);
-	-- put away as soon as the trap wall is up or the chance is gone (an item in hand blocks the shot)
-	if CFG.WallTrap ~= false and CFG.WallTrapEquip ~= false then
-		local k = own and Mark.foeKeeper(root, 40)
-		local slot = Mark.slotOfItem("barricades")
-		if own and k and k.d <= (CFG.WallTrapEquipDist or 24) and Mark.foeDiveLeft() <= 0 and not inHand and slot then
-			if Mark.equipWall("trap ready") then
-				Mark.trapHold = now
-			end
-		elseif isWall and Mark.trapHold then
-			local wp = Mark.wallPend
-			local placed = wp and wp.trap and wp.at >= Mark.trapHold and (wp.seenAt or now - wp.at > 0.35)
-			if placed or not own or not k or k.d > (CFG.WallTrapEquipDist or 24) + 6 or Mark.foeDiveLeft() > 0 then
-				Mark.trapHold = nil
-				Mark.wallEquipAt = nil
-				local s2 = Mark.wallEquipSlot or slot
-				if s2 then
-					Mark.pressSlot(s2)
-					logFile("wall trap", "put away", placed and "placed" or "chance gone")
-				end
-				return
-			end
-		end
+	-- Keeper Trap bait: equip + place + put away, all inside Mark.wallTrap (no holding the item)
+	if CFG.WallTrap ~= false then
 		if own and Mark.wallTrap(root, false) then
 			return
 		end
+	end
+	local wp0 = Mark.wallPend
+	if isWall and Mark.wallEquipAt and wp0 and wp0.at >= Mark.wallEquipAt and now - wp0.at > 0.12 then
+		-- equip -> place -> put away: the wall is down, the item must not stay in the hand (it blocks the ball controls)
+		Mark.wallEquipAt = nil
+		local s1 = Mark.wallEquipSlot or Mark.slotOfItem("barricades")
+		if s1 then
+			Mark.pressSlot(s1)
+			logFile("wall equip", "placed - put away", wp0.kind)
+		end
+		return
 	end
 	if isWall and Mark.wallEquipAt and now - Mark.wallEquipAt > (CFG.WallEquipHold or 3.5) and now - (Mark.skillAt or 0) > (CFG.WallEquipHold or 3.5) then
 		-- put away what we took out and did not use (an equipped item blocks ball controls)
@@ -11346,7 +11348,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v149")
+	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v150")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -22159,10 +22161,7 @@ return function(_Lib, _Core)
 			head(w, "Keeper Trap")
 			tog(w, "Enabled", "WallTrap", "Puts a wall between you and the enemy keeper's dive.")
 			tog(w, "Bait", "WallTrapBait", "Puts it up before he dives when you run at him.")
-			tog(w, "Hold Barricades", "WallTrapEquip", "Keeps them in hand near the keeper for an instant wall.")
 			advanced(w, "Wall", function()
-				sld(w, "Trap Bait Distance", "WallTrapDist", 8, 24, { suffix = " st" })
-				sld(w, "Trap Hold Distance", "WallTrapEquipDist", 10, 40, { suffix = " st" })
 				sld(w, "Body Reach", "WallReach", 8, 40, { suffix = " st", text = "Walls a chaser or the carrier within this distance." })
 				sld(w, "Body Window", "WallWindow", 0.15, 1, { prec = 2, suffix = " s", text = "He must hit the wall this soon after it appears." })
 				sld(w, "Put Away After", "WallEquipHold", 1, 10, { prec = 1, suffix = " s" })
