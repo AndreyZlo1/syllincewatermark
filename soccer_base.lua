@@ -75,6 +75,8 @@ local CFG = {
 	DirSpoof = false, -- Direction Spoof: the replicated charge aim shows decoys until the aim lock
 	DirSpoofChance = 1, -- share of shots spoofed
 	DirSpoofPreset = "Normal", -- Safe | Normal | Long | Custom (the two times below)
+	DirSpoofSpeed = 14, -- fake aim travel speed, half-goals per second (40 = jump)
+	DrawSpoof = true, -- fake aim marker
 	DirSpoofTime = 0.12, -- Custom: how long the fake aim may show (s)
 	FaceSpoofTime = 0.15, -- Custom: how long the body may lie (s)
 	ShotCurve = "Full", -- Full | Light | Off: how much the solver may bend a shot
@@ -340,6 +342,7 @@ local CFG = {
 	SilentFov = 140,
 	FreezeRadius = 8, -- freeze gun blast radius on the ground (not in the dump; `silent area freeze` logs who froze at what distance) -- px radius around the gun reticle
 	AerialJumpLead = 0.3, -- jump when arrival <= this: the whole ~0.27 s rise sits inside the 0.4 s volley window
+	GkDiveLate = 0.07, -- dive only when a dive started this much later would miss (s)
 	GkWalkSlack = 0.12, -- humanoid accel/turn before full WalkSpeed (not from dump)
 	GkReactSeconds = 0.15, -- keeper reaction after release; he sees GoalCrossingPreview (not from dump)
 	ShotReachMargin = 0.05,
@@ -8637,10 +8640,10 @@ end
 -- (GoalkeeperActions: max(1.25, 2*BallRadius)) and 2*SaveReachStuds along the dive. Every ball path sample
 -- (Mark.ballPath, world collisions) inside SaveWindowSeconds is tested after our input delay. Independent of the
 -- game's assist, which only nudges.
-Mark.gkOwnDive = function(root, td)
+Mark.gkOwnDive = function(root, td, noJump)
 	td = td or 0
 	local yJ = 0
-	if td > 0 then
+	if td > 0 and not noJump then
 		local gW = Workspace.Gravity
 		yJ = math.max(math.sqrt(2 * gW * (Mark.jumpH or 7.2)) * td - 0.5 * gW * td * td, 0)
 	end
@@ -8866,6 +8869,11 @@ Mark.gkBait = function(samples, ts, limit)
 		do
 			for _, m in mates do
 				if t < m.skip then
+					continue
+				end
+				-- the ball leaving HIS foot is the kick itself, not a touch: a one-touch shot / quick pass-and-shoot has no
+				-- ownership record for the new kicker, so the "touch at 0.00" hid the shot for 0.15 s (log: bait touch 0.00 d 2.4)
+				if t < 0.07 and flat(m.pos - samples[1]).Magnitude < 4.5 then
 					continue
 				end
 				local lead = m.dly + math.min(t, 0.5)
@@ -10554,10 +10562,22 @@ Mark.tickGk = function(character, root)
 			end
 		end
 		local hit = Mark.gkOwnDive(root) or Mark.gkDiveSearch(root, dState, dWorld)
-		if not hit and CFG.GkJumpDive ~= false then
+		-- Dive at the LAST moment the save still connects: a ground dive cannot be undone, and a walk / jump (or a better
+		-- dive) may open up as the ball comes (log: jump + dive at eta 0.83 while a walk save at 0.35 existed).
+		local late = CFG.GkDiveLate or 0.07
+		local deferred = false
+		if hit and hit.own and late > 0 and Mark.gkOwnDive(root, late, true) then
+			hit = nil
+			deferred = true
+		end
+		if not hit and not deferred and CFG.GkJumpDive ~= false then
 			-- nothing a ground dive touches (the high corner: the dive rises ~1.7 studs): jump first, dive from the air
 			for _, td in { 0.12, 0.25 } do
 				local h2 = Mark.gkOwnDive(root, td)
+				if h2 and late > 0 and Mark.gkOwnDive(root, td + late) then
+					deferred = true
+					break
+				end
 				if h2 then
 					Mark.actionMotion = Mark.actionMotion or require(Modules.Actions.ActionMotion)
 					if Mark.doJump("gk") then
@@ -10598,7 +10618,7 @@ Mark.tickGk = function(character, root)
 				Mark.gkDiveRec = { at = os.clock(), name = hit.name, minD = math.huge, eta = crossT or -1 }
 			end
 			logFile("gk dive", ok and "ok" or "no", "model", hit.own and "own" or "assist", "choice", hit.name, "miss", string.format("%.2f", hit.miss), "t", string.format("%.2f", hit.t or -1), "assist", tostring(hit.assisted), "eta", string.format("%.2f", crossT or -1), "dir", fmtV(hit.wd))
-		elseif not Mark.gkNoDiveLog or now - Mark.gkNoDiveLog > 0.3 then
+		elseif not deferred and (not Mark.gkNoDiveLog or now - Mark.gkNoDiveLog > 0.3) then
 			Mark.gkNoDiveLog = now
 			logFile("gk dive none", "eta", string.format("%.2f", crossT or -1), "cross", string.format("%.1f", crossSide or 0))
 		end
@@ -10957,7 +10977,7 @@ RunService.RenderStepped:Connect(function()
 		Mark.frameCam = nil
 	end
 	paintWorld()
-	if next(Mark.hazEv) ~= nil or (Mark.projLive and next(Mark.projLive) ~= nil) or (Mark.hazFx and not Mark.hazFx.empty) then
+	if next(Mark.hazEv) ~= nil or (Mark.projLive and next(Mark.projLive) ~= nil) or Mark.sp or (Mark.hazFx and not Mark.hazFx.empty) then
 		Mark.hazDraw()
 	end
 	if Mark.gal and Mark.gal.on then
@@ -11468,7 +11488,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v161")
+	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v162")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -14603,7 +14623,7 @@ Mark.spoofPlan = function()
 	local now = os.clock()
 	Mark.sp = {
 		t0 = now, endAt = now + win, steps = pats[pick].steps, O = O, D = D, lb = lb, along = along, W = W, H = H,
-		fov = a.CameraFieldOfView, air = a.IsAirborne, name = pick, hr = hr,
+		fov = a.CameraFieldOfView, air = a.IsAirborne, name = pick, hr = hr, cs = sr, lt = now,
 	}
 	logFile("spoof", "plan", pick, "real s", string.format("%.2f", sr), "h", string.format("%.2f", hr), "keeper s", sk and string.format("%.2f", sk) or "-", "window", string.format("%.2f", win))
 end
@@ -14633,6 +14653,17 @@ Mark.spoofDir = function()
 	end
 	-- sideways only: the decoy keeps the real height. A decoy pitch that leaks into the shot sends it over the bar.
 	h = sp.hr or h
+	-- the decoy slides to each step at Fake Speed (half-goals / s), not a jump: a human flick the keeper can follow
+	local nowC = os.clock()
+	local spd = CFG.DirSpoofSpeed or 14
+	if sp.cs == nil or spd >= 40 then
+		sp.cs = s
+	elseif nowC > (sp.lt or nowC) then
+		local mv = spd * (nowC - sp.lt)
+		sp.cs = sp.cs + math.clamp(s - sp.cs, -mv, mv)
+	end
+	sp.lt = nowC
+	s = sp.cs
 	local Q = sp.lb + sp.along * (sp.W * (s + 1) * 0.5) + Vector3.new(0, sp.H * h, 0)
 	sp.q = Q
 	return unitOrNil(Q - sp.O)
@@ -14772,20 +14803,14 @@ Mark.bracketArt = function(seg, q, right, left, t, st)
 	end
 end
 
-Mark.spoofDraw = function(pen)
+Mark.spoofDraw = function(seg)
 	local sp = Mark.sp
-	local q = sp and sp.q
-	if not (pen and q and Mark.spoofDir()) then
+	local now = os.clock()
+	if not (sp and sp.q and now < sp.endAt + 0.3) then
 		return
 	end
-	local now = os.clock()
-	local seg = function(a, b, col, alpha, thick, z)
-		local x0, y0, d0 = pen.P(a)
-		local x1, y1, d1 = pen.P(b)
-		pen.L(x0, y0, d0, x1, y1, d1, col, alpha, thick, z)
-	end
 	sp.br = sp.br or {}
-	Mark.bracketArt(seg, q, sp.along, (sp.endAt - now) / math.max(sp.endAt - sp.t0, 0.05), now, sp.br)
+	Mark.bracketArt(seg, sp.q, sp.along, (sp.endAt - now) / math.max(sp.endAt - sp.t0, 0.05), now, sp.br)
 end
 
 
@@ -19932,6 +19957,9 @@ Mark.hazDraw = function()
 			end
 		end
 	end
+	if CFG.Draw and CFG.DrawSpoof ~= false and Mark.sp then
+		Mark.spoofDraw(pool.seg)
+	end
 	for k = used + 1, H.triHw or #H.tris do
 		H.tris[k].Visible = false
 	end
@@ -22172,6 +22200,8 @@ return function(_Lib, _Core)
 			head(ds, "Direction Spoof")
 			tog(ds, "Enabled", "DirSpoof", "Shows the keeper fake shot directions while you charge, then shoots for real.")
 			sld(ds, "Chance", "DirSpoofChance", 0, 100, { scale = 100, suffix = "%" })
+			sld(ds, "Fake Speed", "DirSpoofSpeed", 2, 40, { suffix = " /s", text = "How fast the fake aim slides between points. Max jumps instantly." })
+			tog(ds, "Show Fake Marker", "DrawSpoof", "Marks the fake aim point on the goal.")
 			drop(ds, "Preset", "DirSpoofPreset", { "Safe", "Normal", "Long", "Custom" }, "How long the fake shows and the body lies. Longer fools more but can pull the shot off target.")
 			tog(ds, "Smart Select", "DirSpoofSmart", "No spoof once the keeper has dived.")
 			head(ds, "Body Spoof")
@@ -22426,6 +22456,7 @@ return function(_Lib, _Core)
 			advanced(g, "Gk", function()
 				sld(g, "Reaction", "GkReactSeconds", 0.05, 0.4, { prec = 2, suffix = " s" })
 				sld(g, "Walk Slack", "GkWalkSlack", 0, 0.3, { prec = 2, suffix = " s" })
+				sld(g, "Dive Late", "GkDiveLate", 0, 0.2, { prec = 2, suffix = " s", text = "Waits for the last moment to dive; 0 dives as soon as a save exists." })
 				sld(g, "Intercept Radius", "GkInterceptEnemy", 4, 30, { suffix = " st", text = "Free ball with an enemy this close: no run." })
 				sld(g, "Bait Reach", "GkBaitReach", 0, 6, { prec = 1, suffix = " st", text = "How far an enemy can step to take a fake." })
 				sld(g, "Bait Ray", "GkBaitRay", 0.5, 6, { prec = 1, suffix = " st" })
