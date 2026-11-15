@@ -438,6 +438,25 @@ Log.flush = function()
 	end
 	local text = table.concat(Log.wbuf, "\n", 1, Log.wn) .. "\n"
 	table.clear(Log.wbuf)
+	if Log.gn > 0 then
+		local g = table.concat(Log.gbuf, "\n", 1, Log.gn) .. "\n"
+		table.clear(Log.gbuf)
+		Log.gn = 0
+		pcall(function()
+			local f = "illegalsoccer_gk.txt"
+			if not Log.gkOpen then
+				Log.gkOpen = true
+				local old = isfile(f) and readfile(f) or ""
+				if #old > 400000 then
+					writefile("illegalsoccer_gk_prev.txt", old)
+					old = ""
+				end
+				writefile(f, old .. "-- session " .. os.date("%Y-%m-%d %H:%M:%S") .. "\n" .. g)
+			else
+				appendfile(f, g)
+			end
+		end)
+	end
 	Log.wn, Log.wAt = 0, os.clock()
 	if Log.started and isfile(Log.file) then
 		appendfile(Log.file, text)
@@ -459,8 +478,18 @@ local function persist(line)
 	end
 end
 
+-- Keeper / goal-defence lines also go to illegalsoccer_gk.txt, which is NOT rotated per session (illegalsoccerlog.txt
+-- becomes _prev on every start, so two restarts lost the very keeper episode the user wanted to show). Capped: past
+-- ~400 KB it moves to illegalsoccer_gk_prev.txt.
+Log.gbuf, Log.gn = {}, 0
 local function logFile(...)
-	persist(dbg(...))
+	local line = dbg(...)
+	local k = select(1, ...)
+	if type(k) == "string" and (k:sub(1, 3) == "gk " or k:sub(1, 11) == "block clear" or k:sub(1, 10) == "block goal" or k:sub(1, 9) == "block def") then
+		Log.gn += 1
+		Log.gbuf[Log.gn] = line
+	end
+	persist(line)
 end
 
 -- Potassium catalog (debug.md): debug.getupvalue(fn, i) -> any (value only)
@@ -3814,13 +3843,48 @@ local solveShotRaw
 -- random order (Efraimidis-Spirakis keys, seeded by Shoot.roll so the same spot gives the same order), and they are solved one
 -- by one until the first OPEN shot (the keeper cannot reach it in time). Weighted order + first feasible = weighted pick among
 -- the feasible ones, the same distribution as the old pick, for 1-3 candidates instead of all.
+-- SHOT WEIGHTS (AutoShoot > Shot Types > Weights). Key of a candidate for the user's weight: the lob is "chip", a "mid"
+-- is "high", and a CURLED "high" (packHighCurves / the primary 0.85 curl into the top corner) is its own type "curl":
+-- under one "high" key the user could not weigh the top-corner curl apart from the straight high shot, and the
+-- per-family pick (cornerGap) always kept the curl (it ends closer to the corner) - "corners even at 0 %".
+Mark.shotWKey = function(p)
+	if p.lob then
+		return "chip"
+	end
+	local b = p.band or ""
+	if b == "mid" then
+		b = "high"
+	end
+	if b == "high" and type(p.curve) == "number" and math.abs(p.curve) > 0.05 then
+		return "curl"
+	end
+	return b
+end
+Mark.shotUserW = function(p)
+	local sw = CFG.ShotWeight
+	local w = sw and sw[Mark.shotWKey(p)]
+	return type(w) == "number" and w or 1
+end
+-- any slider moved off 100 %: the user's mix replaces the built-in family preferences (curve x4..8 / straight x0.08 /
+-- "only curled when a curl exists" / "only types within 0.15 s of the most open one"). Those were hard filters in
+-- front of the weighted roll, so the weights only ever chose between corner curls.
+Mark.shotMixCustom = function()
+	local sw = CFG.ShotWeight
+	if type(sw) ~= "table" then
+		return false
+	end
+	for _, v in sw do
+		if type(v) == "number" and math.abs(v - 1) > 0.01 then
+			return true
+		end
+	end
+	return false
+end
+
 Mark.quickPrior = function(sp, c)
 	local band = sp.band or ""
-	local w = c.typeW[band] or 0.6
-	local sw = CFG.ShotWeight and CFG.ShotWeight[(band == "mid" and "high") or band]
-	if type(sw) == "number" then
-		w *= sw
-	end
+	local w = (c.typeW[band] or 0.6) * Mark.shotUserW(sp)
+	local userMix = c.userMix
 	local s = sp.side
 	local ap = c.approach
 	if math.abs(ap) > 6 then
@@ -3842,8 +3906,10 @@ Mark.quickPrior = function(sp, c)
 				return 0.001 -- the curl would bend away from the aim side (the old weigh() veto)
 			end
 		end
-		w *= 4 + c.farW * 4
-	elseif c.haveCurves and band ~= "flat" then
+		if not userMix then
+			w *= 4 + c.farW * 4
+		end
+	elseif c.haveCurves and band ~= "flat" and not userMix then
 		w *= 0.08
 	end
 	local hist = Mark.shotHist
@@ -5031,6 +5097,7 @@ solveShotRaw = function(root, forced)
 		end
 		local farW = math.clamp((dist - 28) / 55, 0, 1)
 		local closeW = math.clamp((24 - dist) / 14, 0, 1)
+		local userMix = Mark.shotMixCustom()
 		local hasCurve = false
 		for i = 1, #pool do
 			if pool[i].curve then
@@ -5140,7 +5207,7 @@ solveShotRaw = function(root, forced)
 			end
 			if p.curve then
 				w = w + 3 + farW * 4
-			elseif hasCurve and not p.lob and p.band ~= "flat" then
+			elseif hasCurve and not p.lob and p.band ~= "flat" and not userMix then
 				return 0
 			elseif hasCurve and dist > 40 then
 				w = w * 0.08
@@ -5218,7 +5285,7 @@ solveShotRaw = function(root, forced)
 			Shoot.collect = nil
 			local tried, openN = Mark.quickShot({
 				specs = specs, pool = pool, aimAndPack = aimAndPack, reachMargin = reachMargin, weigh = weigh, roll = Shoot.roll or 0,
-				approach = approach, keeper = keeper, openSign = openSign, rightDot = rightDot, farW = farW, haveCurves = amounts ~= nil,
+				approach = approach, keeper = keeper, openSign = openSign, rightDot = rightDot, farW = farW, haveCurves = amounts ~= nil, userMix = userMix,
 				typeW = { high = 1, airHigh = 1, dipCorner = 0.6, trickLow = 0.45, trick = 0.8, bounceHigh = 0.9, bounceLow = 0.9, corner = 0.65, airLow = 0.8 },
 			})
 			Shoot.quickN = (Shoot.quickN or 0) + 1
@@ -5321,7 +5388,7 @@ solveShotRaw = function(root, forced)
 		if #base == 0 then
 			base = pickFrom
 		end
-		if #curled > 0 and not (Mark.flickAim or Mark.aerial) then
+		if #curled > 0 and not (Mark.flickAim or Mark.aerial) and not userMix then
 			base = curled
 		end
 		-- high or low, not mid: mid height is where the keeper's body and dive are
@@ -5357,7 +5424,7 @@ solveShotRaw = function(root, forced)
 		end
 		for i = 1, #base do
 			local p = base[i]
-			local k = (p.band or "-") .. ((p.side or 0) >= 0 and "+" or "-")
+			local k = Mark.shotWKey(p) .. ((p.side or 0) >= 0 and "+" or "-")
 			local cur = perBand[k]
 			if not cur then
 				perBand[k] = p
@@ -5370,6 +5437,9 @@ solveShotRaw = function(root, forced)
 			end
 		end
 		local floorM = bestM >= CFG.ShotReachMargin and math.max(CFG.ShotReachMargin, bestM - 0.15) or bestM - 0.15
+		if userMix and bestM >= CFG.ShotReachMargin then
+			floorM = CFG.ShotReachMargin -- every OPEN type is in the user's roll, not only the most open one
+		end
 		for _, p in perBand do
 			if (p.reach or -math.huge) >= floorM then
 				band[#band + 1] = p
@@ -5379,7 +5449,7 @@ solveShotRaw = function(root, forced)
 		-- corner from a tight angle is a sliver (curl overruns into the post) and sits next to the keeper.
 		local famN = {}
 		for i = 1, #band do
-			local k = band[i].band or ""
+			local k = Mark.shotWKey(band[i])
 			famN[k] = (famN[k] or 0) + 1
 		end
 		local function sideW(p)
@@ -5401,7 +5471,7 @@ solveShotRaw = function(root, forced)
 			-- (DIP was 0.25 / 0.18 against HIGH 1.0: with the families' side variants that was ~5% of the shots, then the
 			-- foe filter removed most of those; the user read the result as "always the same shot")
 			local typeW = { high = 1, airHigh = 1, dipCorner = 0.6, trickLow = 0.45, trick = 0.8, bounceHigh = 0.9, bounceLow = 0.9, corner = 0.65, airLow = 0.8 }
-			w *= (typeW[p.band or ""] or 0.6) / (famN[p.band or ""] or 1) * ((CFG.ShotWeight and CFG.ShotWeight[(p.band == "mid" and "high") or p.band or ""]) or 1)
+			w *= (typeW[p.band or ""] or 0.6) / (famN[Mark.shotWKey(p)] or 1) * Mark.shotUserW(p)
 			-- variety: what was used in the last shots is less likely again (same family x0.55 each, same family+side x0.8 more)
 			local hist = Mark.shotHist
 			if hist then
@@ -5426,6 +5496,16 @@ solveShotRaw = function(root, forced)
 		for i = 1, #band do
 			band[i].pickW = sideW(band[i])
 			totalW += band[i].pickW
+		end
+		if userMix and #band > 0 then
+			local parts = {}
+			for i = 1, #band do
+				parts[i] = string.format("%s%s:%.2f:%.0f%%", Mark.shotWKey(band[i]), (band[i].side or 0) >= 0 and "+" or "-", band[i].reach or -1, totalW > 0 and band[i].pickW / totalW * 100 or 0)
+			end
+			if Shoot.mixLogRoll ~= Shoot.roll then
+				Shoot.mixLogRoll = Shoot.roll
+				logFile("shoot mix", "roll", string.format("%.2f", Shoot.roll or 0), table.concat(parts, " "))
+			end
 		end
 		if totalW > 0 then
 			local r = (Shoot.roll or 0) * totalW
@@ -11625,7 +11705,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v167")
+	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v168")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -14569,8 +14649,8 @@ Mark.shotFilter = function(pool)
 	for i = 1, #pool do
 		local p = pool[i]
 		local key = p.lob and "chip" or (p.band == "mid" and "high" or p.band)
-		-- a weight of 0% means never (the UI says so), not "least likely"
-		if not ban[key] and not (sw and sw[key] == 0) then
+		-- a weight of 0% means never (the UI says so), not "least likely"; weights use the split key (curl / high)
+		if not ban[key] and not (sw and sw[Mark.shotWKey(p)] == 0) then
 			out[#out + 1] = p
 		end
 	end
@@ -22629,8 +22709,14 @@ return function(_Lib, _Core)
 			tog(ty, "Prefer Corner Curl", "PreferCornerCurl")
 			tog(ty, "Only Trick / Dip", "OnlyTrick")
 			advanced(ty, "Weights", function()
-				note(ty, "100% = default mix. 0% = never, 200% = twice as often.")
+				note(ty, "All 100% = built-in mix. Move any slider and only your weights decide among the open shots. 0% = never.")
+				local W_TYPES = { { "curl", "High Curl (top corner)" }, { "high", "High (straight)" } }
 				for _, t in ipairs(SHOT_TYPES) do
+					if t[1] ~= "high" then
+						W_TYPES[#W_TYPES + 1] = t
+					end
+				end
+				for _, t in ipairs(W_TYPES) do
 					keep(ty:Slider({
 						Name = t[2],
 						Default = math.clamp(round(((CFG.ShotWeight and CFG.ShotWeight[t[1]]) or 1) * 100, 0), 0, 300),
