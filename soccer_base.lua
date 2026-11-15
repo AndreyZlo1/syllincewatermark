@@ -74,6 +74,8 @@ local CFG = {
 	FeintSmart = true,
 	DirSpoof = false, -- Direction Spoof: the replicated charge aim shows decoys until the aim lock
 	DirSpoofChance = 1, -- share of shots spoofed
+	DirSpoofTime = 0.12, -- how long the fake aim may show (s)
+	FaceSpoofTime = 0.15, -- how long the body may lie (s)
 	DirSpoofSmart = true, -- no spoof once the enemy keeper's dive is spent
 	FaceSpoof = false, -- body spoof: the facing lies (spin, twist, jitter, flip, sweep, away, decoy)
 	FaceSpoofMode = "smart",
@@ -7491,70 +7493,6 @@ end
 -- Boomerang aim art = the SilentAim tracer bent along the throw: ink bed + core from the muzzle down the real loop to the
 -- meeting point, hot pulses running out along it at the throw's own pace (one pass = its flight time to him), the
 -- SilentAim split ring at his feet, and the rest of the loop (the way back) as a faint dashed ghost.
--- COMET (SilentAim boomerang): one bead with a tapering tail flies the real loop to the interception point every 1.3 s;
--- on arrival the tail is drawn into the head and a pin drops onto the point and stays until the next throw.
--- pts: 1-based world points, from the muzzle to the meeting point.
-Mark.cometArt = function(seg, pts, col, now)
-	local n = #pts
-	if n < 2 then
-		return
-	end
-	local L = { 0 }
-	for k = 2, n do
-		L[k] = L[k - 1] + (pts[k] - pts[k - 1]).Magnitude
-	end
-	local total = L[n]
-	if total < 1 then
-		return
-	end
-	local hint = 2
-	local function at(s)
-		s = math.clamp(s, 0, total)
-		hint = 2
-		while hint < n and L[hint] < s do
-			hint += 1
-		end
-		local a, b = L[hint - 1], L[hint]
-		return pts[hint - 1]:Lerp(pts[hint], b > a and (s - a) / (b - a) or 0)
-	end
-	local ink = Color3.fromRGB(12, 14, 18)
-	local white = Color3.new(1, 1, 1)
-	local ph = now % 1.3
-	local fly = 0.8
-	local u = math.clamp(ph / fly, 0, 1)
-	u = 1 - (1 - u) ^ 1.4
-	local head = u * total
-	local tail = math.min(total * 0.35, 14)
-	local age = math.max(ph - fly, 0)
-	if age > 0 then
-		tail *= 1 - math.clamp(age / 0.25, 0, 1)
-	end
-	if tail > 0.3 then
-		local prev = at(head)
-		for k = 1, 8 do
-			local p = at(head - tail * k / 8)
-			seg(prev, p, ink, 0.5 * (1 - k / 9), 3.2 * (1 - k / 9) + 1, 44)
-			seg(prev, p, white:Lerp(col, k / 8), 1 - k / 10, 3 * (1 - k / 9) + 0.4, 46 - (k > 4 and 1 or 0))
-			prev = p
-		end
-	end
-	if age > 0 then
-		local P = pts[n]
-		local up = Vector3.new(0, 1, 0)
-		local drop = 1 - (1 - math.clamp(age / 0.2, 0, 1)) ^ 3
-		local top = P + up * (3.2 - 0.9 * drop)
-		local look = Mark.frameLook or Workspace.CurrentCamera.CFrame.LookVector
-		local side = unitOrNil(Vector3.new(-look.Z, 0, look.X)) or Vector3.new(1, 0, 0)
-		seg(P, top, ink, 0.6, 4.2, 44)
-		seg(P, top, col, 1, 1.8, 45)
-		for _, sg in { -1, 1 } do
-			local w = top + side * (0.55 * sg) + up * 0.7
-			seg(top, w, ink, 0.6, 3.6, 44)
-			seg(top, w, white, 1, 1.4, 46)
-		end
-	end
-	seg(at(head) - Vector3.new(0, 0.25, 0), at(head) + Vector3.new(0, 0.25, 0), white, 1, 2.4, 46)
-end
 
 
 -- the SilentAim target ring: three split arcs turning at his feet
@@ -8661,16 +8599,9 @@ Mark.tickSkill = function(character, root)
 		Mark.areaDraw(areaG, areaInfo.R, col)
 	else
 		if CFG.DrawSilent ~= false and boomInfo then
-			-- comet along the real loop to the meeting point
-			local tab, S0 = boomInfo.tab, boomInfo.S
-			local fb = boomDir
-			local side = Vector3.new(fb.Z, 0, -fb.X)
-			local iT = math.clamp(math.floor(boomInfo.t / tab.dt + 0.5), 1, tab.n)
-			local cp = { muzzle }
-			for i = 0, iT do
-				cp[#cp + 1] = S0 + fb * tab.a[i] + side * tab.b[i] + Vector3.new(0, tab.h[i], 0)
-			end
-			Mark.cometArt(pool.seg, cp, col, os.clock())
+			-- the throw's meeting point: the same tracer as every other silent shot (the loop art was rejected)
+			local P = boomInfo.P
+			Mark.silentArt(pool.seg, muzzle, P + Vector3.new(0, 0.6, 0), Vector3.new(P.X, P.Y - 2.9, P.Z), col, os.clock())
 		elseif CFG.DrawSilent ~= false and not Mark.areaItems[id] and id ~= "boomerang" then
 			Mark.silentArt(pool.seg, muzzle, chest, Vector3.new(aimP.X, aimP.Y - 2.9, aimP.Z), col, os.clock())
 		end
@@ -11527,7 +11458,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v159")
+	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v160")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -14540,13 +14471,14 @@ end
 Mark.spoofHist = {}
 -- How long the aim / body may lie: the charge until the aim lock (AimLockSeconds before full charge), minus 0.05 s so the
 -- real aim is replicated (30 Hz, ~0.11 s to the observers) before the lock freezes it
-Mark.spoofWin = function()
-	local fullAt = KickCore.GetFullChargeSeconds and KickCore.GetFullChargeSeconds() or 0.35
-	local maxC = KickCore.Constants.MaximumChargeSeconds or 0.4
-	-- The server reads our aim from the Update stream with the network delay: the real aim has to be there a full
-	-- ping + display delay (~0.11 s in the echo log) before the lock, or the shot is struck on the decoy (bar / wide)
+Mark.spoofWin = function(body)
+	-- How long the aim / the body may lie. The lock freezes the aim AimLockSeconds before the max charge; the real aim has
+	-- to be at the server ping/2 before that (+ a margin). Inside that ceiling the user sets the time (a longer lie = the
+	-- shot may follow it: see the `shoot flight` log, `angle to solved` with decoy yes).
+	local lock = (KickCore.Constants.MaximumChargeSeconds or 0.4) - (KickCore.Constants.AimLockSeconds or 0.1)
 	local ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
-	return math.min(fullAt, maxC) - (KickCore.Constants.AimLockSeconds or 0.1) - ping - 0.12
+	local want = body and (CFG.FaceSpoofTime or 0.15) or (CFG.DirSpoofTime or 0.12)
+	return math.min(want, lock - ping * 0.5 - 0.03)
 end
 
 Mark.spoofPlan = function()
@@ -14581,8 +14513,8 @@ Mark.spoofPlan = function()
 	if W < 1 or H < 1 then
 		return
 	end
-	local win = Mark.spoofWin()
-	if win < 0.05 then
+	local win = Mark.spoofWin(false)
+	if win < 0.04 then
 		return
 	end
 	local sr = math.clamp((P - lb):Dot(along) / W * 2 - 1, -1, 1)
@@ -14598,9 +14530,11 @@ Mark.spoofPlan = function()
 		-- the mirror corner the whole time: he leans the wrong way
 		mirror = { w = 1 + ((sk and math.abs(sk - sr) < 0.5) and 1.5 or 0), steps = { { opp * 0.8, hi and 0.15 or 0.85, win } } },
 		-- opposite low, our side high, opposite high: a bot keeper follows every update
-		swing = { w = 1, steps = { { opp * 0.8, 0.2, win / 3 }, { rs * 0.6, 0.8, win / 3 }, { opp * 0.8, 0.85, win / 3 } } },
+		swing = { w = 1.6, steps = { { opp * 0.8, 0.2, win / 3 }, { rs * 0.6, 0.8, win / 3 }, { opp * 0.8, 0.85, win / 3 } } },
 		-- the middle: he stays where he is (best when he is already far from the real side)
 		freeze = { w = (sk and math.abs(sk - sr) > 0.9) and 2 or 0.4, steps = { { 0, 0.3, win } } },
+		-- four quick hops: with a 30 Hz update stream every hop is one packet, he cannot settle on one side
+		zigzag = { w = 1.6, steps = { { opp * 0.85, 0.5, win / 4 }, { rs * 0.5, 0.5, win / 4 }, { opp * 0.5, 0.5, win / 4 }, { rs * 0.85, 0.5, win / 4 } } },
 		-- a sweep from our side to the far post: he chases it away from the real shot
 		sweep = { w = 0.8, steps = { { rs * 0.9, 0.4, win, opp * 0.9 } } },
 		-- left, right, then the real one (made for a middle shot, high or low)
@@ -14770,7 +14704,7 @@ end
 -- ball a dashed line of chevrons runs to it. The threat tint of kickPalette.armed, never the real-shot line colour.
 
 -- SPRING BRACKETS (Direction Spoof fake aim point): four corners chase the decoy on a spring (overshoot, settle); every
--- arm is a lightning line, now and then a bolt arcs across an edge; the top fuse is the time the aim may still lie.
+-- arm is a lightning line, now and then a bolt arcs across an edge.
 -- st = per-overlay state ({}), right = the goal's along axis, left = 0..1 of the lie left.
 Mark.bracketArt = function(seg, q, right, left, t, st)
 	local up = Vector3.new(0, 1, 0)
@@ -14807,11 +14741,6 @@ Mark.bracketArt = function(seg, q, right, left, t, st)
 		end
 		Mark.boltLine(seg, a, b, t, slot, ice[1], 1 - f * 1.6, 1.2, math.clamp(f * 5, 0, 1))
 	end
-	local a0 = p + up * (s + 0.45) - right * s
-	local a1 = a0 + right * (2 * s * math.clamp(left, 0, 1))
-	seg(a0, a1, COL.Ink, 0.5, 3.6, 44)
-	seg(a0, a1, ice[1], 0.95, 1.6, 46)
-	seg(a1 - up * 0.2, a1 + up * 0.2, Color3.new(1, 1, 1), 0.9, 1.4, 46)
 end
 
 Mark.spoofDraw = function(pen)
@@ -14884,7 +14813,7 @@ Mark.faceTick = function(character, root)
 	-- The body only lies while the aim may lie. The game turns the body at a fixed rate toward the aim and the shot is
 	-- struck from that pose (carry offset, stabilised direction): leaving it sideways at the release put the ball on
 	-- the bar. After the window the body is on the real shot and stays there until the kick.
-	local win = Mark.spoofWin()
+	local win = Mark.spoofWin(true)
 	if charging then
 		fs.chargeAt = fs.chargeAt or now
 	else
@@ -14894,11 +14823,6 @@ Mark.faceTick = function(character, root)
 	if fs.chargeAt then
 		local el = now - fs.chargeAt
 		if el >= win then
-			Mark.faceSet(root, ref)
-			return
-		end
-		if el < 0.08 then
-			-- the Start packet and the first Updates find the body on the real shot
 			Mark.faceSet(root, ref)
 			return
 		end
@@ -21667,17 +21591,6 @@ Mark.galStations = {
 			st.bq = nil
 		end
 	end },
-	{ name = "Boomerang: comet", x = 10, art = function(seg, C, t, st, G)
-		local f = G.fw
-		local side = Vector3.new(f.Z, 0, -f.X)
-		local S = C - f * 14 + Vector3.new(0, 3.5, 0)
-		local pts = { S - side * 1.2 - f * 1.5 }
-		for i = 0, 22 do
-			local th = i / 76 * math.pi * 2
-			pts[#pts + 1] = S + f * (30 * math.sin(th)) + side * (-18 * (1 - math.cos(th))) + Vector3.new(0, 1.2 * math.sin(th * 0.5), 0)
-		end
-		Mark.cometArt(seg, pts, Color3.fromRGB(90, 220, 255), os.clock())
-	end },
 	{ name = "Projectile: fuse rail", x = 50, art = function(seg, C, t, st, G)
 		local A = C + G.fw * 40 + G.right * 8 + Vector3.new(0, 4, 0)
 		local u = (t % 1.4) / 1.1
@@ -22170,11 +22083,13 @@ return function(_Lib, _Core)
 			head(ds, "Direction Spoof")
 			tog(ds, "Enabled", "DirSpoof", "Shows the keeper fake shot directions while you charge, then shoots for real.")
 			sld(ds, "Chance", "DirSpoofChance", 0, 100, { scale = 100, suffix = "%" })
+			sld(ds, "Fake Time", "DirSpoofTime", 0.04, 0.24, { prec = 2, suffix = " s", text = "How long the fake aim shows before the real one." })
 			tog(ds, "Smart Select", "DirSpoofSmart", "No spoof once the keeper has dived.")
 			head(ds, "Body Spoof")
 			tog(ds, "Enabled", "FaceSpoof", "Your body faces the wrong way to fool the keeper.")
 			drop(ds, "Mode", "FaceSpoofMode", { "smart", "spin", "side", "lookoff", "away", "decoy" })
 			drop(ds, "When", "FaceSpoofWhen", { "charge", "ball", "always" }, "Charge: while you charge a shot. Ball: while you have it.")
+			sld(ds, "Body Time", "FaceSpoofTime", 0.04, 0.24, { prec = 2, suffix = " s", text = "How long the body lies before it faces the shot." })
 			sld(ds, "Spin Speed", "FaceSpinSpeed", 1, 6, { prec = 1, suffix = " /s" })
 
 			local b = card(tab, "Left")
