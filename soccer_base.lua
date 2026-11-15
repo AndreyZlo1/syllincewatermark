@@ -75,7 +75,11 @@ local CFG = {
 	DirSpoof = false, -- Direction Spoof: the replicated charge aim shows decoys until the aim lock
 	DirSpoofChance = 1, -- share of shots spoofed
 	DirSpoofSmart = true, -- no spoof once the enemy keeper's dive is spent
-	DirSpoofFace = "decoy", -- body during the charge: decoy | away | spin | off
+	DirSpoofHideLock = false, -- EXPERIMENTAL: the decoy stays in the aim-lock packet, only the release is real
+	FaceSpoof = false, -- body spoof: the facing lies (spin, twist, jitter, flip, sweep, away, decoy)
+	FaceSpoofMode = "smart",
+	FaceSpoofWhen = "charge", -- charge | ball | always
+	FaceSpinSpeed = 3, -- turns per second for spin / twist
 	FeintCompetitor = true, -- an outfield enemy within FeintCompetitorRange of the ball: no feint, the shot goes
 	FeintCompetitorRange = 10, -- Smart Select: no feint once the enemy keeper has dived (his dive is on cooldown): the shot goes as it is
 	AutoFlick = true, -- the flick key starts the scripted flick -> jump -> volley; off = the game's own flick, aim help only
@@ -194,7 +198,12 @@ local CFG = {
 	WallLatency = 0.06, -- the wall exists this long after the press reaches the server (ping/2); seen 0.11-0.14 s after the press at ping 0.08
 	WallEquip = false, -- Auto Use: AutoWall takes the barricades out itself (item slot press) when a threat is coming; off = only when already in hand
 	WallEquipDelay = 0.3, -- extra time the equip needs before the wall can be placed
-	WallEquipHold = 3.5, -- put the unused barricades away after this long
+	WallEquipHold = 3.5,
+	WallTrap = true, -- Keeper Trap: a barricade between us and the enemy keeper's dive
+	WallTrapBait = true, -- put it up before he dives when we close in on him
+	WallTrapDist = 16, -- bait: keeper this close
+	WallTrapEquip = true, -- hold the barricades while the keeper is near
+	WallTrapEquipDist = 24, -- put the unused barricades away after this long
 	WallReach = 18, -- a chaser (our ball) / the carrier within this gets a wall across his run
 	WallWindow = 0.45, -- ... only if he reaches it within this after it appears (earlier and he walks around it)
 	WallShot = true, -- wall on the replicated shot path of a charging carrier (needs barricades in hand)
@@ -5928,6 +5937,7 @@ local function stepLogic()
 
 	Mark.feintTick(own)
 	Mark.spoofTick()
+	Mark.faceTick(LocalPlayer.Character, ActorTargeting.GetActorRoot(LocalPlayer))
 	if Mark.shotLockUntil and os.clock() < Mark.shotLockUntil then
 		-- aerial / bicycle strike in flight: the aim solved at the press is the one the release sends; any re-solve
 		-- from the moved ball (or the ownership flicker at contact) wiped Shoot.aim and the preview at the strike
@@ -6609,7 +6619,7 @@ oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
 			end
 			-- Direction Spoof: until the aim lock the replicated aim is a decoy; the lock packet (AimLockedAt) and the
 			-- release carry the real shot
-			local dec = packet.Phase ~= "Release" and cmd.AimLockedAt == nil and Mark.spoofRay() or nil
+			local dec = packet.Phase ~= "Release" and (cmd.AimLockedAt == nil or CFG.DirSpoofHideLock) and Mark.spoofRay() or nil
 			if dec then
 				cmd.AimDirection = dec
 				cmd.KickDirection = AimFacing.GetFlatDirection(dec.Direction) or dec.Direction
@@ -7903,7 +7913,7 @@ Mark.wallSolve = function(O, pts, dtS, ready, rad, window)
 	local hw = CFG.WallHalf or 5.75
 	local H = CFG.WallHeight or 6.4
 	local floorY = O.Y - 3
-	local i0 = math.floor(ready / dtS) + 1
+	local i0 = math.ceil(ready / dtS) + 1 -- first sample at or after the wall exists
 	local best = nil
 	for k = 0, 47 do
 		local ang = k / 48 * math.pi * 2
@@ -7966,9 +7976,17 @@ Mark.wallVsPath = function(root, pathFn, tEnd, tag, o)
 	local dtS = 0.04
 	local pts = Mark.wallPts or {}
 	Mark.wallPts = pts
-	local n = math.floor(tEnd / dtS) + 2
+	local n = math.floor((tEnd + (o.lagReady and ready or 0)) / dtS) + 2
 	for i = 1, n do
-		pts[i] = pathFn((i - 1) * dtS)
+		-- lagReady: the threat has not started yet (a bait wall for a dive he may start any moment): it starts when the
+		-- wall is there
+		pts[i] = pathFn(o.lagReady and math.max((i - 1) * dtS - ready, 0) or (i - 1) * dtS)
+		-- a body that reaches us is not blocked by a wall it would cross later (behind us): the path ends at the contact.
+		-- Against where we press, not where we run: the wall stands 5 studs ahead and stops us as well.
+		if o.contact and pts[i] and flat(pts[i] - root.Position).Magnitude <= o.contact then
+			n = i
+			break
+		end
 	end
 	for i = n + 1, #pts do
 		pts[i] = nil
@@ -8016,7 +8034,7 @@ Mark.wallVsPath = function(root, pathFn, tEnd, tag, o)
 	Mark.skillRay = { Origin = org, Direction = u, CameraCFrame = CFrame.lookAt(org, org + u) }
 	Mark.skillAt = now
 	use.ActivateEquipped()
-	Mark.wallPend = { at = now, kind = tag, name = o.actor and actorName(o.actor) or tag, model = o.model, us = O, W = W, u = u, before = before }
+	Mark.wallPend = { at = now, kind = tag, name = o.actor and actorName(o.actor) or tag, model = o.model, us = O, W = W, u = u, before = before, trap = o.trap }
 	logFile("skill wall", tag, o.actor and actorName(o.actor) or "-", "cross", string.format("%.2f", best.t), "ready", string.format("%.2f", ready), "lat", string.format("%.1f", best.lat), "margin", string.format("%.1f", best.margin), "q", fmtV(best.q), fmtV(u))
 	return true
 end
@@ -8074,6 +8092,82 @@ end
 -- Every tick (barricades in hand or in a slot): the threats a wall can stop, most urgent first. Not in hand = only with
 -- Auto Use (WallEquip). Bodies: the server pose, a short straight path (a chaser runs at where we will be), and the wall
 -- must appear at most WallWindow before he reaches it, or he steps around it.
+-- KEEPER TRAP (AutoWall). A barricade is solid for the enemy keeper too: his dive into a wall stops on it and the dive
+-- recovery (AnimationStopSeconds 1.3 + the 1.875 s repeat delay) leaves the goal open. Pro move: run at the keeper, make
+-- him dive, put the wall between. The dive is GoalkeeperDive.GetTravel (cubic out over DurationSeconds) up to
+-- GetDistance * 1.3 + 3 (DiveAssist travel scale + bonus), re-locked on the ball = on us every update. The wall (11.5 wide,
+-- 6.4 high, thin, 5 studs in front of our server root along the aim) is solved by Mark.wallSolve against that path.
+--   dive  the GoalkeeperDiveStarted packet: solved at once and every frame for 0.5 s (no 15 Hz throttle)
+--   bait  he has his dive and we close in within WallTrapDist: the wall goes up before he commits
+Mark.foeKeeper = function(root, maxD)
+	local best, bd = nil, maxD
+	for _, model in Mark.models() do
+		local a = Actors.GetFromCharacter(model)
+		if a and a ~= LocalPlayer and not sameTeam(a) and isGoalkeeper(a) then
+			local r = ActorTargeting.GetActorRoot(a)
+			local dd = r and flat(r.Position - root.Position).Magnitude
+			if dd and dd < bd then
+				best, bd = { actor = a, model = model, r = r, d = dd }, dd
+			end
+		end
+	end
+	return best
+end
+
+Mark.wallTrap = function(root, diving)
+	if not (CFG.AutoWall and CFG.WallTrap ~= false) or liveOwnerId() ~= LocalPlayer.UserId then
+		return false
+	end
+	local k = Mark.foeKeeper(root, 40)
+	if not k then
+		return false
+	end
+	Mark.gkDiveMod = Mark.gkDiveMod or require(Modules.Actions.GoalkeeperDive)
+	local D = Mark.gkDiveMod
+	local dur = D.Constants.DurationSeconds or 0.875
+	local reach = (D.GetDistance(k.actor) or 20) * 1.3 + 3
+	local el0 = 0
+	local P0 = k.r.Position
+	if diving then
+		local td = Mark.trapDive
+		if not (td and td.uid == k.actor.UserId) then
+			return false
+		end
+		el0 = math.min(td.el0 + (os.clock() - td.at), dur)
+		P0 = td.P0 or P0
+		if el0 >= dur - 0.05 then
+			return false
+		end
+	else
+		local wp = Mark.wallPend
+		if CFG.WallTrapBait == false or Mark.foeDiveLeft() > 0 or k.d > (CFG.WallTrapDist or 16) or k.d < 7 or (wp and wp.trap and os.clock() - wp.at < 3) then
+			return false
+		end
+		-- he stands between us and his goal and we close in on each other
+		local g = enemyGoalPart()
+		local toK = unitOrNil(flat(k.r.Position - root.Position))
+		if not (g and toK) or flat(g.Position - root.Position):Dot(toK) <= 0 then
+			return false
+		end
+		local close = flat(root.AssemblyLinearVelocity):Dot(toK) - flat(k.r.AssemblyLinearVelocity):Dot(toK)
+		if close < 3 and k.d > 11 then
+			return false
+		end
+	end
+	local O, ourV = root.Position, flat(root.AssemblyLinearVelocity)
+	local base = D.GetTravel(el0, reach)
+	local function path(t)
+		local to = unitOrNil(flat(O + ourV * t - P0)) or Vector3.new(0, 0, 1)
+		return P0 + to * (D.GetTravel(math.min(el0 + t, dur), reach) - base) + Vector3.new(0, D.GetVerticalTravel(el0 + t), 0)
+	end
+	local ok, why = Mark.wallVsPath(root, path, dur - el0, diving and "keeper dive" or "keeper bait", { rad = 2, equip = true, actor = k.actor, model = k.model, trap = true, contact = 3, lagReady = not diving })
+	if not ok and why and (not Mark.trapLog or os.clock() - Mark.trapLog > 0.6) then
+		Mark.trapLog = os.clock()
+		logFile("wall trap", diving and "dive" or "bait", "no", why, "d", string.format("%.1f", k.d), "el", string.format("%.2f", el0))
+	end
+	return ok
+end
+
 Mark.wallTick = function(root, oid, own)
 	Mark.wallWatch()
 	if not CFG.AutoWall then
@@ -8084,13 +8178,44 @@ Mark.wallTick = function(root, oid, own)
 		return
 	end
 	local now = os.clock()
-	-- the solver is 48 yaws x the path samples per threat: 15 Hz is plenty for a 0.5 s decision window
-	if now - (Mark.wallTickAt or 0) < 0.066 then
+	-- a keeper dive at us is decided every frame (0.15 s of it is all the time there is)
+	if Mark.trapDive and now - Mark.trapDive.at < 0.5 and Mark.wallTrap(root, true) then
+		return
+	end
+	-- the rest: 48 yaws x the path samples per threat at 30 Hz
+	if now - (Mark.wallTickAt or 0) < 0.033 then
 		return
 	end
 	Mark.wallTickAt = now
 	local inHand = use.IsEquipped and use.IsEquipped()
 	local isWall = inHand and Mark.equippedId() == "barricades"
+	-- Keeper Trap: barricades in hand while the keeper is near and we carry the ball (placing then costs no equip time);
+	-- put away as soon as the trap wall is up or the chance is gone (an item in hand blocks the shot)
+	if CFG.WallTrap ~= false and CFG.WallTrapEquip ~= false then
+		local k = own and Mark.foeKeeper(root, 40)
+		local slot = Mark.slotOfItem("barricades")
+		if own and k and k.d <= (CFG.WallTrapEquipDist or 24) and Mark.foeDiveLeft() <= 0 and not inHand and slot then
+			if Mark.equipWall("trap ready") then
+				Mark.trapHold = now
+			end
+		elseif isWall and Mark.trapHold then
+			local wp = Mark.wallPend
+			local placed = wp and wp.trap and wp.at >= Mark.trapHold and (wp.seenAt or now - wp.at > 0.35)
+			if placed or not own or not k or k.d > (CFG.WallTrapEquipDist or 24) + 6 or Mark.foeDiveLeft() > 0 then
+				Mark.trapHold = nil
+				Mark.wallEquipAt = nil
+				local s2 = Mark.wallEquipSlot or slot
+				if s2 then
+					Mark.pressSlot(s2)
+					logFile("wall trap", "put away", placed and "placed" or "chance gone")
+				end
+				return
+			end
+		end
+		if own and Mark.wallTrap(root, false) then
+			return
+		end
+	end
 	if isWall and Mark.wallEquipAt and now - Mark.wallEquipAt > (CFG.WallEquipHold or 3.5) and now - (Mark.skillAt or 0) > (CFG.WallEquipHold or 3.5) then
 		-- put away what we took out and did not use (an equipped item blocks ball controls)
 		Mark.wallEquipAt = nil
@@ -8147,7 +8272,7 @@ Mark.wallTick = function(root, oid, own)
 						return pos + v * t
 					end
 				end
-				if spd > 4 and Mark.wallVsPath(root, path, 0.9, own and "chaser" or "carrier", { rad = 1.5, window = CFG.WallWindow or 0.45, equip = equip, actor = actor, model = model }) then
+				if spd > 4 and Mark.wallVsPath(root, path, 0.9, own and "chaser" or "carrier", { rad = 1.5, window = CFG.WallWindow or 0.45, equip = equip, actor = actor, model = model, contact = 3 }) then
 					return
 				end
 			end
@@ -11000,6 +11125,14 @@ local function onFx(kind, userId, a, b, c, aimDir, ...)
 		if who and who ~= LocalPlayer and not sameTeam(who) then
 			Mark.foeDive = Mark.foeDive or {}
 			Mark.foeDive[userId] = os.clock()
+			-- Keeper Trap: the dive starts now; a = his server start time (as for the flick)
+			local hr = ActorTargeting.GetActorRoot(who)
+			local srvNow = Workspace:GetServerTimeNow()
+			Mark.trapDive = { uid = userId, at = os.clock(), el0 = type(a) == "number" and math.clamp(srvNow - a, 0, 0.4) or 0, P0 = hr and hr.Position }
+			local myR = ActorTargeting.GetActorRoot(LocalPlayer)
+			if myR and isGoalkeeper(who) then
+				Mark.wallTrap(myR, true)
+			end
 			logFile("keeper dive seen", actorName(who), "gk", tostring(isGoalkeeper(who)), "-> fakes off for", string.format("%.2f", Mark.foeDiveLeft()))
 		end
 	end
@@ -11149,7 +11282,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v147")
+	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v148")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -14158,6 +14291,9 @@ Mark.spoofPlan = function()
 	if win < 0.08 then
 		return
 	end
+	if CFG.DirSpoofHideLock then
+		win = maxC + 0.3 -- EXPERIMENTAL: the lock packet shows the decoy too, only the Release carries the shot
+	end
 	local sr = math.clamp((P - lb):Dot(along) / W * 2 - 1, -1, 1)
 	local hr = math.clamp((P.Y - lb.Y) / H, 0, 1)
 	local rs = sr >= 0 and 1 or -1
@@ -14211,9 +14347,9 @@ Mark.spoofPlan = function()
 	local now = os.clock()
 	Mark.sp = {
 		t0 = now, endAt = now + win, steps = pats[pick].steps, O = O, D = D, lb = lb, along = along, W = W, H = H,
-		fov = a.CameraFieldOfView, air = a.IsAirborne, name = pick, face = CFG.DirSpoofFace or "decoy",
+		fov = a.CameraFieldOfView, air = a.IsAirborne, name = pick,
 	}
-	logFile("spoof", "plan", pick, "real s", string.format("%.2f", sr), "h", string.format("%.2f", hr), "keeper s", sk and string.format("%.2f", sk) or "-", "window", string.format("%.2f", win), "face", Mark.sp.face)
+	logFile("spoof", "plan", pick, "real s", string.format("%.2f", sr), "h", string.format("%.2f", hr), "keeper s", sk and string.format("%.2f", sk) or "-", "window", string.format("%.2f", win), "hide lock", tostring(CFG.DirSpoofHideLock == true))
 end
 
 -- the decoy direction now (nil = real: after the window, or no plan)
@@ -14253,6 +14389,7 @@ Mark.spoofRay = function()
 end
 
 -- every logic step: the body turn while the charge runs, cleanup when it is over
+-- every logic step: cleanup when the charge is over (the body turn is Mark.faceTick)
 Mark.spoofTick = function()
 	local sp = Mark.sp
 	if not sp then
@@ -14260,30 +14397,135 @@ Mark.spoofTick = function()
 	end
 	local now = os.clock()
 	if not (ChargedKick.IsCharging and ChargedKick.IsCharging()) and now - sp.t0 > 0.05 then
-		if sp.locked then
-			TurnControl.ReleaseAutoRotate("GoKart")
-		end
 		logFile("spoof", "done", sp.name, "held", string.format("%.2f", now - sp.t0))
 		Mark.sp = nil
-		return
-	end
-	local real = unitOrNil(flat(sp.D))
-	local face = nil
-	if sp.face == "decoy" then
-		local d = Mark.spoofDir()
-		face = d and unitOrNil(flat(d)) or sp.lastFace
-		sp.lastFace = face
-	elseif sp.face == "away" and real then
-		face = -real
-	elseif sp.face == "spin" and real then
-		local a = (now - sp.t0) * math.pi * 2 / 0.35
-		face = Vector3.new(real.X * math.cos(a) - real.Z * math.sin(a), 0, real.X * math.sin(a) + real.Z * math.cos(a))
-	end
-	if face then
-		TurnControl.LockAutoRotate("GoKart", face)
-		sp.locked = true
 	end
 end
+
+-- BODY SPOOF. The body facing replicates to everybody for the whole charge (and before it); the shot direction is the
+-- packet's, never checked against it (log: shots with the back to the goal score). A keeper reads the body first, so
+-- the body lies: TurnControl lock "GoKart" (AimFacing rank 5 > Aim / AimCharge 3) on a pattern around the reference
+-- (the real shot while charging, else their goal). Modes:
+--   spin      full turns at FaceSpinSpeed, side rolled per activation
+--   twist     spin that reverses every 0.2-0.4 s (the "crazy spin")
+--   jitter    snaps 60-110 deg left / right every 0.06-0.1 s
+--   flip      corner to corner: +-75 deg, 0.14-0.22 s each
+--   sweep     a pendulum through the back (+-150 deg)
+--   away      back to the goal
+--   decoy     faces the aim decoy of Direction Spoof (flip without one)
+--   smart     a random one of these per activation, re-rolled every 1.5-3 s, never the last two again
+-- When: charge (only while charging a shot), ball (whenever we have it), always (also without the ball).
+Mark.faceModes = { "spin", "twist", "jitter", "flip", "sweep", "away" }
+Mark.faceHist = {}
+Mark.facePick = function()
+	local hist, cand = Mark.faceHist, {}
+	for _, m in Mark.faceModes do
+		if m ~= hist[1] and m ~= hist[2] then
+			cand[#cand + 1] = m
+		end
+	end
+	local m = cand[math.random(1, #cand)]
+	table.insert(hist, 1, m)
+	hist[3] = nil
+	return m
+end
+
+Mark.faceActive = function(character)
+	if not CFG.FaceSpoof or Mark.meKeeper() or Ragdoll.IsActorRagdolled(LocalPlayer) then
+		return false
+	end
+	if ClientSlide.IsSlideTackling() or ClientDodge.IsDribbling() or Mark.ak or Mark.volleyInput or Mark.aerial or Mark.forceBike or Mark.flickStrike then
+		return false
+	end
+	if Mark.pa and Mark.pa.live then
+		return false
+	end
+	local mm = Mark.move.mode
+	if mm == "dodge" or mm == "dribble" then
+		return false
+	end
+	local own = liveOwnerId() == LocalPlayer.UserId
+	local when = CFG.FaceSpoofWhen or "charge"
+	if when == "charge" then
+		return own and ChargedKick.IsCharging and ChargedKick.IsCharging() and true or false
+	elseif when == "ball" then
+		return own
+	end
+	-- always: not while charging a kick without the ball (the AutoKick / volley aim needs the body)
+	return own or not (ChargedKick.IsCharging and ChargedKick.IsCharging())
+end
+
+Mark.faceTick = function(character, root)
+	local fs = Mark.fs
+	if not (character and root) or not Mark.faceActive(character) then
+		if fs then
+			TurnControl.ReleaseAutoRotate("GoKart")
+			Mark.fs = nil
+		end
+		return
+	end
+	local now = os.clock()
+	if not fs then
+		local mode = CFG.FaceSpoofMode or "smart"
+		fs = { t0 = now, mode = mode, cur = mode == "smart" and Mark.facePick() or mode, sgn = math.random() < 0.5 and -1 or 1, nextAt = now, k = 0, off = 0, repickAt = now + 1.5 + math.random() * 1.5 }
+		Mark.fs = fs
+		logFile("face spoof", "start", fs.cur, "when", CFG.FaceSpoofWhen or "charge")
+	end
+	if fs.mode == "smart" and now >= fs.repickAt then
+		fs.cur, fs.repickAt, fs.sgn = Mark.facePick(), now + 1.5 + math.random() * 1.5, -fs.sgn
+	end
+	-- reference: the real shot while charging, else their goal, else our run
+	local ref = nil
+	if Shoot.aim and Shoot.aim.Direction and ChargedKick.IsCharging and ChargedKick.IsCharging() then
+		ref = unitOrNil(flat(Shoot.aim.Direction))
+	end
+	if not ref then
+		local g = enemyGoalPart()
+		ref = g and unitOrNil(flat(g.Position - root.Position)) or unitOrNil(flat(root.CFrame.LookVector)) or Vector3.new(0, 0, 1)
+	end
+	local t = now - fs.t0
+	local spd = (CFG.FaceSpinSpeed or 3) * math.pi * 2
+	local cur, off = fs.cur, 0
+	if cur == "decoy" then
+		local d = Mark.spoofDir()
+		local f = d and unitOrNil(flat(d))
+		if f then
+			TurnControl.LockAutoRotate("GoKart", f)
+			return
+		end
+		cur = "flip"
+	end
+	if cur == "spin" then
+		off = fs.sgn * t * spd
+	elseif cur == "twist" then
+		if now >= fs.nextAt then
+			fs.sgn, fs.nextAt = -fs.sgn, now + 0.2 + math.random() * 0.2
+		end
+		fs.off += fs.sgn * spd * math.min(now - (fs.lastT or now), 0.05)
+		off = fs.off
+	elseif cur == "jitter" then
+		if now >= fs.nextAt then
+			fs.k += 1
+			fs.jit = (fs.k % 2 == 0 and 1 or -1) * math.rad(60 + math.random() * 50)
+			fs.nextAt = now + 0.06 + math.random() * 0.04
+		end
+		off = fs.jit or 0
+	elseif cur == "flip" then
+		if now >= fs.nextAt then
+			fs.k += 1
+			fs.nextAt = now + 0.14 + math.random() * 0.08
+		end
+		off = (fs.k % 2 == 0 and 1 or -1) * math.rad(75)
+	elseif cur == "sweep" then
+		off = math.rad(150) * math.sin(t * math.pi * 2 * 1.3) * fs.sgn
+	elseif cur == "away" then
+		off = math.pi + 0.25 * math.sin(t * 5)
+	end
+	fs.lastT = now
+	local c, s = math.cos(off), math.sin(off)
+	TurnControl.LockAutoRotate("GoKart", Vector3.new(ref.X * c - ref.Z * s, 0, ref.X * s + ref.Z * c))
+end
+
 
 Mark.feintTick = function(own)
 	local mode = CFG.FeintMode or "Off"
@@ -21527,7 +21769,12 @@ return function(_Lib, _Core)
 			tog(ds, "Enabled", "DirSpoof", "Shows the keeper fake shot directions while you charge, then shoots for real.")
 			sld(ds, "Chance", "DirSpoofChance", 0, 100, { scale = 100, suffix = "%" })
 			tog(ds, "Smart Select", "DirSpoofSmart", "No spoof once the keeper has dived.")
-			drop(ds, "Body Turn", "DirSpoofFace", { "decoy", "away", "spin", "off" }, "Where your body faces during the charge.")
+			tog(ds, "Hide Real Aim", "DirSpoofHideLock", "Experimental: fake direction until the ball is kicked.")
+			head(ds, "Body Spoof")
+			tog(ds, "Enabled", "FaceSpoof", "Your body faces the wrong way to fool the keeper.")
+			drop(ds, "Mode", "FaceSpoofMode", { "smart", "spin", "twist", "jitter", "flip", "sweep", "away", "decoy" })
+			drop(ds, "When", "FaceSpoofWhen", { "charge", "ball", "always" }, "Charge: while you charge a shot. Ball: while you have it.")
+			sld(ds, "Spin Speed", "FaceSpinSpeed", 1, 6, { prec = 1, suffix = " /s" })
 
 			local b = card(tab, "Left")
 			head(b, "Bounce FAKE")
@@ -21827,7 +22074,13 @@ return function(_Lib, _Core)
 			tog(w, "Auto Use", "WallEquip", "Takes out the barricades when needed.")
 			tog(w, "Block Projectiles", "BarricadeAddon", "Puts a wall on a projectile's path.")
 			tog(w, "Wall On Shot Path", "WallShot", "Walls a shot charged at our goal.")
+			head(w, "Keeper Trap")
+			tog(w, "Enabled", "WallTrap", "Puts a wall between you and the enemy keeper's dive.")
+			tog(w, "Bait", "WallTrapBait", "Puts it up before he dives when you run at him.")
+			tog(w, "Hold Barricades", "WallTrapEquip", "Keeps them in hand near the keeper for an instant wall.")
 			advanced(w, "Wall", function()
+				sld(w, "Trap Bait Distance", "WallTrapDist", 8, 24, { suffix = " st" })
+				sld(w, "Trap Hold Distance", "WallTrapEquipDist", 10, 40, { suffix = " st" })
 				sld(w, "Body Reach", "WallReach", 8, 40, { suffix = " st", text = "Walls a chaser or the carrier within this distance." })
 				sld(w, "Body Window", "WallWindow", 0.15, 1, { prec = 2, suffix = " s", text = "He must hit the wall this soon after it appears." })
 				sld(w, "Put Away After", "WallEquipHold", 1, 10, { prec = 1, suffix = " s" })
