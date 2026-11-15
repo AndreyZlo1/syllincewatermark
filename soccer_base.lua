@@ -74,8 +74,10 @@ local CFG = {
 	FeintSmart = true,
 	DirSpoof = false, -- Direction Spoof: the replicated charge aim shows decoys until the aim lock
 	DirSpoofChance = 1, -- share of shots spoofed
-	DirSpoofTime = 0.12, -- how long the fake aim may show (s)
-	FaceSpoofTime = 0.15, -- how long the body may lie (s)
+	DirSpoofPreset = "Normal", -- Safe | Normal | Long | Custom (the two times below)
+	DirSpoofTime = 0.12, -- Custom: how long the fake aim may show (s)
+	FaceSpoofTime = 0.15, -- Custom: how long the body may lie (s)
+	ShotCurve = "Full", -- Full | Light | Off: how much the solver may bend a shot
 	DirSpoofSmart = true, -- no spoof once the enemy keeper's dive is spent
 	FaceSpoof = false, -- body spoof: the facing lies (spin, twist, jitter, flip, sweep, away, decoy)
 	FaceSpoofMode = "smart",
@@ -306,7 +308,7 @@ local CFG = {
 	NoRagdoll = false, -- Ragdoll.ClearActor the moment the server ragdoll reaches us (the server may still count us as down)
 	NoStun = false, -- Stun.IsCharacterStunned / IsActorStunnedForPress say false for us (client gates only)
 	FakeFirstChance = 0.95, -- ...and taken without its own roll in this share of solves; the rest fall back to FakeChance, so it is not every time
-	BounceFAKE = true, -- FAKE family member: a flight that looks like a shot on goal, hits a wall and comes back to us (<= 60 studs)
+	BounceFAKE = false, -- FAKE family member: a flight that looks like a shot on goal, hits a wall and comes back to us (<= 60 studs)
 	PriorityBounceFAKE = false, -- BounceFAKE goes first and is used whenever it exists (then PriorityFAKE)
 	FakeAfterDiveBan = true, -- no FAKE family while the enemy keeper's dive is on cooldown (a fake only works as a bait for the dive)
 	FakeOnceThenShoot = true, -- after a SUCCESSFUL BounceFAKE (the ball came back to us) no fakes until we lose the ball: shoot
@@ -4165,6 +4167,7 @@ solveShotRaw = function(root, forced)
 		if (Shoot.sims or 0) >= (Shoot.simCap or 2) then
 			return nil
 		end
+		curve = Mark.curveScale(curve)
 		Shoot.slice()
 		Shoot.sims = (Shoot.sims or 0) + 1
 		local aimTry, vel, launch = serverAim(dir, curve, fromBall)
@@ -8599,9 +8602,16 @@ Mark.tickSkill = function(character, root)
 		Mark.areaDraw(areaG, areaInfo.R, col)
 	else
 		if CFG.DrawSilent ~= false and boomInfo then
-			-- the throw's meeting point: the same tracer as every other silent shot (the loop art was rejected)
+			local tab, S0 = boomInfo.tab, boomInfo.S
+			local fb = boomDir
+			local side = Vector3.new(fb.Z, 0, -fb.X)
+			local iT = math.clamp(math.floor(boomInfo.t / tab.dt + 0.5), 1, tab.n)
+			local cp = { muzzle }
+			for i = 0, iT do
+				cp[#cp + 1] = S0 + fb * tab.a[i] + side * tab.b[i] + Vector3.new(0, tab.h[i], 0)
+			end
 			local P = boomInfo.P
-			Mark.silentArt(pool.seg, muzzle, P + Vector3.new(0, 0.6, 0), Vector3.new(P.X, P.Y - 2.9, P.Z), col, os.clock())
+			Mark.ribbonArt(pool.seg, cp, col, os.clock(), Vector3.new(P.X, P.Y - 2.9, P.Z))
 		elseif CFG.DrawSilent ~= false and not Mark.areaItems[id] and id ~= "boomerang" then
 			Mark.silentArt(pool.seg, muzzle, chest, Vector3.new(aimP.X, aimP.Y - 2.9, aimP.Z), col, os.clock())
 		end
@@ -11458,7 +11468,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v160")
+	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v161")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -14471,13 +14481,34 @@ end
 Mark.spoofHist = {}
 -- How long the aim / body may lie: the charge until the aim lock (AimLockSeconds before full charge), minus 0.05 s so the
 -- real aim is replicated (30 Hz, ~0.11 s to the observers) before the lock freezes it
+-- { fake aim time, body time } in seconds; Custom = the two sliders
+-- Shot Curve preset: scales every curve the solver asks for (the game may not bend a shot as far as the sim does)
+Mark.curveScale = function(curve)
+	local m = CFG.ShotCurve
+	if curve == nil or m == nil or m == "Full" then
+		return curve
+	end
+	if m == "Off" then
+		return nil
+	end
+	return curve * 0.5
+end
+
+Mark.spoofPresets = { Safe = { 0.06, 0.08 }, Normal = { 0.12, 0.15 }, Long = { 0.2, 0.24 } }
+
 Mark.spoofWin = function(body)
 	-- How long the aim / the body may lie. The lock freezes the aim AimLockSeconds before the max charge; the real aim has
 	-- to be at the server ping/2 before that (+ a margin). Inside that ceiling the user sets the time (a longer lie = the
 	-- shot may follow it: see the `shoot flight` log, `angle to solved` with decoy yes).
 	local lock = (KickCore.Constants.MaximumChargeSeconds or 0.4) - (KickCore.Constants.AimLockSeconds or 0.1)
 	local ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
-	local want = body and (CFG.FaceSpoofTime or 0.15) or (CFG.DirSpoofTime or 0.12)
+	local pre = Mark.spoofPresets[CFG.DirSpoofPreset or "Normal"]
+	local want
+	if pre then
+		want = body and pre[2] or pre[1]
+	else
+		want = body and (CFG.FaceSpoofTime or 0.15) or (CFG.DirSpoofTime or 0.12)
+	end
 	return math.min(want, lock - ping * 0.5 - 0.03)
 end
 
@@ -14716,7 +14747,9 @@ Mark.bracketArt = function(seg, q, right, left, t, st)
 	st.bv = st.bv + ((q - st.bq) * 260 - st.bv * 18) * dt
 	st.bq = st.bq + st.bv * dt
 	local p = st.bq
-	local s, e = 1.5, 0.75
+	-- small: the time the aim may still lie is the length of the arms (they draw back into the corners as it runs out)
+	local s = 0.9
+	local e = 0.9 * (0.45 + 0.55 * math.clamp(left, 0, 1))
 	local ice = { Color3.fromRGB(150, 220, 255), Color3.fromRGB(215, 242, 255), Color3.fromRGB(90, 170, 255) }
 	local corners = {}
 	local seed = 0
@@ -14725,21 +14758,17 @@ Mark.bracketArt = function(seg, q, right, left, t, st)
 			local cn = p + right * (sx * s) + up * (sy * s)
 			corners[#corners + 1] = cn
 			seed += 1
-			Mark.boltLine(seg, cn, cn - right * (sx * e), t, seed, ice[2], 1, 1.5, 1)
-			Mark.boltLine(seg, cn, cn - up * (sy * e), t, seed + 11, ice[2], 1, 1.5, 1)
+			Mark.boltLine(seg, cn, cn - right * (sx * e), t, seed, ice[2], 1, 1.3, 1)
+			Mark.boltLine(seg, cn, cn - up * (sy * e), t, seed + 11, ice[2], 1, 1.3, 1)
 		end
 	end
 	-- an arc across one edge, a new one every ~0.12 s, short-lived
 	local slot = math.floor(t * 8)
-	local edge = slot % 4
 	local f = (t * 8) % 1
 	if f < 0.5 then
-		local a = corners[edge + 1]
-		local b = corners[(edge + 1) % 4 + 1]
-		if edge == 1 or edge == 3 then
-			b = corners[edge == 1 and 4 or 1]
-		end
-		Mark.boltLine(seg, a, b, t, slot, ice[1], 1 - f * 1.6, 1.2, math.clamp(f * 5, 0, 1))
+		local pairs4 = { { 1, 2 }, { 2, 4 }, { 4, 3 }, { 3, 1 } }
+		local pr = pairs4[slot % 4 + 1]
+		Mark.boltLine(seg, corners[pr[1]], corners[pr[2]], t, slot, ice[1], 1 - f * 1.6, 1.1, math.clamp(f * 5, 0, 1))
 	end
 end
 
@@ -19687,6 +19716,54 @@ end
 -- Incoming projectile = a wire coming at you: ink bed + thin threat-coloured core along its predicted flight, chevrons
 -- riding it at the projectile's real speed (they arrive when it arrives), and the threat ripple where it meets you.
 -- v = { pts, len (cumulative), speed, hit (point or nil), key }. One renderer for the live overlay and the gallery.
+-- RIBBON (SilentAim boomerang): the real loop to the interception point as a flowing ribbon, no head and no end marker: crests of
+-- light run along it, it tapers and dissolves toward the meeting point; the point itself is the usual silent ring on the floor.
+-- pts: 1-based world points (muzzle -> meeting point), feet: floor point under the meeting point.
+Mark.ribbonArt = function(seg, pts, col, now, feet)
+	local n = #pts
+	if n < 2 then
+		return
+	end
+	local L = { 0 }
+	for k = 2, n do
+		L[k] = L[k - 1] + (pts[k] - pts[k - 1]).Magnitude
+	end
+	local total = L[n]
+	if total < 1 then
+		return
+	end
+	local white = Color3.new(1, 1, 1)
+	local step = math.clamp(total / 28, 1.4, 3)
+	local m = math.max(2, math.floor(total / step))
+	local hint = 2
+	local function at(s)
+		hint = 2
+		while hint < n and L[hint] < s do
+			hint += 1
+		end
+		local a, b = L[hint - 1], L[hint]
+		return pts[hint - 1]:Lerp(pts[hint], b > a and math.clamp((s - a) / (b - a), 0, 1) or 0)
+	end
+	local prev = at(0)
+	for i = 1, m do
+		local u = i / m
+		local p = at(u * total)
+		-- two crests per 18 studs run toward the meeting point
+		local wave = 0.5 + 0.5 * math.sin((u * total - now * 24) / 18 * math.pi * 2)
+		wave *= wave
+		local fade = 1 - math.clamp((u - 0.7) / 0.3, 0, 1) ^ 1.5
+		local w = (2.8 - 2 * u) * (0.7 + 0.5 * wave)
+		if fade > 0.03 then
+			seg(prev, p, COL.Ink, 0.45 * fade, w + 2.2, 44)
+			seg(prev, p, col:Lerp(white, wave * 0.8), (0.35 + 0.6 * wave) * fade, w, 45)
+		end
+		prev = p
+	end
+	if feet and Mark.silentRing then
+		Mark.silentRing(seg, feet, col, now)
+	end
+end
+
 -- FUSE RAIL (incoming projectile): the remaining path as dashes running at us, a spark on the projectile, and the impact
 -- rim burning down with the time left. v = { pts (1-based, from the projectile), hit (point on the floor or nil),
 -- frac (0..1 time left) , speed }.
@@ -21591,6 +21668,18 @@ Mark.galStations = {
 			st.bq = nil
 		end
 	end },
+	{ name = "Boomerang: ribbon", x = 10, art = function(seg, C, t, st, G)
+		local f = G.fw
+		local side = Vector3.new(f.Z, 0, -f.X)
+		local S = C - f * 14 + Vector3.new(0, 3.5, 0)
+		local pts = { S - side * 1.2 - f * 1.5 }
+		for i = 0, 22 do
+			local th = i / 76 * math.pi * 2
+			pts[#pts + 1] = S + f * (30 * math.sin(th)) + side * (-18 * (1 - math.cos(th))) + Vector3.new(0, 1.2 * math.sin(th * 0.5), 0)
+		end
+		local P = pts[#pts]
+		Mark.ribbonArt(seg, pts, Color3.fromRGB(90, 220, 255), os.clock(), Vector3.new(P.X, G.gy, P.Z))
+	end },
 	{ name = "Projectile: fuse rail", x = 50, art = function(seg, C, t, st, G)
 		local A = C + G.fw * 40 + G.right * 8 + Vector3.new(0, 4, 0)
 		local u = (t % 1.4) / 1.1
@@ -22079,18 +22168,24 @@ return function(_Lib, _Core)
 			end
 			feintVis()
 
-			local ds = card(tab, "Left")
+			local ds = card(tab, "Right")
 			head(ds, "Direction Spoof")
 			tog(ds, "Enabled", "DirSpoof", "Shows the keeper fake shot directions while you charge, then shoots for real.")
 			sld(ds, "Chance", "DirSpoofChance", 0, 100, { scale = 100, suffix = "%" })
-			sld(ds, "Fake Time", "DirSpoofTime", 0.04, 0.24, { prec = 2, suffix = " s", text = "How long the fake aim shows before the real one." })
+			drop(ds, "Preset", "DirSpoofPreset", { "Safe", "Normal", "Long", "Custom" }, "How long the fake shows and the body lies. Longer fools more but can pull the shot off target.")
 			tog(ds, "Smart Select", "DirSpoofSmart", "No spoof once the keeper has dived.")
 			head(ds, "Body Spoof")
 			tog(ds, "Enabled", "FaceSpoof", "Your body faces the wrong way to fool the keeper.")
 			drop(ds, "Mode", "FaceSpoofMode", { "smart", "spin", "side", "lookoff", "away", "decoy" })
 			drop(ds, "When", "FaceSpoofWhen", { "charge", "ball", "always" }, "Charge: while you charge a shot. Ball: while you have it.")
-			sld(ds, "Body Time", "FaceSpoofTime", 0.04, 0.24, { prec = 2, suffix = " s", text = "How long the body lies before it faces the shot." })
 			sld(ds, "Spin Speed", "FaceSpinSpeed", 1, 6, { prec = 1, suffix = " /s" })
+			advanced(ds, "Spoof", function()
+				sld(ds, "Custom Fake Time", "DirSpoofTime", 0.04, 0.24, { prec = 2, suffix = " s", text = "Preset Custom: how long the fake aim shows." })
+				sld(ds, "Custom Body Time", "FaceSpoofTime", 0.04, 0.24, { prec = 2, suffix = " s", text = "Preset Custom: how long the body lies." })
+			end)
+			local cv = card(tab, "Right")
+			head(cv, "Shot Curve")
+			drop(cv, "Curve", "ShotCurve", { "Full", "Light", "Off" }, "How much the solver may bend a shot. Off = straight shots only.")
 
 			local b = card(tab, "Left")
 			head(b, "Bounce FAKE")
