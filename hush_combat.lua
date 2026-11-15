@@ -145,8 +145,8 @@ local CFG = {
     -- that appeared in the last PvPCorpseSeconds stays on screen.
     PvPKeepCorpses = true,
     PvPCorpseSeconds = 60,
-    -- WorldFinds filter: shown when its category is on OR its rarity order >= FindMinRarity (3 = Rare, 4 Epic, 5 Legendary,
-    -- 6 Limited) OR the model has RareFind. Firearms = Weapons that have a Guns.Defs entry, Melee = other Weapons.
+    -- WorldFinds filter: shown when its category is on OR its rarity order >= FindMinRarity (Items.Rarity.order: 3 = Rare, 4 Epic,
+    -- 5 Legendary; Mythic and Limited sit above, read from the game) OR the model has RareFind. Firearms = Weapons that have a Guns.Defs entry, Melee = other Weapons.
     FindMinRarity = 3,
     FindFilter = {
         Firearms = true, Ammo = true, Melee = false, Medical = false, Armor = false, Attachments = false, Tools = false,
@@ -224,6 +224,7 @@ local CFG = {
         Rare = { on = true, color = Color3.fromRGB(80, 155, 255) },
         Epic = { on = true, color = Color3.fromRGB(195, 100, 255) },
         Legendary = { on = true, color = Color3.fromRGB(255, 210, 50) },
+        Mythic = { on = true, color = Color3.fromRGB(255, 70, 140) },
         Limited = { on = true, color = Color3.fromRGB(255, 50, 60) },
     },
     EspSupplyMaxDist = 2000,
@@ -341,18 +342,20 @@ local CFG = {
     AutoDecryptMax = 3, -- prompts fired in the same frame; drops to 1 if the server closes the earlier one
     AutoDecryptReveal = true, -- false: open, read the slot count, close at once
     -- AutoLoot: Remotes.Loot "take" (part, slot) on an OPEN container (opened by AutoDecrypt, or by hand with AutoLootManual). A slot is taken when its category is on in
-    -- AutoLootCats and its rarity order >= AutoLootMinRarity, or its rarity order >= AutoLootAlways (any category; 7 = off). Hidden slots wait for their reveal.
+    -- AutoLootCats and its rarity order >= AutoLootMinRarity, or its rarity order >= AutoLootAny (any category; 0 = off). Orders are Items.Rarity.order of the
+    -- running game (a new tier shifts them), so the UI builds its lists from Items.Rarity. Hidden slots wait for their reveal.
     AutoLoot = false,
     AutoLootManual = true,
     AutoLootMinRarity = 1,
-    AutoLootAlways = 7,
+    AutoLootAny = 0,
     AutoLootDelay = 0.25, -- s between two takes; a slot the server leaves unchanged after two takes is skipped
     AutoLootCats = {
         Firearms = true, Ammo = true, Medical = true, Armor = true, Attachments = true, Valuables = true,
         Melee = false, Tools = false, Materials = false, Building = false, Food = false, Water = false, Accessories = false, Junk = false,
     },
-    -- AutoArmor: InvAction Wear from the backpack, ranked by Items rarity order (light < medium < heavy; helmets by their tier). Empty slots are always filled;
-    -- "Upgrade" also replaces a worn piece with a higher tier, and waits for the end of the server combat flag when AutoArmorSafe is on.
+    -- AutoArmor: InvAction Wear from the backpack, ranked by tier parsed from the id (armor light < medium < heavy; helmet moto < ballistic < heavy), ties by condition.
+    -- Empty slots are always filled; "Upgrade" also replaces a worn piece with a higher tier (or a worn-out one with a sound piece of the same tier), and waits
+    -- for the end of the server combat flag when AutoArmorSafe is on.
     AutoArmor = false,
     AutoArmorBody = true,
     AutoArmorHelmet = true,
@@ -2415,7 +2418,7 @@ Visual.fireSlots = function(u)
         guns = tbl("Defs", "rideOf"), aimIgnore = fn("aimIgnoreList"), ignore = fn("ignoreList"),
         params = function(v) return typeof(v) == "RaycastParams" end, mother = tbl("rayHit", "setMode"),
         gun = function(v) return typeof(v) == "Instance" and v.Name == "Gun" end,
-        impact = fn("impact"), spread = fn("currentSpread"), ballistics = tbl("arcTime", "trace"),
+        spread = fn("currentSpread"), ballistics = tbl("arcTime", "trace"),
         state = tbl("pickSlot", "heldId"), muzzle = fn("muzzleOf"), wobble = fn("wobble"), flash = fn("flash"),
         sound = fn("shotSound"), gear = tbl("stats", "slotOf"), ctl = tbl("addStamina", "isWinded"),
         skills = tbl("has", "levelCost"), cfg = tbl("HeatMax", "HeatPerShot"), ears = tbl("shot", "level"),
@@ -4943,7 +4946,7 @@ local function draw_mock(dt)
                 label("Rare rifle", cx - 22, bottom + 3, rare)
                 label("Bandage x2", cx - 26, bottom + 16, Color3.fromRGB(150, 150, 150))
             else
-                label("? not de$rypted", cx - 40, bottom + 3, color)
+                label("? not decrypted", cx - 40, bottom + 3, color)
             end
         else
             -- Review stage only: stable world placement, event-like fade in/hold/out, no idle breathing.
@@ -5470,7 +5473,7 @@ local function draw_loot(dt, origin)
                 elseif info then
                     row.countStr = info.total .. (info.total == 1 and " item" or " items") .. (info.hidden > 0 and (" / " .. info.hidden .. " hidden") or "")
                 else
-                    row.countStr = "? not de$rypted"
+                    row.countStr = "? not decrypted"
                 end
                 row.lineStr = row.titleStr .. "  " .. row.countStr
             end
@@ -5534,7 +5537,7 @@ Loot.stopAuto = Loot.finish
 Loot.takeAt = 0
 Loot.want = function(id)
     local cat, rank = Visual.itemInfo(id)
-    return rank >= CFG.AutoLootAlways or (CFG.AutoLootCats[cat] == true and rank >= CFG.AutoLootMinRarity)
+    return (CFG.AutoLootAny > 0 and rank >= CFG.AutoLootAny) or (CFG.AutoLootCats[cat] == true and rank >= CFG.AutoLootMinRarity)
 end
 Loot.takeStep = function(part, info, now)
     if not (Loot.remote and info and info.slots and CFG.AutoLoot) or (CFG.PvPPauseLoot and Visual.pvp.on) then return false end
@@ -5596,7 +5599,8 @@ Loot.auto = function(now)
                 local busy = CFG.AutoLoot and Loot.takeStep(part, info, now)
                 local waits = info and info.total > 0 and info.hidden > 0 and (CFG.AutoDecryptReveal or CFG.AutoLoot)
                 local done = not waits and not busy
-                if done or now - pending.lastEvent > 12 then Loot.closeOne(part) end
+                -- a box is never held past 20 s from its open, whatever keeps arriving: Auto Decrypt serves the next one
+                if done or now - pending.lastEvent > 12 or now - (pending.openedAt or now) > 20 then Loot.closeOne(part) end
             elseif now - pending.sentAt > 1.5 then
                 local row = searchPrompts[pending.prompt]
                 if row then row.retry = now + 6 end
@@ -6806,6 +6810,46 @@ end
 
 -- AutoArmor: snap.slots.armor / snap.slots.helmet = worn id, snap.backpack = { id = count }; Wear is the verb the inventory UI sends when a piece is dropped on the ARMOR / HELMET square.
 Visual.armor = { at = 0, tries = {} }
+-- Tier comes from the id, not the rarity: a motorcycle helmet is Rare but stops no round, a ballistic one stops handguns.
+Visual.ARMOR_TIER = { light = 1, medium = 2, heavy = 3 }
+Visual.HELMET_TIER = { moto = 1, rare = 2, epic = 3 }
+Visual.gearTier = function(id, kind)
+    if type(id) ~= "string" then return 0 end
+    if kind == "helmet" then
+        local tier = string.match(id, "^helmet_(%a+)_%a+$")
+        return tier and Visual.HELMET_TIER[tier] or 0
+    end
+    local weight = string.match(id, "^armor_(%a+)_")
+    return weight and Visual.ARMOR_TIER[weight] or 0
+end
+-- Mirrors the inventory's own armorPieces(): snap.armorWear[id][piece] = true (destroyed) or { hp = 0..1 }; no entry = untouched. 0..100
+Visual.armorCond = function(snap, id)
+    if Visual.armorLib == nil then
+        local shared = ReplicatedStorage:FindFirstChild("Shared")
+        local inst = shared and shared:FindFirstChild("Armor")
+        local ok, lib = pcall(require, inst)
+        Visual.armorLib = ok and type(lib) == "table" and lib or false
+    end
+    local lib = Visual.armorLib
+    local wear = snap.armorWear and snap.armorWear[id]
+    if not lib or type(wear) ~= "table" then return 100 end
+    local weight = lib.parse(id)
+    local pieces = weight and lib.piecesOf(weight)
+    if type(pieces) ~= "table" then return 100 end
+    local total, left = 0, 0
+    for _, piece in pieces do
+        local w = wear[piece.name]
+        total += piece.hp
+        if w == true then
+            -- destroyed
+        elseif type(w) == "table" and type(w.hp) == "number" then
+            left += piece.hp * math.clamp(w.hp, 0, 1)
+        else
+            left += piece.hp
+        end
+    end
+    return total <= 0 and 100 or math.floor(left / total * 100 + 0.5)
+end
 Visual.armorTick = function(now, client)
     local A = Visual.armor
     if not (running and CFG.AutoArmor) or now < A.at then return end
@@ -6824,24 +6868,34 @@ Visual.armorTick = function(now, client)
     local combat = type(c) == "number" and Workspace:GetServerTimeNow() - c < 15
     for _, row in { { "armor", "armor", CFG.AutoArmorBody }, { "helmet", "helmet", CFG.AutoArmorHelmet } } do
         if row[3] then
+            local kind = row[2]
             local worn = slots[row[1]]
             if type(worn) == "table" then worn = worn.id end
-            local wornRank = 0
-            if type(worn) == "string" then local _, r = Visual.itemInfo(worn); wornRank = math.max(r, 1) end
-            local best, bestRank
-            for id, n in backpack do
-                local _, rank, def = Visual.itemInfo(id)
-                if type(n) == "number" and n > 0 and def and def[row[2]] == true and rank > (bestRank or 0) then best, bestRank = id, rank end
+            local wornTier, wornCond = 0, 100
+            if type(worn) == "string" then
+                wornTier = math.max(Visual.gearTier(worn, kind), 1)
+                if kind == "armor" then wornCond = Visual.armorCond(snap, worn) end
             end
-            if best and best ~= worn and bestRank > wornRank then
-                local fill = wornRank == 0
-                if fill or (CFG.AutoArmorMode == "Upgrade" and not (CFG.AutoArmorSafe and combat)) then
+            local best, bestTier, bestCond
+            for id, n in backpack do
+                local _, _, def = Visual.itemInfo(id)
+                if type(n) == "number" and n > 0 and def and def[kind] == true then
+                    local tier = Visual.gearTier(id, kind)
+                    local cond = kind == "armor" and Visual.armorCond(snap, id) or 100
+                    if tier > (bestTier or 0) or (tier == bestTier and cond > bestCond) then best, bestTier, bestCond = id, tier, cond end
+                end
+            end
+            if best and best ~= worn then
+                local fill = wornTier == 0
+                -- same tier only replaces a worn-out piece with a clearly sounder one, so two equal pieces never trade places
+                local better = bestTier > wornTier or (bestTier == wornTier and wornCond < 60 and bestCond >= wornCond + 30)
+                if fill or (better and CFG.AutoArmorMode == "Upgrade" and not (CFG.AutoArmorSafe and combat)) then
                     local try = A.tries[best]
                     if try and try.n >= 2 and now - try.at < 30 then continue end
                     A.tries[best] = { n = (try and try.n or 0) + 1, at = now }
                     A.at = now + 1.5
                     remote:FireServer({ action = "Wear", id = best, from = "backpack" })
-                    if CFG.ShotLog then warn(string.format("[hush] AutoArmor: wear %s (%s, tier %d over %d)", best, row[1], bestRank, wornRank)) end
+                    if CFG.ShotLog then warn(string.format("[hush] AutoArmor: wear %s (%s, tier %d over %d, condition %d%% over %d%%)", best, row[1], bestTier, wornTier, bestCond, wornCond)) end
                     return
                 end
             elseif best == worn then
@@ -7497,14 +7551,10 @@ end
 -- WorldFinds: workspace.WorldFinds holds Models named Find_<itemId> or Dropped_<itemId> (RareFind = true on rare ones); the id resolves through
 -- Items.Defs. Positions are static, the folder is re-read once a second.
 Visual.items = nil
+-- items() retries until Shared.Items replicates; a failed first require is never cached.
 Visual.itemDefs = function()
-    if Visual.items == nil then
-        local shared = ReplicatedStorage:FindFirstChild("Shared")
-        local inst = shared and shared:FindFirstChild("Items")
-        local ok, m = pcall(require, inst)
-        Visual.items = ok and type(m) == "table" and type(m.Defs) == "table" and m or false
-    end
-    return Visual.items
+    local m = items()
+    return m and type(m.Defs) == "table" and type(m.Rarity) == "table" and m or nil
 end
 -- category (Weapons split into Firearms / Melee), rarity order (0 = unknown), def, rarity row
 Visual.itemInfo = function(id)
@@ -7518,6 +7568,21 @@ Visual.itemInfo = function(id)
         cat = (gd and gd.ammo ~= nil and not gd.melee) and "Firearms" or "Melee"
     end
     return cat, rar and rar.order or 0, def, rar
+end
+-- Items.Rarity of the running game, ascending: a new tier (Mythic) shifts every order above it, so no UI or CFG code may hardcode them.
+Visual.rarityRows = function()
+    local I = Visual.itemDefs()
+    local rows = {}
+    if I and type(I.Rarity) == "table" then
+        for name, r in I.Rarity do
+            if type(r) == "table" and type(r.order) == "number" then rows[#rows + 1] = { name = name, order = r.order, color = r.color } end
+        end
+    end
+    if #rows == 0 then
+        for i, name in { "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic", "Limited" } do rows[i] = { name = name, order = i } end
+    end
+    table.sort(rows, function(a, b) return a.order < b.order end)
+    return rows
 end
 Visual.finds = { rows = setmetatable({}, { __mode = "k" }), list = {}, P = { texts = {} }, at = 0 }
 Visual.FIND_COL = Color3.fromRGB(150, 225, 255)
@@ -8679,11 +8744,16 @@ return function(_Lib, _Core)
                 end,
             }, flag(id)))
         end
+        -- Lists come from the running game's Items.Rarity; the top tier has no "+".
+        local function rarityRows(from)
+            local rows, all = {}, Visual.rarityRows()
+            for i, row in ipairs(all) do
+                if row.order >= (from or 0) then rows[#rows + 1] = { row.name .. (i < #all and "+" or ""), row.order } end
+            end
+            return rows
+        end
         local function rarity(s, key)
-            choice(s, "Min Rarity", key, {
-                { "Common+", 1 }, { "Uncommon+", 2 }, { "Rare+", 3 },
-                { "Epic+", 4 }, { "Legendary+", 5 }, { "Limited", 6 },
-            })
+            choice(s, "Min Rarity", key, rarityRows())
         end
 
         local SIMPLE = {
@@ -8833,8 +8903,9 @@ return function(_Lib, _Core)
             rarity(s, "AutoLootMinRarity")
             setList(s, "Categories", "AutoLootCats", CFG.AutoLootCats,
                 { "Firearms", "Melee", "Ammo", "Medical", "Armor", "Attachments", "Valuables", "Tools", "Materials", "Building", "Food", "Water", "Accessories", "Junk" })
-            choice(s, "Always Take", "AutoLootAlways", { { "Off", 7 }, { "Epic+", 4 }, { "Legendary+", 5 }, { "Limited", 6 } },
-                "Takes this rarity from any category, ignoring Categories and Min Rarity.")
+            local any = rarityRows(4)
+            table.insert(any, 1, { "Off", 0 })
+            choice(s, "Always Take", "AutoLootAny", any, "Takes this rarity from any category, ignoring Categories and Min Rarity.")
             toggle(s, "Containers I Open", "AutoLootManual", "Also takes from a container you opened by hand.")
             keyToggle(s, "AutoLoot", "AutoLoot")
             advanced(s, "AutoLoot", function()
@@ -9042,7 +9113,9 @@ return function(_Lib, _Core)
         end
         do
             local s = card("Visuals", "Left", "Weapon ESP Rarity", "Filters and colors for the weapon list under player boxes, not loot-container visibility.")
-            for _, key in ipairs({ "Common", "Uncommon", "Rare", "Epic", "Legendary", "Limited" }) do
+            for _, row in ipairs(Visual.rarityRows()) do
+                local key = row.name
+                CFG.WeaponRarity[key] = CFG.WeaponRarity[key] or { on = true, color = row.color or Color3.fromRGB(185, 185, 185) }
                 local data = CFG.WeaponRarity[key]
                 s:Toggle({ Name = key, Default = data.on, Callback = function(v)
                     if running then data.on = v end
