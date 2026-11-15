@@ -12390,7 +12390,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v171")
+	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v172")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -13437,8 +13437,10 @@ Mark.tickCounterJump = function(character, root)
 		-- BICYCLE (dump BicycleKick.StartHover): a charge started in the air freezes him - LinearVelocity = his velocity at
 		-- the start * (1 - t / StopSeconds)^2, held up to MaximumHoverSeconds until the release. What is left of the drift
 		-- from now: v(now) * (StopSeconds - e) / 3. He was "powered" (ay ~ 0) for vertState: the old code skipped him.
-		Mark.bike = Mark.bike or require(Modules.Actions.BicycleKick)
-		local S = (Mark.bike.Constants and Mark.bike.Constants.StopSeconds) or 0.375
+		-- the module is the file-level BicycleKick. It used to be cached in Mark.bike - the slot of OUR bicycle state:
+		-- tickBike then read the module as a bicycle with no .at -> "Soccer:19293 arithmetic (sub) on number and nil"
+		-- every frame, and Mark.bike ~= nil blocked every later bicycle / feint
+		local S = (BicycleKick.Constants and BicycleKick.Constants.StopSeconds) or 0.375
 		local e = now - crec.at
 		hoverP = P + Vector3.new(V.X, vs.vy, V.Z) * (math.max(S - e, 0) / 3)
 	elseif vs.kind == "fresh" then
