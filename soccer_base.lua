@@ -75,11 +75,10 @@ local CFG = {
 	DirSpoof = false, -- Direction Spoof: the replicated charge aim shows decoys until the aim lock
 	DirSpoofChance = 1, -- share of shots spoofed
 	DirSpoofSmart = true, -- no spoof once the enemy keeper's dive is spent
-	DirSpoofHideLock = false, -- EXPERIMENTAL: the decoy stays in the aim-lock packet, only the release is real
 	FaceSpoof = false, -- body spoof: the facing lies (spin, twist, jitter, flip, sweep, away, decoy)
 	FaceSpoofMode = "smart",
 	FaceSpoofWhen = "charge", -- charge | ball | always
-	FaceSpinSpeed = 3, -- turns per second for spin / twist
+	FaceSpinSpeed = 3, -- turns per second for spin
 	FeintCompetitor = true, -- an outfield enemy within FeintCompetitorRange of the ball: no feint, the shot goes
 	FeintCompetitorRange = 10, -- Smart Select: no feint once the enemy keeper has dived (his dive is on cooldown): the shot goes as it is
 	AutoFlick = true, -- the flick key starts the scripted flick -> jump -> volley; off = the game's own flick, aim help only
@@ -6597,7 +6596,10 @@ ChargePathVelocity.Get = function(char, secs, kind, aim, origin, reported, kickD
 	-- is drawn from the same aim as the packets: the decoy while it runs, never the solved shot
 	local cr = Mark.chargeRay()
 	if cr then
+		-- kickDir too: the game takes the flat shot direction (and the +-15 deg endpoint yaw) from it, and its caller
+		-- builds it from the body - that was the preview following where the body looked
 		aim, target = cr, nil
+		kickDir = AimFacing.GetFlatDirection(cr.Direction) or kickDir
 		curve = (not Mark.flickStrike) and Shoot.curve or nil
 	end
 	return oldPathGet(char, secs, kind, aim, origin, reported, kickDir, target, boundary, curve)
@@ -6615,6 +6617,11 @@ end
 local TrajectoryPreviewFollow = require(Client.Gameplay.Visual.TrajectoryPreviewFollow)
 local oldAimStep = TrajectoryPreviewFollow.StepAimSampleCFrame
 TrajectoryPreviewFollow.StepAimSampleCFrame = function(current, target, dt)
+	-- the preview eases its aim sample toward the camera: while a charge aim is ours it must not lag behind it
+	local cr = Mark.chargeRay()
+	if cr then
+		return CFrame.lookAt(cr.Origin, cr.Origin + cr.Direction)
+	end
 	return oldAimStep(current, target, dt)
 end
 
@@ -6662,7 +6669,7 @@ oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
 			end
 			-- Direction Spoof: until the aim lock the replicated aim is a decoy; the lock packet (AimLockedAt) and the
 			-- release carry the real shot
-			local dec = packet.Phase ~= "Release" and (cmd.AimLockedAt == nil or CFG.DirSpoofHideLock) and Mark.spoofRay() or nil
+			local dec = packet.Phase ~= "Release" and cmd.AimLockedAt == nil and Mark.spoofRay() or nil
 			if Mark.sp and packet.Phase ~= "Release" then
 				-- what really went out inside the decoy window (log at "spoof done")
 				local sp = Mark.sp
@@ -11412,7 +11419,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v152")
+	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v153")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -14386,6 +14393,14 @@ end
 -- the release carry the real shot. The pattern is picked per shot from where the enemy keeper stands and what was used
 -- last; the body can turn with the decoy, away from the goal or spin (TurnControl lock "GoKart", rank 5 > AimCharge 3).
 Mark.spoofHist = {}
+-- How long the aim / body may lie: the charge until the aim lock (AimLockSeconds before full charge), minus 0.05 s so the
+-- real aim is replicated (30 Hz, ~0.11 s to the observers) before the lock freezes it
+Mark.spoofWin = function()
+	local fullAt = KickCore.GetFullChargeSeconds and KickCore.GetFullChargeSeconds() or 0.35
+	local maxC = KickCore.Constants.MaximumChargeSeconds or 0.4
+	return math.min(fullAt, maxC) - (KickCore.Constants.AimLockSeconds or 0.1) - 0.05
+end
+
 Mark.spoofPlan = function()
 	Mark.sp = nil
 	if not CFG.DirSpoof or Mark.flickStrike or Mark.forceBike or Mark.aerial or Shoot.lob then
@@ -14418,14 +14433,9 @@ Mark.spoofPlan = function()
 	if W < 1 or H < 1 then
 		return
 	end
-	local fullAt = KickCore.GetFullChargeSeconds and KickCore.GetFullChargeSeconds() or 0.35
-	local maxC = KickCore.Constants.MaximumChargeSeconds or 0.4
-	local win = math.min(fullAt, maxC) - (KickCore.Constants.AimLockSeconds or 0.1) - 0.05
+	local win = Mark.spoofWin()
 	if win < 0.08 then
 		return
-	end
-	if CFG.DirSpoofHideLock then
-		win = maxC + 0.3 -- EXPERIMENTAL: the lock packet shows the decoy too, only the Release carries the shot
 	end
 	local sr = math.clamp((P - lb):Dot(along) / W * 2 - 1, -1, 1)
 	local hr = math.clamp((P.Y - lb.Y) / H, 0, 1)
@@ -14482,7 +14492,7 @@ Mark.spoofPlan = function()
 		t0 = now, endAt = now + win, steps = pats[pick].steps, O = O, D = D, lb = lb, along = along, W = W, H = H,
 		fov = a.CameraFieldOfView, air = a.IsAirborne, name = pick,
 	}
-	logFile("spoof", "plan", pick, "real s", string.format("%.2f", sr), "h", string.format("%.2f", hr), "keeper s", sk and string.format("%.2f", sk) or "-", "window", string.format("%.2f", win), "hide lock", tostring(CFG.DirSpoofHideLock == true))
+	logFile("spoof", "plan", pick, "real s", string.format("%.2f", sr), "h", string.format("%.2f", hr), "keeper s", sk and string.format("%.2f", sk) or "-", "window", string.format("%.2f", win))
 end
 
 -- the decoy direction now (nil = real: after the window, or no plan)
@@ -14541,15 +14551,15 @@ end
 -- the body lies: TurnControl lock "GoKart" (AimFacing rank 5 > Aim / AimCharge 3) on a pattern around the reference
 -- (the real shot while charging, else their goal). Modes:
 --   spin      full turns at FaceSpinSpeed, side rolled per activation
---   twist     spin that reverses every 0.2-0.4 s (the "crazy spin")
---   jitter    snaps 60-110 deg left / right every 0.06-0.1 s
---   flip      corner to corner: +-75 deg, 0.14-0.22 s each
---   sweep     a pendulum through the back (+-150 deg)
+--   side      shoulders open ~70 deg to one side (the usual way to hide the corner)
+--   lookoff   a look to one side, then the other, then the shot
 --   away      back to the goal
---   decoy     faces the aim decoy of Direction Spoof (flip without one)
+--   decoy     faces the aim decoy of Direction Spoof (side without one)
 --   smart     a random one of these per activation, re-rolled every 1.5-3 s, never the last two again
+-- The body lies only inside Mark.spoofWin (until the aim lock), then it stands on the real shot until the kick.
 -- When: charge (only while charging a shot), ball (whenever we have it), always (also without the ball).
-Mark.faceModes = { "spin", "twist", "jitter", "flip", "sweep", "away" }
+Mark.faceModes = { "spin", "side", "lookoff", "away", "decoy" }
+Mark.faceSet2 = { spin = true, side = true, lookoff = true, away = true, decoy = true }
 Mark.faceHist = {}
 Mark.facePick = function()
 	local hist, cand = Mark.faceHist, {}
@@ -14605,30 +14615,92 @@ Mark.faceSet = function(root, face)
 	end
 end
 
--- The decoy as a point on the goal (the aim now rests on it for the whole window): a diamond + a line from the ball, in the
--- threat hue so it never reads as the real shot (COL.Line)
+-- The decoy as a lock-on on the goal: a broken ring turning round the point, a diamond that breathes, four inward ticks,
+-- and an outer arc that burns down with the time the aim may still lie (when it is gone the aim is real again). From the
+-- ball a dashed line of chevrons runs to it. The threat tint of kickPalette.armed, never the real-shot line colour.
+Mark.spoofArt = function(seg, q, along, ball, clk, frac)
+	local up = Vector3.new(0, 1, 0)
+	local pal = Mark.kickPalette.armed
+	local core, hi = pal[1], Color3.new(1, 1, 1)
+	local ph = clk * 1.3
+	local breathe = 0.85 + 0.15 * math.sin(clk * 9)
+	-- broken ring (3 arcs, 2 gaps) turning
+	local R = 1.9
+	for arc = 0, 2 do
+		local a0 = ph + arc * math.pi * 2 / 3
+		local prev
+		for k = 0, 5 do
+			local th = a0 + k * 0.17 * math.pi * 2 / 5 * 2.4
+			local p = q + along * (math.cos(th) * R) + up * (math.sin(th) * R)
+			if prev then
+				seg(prev, p, COL.Ink, 0.5, 3.8, 44)
+				seg(prev, p, core, 0.95, 1.6, 45)
+			end
+			prev = p
+		end
+	end
+	-- diamond
+	local r = 0.8 * breathe
+	local d = { q + up * r, q + along * r, q - up * r, q - along * r }
+	for i = 1, 4 do
+		local p0, p1 = d[i], d[i % 4 + 1]
+		seg(p0, p1, COL.Ink, 0.55, 3.4, 44)
+		seg(p0, p1, hi, 1, 1.4, 46)
+	end
+	-- ticks
+	for i = 1, 4 do
+		local dir = (i % 2 == 1) and up or along
+		local sgn = i > 2 and -1 or 1
+		seg(q + dir * sgn * (R + 0.15), q + dir * sgn * (R - 0.45), core, 0.9, 1.6, 45)
+	end
+	-- the time the aim may still lie: an arc round the ring that shortens
+	frac = math.clamp(frac or 1, 0, 1)
+	if frac > 0.02 then
+		local prev
+		local n = math.max(2, math.floor(frac * 18))
+		for k = 0, n do
+			local th = math.pi / 2 + (k / n) * frac * math.pi * 2
+			local p = q + along * (math.cos(th) * (R + 0.7)) + up * (math.sin(th) * (R + 0.7))
+			if prev then
+				seg(prev, p, hi:Lerp(core, 1 - frac), 0.9, 1.2, 46)
+			end
+			prev = p
+		end
+	end
+	-- the line from the ball: chevrons running to the point
+	if ball then
+		local dv = q - ball
+		local len = dv.Magnitude
+		local dir = unitOrNil(dv)
+		if dir then
+			local sideV = unitOrNil(dir:Cross(up)) or along
+			local gap = 4.5
+			local s = (clk * 40) % gap
+			seg(ball, q - dir * (R + 0.2), core, 0.22, 1, 43)
+			while s < len - R - 0.5 do
+				local p = ball + dir * s
+				local c = hi:Lerp(core, s / len)
+				seg(p - dir * 1.1 + sideV * 0.7, p, c, 0.9, 1.6, 45)
+				seg(p - dir * 1.1 - sideV * 0.7, p, c, 0.9, 1.6, 45)
+				s += gap
+			end
+		end
+	end
+end
+
 Mark.spoofDraw = function(pen, ball)
 	local sp = Mark.sp
 	local q = sp and sp.q
 	if not (pen and q and Mark.spoofDir()) then
 		return
 	end
-	local up = Vector3.new(0, 1, 0)
-	local r = 1.1
-	local pts = { q + up * r, q + sp.along * r, q - up * r, q - sp.along * r }
-	local col = COL.Tackle
-	local x0, y0, d0 = pen.P(pts[4])
-	for i = 1, 4 do
-		local x1, y1, d1 = pen.P(pts[i])
-		pen.L(x0, y0, d0, x1, y1, d1, COL.Ink, 0.5, 4, 44)
-		pen.L(x0, y0, d0, x1, y1, d1, col, 1, 1.8, 45)
-		x0, y0, d0 = x1, y1, d1
+	local now = os.clock()
+	local seg = function(a, b, col, alpha, thick, z)
+		local x0, y0, d0 = pen.P(a)
+		local x1, y1, d1 = pen.P(b)
+		pen.L(x0, y0, d0, x1, y1, d1, col, alpha, thick, z)
 	end
-	if ball then
-		local bx, by, bd = pen.P(ball)
-		local qx, qy, qd = pen.P(q)
-		pen.L(bx, by, bd, qx, qy, qd, col, 0.35, 1.2, 45)
-	end
+	Mark.spoofArt(seg, q, sp.along, ball, now, (sp.endAt - now) / math.max(sp.endAt - sp.t0, 0.05))
 end
 
 -- PreSimulation: the controller turns the root during the physics step and CharacterReplication samples it in
@@ -14650,6 +14722,7 @@ end
 
 Mark.faceTick = function(character, root)
 	local fs = Mark.fs
+	local charging = ChargedKick.IsCharging and ChargedKick.IsCharging() or false
 	if not (character and root) or not Mark.faceActive(character) then
 		Mark.faceNow = nil
 		if fs then
@@ -14661,7 +14734,10 @@ Mark.faceTick = function(character, root)
 	local now = os.clock()
 	if not fs then
 		local mode = CFG.FaceSpoofMode or "smart"
-		fs = { t0 = now, mode = mode, cur = mode == "smart" and Mark.facePick() or mode, sgn = math.random() < 0.5 and -1 or 1, nextAt = now, k = 0, off = 0, repickAt = now + 1.5 + math.random() * 1.5 }
+		if mode ~= "smart" and not Mark.faceSet2[mode] then
+			mode = "smart"
+		end
+		fs = { t0 = now, mode = mode, cur = mode == "smart" and Mark.facePick() or mode, sgn = math.random() < 0.5 and -1 or 1, repickAt = now + 1.5 + math.random() * 1.5 }
 		Mark.fs = fs
 		logFile("face spoof", "start", fs.cur, "when", CFG.FaceSpoofWhen or "charge")
 	end
@@ -14670,52 +14746,56 @@ Mark.faceTick = function(character, root)
 	end
 	-- reference: the real shot while charging, else their goal, else our run
 	local ref = nil
-	if Shoot.aim and Shoot.aim.Direction and ChargedKick.IsCharging and ChargedKick.IsCharging() then
+	if Shoot.aim and Shoot.aim.Direction and charging then
 		ref = unitOrNil(flat(Shoot.aim.Direction))
 	end
 	if not ref then
 		local g = enemyGoalPart()
 		ref = g and unitOrNil(flat(g.Position - root.Position)) or unitOrNil(flat(root.CFrame.LookVector)) or Vector3.new(0, 0, 1)
 	end
-	local t = now - fs.t0
-	local spd = (CFG.FaceSpinSpeed or 3) * math.pi * 2
+	-- The body only lies while the aim may lie. The game turns the body at a fixed rate toward the aim and the shot is
+	-- struck from that pose (carry offset, stabilised direction): leaving it sideways at the release put the ball on
+	-- the bar. After the window the body is on the real shot and stays there until the kick.
+	local win = Mark.spoofWin()
+	if charging then
+		fs.chargeAt = fs.chargeAt or now
+	else
+		fs.chargeAt = nil
+	end
+	local p
+	if fs.chargeAt then
+		local el = now - fs.chargeAt
+		if el >= win then
+			Mark.faceSet(root, ref)
+			return
+		end
+		p = el / win
+	else
+		p = ((now - fs.t0) % 1.2) / 1.2
+	end
 	local cur, off = fs.cur, 0
 	if cur == "decoy" then
+		-- the body looks at the decoy point: the keeper reads body and aim as one
 		local d = Mark.spoofDir()
 		local f = d and unitOrNil(flat(d))
 		if f then
 			Mark.faceSet(root, f)
 			return
 		end
-		cur = "flip"
+		cur = "side"
 	end
 	if cur == "spin" then
-		off = fs.sgn * t * spd
-	elseif cur == "twist" then
-		if now >= fs.nextAt then
-			fs.sgn, fs.nextAt = -fs.sgn, now + 0.2 + math.random() * 0.2
-		end
-		fs.off += fs.sgn * spd * math.min(now - (fs.lastT or now), 0.05)
-		off = fs.off
-	elseif cur == "jitter" then
-		if now >= fs.nextAt then
-			fs.k += 1
-			fs.jit = (fs.k % 2 == 0 and 1 or -1) * math.rad(60 + math.random() * 50)
-			fs.nextAt = now + 0.06 + math.random() * 0.04
-		end
-		off = fs.jit or 0
-	elseif cur == "flip" then
-		if now >= fs.nextAt then
-			fs.k += 1
-			fs.nextAt = now + 0.14 + math.random() * 0.08
-		end
-		off = (fs.k % 2 == 0 and 1 or -1) * math.rad(75)
-	elseif cur == "sweep" then
-		off = math.rad(150) * math.sin(t * math.pi * 2 * 1.3) * fs.sgn
+		off = fs.sgn * (now - fs.t0) * (CFG.FaceSpinSpeed or 3) * math.pi * 2
+	elseif cur == "side" then
+		-- shoulders open to one side: the usual way to hide the corner
+		off = fs.sgn * math.rad(70)
+	elseif cur == "lookoff" then
+		-- a look to one side, then to the other, then the shot
+		off = fs.sgn * math.rad(55) * (p < 0.5 and 1 or -1)
 	elseif cur == "away" then
-		off = math.pi + 0.25 * math.sin(t * 5)
+		-- back to goal
+		off = math.pi
 	end
-	fs.lastT = now
 	local c, s = math.cos(off), math.sin(off)
 	Mark.faceSet(root, Vector3.new(ref.X * c - ref.Z * s, 0, ref.X * s + ref.Z * c))
 end
@@ -21449,6 +21529,10 @@ Mark.galStations = {
 		end
 		Mark.projArt(seg, { pts = pts, len = len, speed = 60, hit = (t % 3 < 2) and C or nil, key = "gal" }, os.clock())
 	end },
+	{ name = "Direction Spoof: the fake aim point", x = 180, art = function(seg, C, t, st, G)
+		local q = C + G.right * (math.sin(t * 1.7) * 5) + Vector3.new(0, 4 + math.sin(t * 2.3) * 1.5, 0)
+		Mark.spoofArt(seg, q, G.right, C - G.fw * 22 + Vector3.new(0, 1, 0), os.clock(), 1 - (t % 1.5) / 1.5)
+	end },
 	{ name = "SilentAim boomerang: the throw to him", x = 116, art = function(seg, C, t, st, G)
 		if not st.tab then
 			-- a loop of the same kind as Boomerang.GetPosition (out to the left, back): 1.9 s sampled at 0.025
@@ -21963,10 +22047,9 @@ return function(_Lib, _Core)
 			tog(ds, "Enabled", "DirSpoof", "Shows the keeper fake shot directions while you charge, then shoots for real.")
 			sld(ds, "Chance", "DirSpoofChance", 0, 100, { scale = 100, suffix = "%" })
 			tog(ds, "Smart Select", "DirSpoofSmart", "No spoof once the keeper has dived.")
-			tog(ds, "Hide Real Aim", "DirSpoofHideLock", "Experimental: fake direction until the ball is kicked.")
 			head(ds, "Body Spoof")
 			tog(ds, "Enabled", "FaceSpoof", "Your body faces the wrong way to fool the keeper.")
-			drop(ds, "Mode", "FaceSpoofMode", { "smart", "spin", "twist", "jitter", "flip", "sweep", "away", "decoy" })
+			drop(ds, "Mode", "FaceSpoofMode", { "smart", "spin", "side", "lookoff", "away", "decoy" })
 			drop(ds, "When", "FaceSpoofWhen", { "charge", "ball", "always" }, "Charge: while you charge a shot. Ball: while you have it.")
 			sld(ds, "Spin Speed", "FaceSpinSpeed", 1, 6, { prec = 1, suffix = " /s" })
 
