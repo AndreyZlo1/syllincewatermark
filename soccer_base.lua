@@ -197,7 +197,7 @@ local CFG = {
 	WallLatency = 0.06, -- the wall exists this long after the press reaches the server (ping/2); seen 0.11-0.14 s after the press at ping 0.08
 	WallEquip = false, -- Auto Use: AutoWall takes the barricades out itself (item slot press) when a threat is coming; off = only when already in hand
 	WallEquipDelay = 0.04, -- the equip is a local state change + an ordered remote: about a frame
-	WallTrapBurst = 30, -- NPC keeper: closing speed (st/s) that counts as a dive
+	WallTrapBurst = 35, -- NPC keeper: closing speed over 0.1 s (st/s) that counts as a dive
 	WallEquipHold = 3.5,
 	WallTrap = true, -- Keeper Trap: a barricade between us and the enemy keeper's dive
 	WallReach = 18, -- a chaser (our ball) / the carrier within this gets a wall across his run
@@ -6667,8 +6667,10 @@ oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
 			end
 			-- Direction Spoof: until the aim lock the replicated aim is a decoy; the lock packet (AimLockedAt) and the
 			-- release carry the real shot
-			local dec = packet.Phase ~= "Release" and cmd.AimLockedAt == nil and Mark.spoofRay() or nil
-			if Mark.sp and packet.Phase ~= "Release" then
+			-- Start and Release carry the real shot: the server may take the shot basis from either (the log showed shots
+			-- flying to the decoy while the last Update was real). The decoy lives in Update packets only.
+			local dec = packet.Phase == "Update" and cmd.AimLockedAt == nil and Mark.spoofRay() or nil
+			if Mark.sp and packet.Phase == "Update" then
 				-- what really went out inside the decoy window (log at "spoof done")
 				local sp = Mark.sp
 				if dec then
@@ -6705,23 +6707,34 @@ oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
 				end
 			end
 			if packet.Phase == "Release" and cmd.PassType == "Shot" and Shoot.launch then
-				-- ground truth of every shot: where the ball really goes against the solved shot (and was a decoy up)
-				local want, hadDecoy = Shoot.launch, Mark.sp ~= nil
-				local pA
-				task.delay(0.1, function()
-					pA = Renderer.GetPosition()
-				end)
+				-- ground truth of every shot: the ball 0.2 s after the release against the solved flight (curve included)
+				local pv, hadDecoy, p0 = Shoot.preview, Mark.sp ~= nil, Renderer.GetPosition()
+				local aimSent = typeof(cmd.AimDirection) == "table" and cmd.AimDirection.Direction
 				task.delay(0.2, function()
 					local pB = Renderer.GetPosition()
-					if not (pA and pB) then
+					if not (pv and pv.pts and pv.times and p0 and pB) then
 						return
 					end
-					local v = (pB - pA) * 10
-					local fv, fw = flat(v), flat(want)
-					if v.Magnitude > 20 and fv.Magnitude > 1 and fw.Magnitude > 1 then
-						local off = math.deg(math.acos(math.clamp(fv.Unit:Dot(fw.Unit), -1, 1)))
-						logFile("shoot", "flight", "off solved", string.format("%.1f", off), "speed", string.format("%.0f", v.Magnitude), "solved", string.format("%.0f", want.Magnitude), "decoy", hadDecoy and "yes" or "no")
+					local function at(t)
+						for i = 2, #pv.pts do
+							local t1 = pv.times[i] or 0
+							if t1 >= t then
+								local t0 = pv.times[i - 1] or 0
+								return pv.pts[i - 1]:Lerp(pv.pts[i], t1 > t0 and (t - t0) / (t1 - t0) or 0)
+							end
+						end
+						return nil
 					end
+					local e0, e1 = at(0), at(0.2)
+					if not (e0 and e1) then
+						return
+					end
+					local ea, aa = e1 - e0, pB - p0
+					if ea.Magnitude < 1 or aa.Magnitude < 1 then
+						return
+					end
+					local ang = math.deg(math.acos(math.clamp(ea.Unit:Dot(aa.Unit), -1, 1)))
+					logFile("shoot", "flight", "angle to solved", string.format("%.1f", ang), "moved", string.format("%.1f", aa.Magnitude), "solved", string.format("%.1f", ea.Magnitude), "decoy", hadDecoy and "yes" or "no", "aim sent", aimSent and fmtV(aimSent) or "-")
 				end)
 			end
 			if packet.Phase == "Release" and (Mark.flickStrike or Mark.forceBike) then
@@ -8235,37 +8248,60 @@ Mark.npcDiveWatch = function(root)
 	if not k then
 		return
 	end
-	-- speed from the position itself: an NPC is moved by the server, its AssemblyLinearVelocity is not the dive
+	-- Positions only: an NPC is moved by the server (its AssemblyLinearVelocity is not the dive) and the position arrives
+	-- in steps, so the speed is taken over 0.1 s and the start of the move is the first sample that left the standing spot.
 	local now = os.clock()
 	local tr = Mark.kpTrack
 	if not (tr and tr.key == k.key) then
-		tr = { key = k.key, p = k.r.Position, t = now, v = Vector3.zero }
+		tr = { key = k.key, ring = {}, peak = 0, peakAt = now }
 		Mark.kpTrack = tr
 		logFile("wall trap", "keeper", k.npc and "npc" or "player", "d", string.format("%.1f", k.d))
-		return
 	end
-	local dt = now - tr.t
-	if dt < 0.012 then
-		return
+	local ring = tr.ring
+	ring[#ring + 1] = { t = now, p = k.r.Position }
+	while #ring > 1 and now - ring[1].t > 0.6 do
+		table.remove(ring, 1)
 	end
-	local v = flat(k.r.Position - tr.p) / dt
-	tr.p, tr.t = k.r.Position, now
-	if not k.npc or (Mark.trapDive and Mark.trapDive.uid == k.key and now - Mark.trapDive.at < 1.2) then
+	if not k.npc or #ring < 4 or (Mark.trapDive and Mark.trapDive.uid == k.key and now - Mark.trapDive.at < 1.2) then
 		return
 	end
 	local toUs = unitOrNil(flat(root.Position - k.r.Position))
-	local closing = toUs and v:Dot(toUs) or 0
-	if closing < (CFG.WallTrapBurst or 30) then
+	if not toUs then
 		return
 	end
+	local ref = ring[#ring]
+	for i = #ring, 1, -1 do
+		if now - ring[i].t >= 0.1 then
+			ref = ring[i]
+			break
+		end
+	end
+	local dtw = now - ref.t
+	if dtw < 0.08 then
+		return
+	end
+	local closing = flat(k.r.Position - ref.p):Dot(toUs) / dtw
+	if closing > tr.peak or now - tr.peakAt > 2 then
+		tr.peak, tr.peakAt = closing, now
+		if closing > 18 then
+			logFile("wall trap", "npc closing", string.format("%.0f", closing), "d", string.format("%.1f", k.d))
+		end
+	end
+	if closing < (CFG.WallTrapBurst or 35) then
+		return
+	end
+	local still = ring[1]
+	local tStart = ring[#ring].t
+	for i = 1, #ring do
+		if flat(ring[i].p - still.p).Magnitude > 0.6 then
+			tStart = ring[i].t
+			break
+		end
+	end
 	Mark.gkDiveMod = Mark.gkDiveMod or require(Modules.Actions.GoalkeeperDive)
-	local D = Mark.gkDiveMod
-	local T = D.Constants.DurationSeconds or 0.875
-	local dist = ((k.actor and D.GetDistance(k.actor)) or 20) * 1.3 + 3
-	-- cubic out: speed(el) = 3 dist (1 - el/T)^2 / T
-	local el0 = T * (1 - math.sqrt(math.clamp(closing * T / (3 * dist), 0, 1)))
-	Mark.trapDive = { uid = k.key, at = now, el0 = el0, P0 = k.r.Position - toUs * D.GetTravel(el0, dist) }
-	logFile("wall trap", "npc dive seen", "speed", string.format("%.0f", closing), "el", string.format("%.2f", el0), "d", string.format("%.1f", k.d))
+	local el0 = math.clamp(now - tStart, 0, Mark.gkDiveMod.Constants.DurationSeconds or 0.875)
+	Mark.trapDive = { uid = k.key, at = now, el0 = el0, P0 = still.p }
+	logFile("wall trap", "npc dive seen", "closing", string.format("%.0f", closing), "el", string.format("%.2f", el0), "d", string.format("%.1f", k.d))
 end
 
 Mark.wallTrap = function(root, diving)
@@ -8305,7 +8341,7 @@ Mark.wallTrap = function(root, diving)
 	local ok, why = Mark.wallVsPath(root, path, dur - el0, (diving and "keeper dive" or "keeper bait") .. (k.npc and " npc" or ""), { rad = 2, equip = true, actor = k.actor, model = k.model, trap = true, contact = 3, lagReady = not diving })
 	if not ok and why and (not Mark.trapLog or os.clock() - Mark.trapLog > 0.6) then
 		Mark.trapLog = os.clock()
-		logFile("wall trap", diving and "dive" or "bait", "no", why, "d", string.format("%.1f", k.d), "el", string.format("%.2f", el0))
+		logFile("wall trap", "dive no", why, "d", string.format("%.1f", k.d), "el", string.format("%.2f", el0), "reach", string.format("%.1f", reach))
 	end
 	return ok
 end
@@ -11422,7 +11458,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v154")
+	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v155")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -14769,6 +14805,11 @@ Mark.faceTick = function(character, root)
 	if fs.chargeAt then
 		local el = now - fs.chargeAt
 		if el >= win then
+			Mark.faceSet(root, ref)
+			return
+		end
+		if el < 0.08 then
+			-- the Start packet and the first Updates find the body on the real shot
 			Mark.faceSet(root, ref)
 			return
 		end
