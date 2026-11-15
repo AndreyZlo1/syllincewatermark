@@ -270,6 +270,12 @@ local CFG = {
 	PassMinDist = 7,
 	PassMaxDist = 130,
 	PassToKeeper = false,
+	PassGoalBias = 0.3, -- the receive point leads along his speed turned this share toward their goal (0 = straight extrapolation)
+	PassCross = true, -- a mate in the box area: the lob is aimed to where he catches it in a jump
+	PassCrossZone = 60, -- cross when he is this close to their goal (and farther than PassCrossMin) ...
+	PassCrossMin = 12,
+	PassCrossAhead = 2, -- ... and the ball ends this many studs beyond him toward the goal
+	PassCrossJump = 0.6, -- catch height as a share of the jump (0 = standing receive height)
 	PriorityFAKE = true, -- FAKE is tried FIRST (before BounceFAKE and the normal pool)
 	FakeMateSpeed = 38, -- FAKE: a mate running faster than this is not used (his pose at the pass is too uncertain)
 	Speed = false, -- Movement: extra ground speed (root CFrame step + stream velocity, the way the game's own CFrame dash moves)
@@ -7291,6 +7297,118 @@ end
 -- full lead, a strafer a fraction of it. The flight time is iterated against the lead point; the target is also seen
 -- display-delay + one-way ping behind the server pose.
 Mark.projSeed = { freezeGun = 77.8 } -- measured muzzle speed (log "proj speed freezeGun 77.6-77.9"); used until we shoot
+-- BOOMERANG (dump Modules.Items.Boomerang). It is NOT a straight shot: a fixed loop in the throw's own frame,
+--   P(t) = Start + (Forward * x(t) + up x Forward * y(t)) * Range + up * h(t),   Range 70, FlightSeconds 1.93,
+-- Forward = the FLAT direction of the aim ray, Start = the throw root CFrame * ReleaseOffset (0, 1.38, -2.92) at the release
+-- (ReleaseSeconds 0.067 after the press). With Count > 1 it returns to us (Returns); a single one flies away after the
+-- apex. Hit = CombatHitboxes boxes against the swept 4 x 1.8 x 4 box between two path samples (server-side).
+-- So the aim is a YAW: the loop rotates rigidly about Start. A point at distance r is on the outbound leg at the time
+-- t(r) (the radius of the loop grows to Range at the apex), at the polar angle phi(t) from Forward. For a target D from
+-- Start: Forward = unit(D) rotated by phi (complex: F = W * (a + ib) / rho). The target is led with the same velocity model
+-- as the other projectiles (Mark.silentLead) over t(r) + release + ping. Local loop sampled once per Returns flag.
+Mark.boomTable = function(returns)
+	Mark.boomMod = Mark.boomMod or require(Modules.Items.Boomerang)
+	Mark.boomTabs = Mark.boomTabs or {}
+	local tab = Mark.boomTabs[returns and 1 or 2]
+	if tab then
+		return tab
+	end
+	local B = Mark.boomMod
+	local th = B.NewThrow(Vector3.zero, { Direction = Vector3.new(0, 0, 1) }, returns, 0)
+	local dur = math.min(B.GetEndTime(th), 2.2)
+	local n = math.floor(dur / 0.025)
+	tab = { a = {}, b = {}, h = {}, rho = {}, dt = 0.025, iMax = 1, n = n }
+	for i = 0, n do
+		local p = B.GetPosition(th, i * 0.025, nil)
+		local a, b = p.Z, p.X -- Forward = +Z here, up x Forward = +X
+		tab.a[i], tab.b[i], tab.h[i], tab.rho[i] = a, b, p.Y, math.sqrt(a * a + b * b)
+	end
+	-- outbound leg = up to the first maximum of the radius
+	local im = 0
+	while im < n and tab.rho[im + 1] >= tab.rho[im] - 1e-6 do
+		im += 1
+	end
+	tab.iMax = im
+	Mark.boomTabs[returns and 1 or 2] = tab
+	return tab
+end
+
+-- time on the outbound leg at which the loop is r studs from Start (nil beyond its reach)
+Mark.boomTimeAt = function(tab, r)
+	if r > tab.rho[tab.iMax] then
+		return nil
+	end
+	local lo, hi = 0, tab.iMax
+	while hi - lo > 1 do
+		local m = (lo + hi) // 2
+		if tab.rho[m] < r then
+			lo = m
+		else
+			hi = m
+		end
+	end
+	local r0, r1 = tab.rho[lo], tab.rho[hi]
+	local u = r1 > r0 and (r - r0) / (r1 - r0) or 0
+	return (lo + u) * tab.dt, lo, u
+end
+
+Mark.boomReturns = function()
+	local slot = Mark.slotOfItem("boomerang")
+	local slots = slot and Mark.itemSlots()
+	local e = slots and slots[slot]
+	return type(e) == "table" and (e.Count or 1) > 1
+end
+
+-- -> Forward (flat unit), info { S, P, t, r, pts } or nil (out of reach: the player's own aim stays)
+Mark.boomAim = function(pick, cam, ping, root)
+	local returns = Mark.boomReturns()
+	local tab = Mark.boomTable(returns)
+	local B = Mark.boomMod
+	-- the throw starts from the body the server has at the release: our pose + what we travel by then
+	local S = B.GetReleasePosition(root.CFrame) + flat(root.AssemblyLinearVelocity) * (B.ReleaseSeconds + ping * 0.5)
+	local function flightFn(P)
+		local t = Mark.boomTimeAt(tab, flat(P - S).Magnitude)
+		return (t or tab.iMax * tab.dt) + B.ReleaseSeconds
+	end
+	local P = Mark.silentLead(pick, cam.CFrame.Position, 100, ping, flightFn)
+	local W = flat(P - S)
+	local r = W.Magnitude
+	local t, i, u = Mark.boomTimeAt(tab, r)
+	if not t or r < 4 then
+		return nil
+	end
+	local a = tab.a[i] + (tab.a[i + 1] - tab.a[i]) * u
+	local b = tab.b[i] + (tab.b[i + 1] - tab.b[i]) * u
+	local rho = math.sqrt(a * a + b * b)
+	local wx, wz = W.X / r, W.Z / r
+	-- F = W * (a + i b) / rho  (x = X, z = Z)
+	local fx = (wx * a - wz * b) / rho
+	local fz = (wx * b + wz * a) / rho
+	local f = Vector3.new(fx, 0, fz)
+	return f, { S = S, P = P, t = t, r = r, tab = tab, returns = returns }
+end
+
+-- the loop in the world for forward f (ink bed + colour), a spark where it meets him
+Mark.boomArt = function(seg, f, info, col, now)
+	local tab, S = info.tab, info.S
+	local side = Vector3.new(f.Z, 0, -f.X)
+	local gy = S.Y
+	local last = nil
+	local stride = 2
+	for i = 0, tab.iMax, stride do
+		local p = S + f * tab.a[i] + side * tab.b[i]
+		p = Vector3.new(p.X, gy - 1.2, p.Z)
+		if last then
+			local fade = 1 - 0.5 * (i / tab.iMax)
+			seg(last, p, COL.Ink, 0.35, 3.4, 44)
+			seg(last, p, col, 0.9 * fade, 1.5, 45)
+		end
+		last = p
+	end
+	local H = Vector3.new(info.P.X, gy - 1.2, info.P.Z)
+	Mark.kickRipple(seg, H, 2.6, Mark.defPalette.armed, Mark.rippleStep("boom", Mark.rippleRates.live), now, 2)
+end
+
 -- AREA WEAPONS (bazooka, freeze gun). These hit a spot on the ground, not a body: aimed at his chest the shot flies on
 -- past him when he steps and goes off far behind. So the aim point is the GROUND under where he will be.
 --   bazooka: ProjectileVfx.getLaunchVelocity = unit(TargetPosition - muzzle) * Speed, Gravity = workspace.Gravity;
@@ -7985,8 +8103,11 @@ Mark.tickSkill = function(character, root)
 	local id = Mark.equippedId()
 	Mark.itemAim = Mark.itemAim or require(Modules.Items.ItemAim)
 	local aimGun = id ~= nil and Mark.itemAim.UsesGunReticle(id)
+	-- the boomerang (log: proj start boomerang spd 103 grav 0) is not in the dump we have: if the live ItemAim says it is a gun-
+	-- reticle item the gun path below takes it, otherwise it is aimed by the camera and the aim ray hooks carry our ray
+	local boom = id == "boomerang" and not aimGun
 	local placeWall = id == "barricades"
-	if not aimGun then
+	if not (aimGun or boom) then
 		Mark.saHide()
 	end
 	local ping = LocalPlayer:GetNetworkPing()
@@ -7995,7 +8116,7 @@ Mark.tickSkill = function(character, root)
 	if placeWall then
 		return -- AutoWall ran above (Mark.wallTick)
 	end
-	if not aimGun then
+	if not (aimGun or boom) then
 		return
 	end
 
@@ -8061,6 +8182,7 @@ Mark.tickSkill = function(character, root)
 	local spd = (Mark.projSpeed and Mark.projSpeed[id]) or Mark.projSeed[id]
 	local camPos = cam.CFrame.Position
 	local areaDir, areaG, areaInfo = nil, nil, nil
+	local boomDir, boomInfo = nil, nil
 	if Mark.areaItems[id] then
 		areaDir, areaG, areaInfo = Mark.areaAim(id, pick, cam, ping, root)
 	end
@@ -8074,6 +8196,12 @@ Mark.tickSkill = function(character, root)
 		end
 	elseif Mark.areaItems[id] then
 		Mark.areaLast = nil
+	elseif id == "boomerang" then
+		boomDir, boomInfo = Mark.boomAim(pick, cam, ping, root)
+		if boomInfo and os.clock() - (Mark.boomLogAt or 0) > 1.5 then
+			Mark.boomLogAt = os.clock()
+			logFile("silent boomerang", "r", string.format("%.1f", boomInfo.r), "t", string.format("%.2f", boomInfo.t), "returns", tostring(boomInfo.returns), "fwd", fmtV(boomDir))
+		end
 	elseif spd and spd > 10 then
 		-- projectile: lead by its measured muzzle speed (our ProjectileStart events, seeded for the freeze gun)
 		aimP = Mark.silentLead(pick, camPos, spd, ping)
@@ -8084,9 +8212,13 @@ Mark.tickSkill = function(character, root)
 		end
 	end
 	-- an area weapon with no ground solve (out of reach, blast on us) keeps the player's own aim
-	local dir = areaDir or (not Mark.areaItems[id] and unitOrNil(aimP - camPos)) or nil
+	local dir = areaDir or boomDir or ((not Mark.areaItems[id] and id ~= "boomerang") and unitOrNil(aimP - camPos)) or nil
 	if dir then
-		Mark.silentRay = Ray.new(camPos, dir)
+		if boom then
+			Mark.skillRay = { Origin = camPos, Direction = dir, CameraCFrame = CFrame.lookAt(camPos, camPos + dir) }
+		else
+			Mark.silentRay = Ray.new(camPos, dir)
+		end
 	end
 	-- visual: a world-space tracer from the weapon muzzle (HeldItems.FindMuzzle) to the target, with light pulses
 	-- running down it toward him, plus a spinning split ring at his feet and his name. Reads in one glance as "this
@@ -8098,7 +8230,7 @@ Mark.tickSkill = function(character, root)
 	muzzle = att and att.WorldPosition
 	muzzle = muzzle or (root.Position + Vector3.new(0, 1.2, 0) + flat(cam.CFrame.LookVector) * 1.5)
 	local chest = aimP + Vector3.new(0, 0.6, 0)
-	Mark.saLines = Mark.saLines or makeLines(48, 1.4, 46)
+	Mark.saLines = Mark.saLines or makeLines(110, 1.4, 46)
 	Mark.saPool = Mark.saPool or Mark.segPool(Mark.saLines)
 	local pool = Mark.saPool
 	if areaG then
@@ -8108,7 +8240,9 @@ Mark.tickSkill = function(character, root)
 		end
 		Mark.areaDraw(areaG, areaInfo.R, col)
 	else
-		if CFG.DrawSilent ~= false and not Mark.areaItems[id] then
+		if CFG.DrawSilent ~= false and boomInfo then
+			Mark.boomArt(pool.seg, boomDir, boomInfo, col, os.clock())
+		elseif CFG.DrawSilent ~= false and not Mark.areaItems[id] and id ~= "boomerang" then
 			Mark.silentArt(pool.seg, muzzle, chest, Vector3.new(aimP.X, aimP.Y - 2.9, aimP.Z), col, os.clock())
 		end
 		if Mark.areaFx then
@@ -8271,6 +8405,7 @@ end
 --   none   - it never gets there inside the sampled window.
 Mark.gkVerify = function(samples, ts, c, fwd, side, half, bottomY, topY)
 	local prevA, dec = nil, 0
+	local bounce, bp, bt = false, nil, nil
 	for i = 1, #samples do
 		local a = flat(samples[i] - c):Dot(fwd)
 		if prevA then
@@ -8279,15 +8414,23 @@ Mark.gkVerify = function(samples, ts, c, fwd, side, half, bottomY, topY)
 				local p = samples[i - 1]:Lerp(samples[i], k)
 				local s = flat(p - c):Dot(side)
 				local inMouth = math.abs(s) <= half + 0.8 and p.Y >= bottomY - 0.8 and p.Y <= topY + 0.8
-				return inMouth and "goal" or "wide", p, ts[i - 1] + (ts[i] - ts[i - 1]) * k
-			elseif a > prevA + 0.4 and dec >= 1.0 then
-				return "bounce", samples[i - 1], ts[i - 1]
+				-- 4th result: the flight hit something first (post, bar) and this is the crossing AFTER the rebound
+				return inMouth and "goal" or "wide", p, ts[i - 1] + (ts[i] - ts[i - 1]) * k, bounce
+			elseif a > prevA + 0.4 and dec >= 1.0 and not bounce then
+				-- the ball turned back toward the field: a post / bar / wall. This used to end the scan as "bounce" = no
+				-- shot, but the path is the game's own physics, so a rebound that ends in the mouth is a shot (log: ball hit
+				-- the post, the rebound went in, the keeper treated it as a fake). Keep scanning for a later crossing.
+				bounce, bp, bt = true, samples[i - 1], ts[i - 1]
+				dec = 0
 			end
 			if a < prevA then
 				dec += prevA - a
 			end
 		end
 		prevA = a
+	end
+	if bounce then
+		return "bounce", bp, bt
 	end
 	return "none"
 end
@@ -9635,15 +9778,20 @@ Mark.tickGk = function(character, root)
 		local mc = Mark.gkMouth
 		local _, _, smp, tss = Mark.ballPath(root)
 		if smp then
-			local verdict, vp, vt = Mark.gkVerify(smp, tss, mc and mc.c or defend, fwd, side, half, mc and mc.bottomY or (defend.Y - 1.5), mc and mc.topY or (defend.Y + 8))
+			local verdict, vp, vt, rebound = Mark.gkVerify(smp, tss, mc and mc.c or defend, fwd, side, half, mc and mc.bottomY or (defend.Y - 1.5), mc and mc.topY or (defend.Y + 8))
 			if verdict == "bounce" or (crossWhy ~= "cross" and verdict ~= "goal") then
 				if not Mark.gkNoCrossLog or os.clock() - Mark.gkNoCrossLog > 0.5 then
 					Mark.gkNoCrossLog = os.clock()
 					logFile("gk nocross", crossWhy, "path", verdict, "at", vt and string.format("%.2f", vt) or "-", "was", crossT and string.format("%.2f", crossT) or "-")
 				end
 				crossP, crossT, crossWhy = nil, nil, "no-" .. verdict
-			elseif verdict == "goal" and crossWhy ~= "cross" then
-				crossP, crossT, crossWhy = vp, vt, crossWhy .. "+path"
+			elseif verdict == "goal" and (crossWhy ~= "cross" or rebound) then
+				-- the path knows the rebound: its crossing replaces a plain cross / plane / lin one
+				crossP, crossT, crossWhy = vp, vt, rebound and "rebound" or (crossWhy .. "+path")
+				if rebound and (not Mark.gkReboundLog or os.clock() - Mark.gkReboundLog > 0.5) then
+					Mark.gkReboundLog = os.clock()
+					logFile("gk rebound", "goes in after a hit at", string.format("%.2f", vt))
+				end
 			end
 		end
 	end
@@ -10929,7 +11077,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v144")
+	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v146")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -13175,17 +13323,43 @@ Mark.paSolve = function(sel, fixed)
 	local goalP = enemyGoalPart()
 	goalP = goalP and goalP.Position
 	local leadMin = CFG.PassGoalLead or 34
+	-- GOAL-AWARE INTENT. His velocity (Mark.trendVel) says where he runs now, not where he is going: a winger cutting
+	-- sideways is going for the goal. The receive point leads along his speed turned PassGoalBias of the way toward their goal
+	-- (speed kept), so the ball goes where he will want to be, not where a straight extrapolation puts him.
+	local ug = goalP and unitOrNil(flat(goalP - sel.pos)) or nil
+	local spdV = sel.vel.Magnitude
+	local intent = nil
+	if spdV > 1.5 then
+		local vu = sel.vel / spdV
+		local b = CFG.PassGoalBias or 0.3
+		intent = ug and unitOrNil(vu * (1 - b) + ug * b) or vu
+	end
+	-- CROSS. A mate in the box area (PassCrossMin..PassCrossZone from their goal, the ball farther out) catches a high
+	-- ball in a JUMP: the ball is solved to the point he reaches at the top of a jump (AirReceive box at jump height) and
+	-- PassCrossAhead studs ahead of him toward the goal, so the flight ends a little beyond where he stands and he meets it in
+	-- the air. Only the lob exists in Pass Assist, so this is the lob's aim, not another pass type.
+	local dMate = goalP and flat(sel.pos - goalP).Magnitude or math.huge
+	local crossOn = CFG.PassCross ~= false and goalP ~= nil and dMate <= (CFG.PassCrossZone or 60) and dMate >= (CFG.PassCrossMin or 12) and flat(ballPos - goalP).Magnitude > dMate + 4
+	local ahead = Vector3.zero
+	if crossOn then
+		leadMin = math.min(leadMin, CFG.PassCrossMin or 12)
+		if ug then
+			ahead = ug * math.min(CFG.PassCrossAhead or 2, math.max(dMate - (CFG.PassCrossMin or 12), 0))
+		end
+		local ar = HitboxSettings.AirReceive
+		ctx.yT = math.max(ctx.yT, sel.pos.Y + ar.CFrameOffset.Y + (Mark.jumpH or 7.2) * (CFG.PassCrossJump or 0.6))
+	end
 	-- Near their goal a pass is a pass to HIM: the usual receive point is where he will be when the ball arrives (a through ball),
 	-- which up there sails past or in front of him into the keeper's hands. Within PassNearGoal of the goal (ball or target)
 	-- the lead is capped at PassNearLead studs (0 = exactly on him) and the ball is solved to that point.
 	local nearGoal = goalP ~= nil and CFG.PassNearGoal ~= 0 and math.min(flat(ballPos - goalP).Magnitude, flat(sel.pos - goalP).Magnitude) <= (CFG.PassNearGoal or 80)
 	local leadCap = CFG.PassNearLead or 3
 	local function targetAt(tt)
-		local lead = sel.vel * (tt + ping * 0.5)
+		local lead = intent and intent * (spdV * (tt + ping * 0.5)) or Vector3.zero
 		if nearGoal and lead.Magnitude > leadCap then
 			lead = lead.Magnitude > 1e-3 and lead.Unit * leadCap or Vector3.zero
 		end
-		local T = sel.pos + lead
+		local T = sel.pos + lead + ahead
 		if goalP then
 			-- never predict a receive point close to their goal: shorten the lead until it is outside the zone (or drop it
 			-- when he already stands inside - the keeper owns that area)
@@ -13289,6 +13463,7 @@ Mark.paSolve = function(sel, fixed)
 		ceiling = fl.apex >= ceilY - Physics.BallRadius - 1,
 	}
 	sol.along3 = Vector3.new(-best.dir.Z, 0, best.dir.X)
+	sol.cross = crossOn
 	local contested = false
 	for _, model in Mark.models() do
 		local actor = Actors.GetFromCharacter(model)
@@ -13497,7 +13672,7 @@ Mark.paPress = function(forceSel, forceSol, tag, maxCharge)
 		logFile("pass assist", "press", "start refused", tostring(r))
 		return false
 	end
-	logFile("pass assist", "press", tag or "user", sel.name, "status", sol.status, "charge", string.format("%.3f", sol.charge), "dist", string.format("%.1f", sol.D), "along", string.format("%.1f", sol.along), "lat", string.format("%.1f", sol.lat), "apex", string.format("%.1f", sol.apex - sol.origin.Y), "t", string.format("%.2f", sol.t))
+	logFile("pass assist", "press", tag or "user", sel.name, "status", sol.status, "cross", tostring(sol.cross), "charge", string.format("%.3f", sol.charge), "dist", string.format("%.1f", sol.D), "along", string.format("%.1f", sol.along), "lat", string.format("%.1f", sol.lat), "apex", string.format("%.1f", sol.apex - sol.origin.Y), "t", string.format("%.2f", sol.t))
 	task.spawn(function()
 		local due = live.at + live.charge - 0.004
 		while os.clock() < due and pa.live == live do
@@ -15247,6 +15422,44 @@ Mark.akPlan = function(ctx, futs, character, urgent)
 	return nil, bestConf
 end
 
+-- The player is charging the kick himself (real Kick input held, nothing of ours pressed): AutoKick does not press or release
+-- for him, but the Agent steers him through the charge (Run To Kick): toward where the carrier will be at the release,
+-- from the same weighted futures the script's own kick uses. The release is the player's; his aim is the camera / Kick
+-- Helper, so nothing here touches the shot direction. Returns true when the steer was set.
+Mark.akUser = function(tag, model, r)
+	if CFG.AutoKickMove == false then
+		return false
+	end
+	local character = LocalPlayer.Character
+	local root = ActorTargeting.GetActorRoot(LocalPlayer)
+	if not (character and root and model and r and r.Parent) or Dodge.IsDribbling(model) then
+		return false
+	end
+	local actor = Actors.GetFromCharacter(model)
+	if Mark.mateDown(actor, model) then
+		return false
+	end
+	local ctx = Mark.akCtx(root, model, r)
+	local now = os.clock()
+	local drec = dribbleSeen[model] or (actor and dribbleSeen[actor.UserId])
+	local futs = Mark.akFutures(ctx, root, not (drec and drec.cdUntil and drec.cdUntil > now + 0.4))
+	local mySpd, chSpd = Mark.akSpeeds(character)
+	local inst = Mark.chargeInst()
+	local held = (inst and inst.GetHeldSeconds and inst.GetHeldSeconds()) or 0
+	local fullAt = KickCore.GetFullChargeSeconds and KickCore.GetFullChargeSeconds() or ((KickCore.Constants.MaximumChargeSeconds or 0.4) - 0.05)
+	local conf, _, _, _, m = Mark.akShare(ctx, futs, mySpd, chSpd, 0, math.max(fullAt - held, 0))
+	local toM = m and unitOrNil(flat(m - root.Position))
+	if not toM then
+		return false
+	end
+	Mark.akApproach = { at = now, dir = toM, tp = 0, conf = conf, phase = "user", model = model }
+	if not Mark.akUserLog or now - Mark.akUserLog > 0.5 then
+		Mark.akUserLog = now
+		logFile("autokick user", tag, actorName(actor), "held", string.format("%.2f", held), "conf", string.format("%.2f", conf), "dist", string.format("%.1f", flat(r.Position - root.Position).Magnitude))
+	end
+	return true
+end
+
 Mark.akTry = function(tag, model, r, urgent)
 	if CFG.AutoKick == false then
 		return false, "off"
@@ -15262,6 +15475,9 @@ Mark.akTry = function(tag, model, r, urgent)
 	end
 	if MatchSettings.IsGoalkeeperCharacter(character) or liveOwnerId() == LocalPlayer.UserId then
 		return false, "role"
+	end
+	if not Mark.ak and not Mark.volleyInput and Mark.realKick and Mark.realKick.down and ChargedKick.IsCharging and ChargedKick.IsCharging() then
+		return Mark.akUser(tag, model, r), "user charge"
 	end
 	if (ChargedKick.IsCharging and ChargedKick.IsCharging()) or Mark.volleyInput or (Mark.realKick and Mark.realKick.down) then
 		return false, "charging"
@@ -21299,6 +21515,7 @@ return function(_Lib, _Core)
 				end
 			end)
 			tog(p, "Pass To Keeper", "PassToKeeper")
+			tog(p, "Crosses", "PassCross", "To a teammate near their goal the lob goes slightly past him, where he catches it in a jump.")
 			tog(p, "Show Marks", "PassShow")
 			head(p, "Mark Colors")
 			palette(p, "lime", { "Mark 1", "Mark 2", "Mark 3" })
@@ -21313,6 +21530,10 @@ return function(_Lib, _Core)
 				sld(p, "Goal Lead", "PassGoalLead", 10, 60, { suffix = " st", text = "Receive point stays this far from their goal." })
 				sld(p, "Keeper Radius", "PassKeeperRadius", 4, 30, { suffix = " st" })
 				sld(p, "Goal Angle", "PassGoalSep", 2, 25, { suffix = "°" })
+				sld(p, "Run Toward Goal", "PassGoalBias", 0, 0.8, { prec = 2, text = "How much his predicted run bends toward their goal." })
+				sld(p, "Cross Zone", "PassCrossZone", 20, 100, { suffix = " st" })
+				sld(p, "Cross Past Him", "PassCrossAhead", 0, 6, { prec = 1, suffix = " st" })
+				sld(p, "Cross Catch Height", "PassCrossJump", 0, 1, { prec = 2, text = "Share of a jump: 0 = standing, 1 = top of the jump." })
 				sld(p, "Goal Zone", "PassGoalZone", 10, 70, { suffix = " st" })
 			end)
 		end)
