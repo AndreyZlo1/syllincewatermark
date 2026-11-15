@@ -255,6 +255,12 @@ local CFG = {
 	BlockSlide = true, -- AutoBlock: slide the flying shot when the body cannot reach it (ground slide, or jump + air slide)
 	BlockGoal = true, -- AutoBlock: a ball flying into OUR goal is run down / jumped / slid at, whether or not AutoBall is on
 	BlockGoalTime = 3, -- ... only when it crosses the line within this many seconds
+	BlockGoalClear = true, -- a shot into our goal that the game offers as a volley is struck away (Kick press)
+	BlockClearLift = 0.35, -- upward part of the clear's aim (unit flat + this Y)
+	BlockGoalCenter = 0.8, -- step onto the shot path until it passes this close to our root (studs)
+	BlockDefense = true, -- near our goal: close the goal on the carrier's cone instead of standing aside
+	BlockDefZone = 35, -- ... when we are within this of our mouth segment (studs)
+	BlockDefBallZone = 60, -- ... and the carrier within this of it
 	BarricadeAddon = true, -- projectiles: a wall on their path instead of dodge / pass when the timing allows
 	WallMargin = 0.05, -- on top of WallLatency before the path may cross the wall
 	WallHeight = 6.4, -- measured barricade height (log: size 11.5, 6.4, 1.5-3.4)
@@ -346,6 +352,9 @@ local CFG = {
 	CounterAirSlide = 11, -- CounterJump: longest slide from the air at a raised target (st)
 	GkDiveLate = 0.07, -- dive only when a dive started this much later would miss (s)
 	GkDiveRobust = 0.05, -- a dive must still connect when it leaves this much later (s) to beat an earlier one (guess)
+	GkPassRead = true, -- a pass flying to an enemy near our goal: shift to his cone before he touches it
+	GkPassReadZone = 45, -- ... receiver within this of our mouth segment (studs)
+	GkPassReadDepth = 3, -- ... stand this far in front of the line on his bisector
 	GkWalkSlack = 0.12, -- humanoid accel/turn before full WalkSpeed (not from dump)
 	GkReactSeconds = 0.15, -- keeper reaction after release; he sees GoalCrossingPreview (not from dump)
 	ShotReachMargin = 0.05,
@@ -8959,7 +8968,7 @@ Mark.gkBait = function(samples, ts, limit)
 				local box = { Size = m.src.Size + Vector3.new(grow, 0, grow), Shape = m.src.Shape, CFrameOffset = m.src.CFrameOffset }
 				local alpha = HitboxSettings.GetSegmentEnterAlpha(hold, box, samples[i - 1], samples[i])
 				if alpha then
-					return { t = ts[i - 1] + (ts[i] - ts[i - 1]) * (type(alpha) == "number" and alpha or 1), name = m.name, dist = flat(c - samples[1]).Magnitude }
+					return { t = ts[i - 1] + (ts[i] - ts[i - 1]) * (type(alpha) == "number" and alpha or 1), name = m.name, dist = flat(c - samples[1]).Magnitude, c = c }
 				end
 			end
 		end
@@ -10463,6 +10472,45 @@ Mark.tickGk = function(character, root)
 		end
 	end
 
+	-- PASS READ. A free ball on its way into an enemy's receive box near our goal is a pass to a man who shoots the moment
+	-- it lands (log: cross from side -46 to a receiver at side +31 / 26 out, one-touch shot 0.21 s from the first shot
+	-- frame, keeper still at lat -1.5: "gk dive none", goal). After the touch there is no time; during the pass flight
+	-- (~1-2 s) there is. So while the pass flies the keeper shifts to the receiver's cone: on the bisector of the angle
+	-- receiver -> posts, GkPassReadDepth in front of the line. Observed event (the ball path enters HIS receive box,
+	-- gkBait = the game's own receive test), not positioning; the player's stick wins.
+	local recvStand = nil
+	if free and not shot and not plan and ballPos and CFG.GkPassRead ~= false then
+		local _, _, smpR, tsR = Mark.ballPath(root)
+		local rc = smpR and Mark.gkBait(smpR, tsR, 2.5)
+		local lbR, _, rbR = goalMouthCorners(ours)
+		if rc and rc.c and lbR and rbR then
+			local R = rc.c
+			local relR = flat(R - mouthP)
+			local aR, sR = relR:Dot(fwd), relR:Dot(side)
+			local segR = (relR - side * math.clamp(sR, -half, half)).Magnitude
+			if aR > 3 and segR <= (CFG.GkPassReadZone or 45) then
+				local a1, a2 = unitOrNil(flat(lbR - R)), unitOrNil(flat(rbR - R))
+				local bis = a1 and a2 and unitOrNil(a1 + a2)
+				local den = bis and -bis:Dot(fwd) or 0
+				if den > 0.15 then
+					local depth = math.min(CFG.GkPassReadDepth or 3, aR - 4)
+					local S = R + bis * ((aR - depth) / den)
+					local relS = flat(S - mouthP)
+					S = mouthP + fwd * math.max(relS:Dot(fwd), 1) + side * math.clamp(relS:Dot(side), -(half - 1), half - 1)
+					Mark.gkRecv = { p = Vector3.new(S.X, root.Position.Y, S.Z), at = now, name = rc.name }
+					if not Mark.gkRecvLog or now - Mark.gkRecvLog > 0.5 then
+						Mark.gkRecvLog = now
+						logFile("gk pass read", rc.name, "touch", string.format("%.2f", rc.t), "his a", string.format("%.1f", aR), "s", string.format("%.1f", sR), "stand lat", string.format("%.1f", flat(S - mouthP):Dot(side)), "d", string.format("%.1f", flat(S - mouthP):Dot(fwd)), "move", string.format("%.1f", flat(S - root.Position).Magnitude))
+					end
+				end
+			end
+		end
+	end
+	-- hold through the touch (ownership flips to him, no charge yet / a one-touch shot): 0.35 s
+	if not shot and not plan and Mark.gkRecv and now - Mark.gkRecv.at < 0.35 then
+		recvStand = Mark.gkRecv.p
+	end
+
 	-- Charged shot read. While the carrier charges, ActionPresentationUpdate KickChargeStarted/Updated replicates his
 	-- aim (Mark.charges[uid].dir). Where that ray meets our mouth is where the shot starts; moving there DURING the
 	-- charge buys the 0.3-0.9 s a close corner shot never leaves after release (log: first sight eta 0.27, gap 14.6,
@@ -10548,6 +10596,10 @@ Mark.tickGk = function(character, root)
 		stand = Mark.gkPressStandP
 		why = "press"
 		stopAt, urgent = 0.8, true
+	elseif not plan and not shot and recvStand and not Mark.userInputDir() then
+		stand = recvStand
+		why = "recv"
+		stopAt, urgent = 0.5, true
 	end
 	if plan then
 		stand = plan.p
@@ -11573,7 +11625,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v166")
+	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v167")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -13361,6 +13413,75 @@ Mark.blockCone = function(Pt, g)
 	return bis, (half > 1e-3) and body / math.tan(half) or math.huge
 end
 
+-- DEFENSIVE COVER (AutoBlock near our own goal). With us inside BlockDefZone of OUR mouth segment and an enemy carrier
+-- within BlockDefBallZone of it, a block that would stand aside (a teammate is on him / he is out of the chase range /
+-- we are behind him) closes the goal instead: on the bisector of his angle to the posts (Mark.blockCone), at the depth
+-- where our body spans his whole post-to-post cone (cover = body half / tan(half angle)), never past the line and never
+-- inside his kick reach + 2. His shot then meets our body; a shot that leaves is Defend Goal's (tickBall centring +
+-- Mark.guardClear volley). Returns true when it steers this frame.
+Mark.blockDefCover = function(character, root, carrier, cr, P, V, g, why)
+	if CFG.BlockDefense == false then
+		return false
+	end
+	local lb, _, rb, _, _, n = goalMouthCorners(g)
+	local fwd = n and unitOrNil(flat(n))
+	local side = lb and rb and unitOrNil(flat(rb - lb))
+	if not (fwd and side) then
+		return false
+	end
+	local mc = (lb + rb) * 0.5
+	local half = flat(rb - lb).Magnitude * 0.5
+	local function segD(p)
+		local r = flat(p - mc)
+		return (r - side * math.clamp(r:Dot(side), -half, half)).Magnitude, r:Dot(fwd)
+	end
+	local dUs, aUs = segD(root.Position)
+	if dUs > (CFG.BlockDefZone or 35) or aUs < -1 then
+		return false
+	end
+	local chE = Actors.GetCharacter(carrier)
+	local lag = (chE and math.clamp(CharacterMotion.GetDisplayDelaySeconds(chE) or 0, 0, 0.25) or 0) + math.clamp(LocalPlayer:GetNetworkPing() or 0, 0, 0.22)
+	local Vc = V.Magnitude > 30 and V.Unit * 30 or V
+	local Pn = P + Vc * lag
+	local dP, aP = segD(Pn)
+	if dP > (CFG.BlockDefBallZone or 60) or aP < 2 then
+		return false
+	end
+	local bis, cover = Mark.blockCone(Pn, g)
+	local den = bis and -bis:Dot(fwd) or 0
+	if den < 0.15 then
+		return false
+	end
+	local toLine = aP / den
+	local minD = Mark.kickReach() + 2
+	local depth = math.clamp(cover or math.huge, minD, math.max(toLine - 1.5, minD))
+	local S = Pn + bis * depth
+	S = Vector3.new(S.X, root.Position.Y, S.Z)
+	Mark.mover = Mark.mover or require(Modules.Actions.ActionMovement)
+	local sp = Mark.mover.GetRunWalkSpeed(Mark.mover.GetBaseWalkSpeed(character), false)
+	local off = flat(S - root.Position)
+	local cmd, route = Mark.agentSteer({
+		key = "block", us = root.Position, vUs = flat(root.AssemblyLinearVelocity), center = Pn, vC = Vc,
+		target = S, spd = (type(sp) == "number" and sp >= 8) and sp or 16, ff = Vector3.zero, minR = HitboxSettings.Receive.Size.X * 0.5 + 1.5,
+	})
+	local now = os.clock()
+	if off.Magnitude <= 0.6 then
+		cmd = Vector3.zero
+	elseif off.Magnitude < 3 then
+		cmd = cmd * math.clamp(off.Magnitude / 3, 0.35, 1)
+	end
+	Mark.move.look = unitOrNil(flat(Pn - root.Position))
+	Mark.move.pts = route
+	Mark.move.born = Mark.move.born or now
+	Mark.moveSteer(cmd, "block")
+	Mark.blockHold, Mark.blockLast, Mark.blockDest, Mark.blockRoot = now, now, S, cr
+	if not Mark.defCoverLog or now - Mark.defCoverLog > 0.5 or Mark.defCoverWhy ~= why then
+		Mark.defCoverLog, Mark.defCoverWhy = now, why
+		logFile("block def cover", why, actorName(carrier), "us seg", string.format("%.1f", dUs), "his seg", string.format("%.1f", dP), "depth", string.format("%.1f", depth), "cover", string.format("%.1f", cover or -1), "line", string.format("%.1f", toLine), "move", string.format("%.1f", off.Magnitude))
+	end
+	return true
+end
+
 Mark.tickBlock = function(character, root)
 	if Mark.akUserTick(character, root) then
 		return
@@ -13516,6 +13637,9 @@ Mark.tickBlock = function(character, root)
 		range = math.max(range, (CFG.BlockGoalRange or 70) + (active and 6 or 0))
 	end
 	if dist > range then
+		if Mark.blockDefCover(character, root, carrier, cr, P, V, g, goalSide and "far" or "behind") then
+			return
+		end
 		if active then
 			logFile("block stop", goalSide and "far" or "behind", string.format("%.1f", dist), string.format("%.1f", along))
 			Mark.moveStop("block")
@@ -13547,6 +13671,10 @@ Mark.tickBlock = function(character, root)
 				-- (Mark.mateDown), and one who is about to get up is not counted either while he is also behind us
 				local mRel = flat(ar.Position - P)
 				if mRel.Magnitude <= CFG.CompetitorRadius + (active and 0 or 1) then
+					-- a teammate takes him: near our goal we close the goal behind that duel instead of standing aside
+					if Mark.blockDefCover(character, root, carrier, cr, P, V, g, "mate") then
+						return
+					end
 					if active then
 						logFile("block stop", "mate", actorName(actor), string.format("%.1f", mRel.Magnitude))
 						Mark.moveStop("block")
@@ -16751,6 +16879,65 @@ Mark.volleyPending = function()
 	end
 end
 
+-- GOAL CLEAR (AutoBlock, Defend Goal). An ENEMY shot whose path ends in OUR mouth (Mark.goalThreat) that the game
+-- offers us as a volley (VolleyOpportunity.GetEvaluation: the ball enters our FrontAssist box within MaximumApproachSeconds
+-- 0.4 s, <= MaximumOpponentMissAngleDegrees 6 for an opponent's flight, >= MinimumOpponentFlightSeconds 0.25 after his kick):
+-- press Kick, the game claims it and DelayRelease strikes at the arrival = the ball is cleared, not deflected
+-- (Receiving.Deflection keeps 12-52 % of a shot's speed and drops it in our box). The attack-volley rules of volleyPlan
+-- (never grounded / low, threat or shooting range) are for OUR shots; a ball going into our net is struck whatever it is.
+-- Aim: out of the goal through the meet point, lifted (BlockClearLift) - never back across our own mouth.
+Mark.guardClear = function(character, root, ev)
+	if not (CFG.AutoBlock and CFG.BlockGoal ~= false and CFG.BlockGoalClear ~= false) or MatchSettings.IsGoalkeeperCharacter(character) then
+		return false
+	end
+	local st = Renderer.GetAuthoritativeMovementState and Renderer.GetAuthoritativeMovementState()
+	local kicker = st and type(st.LastKickerUserId) == "number" and playerOf(st.LastKickerUserId) or nil
+	if not kicker or kicker == LocalPlayer or sameTeam(kicker) then
+		return false
+	end
+	local _, vel, samples, ts = Mark.ballPath(root)
+	local threat = samples and Mark.goalThreat(samples, ts)
+	local g = threat and Mark.defendGoal()
+	if not g then
+		return false
+	end
+	local lb, _, rb, _, _, n = goalMouthCorners(g)
+	local fwd = n and unitOrNil(flat(n))
+	if not (lb and rb and fwd) then
+		return false
+	end
+	local meet = samples[#samples]
+	for i = 1, #samples do
+		if ts[i] >= (ev.ApproachSeconds or 0) then
+			meet = samples[i]
+			break
+		end
+	end
+	-- one press attempt per 0.1 s (a refused press must not be re-sent every frame)
+	if os.clock() - (Mark.clearTryAt or 0) < 0.1 then
+		return true
+	end
+	Mark.clearTryAt = os.clock()
+	local outD = unitOrNil(flat(meet - (lb + rb) * 0.5)) or fwd
+	local f = unitOrNil(fwd + outD) or fwd
+	local dir = (f + Vector3.new(0, CFG.BlockClearLift or 0.35, 0)).Unit
+	Mark.volleyAim = dir
+	Mark.volleyAimUntil = os.clock() + 1.5
+	local input = Controls.CreateInput("Kick")
+	if not (ChargedKick.HandleInputBegan(input, false) and ChargedKick.IsCharging()) then
+		Mark.volleyAim, Mark.volleyAimUntil = nil, nil
+		if not Mark.clearRefLog or os.clock() - Mark.clearRefLog > 0.5 then
+			Mark.clearRefLog = os.clock()
+			logFile("block clear", "refused", "approach", string.format("%.2f", ev.ApproachSeconds or -1))
+		end
+		return true
+	end
+	Mark.volleyInput = input
+	Mark.volleyAt = os.clock()
+	logFile("block clear", "press", "from", actorName(kicker), "approach", string.format("%.2f", ev.ApproachSeconds or -1), "miss", string.format("%.1f", ev.MissAngleDegrees or -1), "grounded", tostring(ev.BallGrounded), "goal t", string.format("%.2f", threat.t), "lat", string.format("%.1f", threat.lat), "speed", string.format("%.0f", typeof(vel) == "Vector3" and vel.Magnitude or 0), "aim", fmtV(dir))
+	return true
+end
+
 Mark.tickVolley = function(character, root)
 	Mark.volleyPending()
 	Mark.akTick(character, root)
@@ -16831,6 +17018,9 @@ Mark.tickVolley = function(character, root)
 	Mark.volleyMod = Mark.volleyMod or require(Client.Gameplay.Actions.VolleyOpportunity)
 	local ev = Mark.volleyMod.GetEvaluation(character)
 	if not ev then
+		return
+	end
+	if Mark.guardClear(character, root, ev) then
 		return
 	end
 	local plan, skip = Mark.volleyPlan(root, ev)
@@ -18118,6 +18308,37 @@ Mark.tickBall = function(character, root)
 		end
 		return
 	end
+	-- Defend Goal: "at the contact" (inside the Receive half) is not enough. The clear needs the path through our
+	-- FrontAssist box (Mark.guardClear: <= 6 deg miss for an opponent's shot) and a body block wants it through the
+	-- middle, not the edge of the box (the run stopped at Receive half = 2.75 studs off the line: a shot at the edge
+	-- of the box). Keep stepping onto the path line until it passes within BlockGoalCenter of our root.
+	local moveScale = 1
+	if threat and gap <= receiveHalf + 1 then
+		local O = flat(root.Position)
+		local bq, bd = nil, math.huge
+		for i = 2, #samples do
+			if ts[i] >= 0.1 then
+				local a, b = flat(samples[i - 1]), flat(samples[i])
+				local ab = b - a
+				local L2 = ab:Dot(ab)
+				local k = L2 > 1e-6 and math.clamp((O - a):Dot(ab) / L2, 0, 1) or 0
+				local q = a + ab * k
+				local d = (q - O).Magnitude
+				if d < bd then
+					bq, bd = q, d
+				end
+			end
+		end
+		if bq and bd > (CFG.BlockGoalCenter or 0.8) then
+			dir = unitOrNil(bq - O) or dir
+			gap = receiveHalf + bd
+			moveScale = math.clamp(bd / 2, 0.35, 1)
+			if not Mark.centreLog or os.clock() - Mark.centreLog > 0.5 then
+				Mark.centreLog = os.clock()
+				logFile("block goal", "centre", "off", string.format("%.1f", bd), "t", string.format("%.2f", threat.t))
+			end
+		end
+	end
 	if dir and gap > receiveHalf then
 		if not Mark.ballLogged then
 			Mark.ballLogged = true
@@ -18127,7 +18348,7 @@ Mark.tickBall = function(character, root)
 		Mark.move.look = dir
 		Mark.move.pts = (wayP and wayP ~= aimP) and { root.Position, wayP, aimP } or { root.Position, aimP }
 		Mark.move.born = Mark.move.born or os.clock()
-		Mark.moveSteer(dir, "ball")
+		Mark.moveSteer(dir * moveScale, "ball")
 		Mark.agentHold(true, "ball")
 		if not Mark.ballTraceAt or os.clock() - Mark.ballTraceAt > 0.5 then
 			Mark.ballTraceAt = os.clock()
@@ -22505,6 +22726,8 @@ return function(_Lib, _Core)
 			tog(b, "Pre-Release Jump", "BlockPreJump", "Jumps before the release, timed to his charge.")
 			tog(b, "Slide Block", "BlockSlide")
 			tog(b, "Defend Goal", "BlockGoal", "Gets in the way of shots at our goal.")
+			tog(b, "Clear Shots", "BlockGoalClear", "Kicks away a shot that flies into you.")
+			tog(b, "Close The Goal", "BlockDefense", "Near your goal, covers the shooter's angle.")
 			tog(b, "Pass Solver", "BlockSmart", "If he cannot score, cuts the pass to his teammate.")
 			tog(b, "Read His Charge", "BlockPassRead", "Cuts his pass when he charges it.")
 			tog(b, "Cover Shadow", "BlockShade", "Covers the goal and his best pass.")
@@ -22628,6 +22851,7 @@ return function(_Lib, _Core)
 			tog(p, "Press Jump", "GkPressJump", "Jump + dive at players in the air.")
 			tog(p, "Come Out", "GkPressMove", "Steps out to cut his angle.")
 			tog(p, "Last Man Only", "GkPressLastMan", "No press while another attacker can take the pass.")
+			tog(p, "Read Passes", "GkPassRead", "Moves to the player a pass is going to.")
 			tog(p, "Face Him", "GkPressFace", "Turns your body to him for the dive.")
 			tog(p, "Show Press", "DrawGk", "His possible paths and your dive.")
 			sld(p, "Confidence", "GkPressConf", 0.3, 0.95, { prec = 2, text = "How sure the dive must be." })
