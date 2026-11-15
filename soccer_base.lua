@@ -197,6 +197,8 @@ local CFG = {
 	WallLatency = 0.06, -- the wall exists this long after the press reaches the server (ping/2); seen 0.11-0.14 s after the press at ping 0.08
 	WallEquip = false, -- Auto Use: AutoWall takes the barricades out itself (item slot press) when a threat is coming; off = only when already in hand
 	WallEquipDelay = 0.04, -- the equip is a local state change + an ordered remote: about a frame
+	WallTrapBait = true, -- put the wall up before the keeper's dive when he runs out at you
+	WallTrapTrigger = 8, -- distance (st) at which the keeper starts his dive (NPC: ~7)
 	WallTrapBurst = 35, -- NPC keeper: closing speed over 0.1 s (st/s) that counts as a dive
 	WallEquipHold = 3.5,
 	WallTrap = true, -- Keeper Trap: a barricade between us and the enemy keeper's dive
@@ -6519,38 +6521,6 @@ Reticle.GetCameraRay = function(...)
 	return oldCamRay(...)
 end
 
--- ONE CHARGE AIM. The game reads our aim in four places - the charge ray ChargedKick keeps (u30, frozen at the aim lock),
--- the trajectory preview (ChargePathVelocity.Get), every Update / Lock packet and the Release - and the camera feeds all of
--- them. AutoShoot used to patch only the packet and the preview, each with its own condition: the camera leaked in between
--- (replicated preview followed where the player looked, the local one flickered between camera and shot). Now the game's own
--- aim source (Reticle.GetCameraAimRayWithoutHit) answers with this ray while we charge a solved shot, so the charge ray,
--- the lock, the preview and the packets all carry the same thing: the decoy inside the Direction Spoof window, the solved
--- shot after it. The packets only override the Release (real shot) and keep the real curve in every phase.
-Mark.shotOn = function()
-	local a = Shoot.aim
-	return CFG.AutoShoot and a and a.Direction and not Shoot.lob and not MatchSettings.IsGoalkeeperCharacter(LocalPlayer.Character)
-		and (Mark.flickStrike or (Shoot.launch and Shoot.launch.Y > 1) or a.Direction.Y > 0.05) and true or false
-end
-
-Mark.realRay = function()
-	local a = Shoot.aim
-	return { Origin = a.Origin, Direction = a.Direction, CameraCFrame = a.CameraCFrame, CameraFieldOfView = a.CameraFieldOfView, IsAirborne = a.IsAirborne }
-end
-
-Mark.chargeRay = function()
-	if not (ChargedKick.IsCharging and ChargedKick.IsCharging()) or liveOwnerId() ~= LocalPlayer.UserId or (Mark.pa and Mark.pa.live) then
-		return nil
-	end
-	local decoy = Mark.sp and Mark.spoofRay()
-	if decoy then
-		return decoy
-	end
-	if Mark.shotOn() then
-		return Mark.realRay()
-	end
-	return nil
-end
-
 local oldAimRay = Reticle.GetCameraAimRayWithoutHit
 Reticle.GetCameraAimRayWithoutHit = function()
 	if Mark.pa and Mark.pa.live and Mark.pa.live.ray then
@@ -6563,9 +6533,10 @@ Reticle.GetCameraAimRayWithoutHit = function()
 	if strike then
 		return strike
 	end
-	local charge = Mark.chargeRay()
-	if charge then
-		return charge
+	-- the decoy as the game's own aim sample: the charge aim changes, so ActionRemoteProtocol.Update really sends it
+	local spoof = Mark.sp and Mark.spoofRay()
+	if spoof then
+		return spoof
 	end
 	local ray = oldAimRay()
 	local aim = Mark.volleyAim or Mark.blockAim
@@ -6590,15 +6561,11 @@ ChargePathVelocity.Get = function(char, secs, kind, aim, origin, reported, kickD
 			curve = if Mark.flickStrike then nil else Shoot.curve -- was `and nil or`: the flick kept the curve
 		end
 	end
-	-- Direction Spoof: the game's trajectory preview (the one that is replicated to the other clients as the charge path)
-	-- is drawn from the same aim as the packets: the decoy while it runs, never the solved shot
-	local cr = Mark.chargeRay()
-	if cr then
-		-- kickDir too: the game takes the flat shot direction (and the +-15 deg endpoint yaw) from it, and its caller
-		-- builds it from the body - that was the preview following where the body looked
-		aim, target = cr, nil
-		kickDir = AimFacing.GetFlatDirection(cr.Direction) or kickDir
-		curve = (not Mark.flickStrike) and Shoot.curve or nil
+	-- Direction Spoof: while the decoy runs the local trajectory preview is the decoy shot (same flat direction too)
+	local decoy = Mark.sp and Mark.spoofRay()
+	if decoy then
+		aim, target = decoy, nil
+		kickDir = AimFacing.GetFlatDirection(decoy.Direction) or kickDir
 	end
 	return oldPathGet(char, secs, kind, aim, origin, reported, kickDir, target, boundary, curve)
 end
@@ -6615,11 +6582,6 @@ end
 local TrajectoryPreviewFollow = require(Client.Gameplay.Visual.TrajectoryPreviewFollow)
 local oldAimStep = TrajectoryPreviewFollow.StepAimSampleCFrame
 TrajectoryPreviewFollow.StepAimSampleCFrame = function(current, target, dt)
-	-- the preview eases its aim sample toward the camera: while a charge aim is ours it must not lag behind it
-	local cr = Mark.chargeRay()
-	if cr then
-		return CFrame.lookAt(cr.Origin, cr.Origin + cr.Direction)
-	end
 	return oldAimStep(current, target, dt)
 end
 
@@ -6708,7 +6670,7 @@ oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
 			end
 			if packet.Phase == "Release" and cmd.PassType == "Shot" and Shoot.launch then
 				-- ground truth of every shot: the ball 0.2 s after the release against the solved flight (curve included)
-				local pv, hadDecoy, p0 = Shoot.preview, Mark.sp ~= nil, Renderer.GetPosition()
+				local pv, hadDecoy, hadBody, p0 = Shoot.preview, Mark.sp ~= nil, Mark.fs ~= nil, Renderer.GetPosition()
 				local aimSent = typeof(cmd.AimDirection) == "table" and cmd.AimDirection.Direction
 				task.delay(0.2, function()
 					local pB = Renderer.GetPosition()
@@ -6734,7 +6696,7 @@ oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
 						return
 					end
 					local ang = math.deg(math.acos(math.clamp(ea.Unit:Dot(aa.Unit), -1, 1)))
-					logFile("shoot", "flight", "angle to solved", string.format("%.1f", ang), "moved", string.format("%.1f", aa.Magnitude), "solved", string.format("%.1f", ea.Magnitude), "decoy", hadDecoy and "yes" or "no", "aim sent", aimSent and fmtV(aimSent) or "-")
+					logFile("shoot", "flight", "angle to solved", string.format("%.1f", ang), "moved", string.format("%.1f", aa.Magnitude), "solved", string.format("%.1f", ea.Magnitude), "decoy", hadDecoy and "yes" or "no", "body", hadBody and "yes" or "no", "aim sent", aimSent and fmtV(aimSent) or "-")
 				end)
 			end
 			if packet.Phase == "Release" and (Mark.flickStrike or Mark.forceBike) then
@@ -6784,9 +6746,6 @@ if ChargedKick.HandleInputBegan then
 			local src0 = debug.info(2, "s")
 			local line0 = debug.info(2, "l")
 			logFile("kick input", "own", "type", typeof(input) == "Instance" and tostring(input.UserInputType) or typeof(input), "key", typeof(input) == "Instance" and tostring(input.KeyCode) or "-", "processed", tostring(processed), "caller", tostring(src0), tostring(line0))
-		end
-		if CFG.DirSpoof and Controls.IsInput("Kick", input) and liveOwnerId() == LocalPlayer.UserId and not Mark.sp and Mark.shotOn() then
-			Mark.spoofPlan()
 		end
 		if CFG.AutoShoot and not Shoot.aim and typeof(input) == "Instance" and Controls.IsInput("Kick", input) and liveOwnerId() == LocalPlayer.UserId then
 			logFile("shoot", "press without aim", tostring(Shoot.why), "job", tostring(Shoot.job ~= nil), "full", string.format("%.1f", Shoot.fullCost or 0), "dt", string.format("%.1f", (Mark.dtAvg or 0) * 1000))
@@ -8262,13 +8221,6 @@ Mark.npcDiveWatch = function(root)
 	while #ring > 1 and now - ring[1].t > 0.6 do
 		table.remove(ring, 1)
 	end
-	if not k.npc or #ring < 4 or (Mark.trapDive and Mark.trapDive.uid == k.key and now - Mark.trapDive.at < 1.2) then
-		return
-	end
-	local toUs = unitOrNil(flat(root.Position - k.r.Position))
-	if not toUs then
-		return
-	end
 	local ref = ring[#ring]
 	for i = #ring, 1, -1 do
 		if now - ring[i].t >= 0.1 then
@@ -8277,7 +8229,15 @@ Mark.npcDiveWatch = function(root)
 		end
 	end
 	local dtw = now - ref.t
-	if dtw < 0.08 then
+	if dtw < 0.08 or #ring < 4 then
+		return
+	end
+	tr.vK = flat(k.r.Position - ref.p) / dtw -- his own velocity (bait path)
+	if not k.npc or (Mark.trapDive and Mark.trapDive.uid == k.key and now - Mark.trapDive.at < 1.2) then
+		return
+	end
+	local toUs = unitOrNil(flat(root.Position - k.r.Position))
+	if not toUs then
 		return
 	end
 	local closing = flat(k.r.Position - ref.p):Dot(toUs) / dtw
@@ -8329,8 +8289,51 @@ Mark.wallTrap = function(root, diving)
 			return false
 		end
 	else
-		-- never on a guess: the wall goes down on his real dive (event / NPC burst)
-		return false
+		-- BAIT. The dive is too close to answer: a keeper who runs out at us dives at WallTrapTrigger studs (measured on the
+		-- NPC: his speed jumps from ~20 to 43 st/s at d 7), and from there to the wall plane (5 studs in front of us) is
+		-- 0.03 s - the wall has to exist before he starts. So it goes down `ready` seconds before the predicted trigger:
+		-- time to trigger = (gap - trigger) / closing speed, from his own velocity and ours.
+		local wp, td, now = Mark.wallPend, Mark.trapDive, os.clock()
+		if CFG.WallTrapBait == false or (td and td.uid == k.key and now - td.at < 2) or Mark.foeDiveLeft() > 0 or (wp and wp.trap and now - wp.at < 3) then
+			return false
+		end
+		local tr = Mark.kpTrack
+		local vK = tr and tr.key == k.key and tr.vK
+		local toK = unitOrNil(flat(k.r.Position - root.Position))
+		if not (vK and toK) then
+			return false
+		end
+		local ourV = flat(root.AssemblyLinearVelocity)
+		local rate = -flat(vK - ourV):Dot(toK)
+		local trig = CFG.WallTrapTrigger or 8
+		if rate < 6 or k.d > trig + 14 or k.d < 3 then
+			return false
+		end
+		local use = Mark.itemUse
+		local equipped = use and use.IsEquipped and use.IsEquipped() and Mark.equippedId() == "barricades"
+		local ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
+		local ready = ping * 0.5 + (CFG.WallLatency or 0.06) + (CFG.WallMargin or 0.05) + (equipped and 0 or (CFG.WallEquipDelay or 0.04))
+		local tt = math.max((k.d - trig) / rate, 0)
+		if tt > ready + 0.05 then
+			return false -- too early: he would still have time to see it and stop
+		end
+		local P0b = k.r.Position
+		local O, ourV2 = root.Position, flat(root.AssemblyLinearVelocity)
+		local Pd = P0b + vK * tt
+		local function pathBait(t)
+			if t <= tt then
+				return P0b + vK * t
+			end
+			local to = unitOrNil(flat(O + ourV2 * t - Pd)) or toK * -1
+			local el = math.min(t - tt, dur)
+			return Pd + to * D.GetTravel(el, reach) + Vector3.new(0, D.GetVerticalTravel(el), 0)
+		end
+		local ok, why = Mark.wallVsPath(root, pathBait, tt + dur, "keeper bait" .. (k.npc and " npc" or ""), { rad = 2, equip = true, actor = k.actor, model = k.model, trap = true, contact = 3 })
+		if not ok and why and (not Mark.trapLog or now - Mark.trapLog > 0.6) then
+			Mark.trapLog = now
+			logFile("wall trap", "bait no", why, "d", string.format("%.1f", k.d), "rate", string.format("%.0f", rate), "tt", string.format("%.2f", tt), "ready", string.format("%.2f", ready))
+		end
+		return ok
 	end
 	local O, ourV = root.Position, flat(root.AssemblyLinearVelocity)
 	local base = D.GetTravel(el0, reach)
@@ -8370,6 +8373,10 @@ Mark.wallTick = function(root, oid, own)
 	Mark.wallTickAt = now
 	local inHand = use.IsEquipped and use.IsEquipped()
 	local isWall = inHand and Mark.equippedId() == "barricades"
+	-- Keeper Trap bait: decided at 30 Hz, from his run + the predicted dive trigger
+	if own and CFG.WallTrap ~= false and Mark.wallTrap(root, false) then
+		return
+	end
 	local wp0 = Mark.wallPend
 	if isWall and Mark.wallEquipAt and wp0 and wp0.at >= Mark.wallEquipAt and now - wp0.at > 0.12 then
 		-- equip -> place -> put away: the wall is down, the item must not stay in the hand (it blocks the ball controls)
@@ -11458,7 +11465,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v155")
+	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v156")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -22397,6 +22404,8 @@ return function(_Lib, _Core)
 			tog(w, "Wall On Shot Path", "WallShot", "Walls a shot charged at our goal.")
 			head(w, "Keeper Trap")
 			tog(w, "Enabled", "WallTrap", "Puts a wall between you and the enemy keeper's dive.")
+			tog(w, "Bait", "WallTrapBait", "Puts the wall up just before the keeper dives at you.")
+			sld(w, "Keeper Dive Range", "WallTrapTrigger", 4, 16, { prec = 1, suffix = " st" })
 			advanced(w, "Wall", function()
 				sld(w, "Body Reach", "WallReach", 8, 40, { suffix = " st", text = "Walls a chaser or the carrier within this distance." })
 				sld(w, "Body Window", "WallWindow", 0.15, 1, { prec = 2, suffix = " s", text = "He must hit the wall this soon after it appears." })
