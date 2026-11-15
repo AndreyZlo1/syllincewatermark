@@ -106,6 +106,16 @@ local CFG = {
 	TackleReach = 16,
 	AutoGK = true,
 	AutoWall = true,
+	AutoShield = false, -- Skills > AutoShield: the forcefield on an item hit that nothing else answers (never as keeper)
+	ShieldRocket = true, -- ... preemptive: an enemy holding Rocket Punch near us while we carry the ball
+	ShieldRocketDist = 24, -- ... within this (studs): closer than a reaction to the punch can land (guess, tune)
+	GunPush = false, -- Skills > Keeper Push: shoot the enemy keeper (flintlock / shotgun) when a shot that goes in comes
+	GunPushOwn = true, -- ... our own shot (at the release)
+	GunPushMates = true, -- ... a teammate's shot (the moment his charge is on target)
+	GunPushFlintRange = 70, -- max distance to the keeper for the flintlock (studs, guess)
+	GunPushShotgunRange = 22, -- ... for the shotgun (8 deg cone of 12 pellets: only close, guess)
+	GunPushKeeperZone = 14, -- the keeper "holds the goal": within this of his mouth segment
+	GunPushTravel = 18, -- knock-back travel used for the depth check (log push travel 25-54 on us; conservative)
 	TackleSpeed = 1.2,
 	DribbleClose = 13,
 	DribbleSlop = 3.6,
@@ -205,6 +215,8 @@ local CFG = {
 	WallEquip = false, -- Auto Use: AutoWall takes the barricades out itself (item slot press) when a threat is coming; off = only when already in hand
 	WallEquipDelay = 0.04, -- the equip is a local state change + an ordered remote: about a frame
 	WallTrapBait = true, -- put the wall up before the keeper's dive when he runs out at you
+	WallTrapForwardOnly = true, -- Keeper Trap: only a dive aimed at us (within WallTrapCone) gets a wall
+	WallTrapCone = 50, -- degrees between his dive direction and the line to us
 	WallTrapTrigger = 8, -- distance (st) at which the keeper starts his dive (NPC: ~7)
 	WallTrapBurst = 35, -- NPC keeper: closing speed over 0.1 s (st/s) that counts as a dive
 	WallEquipHold = 3.5,
@@ -485,7 +497,8 @@ Log.gbuf, Log.gn = {}, 0
 local function logFile(...)
 	local line = dbg(...)
 	local k = select(1, ...)
-	if type(k) == "string" and (k:sub(1, 3) == "gk " or k:sub(1, 11) == "block clear" or k:sub(1, 10) == "block goal" or k:sub(1, 9) == "block def") then
+	-- + the context a keeper episode needs (who used what: skill / mine / blast / push / enemy keeper dive)
+	if type(k) == "string" and (k:sub(1, 3) == "gk " or k:sub(1, 11) == "block clear" or k:sub(1, 10) == "block goal" or k:sub(1, 9) == "block def" or k == "skill activate" or k:sub(1, 5) == "mine " or k:sub(1, 6) == "blast " or k == "push" or k:sub(1, 6) == "shield" or k:sub(1, 7) == "gunpush") then
 		Log.gn += 1
 		Log.gbuf[Log.gn] = line
 	end
@@ -6633,6 +6646,19 @@ Reticle.GetCameraRay = function(...)
 	if Mark.pa and Mark.pa.live and Mark.pa.live.ray then
 		return Mark.pa.live.ray
 	end
+	-- Keeper Push / item now: the gun goes at the planned target for the whole sequence (flintlock 3 shots over 0.5 s)
+	local pa = Mark.pushAim
+	if pa and os.clock() < pa.untilT then
+		local cam = Workspace.CurrentCamera
+		local okP, P = Mark.try(pa.fn)
+		if cam and okP and typeof(P) == "Vector3" then
+			local o = cam.CFrame.Position
+			local dir = unitOrNil(P - o)
+			if dir then
+				return Ray.new(o, dir)
+			end
+		end
+	end
 	if Mark.silentRay and not (ChargedKick.IsCharging and ChargedKick.IsCharging()) then
 		return Mark.silentRay
 	end
@@ -6715,6 +6741,13 @@ local oldNamecall
 oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
 	local method = getnamecallmethod()
 	setnamecallmethod(method)
+	if method == "FireServer" and CFG.GunPush then
+		local pk = ...
+		if type(pk) == "table" and pk.Phase == "Release" and type(pk.Command) == "table" and pk.Command.PassType == "Shot" and shotRemote(self) == "kick" then
+			local cmdR = pk.Command
+			task.defer(Mark.gunPushOwn, cmdR) -- after our kick packet has gone out
+		end
+	end
 	if method ~= "FireServer" or not CFG.AutoShoot then
 		return oldNamecall(self, ...)
 	end
@@ -8024,6 +8057,302 @@ Mark.pressSlot = function(i)
 	return false, "nohandler"
 end
 
+-- ==================================================================================================================
+-- ITEM NOW: equip + fire an item in ONE frame (AutoShield, Keeper Push). Two layers, the first that works:
+--   game  Mark.pressSlot runs the Items script's own useSlot synchronously (equip is in hand the same frame, as for
+--         the barricades), then ItemUseState.ActivateEquipped -> fireEquipped (its payload, hit query, gun sequence).
+--   raw   the client gates of that path (useSlot: Shoot/Pass charging, ActionLocks equip block, ragdoll, replay;
+--         fireEquipped: an item already fired) are client-side only: the same two requests go out directly on the Items
+--         Request remote - ItemCommands.UseSlot(slot, id) and ItemCommands.FireEquipped(aimRay, serverTime, id2, itemId,
+--         ExpectedEquipActionId = id), ids from the script's own nextItemActionId (ItemUseState upvalue, so the
+--         counter stays in step). Gun follow-ups (flintlock ShotCount 3, 0.25 s apart) as ContinueGunSequence.
+--         Whether the server takes a FireEquipped whose EquipActionId it has just received in the same batch is NOT in
+--         the dump: logged as "item raw".
+-- aimFn (optional) = world point to hit; while it is live the GetCameraRay hook returns a ray at it (the game builds
+-- the hit query / payload from that ray, exactly like SilentAim).
+-- ==================================================================================================================
+Mark.findUp = function(fn, name)
+	if type(fn) ~= "function" then
+		return nil
+	end
+	for i = 1, 60 do
+		local ok, v = Mark.try(upvalue, fn, i)
+		if not ok then
+			break
+		end
+		if type(v) == "function" then
+			local okN, n = Mark.try(debug.info, v, "n")
+			if okN and n == name then
+				return v
+			end
+		end
+	end
+	return nil
+end
+
+Mark.itemRaw = function(id, slot, tag)
+	local use = Mark.itemUse
+	if not Mark.itemNextId then
+		local fe = use and Mark.findUp(use.ActivateEquipped, "fireEquipped")
+		Mark.itemNextId = fe and Mark.findUp(fe, "nextItemActionId") or false
+	end
+	local nextId = Mark.itemNextId
+	if not nextId or not slot then
+		logFile("item raw", tag, id, "no", nextId and "slot" or "nextItemActionId")
+		return false
+	end
+	Mark.itemCmds = Mark.itemCmds or require(Modules.Items.ItemCommands)
+	Mark.itemReq = Mark.itemReq or Remotes.GetGroup("Items").Request
+	local C, req = Mark.itemCmds, Mark.itemReq
+	local equipped = use and use.IsEquipped and use.IsEquipped() and Mark.equippedId() == id
+	if equipped then
+		-- in hand and the game refused to fire it (already fired / its own lifecycle): a UseSlot now would UNEQUIP it
+		logFile("item raw", tag, id, "no", "in hand, refused by the game")
+		return false
+	end
+	local eq = nextId()
+	req:FireServer(C.UseSlot(slot, eq))
+	local q = Reticle.BuildAimHitQuery and Reticle.BuildAimHitQuery() or nil
+	local ray = Reticle.GetCameraAimRay(q)
+	local fa = nextId()
+	local t0 = Workspace:GetServerTimeNow()
+	req:FireServer(C.FireEquipped(ray, t0, fa, id, eq, false, false))
+	Mark.ssg = Mark.ssg or require(Modules.Items.SingleShotGun)
+	local cfgG = Mark.ssg.GetConfig(id)
+	local n = cfgG and (cfgG.ShotCount or 1) or 1
+	for i = 2, n do
+		task.delay(Mark.ssg.GetShotDelaySeconds(cfgG, i), function()
+			local q2 = Reticle.BuildAimHitQuery and Reticle.BuildAimHitQuery() or nil
+			req:FireServer(C.ContinueGunSequence(Reticle.GetCameraAimRay(q2), Workspace:GetServerTimeNow(), fa, i, id, eq, false))
+		end)
+	end
+	logFile("item raw", tag, id, "slot", slot, "equip", tostring(eq), "fire", fa, "shots", n, "equip+fire")
+	return true
+end
+
+Mark.itemNow = function(id, tag, aimFn)
+	local use = Mark.itemUse
+	if not (use and use.ActivateEquipped) then
+		return false, "no ItemUseState"
+	end
+	local now = os.clock()
+	Mark.itemNowAt = Mark.itemNowAt or {}
+	if now - (Mark.itemNowAt[id] or 0) < 0.6 then
+		return false, "cooldown"
+	end
+	local inHand = use.IsEquipped and use.IsEquipped() and Mark.equippedId() == id
+	local slot = Mark.slotOfItem(id)
+	if not inHand and not slot then
+		return false, "not owned"
+	end
+	Mark.itemNowAt[id] = now
+	if aimFn then
+		Mark.pushAim = { fn = aimFn, untilT = now + 0.85 }
+	end
+	if not inHand then
+		Mark.pressSlot(slot)
+		inHand = use.IsEquipped and use.IsEquipped() and Mark.equippedId() == id
+	end
+	if inHand and use.ActivateEquipped() then
+		logFile("item now", tag, id, "game path")
+		return true
+	end
+	return Mark.itemRaw(id, slot, tag), "raw"
+end
+
+-- AUTOSHIELD (Skills > AutoShield): the forcefield (ItemInvulnerability: item hits, MaxHits 1) when an item hit is
+-- coming and the other answers are worse. Never as the keeper (the user's rule: the keeper's shield is wasted). Not
+-- while one is already up (ItemInvulnerableUntil on our character).
+Mark.shieldUp = function()
+	local ch = LocalPlayer.Character
+	local u = ch and ch:GetAttribute("ItemInvulnerableUntil")
+	return type(u) == "number" and u > Workspace:GetServerTimeNow()
+end
+Mark.shieldNow = function(why)
+	if not CFG.AutoShield or Mark.meKeeper() or Mark.shieldUp() then
+		return false
+	end
+	if not (Mark.slotOfItem("forcefield") or (Mark.itemUse and Mark.itemUse.IsEquipped and Mark.itemUse.IsEquipped() and Mark.equippedId() == "forcefield")) then
+		return false
+	end
+	local ok, how = Mark.itemNow("forcefield", "shield " .. why)
+	logFile("shield", why, ok and "up" or "no", tostring(how or ""))
+	return ok
+end
+-- ROCKET PUNCH, preemptive: it homes on the BALL (ProjectileHoming PointHomingBall), i.e. on us while we carry it. An
+-- enemy holding it (HeldItems rig, lifecycle 0) inside ShieldRocketDist fires before any reaction can land: the shield
+-- goes up now, not when the punch is in the air.
+Mark.shieldTick = function(root)
+	if not (CFG.AutoShield and CFG.ShieldRocket ~= false) or liveOwnerId() ~= LocalPlayer.UserId or Mark.meKeeper() or Mark.shieldUp() then
+		return
+	end
+	local maxD = CFG.ShieldRocketDist or 24
+	for _, model in Mark.models() do
+		local a = Actors.GetFromCharacter(model)
+		if a and a ~= LocalPlayer and not sameTeam(a) and type(a.UserId) == "number" then
+			local r = ActorTargeting.GetActorRoot(a)
+			if r and (r.Position - root.Position).Magnitude <= maxD and Mark.heldLauncher(a.UserId) == "rocketPunch" then
+				Mark.shieldNow(string.format("rocketPunch held by %s d %.1f", actorName(a), (r.Position - root.Position).Magnitude))
+				return
+			end
+		end
+	end
+end
+
+-- KEEPER PUSH (Skills > Keeper Push). A gun hit (flintlock / shotgun: ViolenceDash knock-back, the keeper flies off his
+-- line for ~1-1.5 s) on the enemy keeper the moment a shot that goes in is coming: our release, or a teammate's charge
+-- (his replicated charge path, Mark.chargeShot). Conditions:
+--   the shot path crosses the enemy mouth (inside the posts / under the bar);
+--   the keeper (player or NPC, Mark.foeKeeper) holds the goal: within GunPushKeeperZone of the mouth segment;
+--   he is in range of the gun we have: shotgun (12 pellets in 8 deg - only close) <= GunPushShotgunRange, flintlock
+--   (single accurate pellet x3) <= GunPushFlintRange;
+--   DEPTH: the knock-back goes along our line to him. A push whose path (GunPushTravel studs) runs over the point
+--   where the ball crosses while he stays in front of the line throws him INTO the shot - skipped;
+--   not down / not shielded (ItemInvulnerableUntil).
+Mark.gunPushTry = function(root, tag, key, pts)
+	if not CFG.GunPush or not pts or #pts < 2 then
+		return false
+	end
+	Mark.gunPushKeys = Mark.gunPushKeys or {}
+	if Mark.gunPushKeys[key] then
+		return false
+	end
+	local g = enemyGoalPart()
+	local lb, lt, rb = goalMouthCorners(g)
+	if not (lb and lt and rb) then
+		return false
+	end
+	local mouth = (lb + rb) * 0.5
+	local side = unitOrNil(flat(rb - lb))
+	if not side then
+		return false
+	end
+	local half = flat(rb - lb).Magnitude * 0.5
+	local out = Vector3.new(-side.Z, 0, side.X)
+	if flat(pts[1] - mouth):Dot(out) < 0 then
+		out = -out
+	end
+	local C = nil
+	for i = 2, #pts do
+		local a1 = flat(pts[i] - mouth):Dot(out)
+		if a1 <= 0.3 then
+			local a0 = flat(pts[i - 1] - mouth):Dot(out)
+			local q = pts[i - 1]:Lerp(pts[i], math.clamp((a0 - 0.3) / math.max(a0 - a1, 1e-4), 0, 1))
+			if math.abs(flat(q - mouth):Dot(side)) <= half + 1 and q.Y <= math.max(lt.Y, lb.Y) + 1 then
+				C = q
+			end
+			break
+		end
+	end
+	local function skip(why)
+		Mark.gunPushKeys[key] = true
+		logFile("gunpush skip", tag, why)
+		return false
+	end
+	if not C then
+		return false -- not (yet) on target: a charge can still turn; no key stamp
+	end
+	local k = Mark.foeKeeper(root, math.max(CFG.GunPushFlintRange or 70, CFG.GunPushShotgunRange or 22) + 1)
+	if not k then
+		return skip("no keeper in range")
+	end
+	local K = k.r.Position
+	local relK = flat(K - mouth)
+	local segK = (relK - side * math.clamp(relK:Dot(side), -half, half)).Magnitude
+	if segK > (CFG.GunPushKeeperZone or 14) or relK:Dot(out) < -2 then
+		return skip(string.format("keeper off his goal seg %.1f", segK))
+	end
+	if k.actor and Mark.mateDown(k.actor, k.model) then
+		return skip("keeper already down")
+	end
+	local inv = k.model and k.model:GetAttribute("ItemInvulnerableUntil")
+	if type(inv) == "number" and inv > Workspace:GetServerTimeNow() then
+		return skip("keeper shielded")
+	end
+	local d = (K - root.Position).Magnitude
+	local gun = nil
+	local use = Mark.itemUse
+	local held = use and use.IsEquipped and use.IsEquipped() and Mark.equippedId() or nil
+	local function have(id)
+		return held == id or Mark.slotOfItem(id) ~= nil
+	end
+	if have("shotgun") and d <= (CFG.GunPushShotgunRange or 22) then
+		gun = "shotgun"
+	elseif have("flintlock") and d <= (CFG.GunPushFlintRange or 70) then
+		gun = "flintlock"
+	end
+	if not gun then
+		return skip(string.format("no gun for d %.1f (shotgun %s flintlock %s)", d, tostring(have("shotgun")), tostring(have("flintlock"))))
+	end
+	local pushDir = unitOrNil(flat(K - root.Position))
+	if pushDir then
+		local travel = CFG.GunPushTravel or 18
+		local K2 = K + pushDir * travel
+		local ab = flat(K2 - K)
+		local kk = math.clamp(flat(C - K):Dot(ab) / math.max(ab:Dot(ab), 1e-4), 0, 1)
+		local over = flat(K + ab * kk - C).Magnitude
+		if over < 3 and flat(K2 - mouth):Dot(out) > 1 then
+			return skip(string.format("push runs over the shot point (%.1f) and leaves him in front of the line", over))
+		end
+	end
+	Mark.gunPushKeys[key] = true
+	local r = k.r
+	local ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
+	local ok, how = Mark.itemNow(gun, "gunpush " .. tag, function()
+		local v = r.AssemblyLinearVelocity
+		return r.Position + (typeof(v) == "Vector3" and flat(v) or Vector3.zero) * (ping * 0.5) + Vector3.new(0, 0.4, 0)
+	end)
+	logFile("gunpush", tag, gun, ok and "fired" or "no", tostring(how or ""), "keeper", k.npc and "npc" or actorName(k.actor), "d", string.format("%.1f", d), "seg", string.format("%.1f", segK), "cross lat", string.format("%.1f", flat(C - mouth):Dot(side)))
+	return ok
+end
+
+-- teammates: the moment one charges a shot that goes in (or already charges when he gets the ball)
+Mark.gunPushTick = function(root)
+	if not CFG.GunPush or CFG.GunPushMates == false or not Mark.charges then
+		return
+	end
+	local now = os.clock()
+	for uid, rec in Mark.charges do
+		if rec.live and now - (rec.seen or 0) < 0.3 and uid ~= LocalPlayer.UserId then
+			local a = playerOf(uid)
+			if a and sameTeam(a) then
+				local cs = Mark.chargeShot(uid)
+				if cs and cs.passType == "Shot" then
+					Mark.gunPushTry(root, "mate " .. actorName(a), "m" .. uid .. "@" .. tostring(rec.at), cs.pts)
+				end
+			end
+		end
+	end
+end
+
+-- ours: at the Release packet. The path is the solved shot (AutoShoot preview) or, without one, the released aim as a
+-- straight line from the ball (enough for "inside the posts").
+Mark.gunPushOwn = function(cmd)
+	if not CFG.GunPush or CFG.GunPushOwn == false then
+		return
+	end
+	local root = ActorTargeting.GetActorRoot(LocalPlayer)
+	if not root then
+		return
+	end
+	local pts = nil
+	local pv = Shoot.preview
+	if pv and pv.pts and #pv.pts >= 2 and Shoot.aim then
+		pts = pv.pts
+	else
+		local aim = type(cmd) == "table" and typeof(cmd.AimDirection) == "table" and cmd.AimDirection.Direction
+		aim = typeof(aim) == "Vector3" and aim or (type(cmd) == "table" and typeof(cmd.KickDirection) == "Vector3" and cmd.KickDirection) or nil
+		local b = Renderer.GetPosition()
+		if typeof(aim) == "Vector3" and typeof(b) == "Vector3" and aim.Magnitude > 0 then
+			pts = {}
+			for i = 0, 40 do
+				pts[#pts + 1] = b + aim.Unit * (i * 4)
+			end
+		end
+	end
+	Mark.gunPushTry(root, "own", "o@" .. tostring(os.clock()), pts)
+end
+
 Mark.equipWall = function(tag)
 	local now = os.clock()
 	if now - (Mark.wallEquipAt or 0) < 0.8 then
@@ -8356,7 +8685,7 @@ Mark.npcDiveWatch = function(root)
 	Mark.gkDiveMod = Mark.gkDiveMod or require(Modules.Actions.GoalkeeperDive)
 	local el0 = math.clamp(now - ring[si].t, 0, Mark.gkDiveMod.Constants.DurationSeconds or 0.875)
 	-- P0 = where the dive started (travel 0), el0 = how far into it he is now
-	Mark.trapDive = { uid = k.key, at = now, el0 = el0, P0 = ring[si].p }
+	Mark.trapDive = { uid = k.key, at = now, el0 = el0, P0 = ring[si].p, wd = unitOrNil(flat(k.r.Position - ring[si].p)), name = "npc" }
 	logFile("wall trap", "npc dive seen", "closing", string.format("%.0f", closing), "el", string.format("%.2f", el0), "d", string.format("%.1f", k.d), "from", string.format("%.1f", flat(ring[si].p - root.Position).Magnitude))
 end
 
@@ -8383,6 +8712,19 @@ Mark.wallTrap = function(root, diving)
 		P0 = td.P0 or P0
 		if el0 >= dur - 0.05 then
 			return false
+		end
+		-- only a dash AT us stuns us (user rule; the stun rule itself is server-side): a dive whose direction is more
+		-- than WallTrapCone off the line to us (a save to the side, back, a dive at the ball elsewhere) gets no wall
+		local toUs = unitOrNil(flat(root.Position - P0))
+		if td.wd and toUs and CFG.WallTrapForwardOnly ~= false then
+			local dot = td.wd:Dot(toUs)
+			if dot < math.cos(math.rad(CFG.WallTrapCone or 50)) then
+				if not td.skipLogged then
+					td.skipLogged = true
+					logFile("wall trap", "skip dive not at us", td.name or "?", "dot", string.format("%.2f", dot), "d", string.format("%.1f", k.d))
+				end
+				return false
+			end
 		end
 	else
 		-- BAIT. The dive is too close to answer: a keeper who runs out at us dives at WallTrapTrigger studs (measured on the
@@ -9529,8 +9871,17 @@ Mark.gkPress = function(character, root, c)
 		end
 		return false
 	end
+	-- a downed carrier is no threat - unless the hit is what carries him: a mine / bazooka / explosion ragdolls him and
+	-- throws him (and the ball he holds) at our goal (log: "gk press skip down", 0.5 s later he flew in from dSeg 9.5,
+	-- dy 15, the keeper stood). A ragdolled body flying faster than 8 st/s is a flier, read like any other launch.
+	local downFly = false
 	if Mark.mateDown(pl, model) then
-		return note("skip down")
+		local hrp = model:FindFirstChild("HumanoidRootPart")
+		local vD = hrp and hrp.AssemblyLinearVelocity
+		if not (typeof(vD) == "Vector3" and (flat(vD).Magnitude > 8 or math.abs(vD.Y) > 8)) then
+			return note("skip down")
+		end
+		downFly = true
 	end
 	local D = c.diveMod
 	local P, V, W = Mark.carrierPose(er, model)
@@ -9637,13 +9988,30 @@ Mark.gkPress = function(character, root, c)
 		end
 	end
 	-- a jetpack flier: no coming out (he lands where the dash ends, or shoots from above: the save logic blocks the ball)
-	local moveOk = CFG.GkPressMove ~= false and not committed and not jet and (dSeg <= (CFG.GkPressMoveZone or 50) and tReach <= 3.5 or landP ~= nil)
+	-- a committed flier (in the air, inside dive range, over the mouth) cannot turn: standing where he comes down is
+	-- exactly right, so a landing point is taken even then (it was "not committed" -> the keeper stood still)
+	local moveOk = CFG.GkPressMove ~= false and not jet and ((not committed and dSeg <= (CFG.GkPressMoveZone or 50) and tReach <= 3.5) or landP ~= nil)
 	if moveOk and Mark.userInputDir() then
 		moveOk = false
 	end
 	if moveOk then
 		local Pl = landP or futs[1].pts[13] or E0
-		local u = unitOrNil(flat(Pl - mouth))
+		-- he comes down behind the line: meet him where his arc crosses the mouth plane instead
+		if landP and flat(landP - mouth):Dot(fwd) < 1.5 then
+			local pts = futs[1].pts
+			for k = 2, #pts do
+				local a0, a1 = flat(pts[k - 1] - mouth):Dot(fwd), flat(pts[k] - mouth):Dot(fwd)
+				if a0 >= 1.5 and a1 < 1.5 then
+					local q = pts[k - 1]:Lerp(pts[k], (a0 - 1.5) / math.max(a0 - a1, 1e-4))
+					local lat = math.clamp(flat(q - mouth):Dot(side), -(half + 1), half + 1)
+					Pl = nil
+					Mark.gkPressStandP = Vector3.new((mouth + fwd * 1.5 + side * lat).X, root.Position.Y, (mouth + fwd * 1.5 + side * lat).Z)
+					Mark.gkStandLast = { p = Mark.gkPressStandP, at = c.now, id = c.ownerId }
+					break
+				end
+			end
+		end
+		local u = Pl and unitOrNil(flat(Pl - mouth))
 		if u and u:Dot(fwd) > 0.15 then
 			local depth = math.clamp(flat(Pl - mouth).Magnitude - (landP and 5 or (CFG.GkPressGap or 12)), 1.5, CFG.GkPressOut or 18)
 			local S = mouth + u * depth
@@ -9695,7 +10063,7 @@ Mark.gkPress = function(character, root, c)
 	local function fmt(x)
 		return string.format("%.2f", x)
 	end
-	local info = string.format("dSeg %.1f appr %.1f tReach %s air %s vy %.1f dy %.1f drib %s jet %s vk %s", dSeg, appr, tReach == math.huge and "-" or fmt(tReach), tostring(airborne), vy, P.Y - root.Position.Y, dribReady and "ready" or "spent", jet and fmt(jet.te) or "-", vKind)
+	local info = string.format("dSeg %.1f appr %.1f tReach %s air %s vy %.1f dy %.1f drib %s jet %s vk %s%s%s", dSeg, appr, tReach == math.huge and "-" or fmt(tReach), tostring(airborne), vy, P.Y - root.Position.Y, dribReady and "ready" or "spent", jet and fmt(jet.te) or "-", vKind, downFly and " downFly" or "", Mark.gkPressStandP and string.format(" stand %.1f", flat(Mark.gkPressStandP - root.Position).Magnitude) or "")
 	if not best then
 		return note("no contact " .. info)
 	end
@@ -11549,9 +11917,22 @@ local function onFx(kind, userId, a, b, c, aimDir, ...)
 			Mark.foeDive = Mark.foeDive or {}
 			Mark.foeDive[userId] = os.clock()
 			-- Keeper Trap: the dive starts now; a = his server start time (as for the flick)
+			-- Packet (dump TackleEffects.receiveEffect -> presentEffect): a = the dive DIRECTION NAME (ActionMotion
+			-- .DirectionChoices: F / RF / R / ... relative to his camera; a keeper's body faces his camera), the server start
+			-- time is the 9th arg = select(3, ...). The old code read `a` as the start time (a string -> el0 always 0) and
+			-- had no direction at all: every dive was solved as a dash at us.
 			local hr = ActorTargeting.GetActorRoot(who)
 			local srvNow = Workspace:GetServerTimeNow()
-			Mark.trapDive = { uid = userId, at = os.clock(), el0 = type(a) == "number" and math.clamp(srvNow - a, 0, 0.4) or 0, P0 = hr and hr.Position }
+			local st = select(3, ...)
+			local wd = nil
+			Mark.actionMotion = Mark.actionMotion or require(Modules.Actions.ActionMotion)
+			Mark.gkDiveMod = Mark.gkDiveMod or require(Modules.Actions.GoalkeeperDive)
+			local choice = type(a) == "string" and Mark.actionMotion.DirectionChoices[a]
+			local look = hr and unitOrNil(flat(hr.CFrame.LookVector))
+			if choice and look then
+				wd = unitOrNil(flat(look * (choice.Forward or 0) + Vector3.new(-look.Z, 0, look.X) * (choice.Right or 0)))
+			end
+			Mark.trapDive = { uid = userId, at = os.clock(), el0 = type(st) == "number" and math.clamp(srvNow - st, 0, 0.4) or 0, P0 = hr and hr.Position, wd = wd, name = type(a) == "string" and a or "?" }
 			local myR = ActorTargeting.GetActorRoot(LocalPlayer)
 			if myR and isGoalkeeper(who) then
 				Mark.wallTrap(myR, true)
@@ -11705,7 +12086,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v168")
+	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v169")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -20000,6 +20381,14 @@ Mark.hazFlee = function(character, root)
 		ev.logged = true
 		logFile("blast flee", ev.item, "ta", string.format("%.2f", ta), "d", string.format("%.1f", d0), "need", string.format("%.1f", need), "gain", string.format("%.1f", gain), "run", tostring(byRun), "step", tostring(byStep), "own", tostring(own))
 	end
+	-- no way out on foot (run and step both short): the shield takes the blast
+	if not byRun and not byStep and not ev.shieldTried and ta > ping * 0.5 then
+		ev.shieldTried = true
+		if Mark.shieldNow(string.format("%s blast in %.2f slack %.1f", ev.item, ta, slack)) then
+			ev.passed = true
+			return
+		end
+	end
 	-- with the ball: out by a thin margin or not at all -> the ball goes to a mate now
 	if own and slack < (CFG.HazPassSlack or 2) and not ev.passed and not (Mark.pa and Mark.pa.live) and os.clock() >= (ev.passTry or 0) then
 		ev.passTry = os.clock() + 0.1
@@ -20552,6 +20941,14 @@ Mark.projTick = function(character, root)
 			if not tKeep then
 				continue
 			end
+			-- AutoShield first: one activation, the ball stays ours (a pass gives it away, a wall needs a line)
+			if not st.shieldTried then
+				st.shieldTried = true
+				if Mark.shieldNow(string.format("%s keepHit %.2f", st.item, tKeep)) then
+					st.done = true
+					continue
+				end
+			end
 			-- BarricadeAddon: the punch homes on the ball we hold; a wall on its approach stops it (path = the same simulation)
 			if not st.wallTried then
 				local trail = {}
@@ -20710,6 +21107,14 @@ Mark.projTick = function(character, root)
 				end
 			end
 			local sure = bestC >= rad + margin
+			-- AutoShield: a hit no step clears (and no wall) - the shield takes it; nothing else this frame
+			if not sure and not st.shieldTried and tImp > 0.05 then
+				st.shieldTried = true
+				if Mark.shieldNow(string.format("%s hit in %.2f stay %.1f step %.1f", st.item, tImp, stay, bestC)) then
+					st.done = true
+					continue
+				end
+			end
 			if own and not sure and CFG.PassAssistSync ~= false and Mark.paList and Mark.paPress and not (Mark.pa and Mark.pa.live) then
 				-- low confidence: get rid of the ball legitimately before the impact if the lob can be released in time
 				local pick, pickSol, pickD = nil, nil, -1
@@ -20736,6 +21141,8 @@ Mark.projTick = function(character, root)
 end
 
 Mark.tickHazard = function(character, root)
+	Mark.shieldTick(root)
+	Mark.gunPushTick(root)
 	Mark.stateWatch(character)
 	Mark.chargeWatch()
 	Mark.sprintWatch()
@@ -22981,6 +23388,27 @@ return function(_Lib, _Core)
 				sld(sa, "Freeze Radius", "FreezeRadius", 3, 20, { prec = 1, suffix = " st", text = "Size of the freeze area." })
 			end)
 
+			local sh = card(tab, "Left")
+			head(sh, "AutoShield")
+			feature(sh, "AutoShield", "AutoShield")
+			note(sh, "Puts the shield up when an item hit is coming that a dodge, pass or wall cannot stop. Never as the keeper.")
+			head(sh, "Rocket Punch")
+			tog(sh, "Shield Early", "ShieldRocket", "An enemy holding Rocket Punch close while you have the ball: shield at once.")
+			sld(sh, "Distance", "ShieldRocketDist", 8, 60, { suffix = " st" })
+
+			local kp = card(tab, "Left")
+			head(kp, "Keeper Push")
+			feature(kp, "Keeper Push", "GunPush")
+			note(kp, "Shoots the enemy keeper with a flintlock / shotgun when a shot that goes in is on its way.")
+			tog(kp, "Your Shots", "GunPushOwn")
+			tog(kp, "Teammate Shots", "GunPushMates", "Fires as soon as a teammate charges a shot on target.")
+			sld(kp, "Flintlock Range", "GunPushFlintRange", 10, 150, { suffix = " st" })
+			sld(kp, "Shotgun Range", "GunPushShotgunRange", 5, 60, { suffix = " st" })
+			advanced(kp, "Keeper Push", function()
+				sld(kp, "Keeper Zone", "GunPushKeeperZone", 4, 40, { suffix = " st", text = "Only a keeper this close to his goal." })
+				sld(kp, "Push Travel", "GunPushTravel", 5, 50, { suffix = " st", text = "How far a hit throws him (depth check)." })
+			end)
+
 			local w = card(tab, "Right")
 			head(w, "AutoWall")
 			feature(w, "AutoWall", "AutoWall")
@@ -22991,6 +23419,8 @@ return function(_Lib, _Core)
 			tog(w, "Enabled", "WallTrap", "Puts a wall between you and the enemy keeper's dive.")
 			tog(w, "Bait", "WallTrapBait", "Puts the wall up just before the keeper dives at you.")
 			sld(w, "Keeper Dive Range", "WallTrapTrigger", 4, 16, { prec = 1, suffix = " st" })
+			tog(w, "Only Dives At You", "WallTrapForwardOnly", "Ignores keeper dives that do not go at you.")
+			sld(w, "Dive Cone", "WallTrapCone", 20, 90, { suffix = " deg" })
 			advanced(w, "Wall", function()
 				sld(w, "Body Reach", "WallReach", 8, 40, { suffix = " st", text = "Walls a chaser or the carrier within this distance." })
 				sld(w, "Body Window", "WallWindow", 0.15, 1, { prec = 2, suffix = " s", text = "He must hit the wall this soon after it appears." })
