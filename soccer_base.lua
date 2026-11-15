@@ -6389,6 +6389,9 @@ local function paintWorld()
 			end
 		end
 	end
+	if Mark.sp then
+		Mark.spoofDraw(Mark.pen, Renderer.GetPosition())
+	end
 	if Mark.paDraw then
 		Mark.paDraw(gy)
 	end
@@ -6519,6 +6522,38 @@ Reticle.GetCameraRay = function(...)
 	return oldCamRay(...)
 end
 
+-- ONE CHARGE AIM. The game reads our aim in four places - the charge ray ChargedKick keeps (u30, frozen at the aim lock),
+-- the trajectory preview (ChargePathVelocity.Get), every Update / Lock packet and the Release - and the camera feeds all of
+-- them. AutoShoot used to patch only the packet and the preview, each with its own condition: the camera leaked in between
+-- (replicated preview followed where the player looked, the local one flickered between camera and shot). Now the game's own
+-- aim source (Reticle.GetCameraAimRayWithoutHit) answers with this ray while we charge a solved shot, so the charge ray,
+-- the lock, the preview and the packets all carry the same thing: the decoy inside the Direction Spoof window, the solved
+-- shot after it. The packets only override the Release (real shot) and keep the real curve in every phase.
+Mark.shotOn = function()
+	local a = Shoot.aim
+	return CFG.AutoShoot and a and a.Direction and not Shoot.lob and not MatchSettings.IsGoalkeeperCharacter(LocalPlayer.Character)
+		and (Mark.flickStrike or (Shoot.launch and Shoot.launch.Y > 1) or a.Direction.Y > 0.05) and true or false
+end
+
+Mark.realRay = function()
+	local a = Shoot.aim
+	return { Origin = a.Origin, Direction = a.Direction, CameraCFrame = a.CameraCFrame, CameraFieldOfView = a.CameraFieldOfView, IsAirborne = a.IsAirborne }
+end
+
+Mark.chargeRay = function()
+	if not (ChargedKick.IsCharging and ChargedKick.IsCharging()) or liveOwnerId() ~= LocalPlayer.UserId or (Mark.pa and Mark.pa.live) then
+		return nil
+	end
+	local decoy = Mark.sp and Mark.spoofRay()
+	if decoy then
+		return decoy
+	end
+	if Mark.shotOn() then
+		return Mark.realRay()
+	end
+	return nil
+end
+
 local oldAimRay = Reticle.GetCameraAimRayWithoutHit
 Reticle.GetCameraAimRayWithoutHit = function()
 	if Mark.pa and Mark.pa.live and Mark.pa.live.ray then
@@ -6531,10 +6566,9 @@ Reticle.GetCameraAimRayWithoutHit = function()
 	if strike then
 		return strike
 	end
-	-- the decoy as the game's own aim sample: the charge aim changes, so ActionRemoteProtocol.Update really sends it
-	local spoof = Mark.sp and Mark.spoofRay()
-	if spoof then
-		return spoof
+	local charge = Mark.chargeRay()
+	if charge then
+		return charge
 	end
 	local ray = oldAimRay()
 	local aim = Mark.volleyAim or Mark.blockAim
@@ -6561,9 +6595,10 @@ ChargePathVelocity.Get = function(char, secs, kind, aim, origin, reported, kickD
 	end
 	-- Direction Spoof: the game's trajectory preview (the one that is replicated to the other clients as the charge path)
 	-- is drawn from the same aim as the packets: the decoy while it runs, never the solved shot
-	local decoy = Mark.sp and Mark.spoofRay()
-	if decoy then
-		aim, curve, target = decoy, nil, nil
+	local cr = Mark.chargeRay()
+	if cr then
+		aim, target = cr, nil
+		curve = (not Mark.flickStrike) and Shoot.curve or nil
 	end
 	return oldPathGet(char, secs, kind, aim, origin, reported, kickDir, target, boundary, curve)
 end
@@ -6622,7 +6657,7 @@ oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
 			cmd.AimDirection = { Origin = r.Origin, Direction = r.Direction, CameraCFrame = r.CameraCFrame, CameraFieldOfView = r.CameraFieldOfView, IsAirborne = false }
 			cmd.TargetUserId = nil
 		elseif type(cmd) == "table" and not MatchSettings.IsGoalkeeperCharacter(LocalPlayer.Character) and (packet.Phase == "Start" or packet.Phase == "Release" or packet.Phase == "Update") and Shoot.aim and Shoot.aim.Direction and not Shoot.lob and not (liveOwnerId() == LocalPlayer.UserId and (cmd.PassType == "FreeLowPass" or cmd.PassType == "FreeLobPass" or cmd.PassType == "AssistedPass")) and (Mark.flickStrike or (Shoot.launch and Shoot.launch.Y > 1) or Shoot.aim.Direction.Y > 0.05) then
-			if which == "kick" and packet.Phase == "Start" and cmd.PassType == "Shot" then
+			if which == "kick" and packet.Phase == "Start" and cmd.PassType == "Shot" and not Mark.sp then
 				Mark.spoofPlan()
 			end
 			-- Direction Spoof: until the aim lock the replicated aim is a decoy; the lock packet (AimLockedAt) and the
@@ -6641,7 +6676,11 @@ oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
 			if dec then
 				cmd.AimDirection = dec
 				cmd.KickDirection = AimFacing.GetFlatDirection(dec.Direction) or dec.Direction
-				cmd.Curve = nil
+				-- the session keeps the curve of the latest packet: the real one in every phase (nil here cost every
+				-- spoofed shot its curve)
+				if cmd.PassType == "Shot" and Shoot.curve and not Mark.flickStrike then
+					cmd.Curve = Shoot.curve
+				end
 			else
 				cmd.AimDirection = {
 					Origin = Shoot.aim.Origin,
@@ -6704,6 +6743,9 @@ if ChargedKick.HandleInputBegan then
 			local src0 = debug.info(2, "s")
 			local line0 = debug.info(2, "l")
 			logFile("kick input", "own", "type", typeof(input) == "Instance" and tostring(input.UserInputType) or typeof(input), "key", typeof(input) == "Instance" and tostring(input.KeyCode) or "-", "processed", tostring(processed), "caller", tostring(src0), tostring(line0))
+		end
+		if CFG.DirSpoof and Controls.IsInput("Kick", input) and liveOwnerId() == LocalPlayer.UserId and not Mark.sp and Mark.shotOn() then
+			Mark.spoofPlan()
 		end
 		if CFG.AutoShoot and not Shoot.aim and typeof(input) == "Instance" and Controls.IsInput("Kick", input) and liveOwnerId() == LocalPlayer.UserId then
 			logFile("shoot", "press without aim", tostring(Shoot.why), "job", tostring(Shoot.job ~= nil), "full", string.format("%.1f", Shoot.fullCost or 0), "dt", string.format("%.1f", (Mark.dtAvg or 0) * 1000))
@@ -10770,6 +10812,7 @@ Mark.moveHackTick = function(dt)
 	end
 end
 RunService.PreSimulation:Connect(function(dt)
+	Mark.faceStep()
 	Mark.moveHackTick(dt)
 end)
 
@@ -11369,7 +11412,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v151")
+	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v152")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -14466,6 +14509,7 @@ Mark.spoofDir = function()
 		acc += st[3]
 	end
 	local Q = sp.lb + sp.along * (sp.W * (s + 1) * 0.5) + Vector3.new(0, sp.H * h, 0)
+	sp.q = Q
 	return unitOrNil(Q - sp.O)
 end
 
@@ -14551,6 +14595,7 @@ end
 -- jitter / flip faster than that never reaches the root, so the wire shows a small wobble (only spin read as real).
 -- So the root is rotated directly (position kept) and the lock holds the controller on the same heading.
 Mark.faceSet = function(root, face)
+	Mark.faceNow = face
 	TurnControl.LockAutoRotate("GoKart", face)
 	local lv = root.CFrame.LookVector
 	local lf = Vector3.new(lv.X, 0, lv.Z)
@@ -14560,9 +14605,53 @@ Mark.faceSet = function(root, face)
 	end
 end
 
+-- The decoy as a point on the goal (the aim now rests on it for the whole window): a diamond + a line from the ball, in the
+-- threat hue so it never reads as the real shot (COL.Line)
+Mark.spoofDraw = function(pen, ball)
+	local sp = Mark.sp
+	local q = sp and sp.q
+	if not (pen and q and Mark.spoofDir()) then
+		return
+	end
+	local up = Vector3.new(0, 1, 0)
+	local r = 1.1
+	local pts = { q + up * r, q + sp.along * r, q - up * r, q - sp.along * r }
+	local col = COL.Tackle
+	local x0, y0, d0 = pen.P(pts[4])
+	for i = 1, 4 do
+		local x1, y1, d1 = pen.P(pts[i])
+		pen.L(x0, y0, d0, x1, y1, d1, COL.Ink, 0.5, 4, 44)
+		pen.L(x0, y0, d0, x1, y1, d1, col, 1, 1.8, 45)
+		x0, y0, d0 = x1, y1, d1
+	end
+	if ball then
+		local bx, by, bd = pen.P(ball)
+		local qx, qy, qd = pen.P(q)
+		pen.L(bx, by, bd, qx, qy, qd, col, 0.35, 1.2, 45)
+	end
+end
+
+-- PreSimulation: the controller turns the root during the physics step and CharacterReplication samples it in
+-- PostSimulation; a Heartbeat write alone races that. Re-apply the facing right before the step.
+Mark.faceStep = function()
+	local fs, face = Mark.fs, Mark.faceNow
+	if not (fs and face) then
+		return
+	end
+	local root = ActorTargeting.GetActorRoot(LocalPlayer)
+	if root then
+		local lv = root.CFrame.LookVector
+		local lf = Vector3.new(lv.X, 0, lv.Z)
+		if lf.Magnitude < 0.1 or lf.Unit:Dot(face) < 0.999 then
+			root.CFrame = CFrame.lookAt(root.Position, root.Position + face)
+		end
+	end
+end
+
 Mark.faceTick = function(character, root)
 	local fs = Mark.fs
 	if not (character and root) or not Mark.faceActive(character) then
+		Mark.faceNow = nil
 		if fs then
 			TurnControl.ReleaseAutoRotate("GoKart")
 			Mark.fs = nil
