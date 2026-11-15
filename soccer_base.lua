@@ -6671,6 +6671,11 @@ oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
 			if packet.Phase == "Release" and cmd.PassType == "Shot" and Shoot.launch then
 				-- ground truth of every shot: the ball 0.2 s after the release against the solved flight (curve included)
 				local pv, hadDecoy, hadBody, p0 = Shoot.preview, Mark.sp ~= nil, Mark.fs ~= nil, Renderer.GetPosition()
+				-- how stale the solved shot is at the release: the ball against the origin it was solved from, the age of the
+				-- solve / of the last re-aim (the carried ball swings with the body pose)
+				local drift = p0 and Shoot.aimBallAt and (p0 - Shoot.aimBallAt).Magnitude or -1
+				local nowR = os.clock()
+				local ageS, ageR = nowR - (Shoot.goodT or nowR), nowR - (Shoot.rebased or nowR)
 				local aimSent = typeof(cmd.AimDirection) == "table" and cmd.AimDirection.Direction
 				task.delay(0.2, function()
 					local pB = Renderer.GetPosition()
@@ -6696,7 +6701,7 @@ oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
 						return
 					end
 					local ang = math.deg(math.acos(math.clamp(ea.Unit:Dot(aa.Unit), -1, 1)))
-					logFile("shoot", "flight", "angle to solved", string.format("%.1f", ang), "moved", string.format("%.1f", aa.Magnitude), "solved", string.format("%.1f", ea.Magnitude), "decoy", hadDecoy and "yes" or "no", "body", hadBody and "yes" or "no", "aim sent", aimSent and fmtV(aimSent) or "-")
+					logFile("shoot", "flight", "angle to solved", string.format("%.1f", ang), "moved", string.format("%.1f", aa.Magnitude), "solved", string.format("%.1f", ea.Magnitude), "decoy", hadDecoy and "yes" or "no", "body", hadBody and "yes" or "no", "drift", string.format("%.1f", drift), "solve age", string.format("%.2f", ageS), "rebase age", string.format("%.2f", ageR), "aim sent", aimSent and fmtV(aimSent) or "-")
 				end)
 			end
 			if packet.Phase == "Release" and (Mark.flickStrike or Mark.forceBike) then
@@ -8377,14 +8382,32 @@ Mark.wallTick = function(root, oid, own)
 	if own and CFG.WallTrap ~= false and Mark.wallTrap(root, false) then
 		return
 	end
+	-- PUT AWAY. Equip -> place -> put away. A used item stays "fired" in hand until its lifecycle ends and the game ignores
+	-- the unequip until then (one press 0.12 s after the placement did nothing and the item stayed in hand): ask the game's
+	-- own unequip as soon as the item is not fired any more, every 0.1 s, give up after 3 s.
 	local wp0 = Mark.wallPend
-	if isWall and Mark.wallEquipAt and wp0 and wp0.at >= Mark.wallEquipAt and now - wp0.at > 0.12 then
-		-- equip -> place -> put away: the wall is down, the item must not stay in the hand (it blocks the ball controls)
-		Mark.wallEquipAt = nil
-		local s1 = Mark.wallEquipSlot or Mark.slotOfItem("barricades")
-		if s1 then
-			Mark.pressSlot(s1)
-			logFile("wall equip", "placed - put away", wp0.kind)
+	if isWall and Mark.wallEquipAt and wp0 and wp0.at >= Mark.wallEquipAt then
+		Mark.wallAway = Mark.wallAway or now
+	end
+	if not isWall then
+		if Mark.wallAway and not inHand then
+			logFile("wall equip", "away", string.format("%.2f", now - Mark.wallAway), "s after the placement")
+		end
+		Mark.wallAway = nil
+		if Mark.wallEquipAt and now - Mark.wallEquipAt > 1 then
+			Mark.wallEquipAt = nil
+		end
+	elseif Mark.wallAway then
+		if now - Mark.wallAway > 3 then
+			Mark.wallAway, Mark.wallEquipAt = nil, nil
+			logFile("wall equip", "away failed")
+		elseif now - (Mark.wallAwayTry or 0) > 0.1 and not (use.IsEquippedItemFired and use.IsEquippedItemFired()) then
+			Mark.wallAwayTry = now
+			if use.RequestUnequip then
+				use.RequestUnequip()
+			else
+				Mark.pressSlot(Mark.wallEquipSlot or Mark.slotOfItem("barricades"))
+			end
 		end
 		return
 	end
@@ -11465,7 +11488,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v156")
+	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v157")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
