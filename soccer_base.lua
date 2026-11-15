@@ -196,12 +196,10 @@ local CFG = {
 	KillerAngle = 50, -- the killer slide may leave our route direction by at most this many degrees (searched from 0 outward)
 	WallLatency = 0.06, -- the wall exists this long after the press reaches the server (ping/2); seen 0.11-0.14 s after the press at ping 0.08
 	WallEquip = false, -- Auto Use: AutoWall takes the barricades out itself (item slot press) when a threat is coming; off = only when already in hand
-	WallEquipDelay = 0.3, -- extra time the equip needs before the wall can be placed
+	WallEquipDelay = 0.04, -- the equip is a local state change + an ordered remote: about a frame
+	WallTrapBurst = 30, -- NPC keeper: closing speed (st/s) that counts as a dive
 	WallEquipHold = 3.5,
 	WallTrap = true, -- Keeper Trap: a barricade between us and the enemy keeper's dive
-	WallTrapCome = 5, -- keeper closing speed on us before the barricades are armed
-	WallTrapArm = 1, -- armed barricades are put away after this long without a dive
-	WallTrapBait = true, -- put it up before he dives when we close in on him
 	WallReach = 18, -- a chaser (our ball) / the carrier within this gets a wall across his run
 	WallWindow = 0.45, -- ... only if he reaches it within this after it appears (earlier and he walks around it)
 	WallShot = true, -- wall on the replicated shot path of a charging carrier (needs barricades in hand)
@@ -6682,7 +6680,10 @@ oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
 			end
 			if dec then
 				cmd.AimDirection = dec
-				cmd.KickDirection = AimFacing.GetFlatDirection(dec.Direction) or dec.Direction
+				-- KickDirection stays the REAL one in every packet: Shoot.GetVelocity takes the flat shot direction from it
+				-- and clamps the endpoint yaw to +-15 deg around it (EndpointAim.MaximumEndpointYawDegrees). A decoy here
+				-- pinned every shot to within 15 deg of the decoy - the ball flew to the fake, off target.
+				cmd.KickDirection = AimFacing.GetFlatDirection(Shoot.aim.Direction) or Shoot.aim.Direction
 				-- the session keeps the curve of the latest packet: the real one in every phase (nil here cost every
 				-- spoofed shot its curve)
 				if cmd.PassType == "Shot" and Shoot.curve and not Mark.flickStrike then
@@ -6702,6 +6703,26 @@ oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
 				elseif cmd.PassType == "Shot" and Shoot.curve then
 					cmd.Curve = Shoot.curve
 				end
+			end
+			if packet.Phase == "Release" and cmd.PassType == "Shot" and Shoot.launch then
+				-- ground truth of every shot: where the ball really goes against the solved shot (and was a decoy up)
+				local want, hadDecoy = Shoot.launch, Mark.sp ~= nil
+				local pA
+				task.delay(0.1, function()
+					pA = Renderer.GetPosition()
+				end)
+				task.delay(0.2, function()
+					local pB = Renderer.GetPosition()
+					if not (pA and pB) then
+						return
+					end
+					local v = (pB - pA) * 10
+					local fv, fw = flat(v), flat(want)
+					if v.Magnitude > 20 and fv.Magnitude > 1 and fw.Magnitude > 1 then
+						local off = math.deg(math.acos(math.clamp(fv.Unit:Dot(fw.Unit), -1, 1)))
+						logFile("shoot", "flight", "off solved", string.format("%.1f", off), "speed", string.format("%.0f", v.Magnitude), "solved", string.format("%.0f", want.Magnitude), "decoy", hadDecoy and "yes" or "no")
+					end
+				end)
 			end
 			if packet.Phase == "Release" and (Mark.flickStrike or Mark.forceBike) then
 				local src0 = typeof(packet.Command.AimDirection) == "table" and packet.Command.AimDirection.Direction
@@ -8032,6 +8053,10 @@ Mark.wallVsPath = function(root, pathFn, tEnd, tag, o)
 		return false -- the last one has not appeared yet
 	end
 	local equipped = use.IsEquipped and use.IsEquipped() and Mark.equippedId() == "barricades"
+	if equipped and Mark.wallEqSent then
+		logFile("wall equip", "ready after", string.format("%.3f", now - Mark.wallEqSent))
+		Mark.wallEqSent = nil
+	end
 	local canEquip = o.equip ~= false and not equipped and Mark.slotOfItem("barricades") ~= nil
 	if not equipped and not canEquip then
 		return false
@@ -8064,10 +8089,16 @@ Mark.wallVsPath = function(root, pathFn, tEnd, tag, o)
 		return false, "no line"
 	end
 	if not equipped then
-		if Mark.equipWall(tag) then
+		if not Mark.equipWall(tag) then
+			return false, "equip failed"
+		end
+		-- the press runs the equip synchronously: when the item is already in hand, place it in this very frame
+		equipped = use.IsEquipped and use.IsEquipped() and Mark.equippedId() == "barricades"
+		if not equipped then
+			Mark.wallEqSent = now
 			return "equip", "equip"
 		end
-		return false, "equip failed"
+		logFile("wall equip", "ready same frame")
 	end
 	local u = best.u
 	-- where the game really puts it (field clamp, pushed out of a goal): the plan must survive that
@@ -8174,7 +8205,7 @@ Mark.foeKeeper = function(root, maxD)
 			local r = ActorTargeting.GetActorRoot(a)
 			local dd = r and flat(r.Position - root.Position).Magnitude
 			if dd and dd < bd then
-				best, bd = { actor = a, model = model, r = r, d = dd, key = a.UserId }, dd
+				best, bd = { actor = a, model = model, r = r, d = dd, key = a.UserId, npc = playerOf(a.UserId) == nil }, dd
 			end
 		end
 	end
@@ -8201,21 +8232,40 @@ end
 -- is the derivative of the cubic-out travel, v(t) = 3 D / T * (1 - t / T)^2, so a burst toward us gives the dive time.
 Mark.npcDiveWatch = function(root)
 	local k = Mark.foeKeeper(root, 40)
-	if not (k and k.npc) or (Mark.trapDive and Mark.trapDive.uid == k.key and os.clock() - Mark.trapDive.at < 1.2) then
+	if not k then
 		return
 	end
-	local v = flat(k.r.AssemblyLinearVelocity)
+	-- speed from the position itself: an NPC is moved by the server, its AssemblyLinearVelocity is not the dive
+	local now = os.clock()
+	local tr = Mark.kpTrack
+	if not (tr and tr.key == k.key) then
+		tr = { key = k.key, p = k.r.Position, t = now, v = Vector3.zero }
+		Mark.kpTrack = tr
+		logFile("wall trap", "keeper", k.npc and "npc" or "player", "d", string.format("%.1f", k.d))
+		return
+	end
+	local dt = now - tr.t
+	if dt < 0.012 then
+		return
+	end
+	local v = flat(k.r.Position - tr.p) / dt
+	tr.p, tr.t = k.r.Position, now
+	if not k.npc or (Mark.trapDive and Mark.trapDive.uid == k.key and now - Mark.trapDive.at < 1.2) then
+		return
+	end
 	local toUs = unitOrNil(flat(root.Position - k.r.Position))
-	if not toUs or v:Dot(toUs) < 30 then
+	local closing = toUs and v:Dot(toUs) or 0
+	if closing < (CFG.WallTrapBurst or 30) then
 		return
 	end
 	Mark.gkDiveMod = Mark.gkDiveMod or require(Modules.Actions.GoalkeeperDive)
 	local D = Mark.gkDiveMod
 	local T = D.Constants.DurationSeconds or 0.875
-	local dist = 20 * 1.3 + 3
-	local el0 = T * (1 - math.sqrt(math.clamp(v.Magnitude * T / (3 * dist), 0, 1)))
-	Mark.trapDive = { uid = k.key, at = os.clock(), el0 = el0, P0 = k.r.Position - toUs * D.GetTravel(el0, dist) }
-	logFile("wall trap", "npc dive seen", "speed", string.format("%.0f", v.Magnitude), "el", string.format("%.2f", el0), "d", string.format("%.1f", k.d))
+	local dist = ((k.actor and D.GetDistance(k.actor)) or 20) * 1.3 + 3
+	-- cubic out: speed(el) = 3 dist (1 - el/T)^2 / T
+	local el0 = T * (1 - math.sqrt(math.clamp(closing * T / (3 * dist), 0, 1)))
+	Mark.trapDive = { uid = k.key, at = now, el0 = el0, P0 = k.r.Position - toUs * D.GetTravel(el0, dist) }
+	logFile("wall trap", "npc dive seen", "speed", string.format("%.0f", closing), "el", string.format("%.2f", el0), "d", string.format("%.1f", k.d))
 end
 
 Mark.wallTrap = function(root, diving)
@@ -8243,39 +8293,7 @@ Mark.wallTrap = function(root, diving)
 			return false
 		end
 	else
-		local wp = Mark.wallPend
-		local td = Mark.trapDive
-		if (td and td.uid == k.key and os.clock() - td.at < 2) or CFG.WallTrapBait == false or Mark.foeDiveLeft() > 0 or (wp and wp.trap and os.clock() - wp.at < 3) then
-			return false
-		end
-		-- The dive's limit and speed (GetTravel: cubic out, v0 = 3 reach / T). Its front reaches the wall plane (5 st ahead
-		-- of us) at tFront(d). A dive seen at the start can still be answered while tFront > equip + latency (reactive, no
-		-- need to be early); the bait is for the window where it cannot: tFront below that, but still above the press-only
-		-- latency (the wall must exist before it arrives). Outside it: wait.
-		local Tm = dur
-		local function front(t)
-			return reach * (1 - (1 - math.min(t / Tm, 1)) ^ 3) + 5
-		end
-		local ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
-		local lat = ping * 0.5 + (CFG.WallLatency or 0.06) + (CFG.WallMargin or 0.05)
-		local dHi = front(lat + (CFG.WallEquipDelay or 0.3) + 0.12)
-		local dLo = front(lat)
-		if k.d > dHi or k.d > reach + 5 or k.d < math.max(dLo - 2, 8) then
-			return false
-		end
-		-- he must be coming for us: closing on us, not standing on his line
-		local toKk = unitOrNil(flat(k.r.Position - root.Position))
-		local kv = toKk and -flat(k.r.AssemblyLinearVelocity):Dot(toKk) or 0
-		if kv < (CFG.WallTrapCome or 5) then
-			return false
-		end
-		-- ARM only: the wall itself goes down on his real dive (the dive event / the NPC burst), never on a guess.
-		-- Armed = barricades in hand, put away if he does not dive within WallTrapArm seconds.
-		Mark.trapArm = os.clock()
-		local equipped = Mark.itemUse and Mark.itemUse.IsEquipped and Mark.itemUse.IsEquipped() and Mark.equippedId() == "barricades"
-		if not equipped and Mark.slotOfItem("barricades") then
-			Mark.equipWall("trap arm")
-		end
+		-- never on a guess: the wall goes down on his real dive (event / NPC burst)
 		return false
 	end
 	local O, ourV = root.Position, flat(root.AssemblyLinearVelocity)
@@ -8316,21 +8334,6 @@ Mark.wallTick = function(root, oid, own)
 	Mark.wallTickAt = now
 	local inHand = use.IsEquipped and use.IsEquipped()
 	local isWall = inHand and Mark.equippedId() == "barricades"
-	-- Keeper Trap bait: equip + place + put away, all inside Mark.wallTrap (no holding the item)
-	if CFG.WallTrap ~= false then
-		if own and Mark.wallTrap(root, false) then
-			return
-		end
-	end
-	if isWall and Mark.trapArm and now - Mark.trapArm > (CFG.WallTrapArm or 1) and not (Mark.trapDive and now - Mark.trapDive.at < 0.6) and Mark.wallEquipAt then
-		Mark.trapArm, Mark.wallEquipAt = nil, nil
-		local s0 = Mark.wallEquipSlot or Mark.slotOfItem("barricades")
-		if s0 then
-			Mark.pressSlot(s0)
-			logFile("wall trap", "no dive - put away")
-		end
-		return
-	end
 	local wp0 = Mark.wallPend
 	if isWall and Mark.wallEquipAt and wp0 and wp0.at >= Mark.wallEquipAt and now - wp0.at > 0.12 then
 		-- equip -> place -> put away: the wall is down, the item must not stay in the hand (it blocks the ball controls)
@@ -11419,7 +11422,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v153")
+	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v154")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -22353,7 +22356,6 @@ return function(_Lib, _Core)
 			tog(w, "Wall On Shot Path", "WallShot", "Walls a shot charged at our goal.")
 			head(w, "Keeper Trap")
 			tog(w, "Enabled", "WallTrap", "Puts a wall between you and the enemy keeper's dive.")
-			tog(w, "Bait", "WallTrapBait", "Puts it up before he dives when you run at him.")
 			advanced(w, "Wall", function()
 				sld(w, "Body Reach", "WallReach", 8, 40, { suffix = " st", text = "Walls a chaser or the carrier within this distance." })
 				sld(w, "Body Window", "WallWindow", 0.15, 1, { prec = 2, suffix = " s", text = "He must hit the wall this soon after it appears." })
