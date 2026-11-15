@@ -128,9 +128,10 @@ local CFG = {
 	AutoBall = true,
 	BlockRange = 40,
 	BlockBehind = 22,
-	TackleGoalZone = 40,
+	NearGoal = 100, -- "near the goal" in studs: the zone the goal-side rules below use (this field is large)
+	TackleGoalZone = 100,
 	CompetitorRadius = 12,
-	CompetitorGoalZone = 45, -- AutoBlock / AutoBall: ball and we both this close to OUR goal -> Competitor Check is ignored (0 = always apply)
+	CompetitorGoalZone = 100, -- AutoBlock / AutoBall: ball and we both this close to OUR goal -> Competitor Check is ignored (0 = always apply)
 	CounterJump = true,
 	ShootMaxDist = 160,
 	-- Perf probe: on in the raw file (testers send the perf lines), OFF in an obfuscated build (LPH_OBFUSCATED folds to true
@@ -192,7 +193,7 @@ local CFG = {
 	PressVert = 4, -- vertical contact window
 	ChargeTackleRange = 10, -- slide at a kick-charging carrier / his shot line only within this many studs of him
 	KillerGuard = true, -- ball near OUR goal and we are close to it: slide the enemy nearest to the ball first, keep chasing
-	KillerGuardGoal = 55, -- ball this close to our goal (studs)
+	KillerGuardGoal = 100, -- ball this close to our goal (studs)
 	KillerGuardNear = 22, -- we are this close to the ball
 	KillerGuardFoe = 40, -- the enemy must be this close to the ball
 	CandidateKiller = true, -- AutoBall x AutoTackle: slide an enemy who runs for the same loose ball (stun him, and the slide is faster than a run)
@@ -223,7 +224,7 @@ local CFG = {
 	TrendVel = true, -- long predictions follow where a zig-zag goes, not the last zig
 	TrendWindow = 0.7,
 	BlockFarGoal = 100, -- carrier farther than this from our mouth: mark his teammate closer to our goal
-	BlockGoalRange = 70,
+	BlockGoalRange = 100,
 	BlockDanger = true, -- AutoBlock near our goal: block only a carrier who has an open shot past our keeper
 	BlockOpenAngle = 5, -- degrees of open mouth (past the keeper) that make him a shooter
 	BlockShotSpeed = 90, -- shot speed assumed before his charge is replicated (st/s) -- carrier within BlockFarGoal and nobody of ours on him: start the block from this far
@@ -280,7 +281,7 @@ local CFG = {
 	PassManualNear = 16, -- a teammate closer than this is only chosen when nobody farther is passable
 	PassShow = true, -- lime trajectory + brackets on the selected teammate
 	PassFov = 9, -- new lock: crosshair within this many degrees of his chest
-	PassNearGoal = 80, -- within this many studs of their goal (ball or target) the pass goes ON the teammate, not ahead of him (0 = off)
+	PassNearGoal = 100, -- within this many studs of their goal (ball or target) the pass goes ON the teammate, not ahead of him (0 = off)
 	PassNearLead = 3, -- ... the lead is capped at this many studs there
 	PassGoalLead = 34, -- the predicted receive point never gets closer than this to the enemy goal (the keeper takes it there)
 	PassKeeperRadius = 14, -- keeper this close to the landing point -> contested
@@ -291,7 +292,7 @@ local CFG = {
 	PassToKeeper = false,
 	PassGoalBias = 0.3, -- the receive point leads along his speed turned this share toward their goal (0 = straight extrapolation)
 	PassCross = true, -- a mate in the box area: the lob is aimed to where he catches it in a jump
-	PassCrossZone = 60, -- cross when he is this close to their goal (and farther than PassCrossMin) ...
+	PassCrossZone = 100, -- cross when he is this close to their goal (and farther than PassCrossMin) ...
 	PassCrossMin = 12,
 	PassCrossAhead = 2, -- ... and the ball ends this many studs beyond him toward the goal
 	PassCrossJump = 0.6, -- catch height as a share of the jump (0 = standing receive height)
@@ -8404,7 +8405,8 @@ Mark.wallTick = function(root, oid, own)
 	-- no equip while we hold the ball: an item in hand blocks the ball controls
 	local equip = CFG.WallEquip ~= false and not own
 	-- 1) the shot being charged goes into our mouth
-	if not own and CFG.WallShot ~= false and Mark.wallVsShot(root, equip) then
+	-- the keeper saves a shot with the dive / catch: a wall in front of our own mouth only blocks him
+	if not own and CFG.WallShot ~= false and not Mark.meKeeper() and Mark.wallVsShot(root, equip) then
 		return
 	end
 	-- 2) a slide at us while we hold the ball: its box path (origin + heading * the dump's slide travel)
@@ -11488,7 +11490,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v162")
+	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v163")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -11908,7 +11910,12 @@ Mark.duelSolve = function(o)
 					local close = math.max(dE - mid - travelM * o.mLo, 0)
 					local Q = o.O + u * math.min(run(u, tp), close)
 					local m = (flat(E - Q).Magnitude - mid) / travelM
-					if m >= o.mLo * 0.85 and m <= o.mHi * 1.1 then
+					-- Airborne slide at range: the slide keeps only the X/Z rig, the body falls on gravity while the dash runs (the
+					-- box is 5 studs high around the root), so from the air a long slide is a guess about where we are 0.4 s on
+					-- (user: at ~16 st tackle INTO him while he is on the ground, or come closer). In the air only a short slide.
+					local airSlide = td ~= "ground"
+					local farSlide = airSlide and flat(E - Q).Magnitude > (CFG.CounterAirSlide or 11) and E.Y > o.floor + 2.5
+					if not farSlide and m >= o.mLo * 0.85 and m <= o.mHi * 1.1 then
 						m = math.clamp(m, o.mLo, o.mHi)
 						local hits, tHit = 0, nil
 						for k = 0, 6 do
@@ -16461,7 +16468,7 @@ Mark.akTry = function(tag, model, r, urgent)
 	local goal = Mark.defendGoal()
 	if ball and goal and flat(ball - r.Position).Magnitude < 7 then
 		local own = unitOrNil(flat(goal.Position - root.Position))
-		if own and own:Dot(plan.aim) > 0.5 and flat(goal.Position - root.Position).Magnitude < 70 then
+		if own and own:Dot(plan.aim) > 0.5 and flat(goal.Position - root.Position).Magnitude < (CFG.NearGoal or 100) then
 			Mark.akApproach = nil
 			return false, "ownside"
 		end
@@ -16774,6 +16781,19 @@ Mark.planJump = function(root, samples, ts, spd)
 	local reachHi = front.CFrameOffset.Y + front.Size.Y * 0.5
 	local reachXZ = front.Size.X * 0.5 + (-front.CFrameOffset.Z)
 	local jumpH = Mark.jumpH or 7.2
+	local gain = CFG.BallJumpGain or 0.3
+	-- A jump is worth it only if the ball would not be standing-reachable soon after the contact: a ball that drops into
+	-- reach 0.1 s after it passes the jump height is on the ground by the time the body is up (log: jump at t 0.25, h 7.0
+	-- of a ball that landed in front of us - the jump only delayed the receive).
+	local function worth(i)
+		for j = i + 1, #samples do
+			local h = samples[j].Y - root.Position.Y
+			if h <= reachHi and flat(samples[j] - root.Position).Magnitude <= reachXZ + spd * math.min(ts[j], 0.5) then
+				return ts[j] - ts[i] >= gain
+			end
+		end
+		return true
+	end
 	for i = 2, #samples do
 		local t = ts[i]
 		if t > 1.25 then
@@ -16787,10 +16807,10 @@ Mark.planJump = function(root, samples, ts, spd)
 			local flatD = flat(p - root.Position).Magnitude
 			-- already under the arc: jump up to 0.28 s early (the hold covers it). Running in: 0.18 s, not the old 0.1 s window that a skipped frame missed.
 			if flatD <= reachXZ + 2 and d >= -0.04 and d <= 0.14 then
-				return t, h
+				return worth(i) and t or nil, h
 			end
 			if d >= -0.04 and d <= 0.10 and flatD <= reachXZ + spd * math.min(t, 0.5) then
-				return t, h
+				return worth(i) and t or nil, h
 			end
 		end
 	end
@@ -17251,7 +17271,7 @@ Mark.routePlan = function(c)
 				local cand = { kind = mode == "air" and "jump" or mode, p = p, t = tb, tUs = tU, way = p, td = td }
 				if mode == "jump" then
 					run = run or cand -- kept only if no plain run comes within JumpGain of it
-				elseif run and tb - run.t > (CFG.BallJumpGain or 0.12) then
+				elseif run and tb - run.t > (CFG.BallJumpGain or 0.3) then
 					break
 				else
 					run = cand
@@ -17259,7 +17279,7 @@ Mark.routePlan = function(c)
 				end
 			end
 		end
-		if run and tb - run.t > (CFG.BallJumpGain or 0.12) then
+		if run and tb - run.t > (CFG.BallJumpGain or 0.3) then
 			break
 		end
 	end
@@ -18024,6 +18044,10 @@ Mark.tickBall = function(character, root)
 		end
 	elseif landed then
 		jumpAt, jumpMeet = Mark.planJump(root, samples, ts, spd)
+		-- the route already has this ball earlier on the ground (a run / slide contact): no jump after it
+		if jumpAt and plan and plan.t and plan.kind ~= "rest" and plan.t <= jumpAt + 0.05 then
+			jumpAt = nil
+		end
 	end
 	local slideDir = slidePress and slidePress.phi
 	-- CandidateKiller first: an enemy racing us for this ball and a slide within KillerAngle of our route that hits him.
@@ -22035,66 +22059,6 @@ return function(_Lib, _Core)
 			return keep(ctx.keybind(sec, { Name = name, Flag = fl(key), Toggle = fn }))
 		end
 
-		local function color(sec, name, role)
-			return keep(sec:Colorpicker({
-				Name = name,
-				Default = COL[role],
-				Callback = function(c)
-					COL[role] = c
-				end,
-			}, fl("COL_" .. role)))
-		end
-
-		-- art palettes: a 48-step LUT is cached per palette TABLE, so a colour change swaps in a new table
-		local function palette(sec, kind, names)
-			local pal = Mark.artPal and Mark.artPal[kind]
-			if not pal then
-				return
-			end
-			for i = 1, 3 do
-				keep(sec:Colorpicker({
-					Name = names[i],
-					Default = pal[i],
-					Callback = function(c)
-						local old = Mark.artPal[kind]
-						local new = { old[1], old[2], old[3] }
-						new[i] = c
-						Mark.artPal[kind] = new
-					end,
-				}, fl("PAL_" .. kind .. i)))
-			end
-		end
-
-		-- Everything built inside fn() sits behind one toggle at the bottom of the card. Hidden controls keep
-		-- their value and stay in the config; the toggle itself is saved too, so the card opens as you left it.
-		local function advanced(sec, key, fn, label)
-			local els, shown = {}, false
-			local function apply()
-				for _, e in ipairs(els) do
-					Mark.try(function()
-						e:SetVisibility(shown)
-					end)
-				end
-			end
-			keep(sec:Divider())
-			sec:Toggle({
-				Name = label or "Show Advanced Settings",
-				Default = false,
-				Callback = function(v)
-					shown = v and true or false
-					apply()
-				end,
-			}, fl("ADV_" .. key))
-			local outer = cap
-			cap = els
-			local ok, err = Mark.try(fn)
-			cap = outer
-			if not ok then
-				logFile("ui advanced", key, tostring(err))
-			end
-			apply()
-		end
-
 		local function block(name, fn)
 			local ok, err = Mark.try(fn)
 			if not ok then
@@ -22120,177 +22084,74 @@ return function(_Lib, _Core)
 			{ "airLow", "Air Low" },
 		}
 
+		-- ==================================================================================================
+		-- AUTOSHOOT: what it shoots, how it fools the keeper, flicks
+		-- ==================================================================================================
 		block("AutoShoot", function()
 			local tab = T.AutoShoot
 
-			-- left column ------------------------------------------------------------------------------------
 			local s = card(tab, "Left")
 			head(s, "AutoShoot")
 			feature(s, "AutoShoot", "AutoShoot")
-			tog(s, "Quick Solve", "ShootQuick", "Faster shot search for weak PCs.")
 			sld(s, "Max Distance", "ShootMaxDist", 20, 160, { suffix = " st" })
-			sld(s, "Keeper Margin", "ShotReachMargin", -0.2, 0.5, { prec = 2, suffix = " s", text = "How late the keeper must be for a shot to count." })
-
-			local pr = card(tab, "Left")
-			head(pr, "Priority")
-			pick(pr, "Try First", "TryFirst", { { "FAKE", "FAKE" }, { "Normal Shot", "NORMAL" }, { "Bounce FAKE", "BOUNCE" } }, "The rest follow it, the normal shot comes last.", function(v)
+			tog(s, "Quick Solve", "ShootQuick", "Faster shot search for weak PCs.")
+			drop(s, "Shot Curve", "ShotCurve", { "Full", "Light", "Off" }, "How much the shot may bend. Off = straight shots only.")
+			typeList(s, "Allowed Shots", "ShotBan", "ShotTypes", SHOT_TYPES, "Unchecked shots are never used.")
+			pick(s, "Try First", "TryFirst", { { "FAKE", "FAKE" }, { "Normal Shot", "NORMAL" }, { "Bounce FAKE", "BOUNCE" } }, nil, function(v)
 				CFG.PriorityFAKE = v == "FAKE"
 				CFG.PriorityBounceFAKE = v == "BOUNCE"
 			end, (CFG.PriorityBounceFAKE and "BOUNCE") or (CFG.PriorityFAKE and "FAKE") or "NORMAL")
-			sld(pr, "FAKE Chance", "FakeFirstChance", 0, 100, { scale = 100, suffix = "%", text = "When a teammate is open and FAKE is tried first." })
-			tog(pr, "Wait For Keeper Dive", "FakeAfterDiveBan", "No FAKE while the enemy keeper's dive is on cooldown.")
-			tog(pr, "Shoot After Bounce FAKE", "FakeOnceThenShoot", "After one worked, no fakes until the ball is lost.")
-
-			-- Feint: the controls that do not apply to the chosen mode are hidden
-			local fe = card(tab, "Left")
-			head(fe, "Feint")
-			local chanceEl, countEl, atEl, atNote, skipEl, smartEl, smartNote, compEl
-			local function feintVis(mode)
-				mode = mode or CFG.FeintMode or "Off"
-				local rows = { { chanceEl, mode == "Chance" }, { countEl, mode == "Count" }, { atEl, mode ~= "Off" }, { skipEl, mode ~= "Off" }, { smartEl, mode ~= "Off" }, { atNote, mode ~= "Off" }, { smartNote, mode ~= "Off" }, { compEl, mode ~= "Off" } }
-				for i = 1, 8 do
-					local el, on = rows[i][1], rows[i][2]
-					if el then
-						Mark.try(function()
-							el:SetVisibility(on)
-						end)
-					end
-				end
-			end
-			pick(fe, "Mode", "FeintMode", { { "Off", "Off" }, { "Chance", "Chance" }, { "Count", "Count" } }, "Chance: rolled per charge. Count: N feints, then a real shot.", feintVis)
-			chanceEl = sld(fe, "Chance", "FeintChance", 0, 100, { scale = 100, suffix = "%" })
-			countEl = sld(fe, "Feints In A Row", "FeintCount", 1, 5)
-			atEl = sld(fe, "Cancel At", "FeintAt", 0.2, 0.38, { prec = 2, suffix = " s" })
-			atNote = note(fe, "Or when you release, if that comes first.")
-			smartEl = tog(fe, "Smart Select", "FeintSmart")
-			smartNote = note(fe, "No feint once the keeper has dived: the shot goes.")
-			compEl = tog(fe, "Competitor", "FeintCompetitor", "No feint while an outfield enemy is within 10 studs of the ball.")
-			do
-				local def = {}
-				if CFG.FeintSkipFake ~= false then
-					def[#def + 1] = "FAKE"
-				end
-				if CFG.FeintSkipBounce ~= false then
-					def[#def + 1] = "Bounce FAKE"
-				end
-				skipEl = fe:Dropdown({
-					Name = "Never Feint On",
-					Options = { "FAKE", "Bounce FAKE" },
-					Multi = true,
-					Default = def,
-					Callback = function(sel)
-						local on = {}
-						if type(sel) == "table" then
-							for k, v in pairs(sel) do
-								if v == true then
-									on[k] = true
-								elseif type(v) == "string" then
-									on[v] = true
-								end
-							end
-						end
-						CFG.FeintSkipFake = on["FAKE"] == true
-						CFG.FeintSkipBounce = on["Bounce FAKE"] == true
-					end,
-				}, fl("FeintSkip"))
-			end
-			feintVis()
-
-			local ds = card(tab, "Right")
-			head(ds, "Direction Spoof")
-			tog(ds, "Enabled", "DirSpoof", "Shows the keeper fake shot directions while you charge, then shoots for real.")
-			sld(ds, "Chance", "DirSpoofChance", 0, 100, { scale = 100, suffix = "%" })
-			sld(ds, "Fake Speed", "DirSpoofSpeed", 2, 40, { suffix = " /s", text = "How fast the fake aim slides between points. Max jumps instantly." })
-			tog(ds, "Show Fake Marker", "DrawSpoof", "Marks the fake aim point on the goal.")
-			drop(ds, "Preset", "DirSpoofPreset", { "Safe", "Normal", "Long", "Custom" }, "How long the fake shows and the body lies. Longer fools more but can pull the shot off target.")
-			tog(ds, "Smart Select", "DirSpoofSmart", "No spoof once the keeper has dived.")
-			head(ds, "Body Spoof")
-			tog(ds, "Enabled", "FaceSpoof", "Your body faces the wrong way to fool the keeper.")
-			drop(ds, "Mode", "FaceSpoofMode", { "smart", "spin", "side", "lookoff", "away", "decoy" })
-			drop(ds, "When", "FaceSpoofWhen", { "charge", "ball", "always" }, "Charge: while you charge a shot. Ball: while you have it.")
-			sld(ds, "Spin Speed", "FaceSpinSpeed", 1, 6, { prec = 1, suffix = " /s" })
-			advanced(ds, "Spoof", function()
-				sld(ds, "Custom Fake Time", "DirSpoofTime", 0.04, 0.24, { prec = 2, suffix = " s", text = "Preset Custom: how long the fake aim shows." })
-				sld(ds, "Custom Body Time", "FaceSpoofTime", 0.04, 0.24, { prec = 2, suffix = " s", text = "Preset Custom: how long the body lies." })
-			end)
-			local cv = card(tab, "Right")
-			head(cv, "Shot Curve")
-			drop(cv, "Curve", "ShotCurve", { "Full", "Light", "Off" }, "How much the solver may bend a shot. Off = straight shots only.")
-
-			local b = card(tab, "Left")
-			head(b, "Bounce FAKE")
-			tog(b, "Enabled", "BounceFAKE", "A shot that bounces off a wall and comes back to you.")
-			sld(b, "Chance", "BounceFakeChance", 0, 100, { scale = 100, suffix = "%" })
-			sld(b, "Extra Height", "BounceFakeHeight", 0, 10, { prec = 1, suffix = " st", text = "Raises the aim points, out of the keeper's jump." })
-			sld(b, "Max Distance To Goal", "BounceFakeRange", 30, 160, { suffix = " st" })
-			advanced(b, "BounceFake", function()
-				sld(b, "Run Allowance", "BounceFakeRun", 4, 24, { suffix = " st", text = "How far you may run for the returning ball." })
-				sld(b, "Return Slack", "BounceFakeSlack", 0.5, 8, { prec = 1, suffix = " st" })
-				sld(b, "Walls Tried", "BounceFakeMaxSim", 2, 20, { text = "Higher finds more, delays the preview." })
-				sld(b, "Flight Steps", "BounceFakeSteps", 20, 90)
-			end)
 
 			local v = card(tab, "Left")
 			head(v, "Shot Preview")
 			tog(v, "Show Preview", "DrawShot")
-			drop(v, "Style", "ShotStyle", { "aurora", "classic" }, "Classic uses the colors from Visuals.")
-			if Mark.artPal then
-				head(v, "High Shots")
-				palette(v, "hi", { "Color 1", "Color 2", "Color 3" })
-				head(v, "Low Shots")
-				palette(v, "lo", { "Color 1", "Color 2", "Color 3" })
-				head(v, "Curled Shots")
-				palette(v, "curl", { "Color 1", "Color 2", "Color 3" })
-			end
+			drop(v, "Style", "ShotStyle", { "aurora", "classic" })
 
-			-- right column -----------------------------------------------------------------------------------
-			local ty = card(tab, "Right")
-			head(ty, "Shot Types")
-			typeList(ty, "Allowed Types", "ShotBan", "ShotTypes", SHOT_TYPES, "Unchecked types are never used.")
-			tog(ty, "Prefer Corner Curl", "PreferCornerCurl")
-			tog(ty, "Only Trick / Dip", "OnlyTrick")
-			advanced(ty, "Weights", function()
-				note(ty, "100% = default mix. 0% = never, 200% = twice as often.")
-				for _, t in ipairs(SHOT_TYPES) do
-					keep(ty:Slider({
-						Name = t[2],
-						Default = math.clamp(round(((CFG.ShotWeight and CFG.ShotWeight[t[1]]) or 1) * 100, 0), 0, 300),
-						Minimum = 0,
-						Maximum = 300,
-						Precision = 0,
-						Suffix = "%",
-						Callback = function(x)
-							CFG.ShotWeight = CFG.ShotWeight or {}
-							CFG.ShotWeight[t[1]] = x / 100
-						end,
-					}, fl("W_" .. t[1])))
-				end
-			end, "Edit Weights")
-
-			local f = card(tab, "Right")
-			head(f, "FAKE")
-			tog(f, "Enabled", "FakeShot", "A shot through a teammate in front of goal.")
-			tog(f, "Friends First", "PrioritizeFriends")
-			tog(f, "Curved FAKE", "FakeCurve")
-			tog(f, "Corner Name", "FakeCorner", "Labels it FAKE CORNER when it lands in a corner.")
-			advanced(f, "Fake", function()
-				head(f, "Teammate Rules")
-				sld(f, "Max Distance To Goal", "FakeMaxDepth", 30, 160, { suffix = " st" })
-				sld(f, "Defender Clearance", "FakeFoeRadius", 2, 14, { suffix = " st", text = "An enemy this close to him takes the ball." })
-				sld(f, "Side Tolerance", "FakeLatMul", 1, 3, { prec = 1, suffix = "x", text = "How far off the goal his line may be. Curves bend it back." })
-				sld(f, "Slack", "FakeSlop", 1, 12, { suffix = " st" })
-				sld(f, "Fallback Chance", "FakeChance", 0, 100, { scale = 100, suffix = "%", text = "Used when FAKE is not tried first." })
-			end)
-
-			local fk = card(tab, "Right")
+			local fk = card(tab, "Left")
 			head(fk, "Flick")
 			tog(fk, "Auto Flick", "AutoFlick", "The flick key runs flick, jump and volley for you.")
 			tog(fk, "Auto Jump", "FlickAutoJump")
 			tog(fk, "Auto Kick", "FlickAutoKick", "Off: you kick, the aim stays locked.")
-			typeList(fk, "Flick Shot Types", "FlickBan", "FlickTypes", SHOT_TYPES, "Used while a flick or volley is aimed.")
-			advanced(fk, "Flick", function()
-				sld(fk, "Jump Timing", "AerialJumpLead", 0.1, 0.5, { prec = 2, suffix = " s", text = "Jumps this long before the ball arrives." })
-			end)
+			typeList(fk, "Flick Shots", "FlickBan", "FlickTypes", SHOT_TYPES, "Shots used while a flick or volley is aimed.")
+
+			local f = card(tab, "Right")
+			head(f, "FAKE")
+			tog(f, "Enabled", "FakeShot", "A shot through a teammate in front of goal.")
+			sld(f, "Chance", "FakeFirstChance", 0, 100, { scale = 100, suffix = "%" })
+			head(f, "Bounce FAKE")
+			tog(f, "Enabled", "BounceFAKE", "A shot that bounces off a wall back to you.")
+			sld(f, "Chance", "BounceFakeChance", 0, 100, { scale = 100, suffix = "%" })
+
+			local fe = card(tab, "Right")
+			head(fe, "Feint")
+			local chanceEl, countEl
+			local function feintVis(mode)
+				mode = mode or CFG.FeintMode or "Off"
+				if chanceEl then
+					Mark.try(function()
+						chanceEl:SetVisibility(mode == "Chance")
+					end)
+				end
+				if countEl then
+					Mark.try(function()
+						countEl:SetVisibility(mode == "Count")
+					end)
+				end
+			end
+			pick(fe, "Mode", "FeintMode", { { "Off", "Off" }, { "Chance", "Chance" }, { "Count", "Count" } }, "Cancels the charge before the shot. Chance: random. Count: N feints, then a real shot.", feintVis)
+			chanceEl = sld(fe, "Chance", "FeintChance", 0, 100, { scale = 100, suffix = "%" })
+			countEl = sld(fe, "Feints In A Row", "FeintCount", 1, 5)
+			feintVis()
+
+			local ds = card(tab, "Right")
+			head(ds, "Direction Spoof")
+			tog(ds, "Enabled", "DirSpoof", "Shows the keeper fake aim points while you charge, then shoots for real.")
+			drop(ds, "Preset", "DirSpoofPreset", { "Safe", "Normal", "Long" }, "How long the fake shows. Longer fools more but can pull the shot off target.")
+			sld(ds, "Fake Speed", "DirSpoofSpeed", 2, 40, { suffix = " /s", text = "How fast the fake aim moves between points. Max = instant." })
+			tog(ds, "Show Fake Marker", "DrawSpoof")
+			head(ds, "Body Spoof")
+			tog(ds, "Enabled", "FaceSpoof", "Your body turns the wrong way while you charge.")
+			drop(ds, "Mode", "FaceSpoofMode", { "smart", "spin", "side", "lookoff", "away", "decoy" })
 		end)
 
 		-- ==================================================================================================
@@ -22299,11 +22160,9 @@ return function(_Lib, _Core)
 		block("Defense", function()
 			local tab = T.Defense
 
-			-- AutoTackle -----------------------------------------------------------------------------------
 			local s = card(tab, "Left")
 			head(s, "AutoTackle")
 			feature(s, "AutoTackle", "AutoTackle")
-			sld(s, "Confidence", "TackleConfidence", 0, 100, { scale = 100, suffix = "%", text = "Share of the hit window that must still connect. 0 = any." })
 			sld(s, "Reach", "TackleReach", 8, 30, { suffix = " st" })
 			sld(s, "Slide Power", "TackleSpeed", 0.8, 1.6, {
 				prec = 2, suffix = "x",
@@ -22314,130 +22173,57 @@ return function(_Lib, _Core)
 			pick(s, "Priority", "TackleVsBlock", { { "Block First", "block" }, { "Smart", "smart" }, { "Tackle First", "tackle" } }, "Block First: waits for AutoBlock while it is on him.")
 			tog(s, "Competitor Check", "TackleCompetitor", "Skips a carrier a teammate is already on.")
 			tog(s, "Tackle On Dribble", "TackleOnDribble", "Slides only after he has used his dribble.")
-			sld(s, "Competitor Radius", "TackleCompetitorRadius", 3, 25, { suffix = " st" })
-			head(s, "Charging Carrier")
-			tog(s, "Charge Guard", "ChargeTackleGuard", "Slide only if it lands before his release.")
-			tog(s, "Slide Across The Shot", "ChargeSlideBlock")
+			tog(s, "Show Prediction", "DrawTackle")
 			head(s, "Manual Tackle")
-			tog(s, "Manual Tackle", "ManualTackle", "Your own tackle press is aimed at the carrier.")
-			bind(s, "Manual Tackle Key", "KB_ManualTackle", function()
+			tog(s, "Enabled", "ManualTackle", "Your own tackle press is aimed at the carrier.")
+			bind(s, "Key", "KB_ManualTackle", function()
 				Mark.manualFire()
 			end)
-			head(s, "Visual")
-			tog(s, "Show Prediction", "DrawTackle")
-			drop(s, "Sight Style", "SightStyle", { "reticle", "classic" })
-			advanced(s, "Tackle", function()
-				sld(s, "Goal Zone", "TackleGoalZone", 0, 80, { suffix = " st", text = "Near our goal, tackle without waiting for AutoBlock." })
-				sld(s, "Max Block Wait", "TackleHoldMax", 0.2, 2, { prec = 1, suffix = " s", text = "Block First: longest the tackle waits for the block." })
-				sld(s, "Track Radius", "TrackStuds", 30, 160, { suffix = " st" })
-				sld(s, "Min Slide Power", "TackleMinSpeed", 0.3, 1.2, { prec = 2, suffix = "x" })
-				sld(s, "Charge Range", "ChargeTackleRange", 4, 20, { suffix = " st" })
-				sld(s, "Manual Radius", "ManualRadius", 8, 50, { suffix = " st" })
-			end)
 
-			-- AutoBlock ------------------------------------------------------------------------------------
 			local b = card(tab, "Left")
 			head(b, "AutoBlock")
 			feature(b, "AutoBlock", "AutoBlock")
 			sld(b, "Range", "BlockRange", 15, 80, { suffix = " st" })
 			tog(b, "Competitor Check", "BlockCompetitor", "Stops when a teammate is already on the carrier.")
-			sld(b, "Competitor Radius", "CompetitorRadius", 4, 30, { suffix = " st" })
-			sld(b, "Ignore Near Our Goal", "CompetitorGoalZone", 0, 90, { suffix = " st", text = "Near our goal, chase even if a teammate is on him. 0 = off." })
-			head(b, "High Shots")
-			tog(b, "Pre-Release Jump", "BlockPreJump", "Jumps before the release, timed to his charge.")
-			tog(b, "Slide Block", "BlockSlide")
 			tog(b, "Defend Goal", "BlockGoal", "Gets in the way of shots at our goal.")
-			tog(b, "Pass Solver", "BlockSmart", "If he cannot score, cuts the pass to his teammate.")
-			tog(b, "Read His Charge", "BlockPassRead", "Cuts his pass when he charges it.")
-			tog(b, "Cover Shadow", "BlockShade", "Covers the goal and his best pass.")
 			tog(b, "Press Alone", "BlockPressIso", "Closes in on a carrier who has nobody to pass to.")
-			tog(b, "Press Open Shot", "BlockPressOpen", "Closes in on a carrier with a clear shot at your goal.")
-			tog(b, "Shot Danger", "BlockDanger", "Blocks a carrier who has an open shot.")
+			tog(b, "Press Open Shot", "BlockPressOpen", "Closes in on a carrier with a clear shot.")
+			tog(b, "Pre-Release Jump", "BlockPreJump", "Jumps before the release, timed to his charge.")
+			tog(b, "Slide Block", "BlockSlide", "Slides across a shot.")
 			tog(b, "Show Marking", "DrawBlock", "The pass lane and where you cut it.")
-			tog(b, "Behind Logic", "BlockBehindLogic", "Behind the carrier: take the next attacker, else cut him off.")
-			advanced(b, "Block", function()
-				sld(b, "Opposition Depth", "BlockOppDepth", 3, 12, { prec = 1, suffix = " st", text = "How far in front of him you first set up." })
-				sld(b, "Far From Goal", "BlockFarGoal", 40, 200, { suffix = " st" })
-				sld(b, "Behind Receiver Gap", "BlockBehindRcv", 6, 40, { suffix = " st" })
-				sld(b, "Near Goal Range", "BlockGoalRange", 30, 120, { suffix = " st" })
-				sld(b, "Mark Gap", "BlockMarkGap", 2, 10, { prec = 1, suffix = " st" })
-				sld(b, "No-Shot Angle", "BlockShotAngle", 3, 25, { suffix = "°" })
-				sld(b, "Open Goal Angle", "BlockOpenAngle", 1, 20, { suffix = "°", text = "How much open goal past our keeper makes him a shooter." })
-				sld(b, "Shot Speed", "BlockShotSpeed", 50, 150, { suffix = " st/s", text = "Shot speed assumed before his charge is seen." })
-				sld(b, "Pass Speed", "BlockPassSpeed", 40, 140, { suffix = " st/s" })
-				sld(b, "Cut Margin", "BlockInterceptMargin", 0, 0.8, { prec = 2, suffix = " s" })
-				sld(b, "Marked Radius", "BlockCoverRadius", 3, 16, { suffix = " st" })
-				sld(b, "Behind Limit", "BlockBehind", 8, 40, { suffix = " st", text = "How far behind the carrier it may still start." })
-				sld(b, "Stand Closer By", "BlockCloser", -1, 3, { prec = 1, suffix = " st" })
-				sld(b, "Min Gap", "BlockGapMin", 1, 6, { prec = 1, suffix = " st" })
-				sld(b, "Close In To", "BlockMaxDepth", 3, 26, { suffix = " st" })
-				sld(b, "Goal Threat Window", "BlockGoalTime", 1, 5, { prec = 1, suffix = " s", text = "How early Defend Goal reacts." })
-			end)
 
-			-- AutoKick -------------------------------------------------------------------------------------
 			local k = card(tab, "Left")
 			head(k, "AutoKick")
 			feature(k, "AutoKick", "AutoKick")
 			note(k, "Kicks the ball off the carrier.")
-			tog(k, "Run To Kick", "AutoKickMove", "Moves you to the carrier while a kick charges, yours too.")
-			tog(k, "Always Full Charge", "AutoKickFull", "Always charges the kick fully.")
-			sld(k, "Confidence", "AutoKickConf", 0.3, 0.95, { prec = 2, text = "How sure the hit must be." })
+			tog(k, "Run To Kick", "AutoKickMove", "Moves you to the carrier while the kick charges.")
+			tog(k, "Full Charge", "AutoKickFull", "Always charges the kick fully.")
 			sld(k, "Range", "AutoKickRange", 2, 30, { prec = 1, suffix = " st" })
-			advanced(k, "Kick", function()
-				sld(k, "Cooldown", "AutoKickCooldown", 0.2, 2, { prec = 2, suffix = " s" })
-				sld(k, "Run-Up", "AutoKickLead", 0.1, 1, { prec = 2, suffix = " s" })
-				sld(k, "Cancel Under", "AutoKickCancel", 0.05, 0.6, { prec = 2 })
-			end)
+			head(k, "Kick Helper")
+			tog(k, "Enabled", "KickHelper", "Turns you to the carrier while you charge a kick.")
 
-			-- Kick Helper -----------------------------------------------------------------------------------
-			local kh = card(tab, "Right")
-			head(kh, "Kick Helper")
-			tog(kh, "Enabled", "KickHelper", "Turns you to the carrier while you charge a kick.")
-			sld(kh, "Range", "KickHelperRange", 10, 80, { suffix = " st" })
-
-			-- AutoDribble ----------------------------------------------------------------------------------
 			local d = card(tab, "Right")
 			head(d, "AutoDribble")
 			feature(d, "AutoDribble", "AutoDribble")
 			tog(d, "Agent Addon", "AgentAddon", "Dodges through the tackler.")
 			tog(d, "Show Threat", "DrawDanger")
-			advanced(d, "Dribble", function()
-				sld(d, "React Range", "DribbleReact", 10, 40, { suffix = " st" })
-				sld(d, "Close Range", "DribbleClose", 5, 25, { suffix = " st" })
-				sld(d, "Margin", "DribbleSlop", 1, 8, { prec = 1, suffix = " st" })
-			end)
 
-			-- AutoDodge ------------------------------------------------------------------------------------
 			local dg = card(tab, "Right")
 			head(dg, "AutoDodge")
 			feature(dg, "AutoDodge", "AutoDodge")
 			note(dg, "Dodges tackles and keeps you out of blasts.")
 			pick(dg, "Dodge Mode", "DodgeTeleport", { { "Teleport + Movement", true }, { "Movement Only", false } }, "Movement Only never moves the character by CFrame.")
 			tog(dg, "Pass Instead", "PassAssistSync", "Passes the ball away when you can't escape.")
-			tog(dg, "Show Danger Zones", "DrawHazard", "Shows where blasts and projectiles will hit.")
-			advanced(dg, "Dodge", function()
-				head(dg, "Projectiles")
-				sld(dg, "Safe Margin", "ProjSafeMargin", 0, 4, { prec = 1, suffix = " st" })
-				sld(dg, "Punch Radius", "ProjHitRadius", 2, 10, { prec = 1, suffix = " st" })
-				head(dg, "Hazards")
-				sld(dg, "Blast Margin", "BlastMargin", 0, 5, { prec = 1, suffix = " st" })
-				sld(dg, "Pass Before Blast", "HazPassSlack", 0, 6, { prec = 1, suffix = " st", text = "Passes if the escape is this close." })
-				sld(dg, "Mine Margin", "MineMargin", 0, 6, { prec = 1, suffix = " st" })
-			end)
+			tog(dg, "Show Danger Zones", "DrawHazard", "Where blasts and projectiles will hit.")
 
-			-- CounterJump ----------------------------------------------------------------------------------
 			local c = card(tab, "Right")
 			head(c, "CounterJump")
 			feature(c, "CounterJump", "CounterJump")
 			note(c, "Stops enemies in the air and their flicks.")
-			tog(c, "Show Plan", "DrawDuel", "Shows the counter as lightning.")
 			tog(c, "Move To Him", "CounterMove", "Runs you to the take-off point.")
 			tog(c, "Counter Tackle", "CounterTackle", "Uses a tackle for the counter.")
 			tog(c, "Competitor Check", "CounterCompetitor", "Stops when a teammate is already on him.")
-			sld(c, "Competitor Radius", "CounterCompetitorRadius", 4, 30, { suffix = " st" })
-			advanced(c, "Counter", function()
-				sld(c, "Range", "CounterJumpRange", 8, 40, { suffix = " st" })
-			end)
+			tog(c, "Show Plan", "DrawDuel", "The counter drawn as lightning.")
 		end)
 
 		-- ==================================================================================================
@@ -22449,50 +22235,19 @@ return function(_Lib, _Core)
 			local g = card(tab, "Left")
 			head(g, "AutoGK")
 			feature(g, "AutoGK", "AutoGK")
-			note(g, "Reactions only: intercept, dive, press, return.")
+			note(g, "Saves: intercept, dive, press, return.")
 			tog(g, "Jump + Dive", "GkJumpDive", "For shots no ground dive reaches.")
-			tog(g, "Lost-Path Stand", "GkLostPath")
-			tog(g, "Auto Clear", "GkAutoClear")
-			advanced(g, "Gk", function()
-				sld(g, "Reaction", "GkReactSeconds", 0.05, 0.4, { prec = 2, suffix = " s" })
-				sld(g, "Walk Slack", "GkWalkSlack", 0, 0.3, { prec = 2, suffix = " s" })
-				sld(g, "Dive Late", "GkDiveLate", 0, 0.2, { prec = 2, suffix = " s", text = "Waits for the last moment to dive; 0 dives as soon as a save exists." })
-				sld(g, "Intercept Radius", "GkInterceptEnemy", 4, 30, { suffix = " st", text = "Free ball with an enemy this close: no run." })
-				sld(g, "Bait Reach", "GkBaitReach", 0, 6, { prec = 1, suffix = " st", text = "How far an enemy can step to take a fake." })
-				sld(g, "Bait Ray", "GkBaitRay", 0.5, 6, { prec = 1, suffix = " st" })
-				sld(g, "Lost-Path Share", "GkLostDiveFrac", 0.3, 1, { prec = 2 })
-			end)
+			tog(g, "Auto Clear", "GkAutoClear", "Clears the ball after a save.")
+			head(g, "Return")
+			tog(g, "Return After Push", "GkReturn", "Back to the spot after a shotgun or dash push.")
 
 			local p = card(tab, "Right")
 			head(p, "Press")
-			tog(p, "Press", "GkPress", "Dives into a carrier running at your goal.")
-			tog(p, "Press Jump", "GkPressJump", "Jump + dive at players in the air.")
+			tog(p, "Enabled", "GkPress", "Dives into a carrier running at your goal.")
 			tog(p, "Come Out", "GkPressMove", "Steps out to cut his angle.")
 			tog(p, "Last Man Only", "GkPressLastMan", "No press while another attacker can take the pass.")
 			tog(p, "Face Him", "GkPressFace", "Turns your body to him for the dive.")
 			tog(p, "Show Press", "DrawGk", "His possible paths and your dive.")
-			sld(p, "Confidence", "GkPressConf", 0.3, 0.95, { prec = 2, text = "How sure the dive must be." })
-			advanced(p, "GkPress", function()
-				sld(p, "Press Zone", "GkPressZone", 20, 140, { suffix = " st" })
-				sld(p, "Hit Margin", "GkPressRadiusFrac", 0.4, 1, { prec = 2 })
-				sld(p, "Dive Reach Share", "GkPressReachFrac", 0.5, 1, { prec = 2 })
-				sld(p, "Last-Second Confidence", "GkPressConfLate", 0.1, 0.9, { prec = 2 })
-				sld(p, "Last Second", "GkPressLate", 0.3, 1.5, { prec = 2, suffix = " s" })
-				sld(p, "Max Contact Time", "GkPressMaxT", 0.2, 0.6, { prec = 2, suffix = " s" })
-				sld(p, "Launcher Reaction", "GkLauncherReact", 0.05, 0.5, { prec = 2, suffix = " s", text = "Against item users: the latest dive allowed." })
-				sld(p, "Come Out Max", "GkPressOut", 2, 60, { suffix = " st" })
-				sld(p, "Come Out Zone", "GkPressMoveZone", 15, 120, { suffix = " st" })
-				sld(p, "Gap To Him", "GkPressGap", 4, 24, { suffix = " st" })
-				tog(p, "Any-Angle Dive", "GkPressExact", "Dives at any angle, not only 8 directions.")
-				tog(p, "Steer Dive", "GkPressHome")
-			end)
-
-			local r = card(tab, "Right")
-			head(r, "Return")
-			tog(r, "Return After Push", "GkReturn", "Back to the spot after a shotgun or dash push.")
-			advanced(r, "GkReturn", function()
-				sld(r, "Dive Back From", "GkReturnDive", 5, 30, { suffix = " st" })
-			end)
 		end)
 
 		-- ==================================================================================================
@@ -22508,26 +22263,16 @@ return function(_Lib, _Core)
 			sld(sa, "FOV", "SilentFov", 30, 400, { suffix = " px" })
 			tog(sa, "Show FOV Circle", "DrawSilentFov")
 			tog(sa, "Show Tracer", "DrawSilent")
-			advanced(sa, "Silent", function()
-				sld(sa, "Freeze Radius", "FreezeRadius", 3, 20, { prec = 1, suffix = " st", text = "Size of the freeze area." })
-			end)
 
 			local w = card(tab, "Right")
 			head(w, "AutoWall")
 			feature(w, "AutoWall", "AutoWall")
-			tog(w, "Auto Use", "WallEquip", "Takes out the barricades when needed.")
-			tog(w, "Block Projectiles", "BarricadeAddon", "Puts a wall on a projectile's path.")
-			tog(w, "Wall On Shot Path", "WallShot", "Walls a shot charged at our goal.")
+			tog(w, "Auto Use", "WallEquip", "Takes the barricades out when needed and puts them away.")
+			tog(w, "Block Projectiles", "BarricadeAddon", "A wall on a projectile's path.")
+			tog(w, "Wall On Shot Path", "WallShot", "A wall on a shot charged at our goal. Not used when you are the keeper.")
 			head(w, "Keeper Trap")
-			tog(w, "Enabled", "WallTrap", "Puts a wall between you and the enemy keeper's dive.")
-			tog(w, "Bait", "WallTrapBait", "Puts the wall up just before the keeper dives at you.")
-			sld(w, "Keeper Dive Range", "WallTrapTrigger", 4, 16, { prec = 1, suffix = " st" })
-			advanced(w, "Wall", function()
-				sld(w, "Body Reach", "WallReach", 8, 40, { suffix = " st", text = "Walls a chaser or the carrier within this distance." })
-				sld(w, "Body Window", "WallWindow", 0.15, 1, { prec = 2, suffix = " s", text = "He must hit the wall this soon after it appears." })
-				sld(w, "Put Away After", "WallEquipHold", 1, 10, { prec = 1, suffix = " s" })
-				sld(w, "Cooldown", "WallCooldown", 0.2, 3, { prec = 1, suffix = " s" })
-			end)
+			tog(w, "Enabled", "WallTrap", "A wall between you and the enemy keeper's dive.")
+			tog(w, "Bait", "WallTrapBait", "The wall goes up just before the keeper dives at you.")
 		end)
 
 		-- ==================================================================================================
@@ -22539,32 +22284,33 @@ return function(_Lib, _Core)
 			local ba = card(tab, "Left")
 			head(ba, "AutoBall")
 			feature(ba, "AutoBall", "AutoBall")
+			note(ba, "Runs, jumps and slides for a loose ball.")
 			tog(ba, "Competitor Check", "BallCompetitor", "Stops when a teammate is clearly closer to the ball.")
 			tog(ba, "Catch Flicks", "BallFlick", "Wins the ball from enemy flicks.")
-			sld(ba, "Body Range", "LobBodyRange", 0, 20, { suffix = " st", text = "Closer than this, take the lob with the body." })
-			sld(ba, "Competitor Gap", "BallYieldGap", 2, 20, { suffix = " st", text = "How much closer he must be." })
-			head(ba, "Rival Slide")
-			tog(ba, "Enabled", "CandidateKiller", "Slides an enemy who runs for the same ball.")
-			head(ba, "Goal Guard")
-			tog(ba, "Enabled", "KillerGuard", "Ball near our goal: slide the closest enemy first.")
-			advanced(ba, "Ball", function()
-				sld(ba, "Slide Gain", "RouteSlideGain", 0, 1.5, { prec = 2, suffix = " s", text = "A slide replaces the run if it gets there this much sooner." })
-				head(ba, "Rival Slide")
-				sld(ba, "Ball Radius", "KillerRadius", 8, 40, { suffix = " st" })
-				sld(ba, "Our Reach", "KillerReach", 10, 50, { suffix = " st" })
-				sld(ba, "Threat Margin", "KillerMargin", 0, 1.5, { prec = 2, suffix = " s" })
-				sld(ba, "Max Turn", "KillerAngle", 10, 90, { suffix = "°" })
-				sld(ba, "Intent Radius", "IntentTackleRadius", 20, 120, { suffix = " st" })
-				head(ba, "Goal Guard")
-				sld(ba, "Goal Distance", "KillerGuardGoal", 20, 100, { suffix = " st" })
-				sld(ba, "Ball Distance", "KillerGuardNear", 8, 40, { suffix = " st" })
-				sld(ba, "Enemy Distance", "KillerGuardFoe", 10, 80, { suffix = " st" })
-			end)
+			tog(ba, "Rival Slide", "CandidateKiller", "Slides an enemy who runs for the same ball.")
+			tog(ba, "Goal Guard", "KillerGuard", "Ball near our goal: slide the closest enemy first.")
 
-			local j = card(tab, "Right")
-			head(j, "Free Jump")
-			j:Keybind({
-				Name = "Free Jump Key",
+			local ply = card(tab, "Left")
+			head(ply, "Player")
+			feature(ply, "No Ragdoll", "NoRagdoll")
+			feature(ply, "No Knockback", "NoKnockback")
+			feature(ply, "No Stun", "NoStun")
+			feature(ply, "Infinite Stamina", "InfStamina")
+
+			local sp = card(tab, "Right")
+			head(sp, "Speed")
+			feature(sp, "Speed", "Speed")
+			pick(sp, "Mode", "SpeedMode", { { "CFrame", "CFrame" }, { "Pulse", "Pulse" } }, "CFrame: constant boost. Pulse: boost in bursts.")
+			sld(sp, "Speed", "SpeedValue", 20, 120, { suffix = " st/s" })
+			tog(sp, "Wall Check", "SpeedWall", "Stops you from running through walls.")
+
+			local jb = card(tab, "Right")
+			head(jb, "Jump Boost")
+			feature(jb, "Jump Boost", "JumpBoost")
+			sld(jb, "Jump Height", "JumpMult", 1, 3, { prec = 1, suffix = "x" })
+			head(jb, "Free Jump")
+			jb:Keybind({
+				Name = "Key",
 				Callback = function()
 					if UserInputService:GetFocusedTextBox() then
 						return
@@ -22577,45 +22323,12 @@ return function(_Lib, _Core)
 					end
 				end,
 			}, fl("KB_Jump"))
-			note(j, "A jump that costs no stamina.")
-
-			local fb = card(tab, "Right")
-			head(fb, "Force Bicycle")
-			bind(fb, "Force Bicycle Key", "KB_Bike", function()
+			note(jb, "A jump that costs no stamina.")
+			head(jb, "Force Bicycle")
+			bind(jb, "Key", "KB_Bike", function()
 				Mark.startBike()
 			end)
-			note(fb, "Jumps and bicycle-kicks the ball. Needs the ball.")
-
-			local sp = card(tab, "Right")
-			head(sp, "Speed")
-			feature(sp, "Speed", "Speed")
-			pick(sp, "Mode", "SpeedMode", { { "CFrame", "CFrame" }, { "Pulse", "Pulse" } }, "CFrame: constant boost. Pulse: boost in bursts.")
-			sld(sp, "Speed", "SpeedValue", 20, 120, { suffix = " st/s", text = "How fast you run." })
-			tog(sp, "Wall Check", "SpeedWall", "Stops you from running through walls.")
-			advanced(sp, "Speed", function()
-				head(sp, "Pulse")
-				sld(sp, "Burst", "SpeedPulseOn", 0.05, 1, { prec = 2, suffix = " s" })
-				sld(sp, "Pause", "SpeedPulseOff", 0.05, 1, { prec = 2, suffix = " s" })
-			end)
-
-			local jb = card(tab, "Right")
-			head(jb, "Jump Boost")
-			feature(jb, "Jump Boost", "JumpBoost")
-			sld(jb, "Jump Height", "JumpMult", 1, 3, { prec = 1, suffix = "x", text = "How high you jump." })
-			head(jb, "Infinite Stamina")
-			feature(jb, "Infinite Stamina", "InfStamina")
-			note(jb, "Sprint and jumps never drain stamina.")
-
-			local rc = card(tab, "Left")
-			head(rc, "No Ragdoll")
-			feature(rc, "No Ragdoll", "NoRagdoll")
-			note(rc, "You don't fall down when hit.")
-			head(rc, "No Knockback")
-			feature(rc, "No Knockback", "NoKnockback")
-			note(rc, "Shotguns and hits don't push you.")
-			head(rc, "No Stun")
-			feature(rc, "No Stun", "NoStun")
-			note(rc, "You can still sprint while stunned.")
+			note(jb, "Jumps and bicycle-kicks the ball. Needs the ball.")
 		end)
 
 		-- ==================================================================================================
@@ -22627,7 +22340,6 @@ return function(_Lib, _Core)
 			local s = card(tab, "Left")
 			head(s, "Overlay")
 			tog(s, "Draw Overlay", "Draw")
-			head(s, "Show")
 			tog(s, "Positions", "DrawPos")
 			tog(s, "Goal Frame", "DrawGoal")
 			tog(s, "Ball Mark", "DrawBall")
@@ -22635,36 +22347,13 @@ return function(_Lib, _Core)
 			tog(s, "Oil Puddles", "DrawHazards")
 			tog(s, "Kick Box", "DrawKickBox")
 			note(s, "Other visuals are in their own features.")
-			advanced(s, "Overlay", function()
-				sld(s, "Paint Rate", "PaintHz", 0, 240, { suffix = " Hz", text = "Only at 100+ fps. 0 = every frame." })
-			end)
 
 			local st = card(tab, "Right")
 			head(st, "Styles")
 			drop(st, "Positions", "PosStyle", { "phantom", "classic" })
 			drop(st, "Route Destination", "AgentSpotStyle", { "corners", "ripple", "kick" })
 			drop(st, "Route Line", "AgentPathStyle", { "flow", "classic" })
-			sld(st, "Route Opacity", "AgentPathAlpha", 0.15, 1, { prec = 2 })
-
-			local r = card(tab, "Right")
-			head(r, "Colors")
-			note(r, "Other colors are in their own features.")
-			if Mark.artPal then
-				head(r, "You")
-				palette(r, "live", { "Color 1", "Color 2", "Color 3" })
-				head(r, "Server Position")
-				palette(r, "srv", { "Color 1", "Color 2", "Color 3" })
-				head(r, "Alerts")
-				palette(r, "hot", { "Color 1", "Color 2", "Color 3" })
-			end
-			head(r, "Classic Style")
-			color(r, "Route / Ball Path", "Line")
-			color(r, "Tackle", "Tackle")
-			color(r, "Shadows", "Chalk")
-			color(r, "Highlights", "Paper")
-			color(r, "Lob / Curl", "Lob")
-			color(r, "Flat Shots", "Flat")
-			color(r, "Dodge", "Dodge")
+			drop(st, "Tackle Sight", "SightStyle", { "reticle", "classic" })
 		end)
 
 		-- ==================================================================================================
@@ -22675,33 +22364,15 @@ return function(_Lib, _Core)
 			head(p, "Pass Assist")
 			feature(p, "Pass Assist", "PassAssist")
 			note(p, "Aims your passes for you.")
-			tog(p, "Manual Pass", "PassManual", "One key passes to the best teammate.")
-			bind(p, "Manual Pass Key", "KB_ManualPass", function()
-				if CFG.PassManual then
-					Mark.paManual()
-				end
-			end)
 			tog(p, "Pass To Keeper", "PassToKeeper")
 			tog(p, "Crosses", "PassCross", "Near their goal, passes a bit past him to catch in a jump.")
 			tog(p, "Show Marks", "PassShow")
-			head(p, "Mark Colors")
-			palette(p, "lime", { "Mark 1", "Mark 2", "Mark 3" })
-			advanced(p, "Pass", function()
-				sld(p, "Lock Angle", "PassFov", 3, 25, { suffix = "°" })
-				sld(p, "Min Distance", "PassMinDist", 3, 30, { suffix = " st" })
-				sld(p, "Max Distance", "PassMaxDist", 40, 200, { suffix = " st" })
-				sld(p, "Manual Near Limit", "PassManualNear", 4, 40, { suffix = " st" })
-				head(p, "Landing")
-				sld(p, "Exact Pass Zone", "PassNearGoal", 0, 130, { suffix = " st", text = "Near their goal, pass to him, not ahead. 0 = off." })
-				sld(p, "Exact Pass Lead", "PassNearLead", 0, 10, { suffix = " st" })
-				sld(p, "Goal Lead", "PassGoalLead", 10, 60, { suffix = " st", text = "Receive point stays this far from their goal." })
-				sld(p, "Keeper Radius", "PassKeeperRadius", 4, 30, { suffix = " st" })
-				sld(p, "Goal Angle", "PassGoalSep", 2, 25, { suffix = "°" })
-				sld(p, "Run Toward Goal", "PassGoalBias", 0, 0.8, { prec = 2, text = "How much his run is expected to turn to their goal." })
-				sld(p, "Cross Zone", "PassCrossZone", 20, 100, { suffix = " st" })
-				sld(p, "Cross Past Him", "PassCrossAhead", 0, 6, { prec = 1, suffix = " st" })
-				sld(p, "Cross Catch Height", "PassCrossJump", 0, 1, { prec = 2, text = "Share of a jump: 0 = standing, 1 = top of the jump." })
-				sld(p, "Goal Zone", "PassGoalZone", 10, 70, { suffix = " st" })
+			head(p, "Manual Pass")
+			tog(p, "Enabled", "PassManual", "One key passes to the best teammate.")
+			bind(p, "Key", "KB_ManualPass", function()
+				if CFG.PassManual then
+					Mark.paManual()
+				end
 			end)
 		end)
 
@@ -22712,12 +22383,11 @@ return function(_Lib, _Core)
 			local tab = T.Debug
 
 			local s = card(tab, "Left")
-			head(s, "AutoShoot")
-			tog(s, "Debug Text", "ShotDebug", "Shot name, side, distance and curve under the crosshair.")
+			head(s, "Info")
+			tog(s, "Shot Debug Text", "ShotDebug", "Shot name, side, distance and curve under the crosshair.")
 			tog(s, "Status Text", "DrawHud", "Tackle, dribble and ball state, bottom left.")
-			sld(s, "Solver Budget", "ShootSliceMs", 0.3, 3, { prec = 1, suffix = " ms", text = "CPU per frame. Higher solves faster, hitches more." })
 
-			local lg = card(tab, "Left")
+			local lg = card(tab, "Right")
 			head(lg, "Log")
 			tog(lg, "Perf Probe", "Perf", "Writes ms per section into the log every 5 s.")
 			lg:Button({
@@ -22727,24 +22397,6 @@ return function(_Lib, _Core)
 					notify("Log", ok and "Saved: illegalsoccerlog.txt" or ("Failed: " .. tostring(err)))
 				end,
 			})
-
-			local ag = card(tab, "Right")
-			head(ag, "Agent Estimates")
-			note(ag, "Guessed values. Change only if something misses.")
-			head(ag, "Hazards")
-			sld(ag, "Oil Radius", "OilRadius", 2, 8, { prec = 1, suffix = " st" })
-			sld(ag, "Hammer Radius", "HammerRadius", 4, 16, { suffix = " st" })
-			head(ag, "Slide")
-			sld(ag, "Slide Lag", "SlideLag", 0, 120, { scale = 1000, suffix = " ms" })
-			sld(ag, "Min Ball Hits", "SlideMinHits", 1, 8, { text = "Of 11 samples the slide must hold the ball." })
-			sld(ag, "Run Ramp-Up", "BallRamp", 0, 0.6, { prec = 2, suffix = " s" })
-			head(ag, "Keeper Press")
-			sld(ag, "Contact Radius", "PressReach", 1, 5, { prec = 1, suffix = " st" })
-			sld(ag, "Contact Height", "PressVert", 1, 8, { prec = 1, suffix = " st" })
-			head(ag, "Wall")
-			sld(ag, "Latency", "WallLatency", 0, 300, { scale = 1000, suffix = " ms" })
-			sld(ag, "Margin", "WallMargin", 0, 0.5, { prec = 2, suffix = " s" })
-			sld(ag, "Half Width", "WallHalf", 3, 8, { prec = 2, suffix = " st" })
 		end)
 
 		task.defer(function()
