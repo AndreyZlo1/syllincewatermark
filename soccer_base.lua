@@ -221,6 +221,8 @@ local CFG = {
 	BlockDanger = true, -- AutoBlock near our goal: block only a carrier who has an open shot past our keeper
 	BlockOpenAngle = 5, -- degrees of open mouth (past the keeper) that make him a shooter
 	BlockShotSpeed = 90, -- shot speed assumed before his charge is replicated (st/s) -- carrier within BlockFarGoal and nobody of ours on him: start the block from this far
+	BlockPressIso = true, -- press a carrier who has nobody to pass to
+	BlockPressOpen = true, -- press a carrier with an open shot near our goal
 	BlockLevelSlack = 8, -- with a teammate on the carrier: mark an enemy at most this much farther from goal than him
 	BlockCoverRadius = 8, -- an enemy with one of ours this close is already marked
 	BlockMarkGap = 4, -- marking: stand this far from him toward the carrier (the pass lane)
@@ -2021,9 +2023,13 @@ local function solveIntercept(ourRoot, carrierRoot, carrierChar, tune)
 	local wait = nil
 	local iframe = 0
 	if carrierChar and Dodge.IsDribbling(carrierChar) then
+		-- Server time, not what we see: the Dribbling attribute reached us ping/2 after the server set it (untilT is that
+		-- late) and our press reaches the server ping/2 after we send it, so the iframe left at the server when our slide
+		-- starts is untilT - now - ping. The old value waited out the whole client-side dribble.
 		local rec = dribbleSeen[carrierChar]
-		iframe = (rec and rec.untilT) and math.max(0, rec.untilT - os.clock()) or Dodge.Constants.ActiveSeconds
-		if iframe >= t1 then
+		local pingI = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
+		iframe = (rec and rec.untilT) and math.max(0, rec.untilT - os.clock() - pingI) or Dodge.Constants.ActiveSeconds
+		if iframe >= t1 - 0.02 then
 			wait = "iframe"
 		end
 	end
@@ -6388,9 +6394,6 @@ local function paintWorld()
 			end
 		end
 	end
-	if Mark.sp then
-		Mark.spoofDraw(Mark.pen, Renderer.GetPosition())
-	end
 	if Mark.paDraw then
 		Mark.paDraw(gy)
 	end
@@ -6533,10 +6536,18 @@ Reticle.GetCameraAimRayWithoutHit = function()
 	if strike then
 		return strike
 	end
-	-- the decoy as the game's own aim sample: the charge aim changes, so ActionRemoteProtocol.Update really sends it
-	local spoof = Mark.sp and Mark.spoofRay()
-	if spoof then
-		return spoof
+	-- the decoy as the game's own aim sample: the charge aim changes, so ActionRemoteProtocol.Update really sends it.
+	-- After the window (spoofed charge only) the sample is the real shot: the charge ray frozen at the lock and the lock
+	-- packet carry it natively, not the camera.
+	if Mark.sp then
+		local spoof = Mark.spoofRay()
+		if spoof then
+			return spoof
+		end
+		local a = Shoot.aim
+		if a and a.Direction and ChargedKick.IsCharging and ChargedKick.IsCharging() then
+			return { Origin = a.Origin, Direction = a.Direction, CameraCFrame = a.CameraCFrame, CameraFieldOfView = a.CameraFieldOfView, IsAirborne = a.IsAirborne }
+		end
 	end
 	local ray = oldAimRay()
 	local aim = Mark.volleyAim or Mark.blockAim
@@ -8109,7 +8120,9 @@ Mark.wallVsPath = function(root, pathFn, tEnd, tag, o)
 	Mark.skillRay = { Origin = org, Direction = u, CameraCFrame = CFrame.lookAt(org, org + u) }
 	Mark.skillAt = now
 	use.ActivateEquipped()
-	Mark.wallPend = { at = now, kind = tag, name = o.actor and actorName(o.actor) or tag, model = o.model, us = O, W = W, u = u, before = before, trap = o.trap }
+	-- ours: the barricades were taken out by us (equipWall stamps os.clock() after this `now`, so a time compare fails)
+	local ours = Mark.wallEquipAt ~= nil and math.abs(now - Mark.wallEquipAt) < 2
+	Mark.wallPend = { at = now, kind = tag, name = o.actor and actorName(o.actor) or tag, model = o.model, us = O, W = W, u = u, before = before, trap = o.trap, ours = ours }
 	logFile("skill wall", tag, o.actor and actorName(o.actor) or "-", "cross", string.format("%.2f", best.t), "ready", string.format("%.2f", ready), "lat", string.format("%.1f", best.lat), "margin", string.format("%.1f", best.margin), "q", fmtV(best.q), fmtV(u))
 	return true
 end
@@ -8386,8 +8399,9 @@ Mark.wallTick = function(root, oid, own)
 	-- the unequip until then (one press 0.12 s after the placement did nothing and the item stayed in hand): ask the game's
 	-- own unequip as soon as the item is not fired any more, every 0.1 s, give up after 3 s.
 	local wp0 = Mark.wallPend
-	if isWall and Mark.wallEquipAt and wp0 and wp0.at >= Mark.wallEquipAt then
-		Mark.wallAway = Mark.wallAway or now
+	if isWall and wp0 and wp0.ours then
+		wp0.ours = nil
+		Mark.wallAway = now
 	end
 	if not isWall then
 		if Mark.wallAway and not inHand then
@@ -8401,12 +8415,19 @@ Mark.wallTick = function(root, oid, own)
 		if now - Mark.wallAway > 3 then
 			Mark.wallAway, Mark.wallEquipAt = nil, nil
 			logFile("wall equip", "away failed")
-		elseif now - (Mark.wallAwayTry or 0) > 0.1 and not (use.IsEquippedItemFired and use.IsEquippedItemFired()) then
+		elseif now - (Mark.wallAwayTry or 0) > 0.1 then
 			Mark.wallAwayTry = now
-			if use.RequestUnequip then
-				use.RequestUnequip()
-			else
-				Mark.pressSlot(Mark.wallEquipSlot or Mark.slotOfItem("barricades"))
+			local fired = use.IsEquippedItemFired and use.IsEquippedItemFired()
+			if not fired then
+				if use.RequestUnequip then
+					use.RequestUnequip()
+				else
+					Mark.pressSlot(Mark.wallEquipSlot or Mark.slotOfItem("barricades"))
+				end
+			end
+			if not Mark.wallAwayLog or now - Mark.wallAwayLog > 0.5 then
+				Mark.wallAwayLog = now
+				logFile("wall equip", "away try", "fired", tostring(fired), "t", string.format("%.2f", now - Mark.wallAway))
 			end
 		end
 		return
@@ -8414,10 +8435,9 @@ Mark.wallTick = function(root, oid, own)
 	if isWall and Mark.wallEquipAt and now - Mark.wallEquipAt > (CFG.WallEquipHold or 3.5) and now - (Mark.skillAt or 0) > (CFG.WallEquipHold or 3.5) then
 		-- put away what we took out and did not use (an equipped item blocks ball controls)
 		Mark.wallEquipAt = nil
-		local slot = Mark.wallEquipSlot or Mark.slotOfItem("barricades")
-		if slot then
-			Mark.pressSlot(slot)
-			logFile("wall equip", "idle - put away", "slot", slot)
+		if use.RequestUnequip then
+			use.RequestUnequip()
+			logFile("wall equip", "idle - put away")
 		end
 		return
 	end
@@ -8630,9 +8650,8 @@ Mark.tickSkill = function(character, root)
 		end
 		Mark.areaDraw(areaG, areaInfo.R, col)
 	else
-		if CFG.DrawSilent ~= false and boomInfo then
-			Mark.boomArt(pool.seg, boomDir, boomInfo, col, os.clock(), muzzle)
-		elseif CFG.DrawSilent ~= false and not Mark.areaItems[id] and id ~= "boomerang" then
+		-- (the boomerang loop art lives in the P gallery as variants until one is picked: the plain tracer here)
+		if CFG.DrawSilent ~= false and not Mark.areaItems[id] then
 			Mark.silentArt(pool.seg, muzzle, chest, Vector3.new(aimP.X, aimP.Y - 2.9, aimP.Z), col, os.clock())
 		end
 		if Mark.areaFx then
@@ -11488,7 +11507,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v157")
+	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v158")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -12808,6 +12827,31 @@ Mark.blockShadeLane = function(P, carrier, g)
 	return best
 end
 
+-- ISOLATED CARRIER (the user's pro read): he has nobody to pass to when no teammate of his stands level with him or
+-- closer to our goal, or every such teammate is already marked by one of ours. Holding distance for the pass is then
+-- pointless: press him (stand at kick reach on his goal line, the push / AutoKick distance).
+Mark.foeIsolated = function(carrier, P, g)
+	local lb, _, rb = goalMouthCorners(g)
+	local mouth = (lb and rb) and (lb + rb) * 0.5 or g.Position
+	local dC = flat(P - mouth).Magnitude
+	local slack = CFG.BlockLevelSlack or 8
+	local outlets, names = 0, nil
+	for _, model in Mark.models() do
+		local actor = Actors.GetFromCharacter(model)
+		if actor and actor ~= LocalPlayer and actor ~= carrier and not sameTeam(actor) and not isGoalkeeper(actor) and not Mark.mateDown(actor, model) then
+			local r = ActorTargeting.GetActorRoot(actor)
+			if r then
+				local pos = CharacterMotion.GetPosition(model) or r.Position
+				if flat(pos - mouth).Magnitude <= dC + slack and flat(pos - P).Magnitude <= (CFG.BlockPassMax or 130) and not Mark.mateNear(pos, CFG.BlockCoverRadius or 8) then
+					outlets += 1
+					names = (names and names .. "," or "") .. actorName(actor)
+				end
+			end
+		end
+	end
+	return outlets == 0, outlets, names, dC
+end
+
 Mark.blockChoose = function(root, carrier, cr, P, V, g, danger)
 	if CFG.BlockSmart == false then
 		return nil
@@ -13364,8 +13408,20 @@ Mark.tickBlock = function(character, root)
 		end
 	end
 	Mark.blockDanger = danger
+	-- PRESS: an isolated carrier (no pass on) or an open shot near our goal is pressed, not contained
+	local iso, isoN, isoNames = false, 0, nil
+	if CFG.BlockPressIso ~= false then
+		iso, isoN, isoNames = Mark.foeIsolated(carrier, P, g)
+	end
+	local pressWhy = (iso and "alone") or (danger and danger.on and CFG.BlockPressOpen ~= false and "open shot") or nil
+	if pressWhy ~= Mark.pressWhyLast then
+		Mark.pressWhyLast = pressWhy
+		logFile("block press", pressWhy or "off", actorName(carrier), "outlets", tostring(isoN), isoNames or "-")
+	end
 	local pick
-	if danger and danger.on then
+	if iso and not (danger and danger.on) then
+		pick = { kind = "carrier", dC = flat(P - g.Position).Magnitude, width = 0 }
+	elseif danger and danger.on then
 		pick = { kind = "carrier", dC = danger.dist, width = danger.width, danger = danger, mouth = danger.mouth }
 		local eg0 = unitOrNil(flat(danger.mouth - P))
 		if CFG.BlockBehindLogic ~= false and eg0 and flat(root.Position - P):Dot(eg0) < -3 and flat(V):Dot(eg0) > 3
@@ -13385,7 +13441,7 @@ Mark.tickBlock = function(character, root)
 	local active = Mark.move.mode == "block"
 	local goalSide = along > -1
 	local range = goalSide and ((CFG.BlockRange or 28) + (active and 6 or 0)) or ((CFG.BlockBehind or 14) + (active and 4 or 0))
-	if pick and pick.kind == "carrier" and (goalSide or pick.danger) then
+	if pick and pick.kind == "carrier" and (goalSide or pick.danger or pressWhy) then
 		range = math.max(range, (CFG.BlockGoalRange or 70) + (active and 6 or 0))
 	end
 	if dist > range then
@@ -13519,7 +13575,7 @@ Mark.tickBlock = function(character, root)
 	-- OPPOSITION first: from the side / behind we go for the goal-side point at BlockOppDepth on his (shaded) line, not
 	-- for the tight spot in front of his feet; the agent steer curves round him on the way.
 	local maxDepth = math.max(gap, (shotLine and not faceLine) and (CFG.BlockMaxDepth or 9) or math.min(CFG.BlockMaxDepth or 9, coverD or math.huge))
-	local oppD = math.clamp(CFG.BlockOppDepth or 7, gap, maxDepth)
+	local oppD = pressWhy and gap or math.clamp(CFG.BlockOppDepth or 7, gap, maxDepth)
 	local dest = Pf + uf * oppD
 	local target = dest
 	-- Between him and the goal: the old spot ran back toward the carrier (gap 4 in front of him) = into his dribble
@@ -13546,7 +13602,7 @@ Mark.tickBlock = function(character, root)
 				opp = nil
 			end
 			local ugN = unitOrNil(flat(g.Position - Pnow)) or u
-			local press = opp and os.clock() - opp.at > 0.3 and Vc:Dot(ugN) < 4
+			local press = pressWhy ~= nil or (opp and os.clock() - opp.at > 0.3 and Vc:Dot(ugN) < 4)
 			dest = Pf + uf * (press and gap or math.clamp(dAlong, gap, maxDepth))
 			target = dest
 		end
@@ -14467,7 +14523,10 @@ Mark.spoofHist = {}
 Mark.spoofWin = function()
 	local fullAt = KickCore.GetFullChargeSeconds and KickCore.GetFullChargeSeconds() or 0.35
 	local maxC = KickCore.Constants.MaximumChargeSeconds or 0.4
-	return math.min(fullAt, maxC) - (KickCore.Constants.AimLockSeconds or 0.1) - 0.05
+	-- The server reads our aim from the Update stream with the network delay: the real aim has to be there a full
+	-- ping + display delay (~0.11 s in the echo log) before the lock, or the shot is struck on the decoy (bar / wide)
+	local ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
+	return math.min(fullAt, maxC) - (KickCore.Constants.AimLockSeconds or 0.1) - ping - 0.12
 end
 
 Mark.spoofPlan = function()
@@ -14503,7 +14562,7 @@ Mark.spoofPlan = function()
 		return
 	end
 	local win = Mark.spoofWin()
-	if win < 0.08 then
+	if win < 0.05 then
 		return
 	end
 	local sr = math.clamp((P - lb):Dot(along) / W * 2 - 1, -1, 1)
@@ -14559,7 +14618,7 @@ Mark.spoofPlan = function()
 	local now = os.clock()
 	Mark.sp = {
 		t0 = now, endAt = now + win, steps = pats[pick].steps, O = O, D = D, lb = lb, along = along, W = W, H = H,
-		fov = a.CameraFieldOfView, air = a.IsAirborne, name = pick,
+		fov = a.CameraFieldOfView, air = a.IsAirborne, name = pick, hr = hr,
 	}
 	logFile("spoof", "plan", pick, "real s", string.format("%.2f", sr), "h", string.format("%.2f", hr), "keeper s", sk and string.format("%.2f", sk) or "-", "window", string.format("%.2f", win))
 end
@@ -14587,6 +14646,8 @@ Mark.spoofDir = function()
 		end
 		acc += st[3]
 	end
+	-- sideways only: the decoy keeps the real height. A decoy pitch that leaks into the shot sends it over the bar.
+	h = sp.hr or h
 	local Q = sp.lb + sp.along * (sp.W * (s + 1) * 0.5) + Vector3.new(0, sp.H * h, 0)
 	sp.q = Q
 	return unitOrNil(Q - sp.O)
@@ -17376,6 +17437,7 @@ Mark.killerSlide = function(root, routeDir, foes, ballNow, ourT, mLo, mHi, guard
 	local boxMid = -box.CFrameOffset.Z
 	local hx, hz = box.Size.X * 0.5, box.Size.Z * 0.5
 	local ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
+	local minHits = CFG.SlideMinHits or 3
 	local fine, fineD = {}, {}
 	for k = 0, 10 do
 		local tau = t0 + (t1 - t0) * k / 10
@@ -17383,8 +17445,8 @@ Mark.killerSlide = function(root, routeDir, foes, ballNow, ourT, mLo, mHi, guard
 	end
 	local maxA = CFG.KillerAngle or 50
 	local why = {}
-	local best = nil
-	local mates = nil
+	-- 1) every enemy a slide may hit, with his server-side path over the hitbox window
+	local cands = {}
 	for _, f in foes do
 		local name = f.actor and actorName(f.actor) or "?"
 		if not (f.root and f.root.Parent and f.model) then
@@ -17399,11 +17461,6 @@ Mark.killerSlide = function(root, routeDir, foes, ballNow, ourT, mLo, mHi, guard
 		local dBall = ballNow and flat(pos - ballNow).Magnitude or math.huge
 		if dBall > (CFG.IntentTackleRadius or 60) then
 			why[#why + 1] = name .. string.format(" ball %.0f > %d", dBall, CFG.IntentTackleRadius or 60)
-			continue
-		end
-		local racer = dBall <= (CFG.KillerRadius or 22) or (f.first or math.huge) <= (ourT or math.huge) + (CFG.KillerMargin or 0.5)
-		if not racer and not guard then
-			why[#why + 1] = name .. string.format(" notracer ball %.0f first %.2f us %.2f", dBall, f.first or -1, ourT or -1)
 			continue
 		end
 		if Dodge.IsDribbling(f.model) then
@@ -17426,9 +17483,31 @@ Mark.killerSlide = function(root, routeDir, foes, ballNow, ourT, mLo, mHi, guard
 		for k = 1, #fine do
 			E[k] = pos + vel * (delay + ping * 0.5 + fine[k])
 		end
+		local racer = dBall <= (CFG.KillerRadius or 22) or (f.first or math.huge) <= (ourT or math.huge) + (CFG.KillerMargin or 0.5)
+		cands[#cands + 1] = { f = f, name = name, pos = pos, dUs = dUs, dBall = dBall, E = E, racer = racer or guard }
+	end
+	local function hitsOf(c, phi, m)
+		local hits = 0
+		for k = 1, #fine do
+			local ctr = O + phi * (fineD[k] * m + boxMid)
+			local rel = flat(c.E[k] - ctr)
+			if math.abs(rel:Dot(phi)) <= hz and math.abs(rel.X * phi.Z - rel.Z * phi.X) <= hx then
+				hits += 1
+			end
+		end
+		return hits
+	end
+	local mates = nil
+	local best = nil
+	-- 2) per target: the slide that catches him, and among those the one that also catches the most other enemies (a
+	-- cluster at the ball: two men in one slide). Ranked by who is nearest to the ball, not who is nearest to us.
+	for _, c in cands do
+		if not c.racer then
+			why[#why + 1] = c.name .. string.format(" notracer ball %.0f first %.2f us %.2f", c.dBall, c.f.first or -1, ourT or -1)
+			continue
+		end
 		local found = nil
-		-- guard: the slide is at HIM (nearest to the ball), not along our route to the ball
-		local base = (not guard and routeDir) or unitOrNil(flat(pos - O))
+		local base = (not guard and routeDir) or unitOrNil(flat(c.pos - O))
 		if base then
 			for step = 0, math.floor(maxA / 3) do
 				for _, sg in (step == 0 and { 1 } or { 1, -1 }) do
@@ -17437,26 +17516,30 @@ Mark.killerSlide = function(root, routeDir, foes, ballNow, ourT, mLo, mHi, guard
 					local phi = Vector3.new(base.X * ca - base.Z * sa, 0, base.X * sa + base.Z * ca)
 					for mi = 0, 4 do
 						local m = mLo + (mHi - mLo) * mi / 4
-						local hits = 0
-						for k = 1, #fine do
-							local ctr = O + phi * (fineD[k] * m + boxMid)
-							local rel = flat(E[k] - ctr)
-							if math.abs(rel:Dot(phi)) <= hz and math.abs(rel.X * phi.Z - rel.Z * phi.X) <= hx then
-								hits += 1
+						local hits = hitsOf(c, phi, m)
+						if hits >= minHits then
+							local extra, names = 0, nil
+							for _, o in cands do
+								if o ~= c and hitsOf(o, phi, m) >= minHits then
+									extra += 1
+									names = (names and names .. "+" or "") .. o.name
+								end
 							end
-						end
-						if hits >= (CFG.SlideMinHits or 3) and (not found or hits > found.hits) then
-							found = { aim = phi, mult = m, hits = hits, ang = step * 3 * sg }
+							if not found or extra > found.extra or (extra == found.extra and hits > found.hits) then
+								found = { aim = phi, mult = m, hits = hits, ang = step * 3 * sg, extra = extra, also = names }
+							end
 						end
 					end
 				end
-				if found then
+				-- alone at the ball: the first (straightest) direction is enough; with others around keep looking for one
+				-- that takes two
+				if found and (#cands == 1 or found.extra > 0) then
 					break
 				end
 			end
 		end
 		if not found then
-			why[#why + 1] = name .. string.format(" angle (dist %.0f)", dUs)
+			why[#why + 1] = c.name .. string.format(" angle (dist %.0f)", c.dUs)
 			continue
 		end
 		if not mates then
@@ -17475,19 +17558,20 @@ Mark.killerSlide = function(root, routeDir, foes, ballNow, ourT, mLo, mHi, guard
 		for _, mp in mates do
 			local rel = flat(mp - O)
 			local along = rel:Dot(found.aim)
-			if along > 0 and along < dUs + 3 and math.abs(rel.X * found.aim.Z - rel.Z * found.aim.X) < 2.6 then
+			if along > 0 and along < c.dUs + 3 and math.abs(rel.X * found.aim.Z - rel.Z * found.aim.X) < 2.6 then
 				clear = false
 				break
 			end
 		end
 		if not clear then
-			why[#why + 1] = name .. " mate on line"
+			why[#why + 1] = c.name .. " mate on line"
 			continue
 		end
-		-- rank: who reaches the ball first, a small bonus for staying close to our route
-		local score = (f.first or 9) + math.abs(found.ang) * 0.004
+		-- rank: two in one slide first, then the man nearest to the ball (he is the one who gets it), then who reaches it
+		-- first, a small bonus for staying close to our route
+		local score = -found.extra * 2 + c.dBall / 12 + (c.f.first or 3) * 0.5 + math.abs(found.ang) * 0.004
 		if not best or score < best.score then
-			found.foe, found.dist, found.dBall, found.name, found.score = f, dUs, dBall, name, score
+			found.foe, found.dist, found.dBall, found.name, found.score = c.f, c.dUs, c.dBall, c.name, score
 			best = found
 		end
 	end
@@ -17698,11 +17782,17 @@ Mark.tickBall = function(character, root)
 			if bestF then
 				local mHiG = math.max(0.4, CFG.TackleSpeed)
 				local mLoG = math.min(mHiG, CFG.TackleMinSpeed or 0.6)
-				local k, kWhy = Mark.killerSlide(root, nil, { bestF }, pos, nil, mLoG, mHiG, true)
+				local near = { bestF }
+				for _, f in foes do
+					if f ~= bestF and (f.delay or 0) <= 0 and not f.sliding and flat(f.p - pos).Magnitude <= (CFG.KillerGuardFoe or 40) then
+						near[#near + 1] = f
+					end
+				end
+				local k, kWhy = Mark.killerSlide(root, nil, near, pos, nil, mLoG, mHiG, true)
 				if k then
 					predict = solveIntercept(root, bestF.root, bestF.model, tackleTuning()) or predict
 					local sent, why = tryTackle(character, root, k.aim, k.mult, { char = bestF.model, root = bestF.root })
-					logFile("killer guard", sent and "sent" or ("no " .. tostring(why)), k.name, "ang", string.format("%.0f", k.ang), "hits", tostring(k.hits), "mult", string.format("%.2f", k.mult), "ballD", string.format("%.1f", bestD))
+					logFile("killer guard", sent and "sent" or ("no " .. tostring(why)), k.name, "also", k.also or "-", "ang", string.format("%.0f", k.ang), "hits", tostring(k.hits), "mult", string.format("%.2f", k.mult), "ballD", string.format("%.1f", bestD))
 					if sent then
 						return
 					end
@@ -17977,7 +18067,7 @@ Mark.tickBall = function(character, root)
 		local solved = solveIntercept(root, f.root, f.model, tackleTuning())
 		predict = solved or predict
 		local sent, why = tryTackle(character, root, kill.aim, kill.mult, { char = f.model, root = f.root })
-		logFile(kill.guard and "killer guard" or "killer", sent and "sent" or ("no " .. tostring(why)), kill.name, "ang", string.format("%.0f", kill.ang), "hits", tostring(kill.hits), "mult", string.format("%.2f", kill.mult), "dist", string.format("%.1f", kill.dist), "ballD", string.format("%.1f", kill.dBall), "hisFirst", string.format("%.2f", f.first or -1), "ourT", string.format("%.2f", steerT or -1))
+		logFile(kill.guard and "killer guard" or "killer", sent and "sent" or ("no " .. tostring(why)), kill.name, "also", kill.also or "-", "ballD", string.format("%.1f", kill.dBall or -1), "ang", string.format("%.0f", kill.ang), "hits", tostring(kill.hits), "mult", string.format("%.2f", kill.mult), "dist", string.format("%.1f", kill.dist), "ballD", string.format("%.1f", kill.dBall), "hisFirst", string.format("%.2f", f.first or -1), "ourT", string.format("%.2f", steerT or -1))
 	elseif CFG.AutoTackle and slideDir and not allyBlock and not noTouch and (landed or (airborne and nowBox)) then
 		logFile("ball tackle", "route", "tc", string.format("%.2f", slideT or 0), "h", string.format("%.1f", slideP.Y - root.Position.Y), "rot", string.format("%.0f", slidePress.rot or 0), "hits", tostring(slidePress.hits), "mult", string.format("%.2f", slidePress.mult), "by", slidePress.body and "body" or "box")
 		tryTackle(character, root, slideDir, slidePress.mult)
@@ -19796,11 +19886,8 @@ Mark.hazDraw = function()
 			for _, st in Mark.projLive do
 				local who = st.src and playerOf(st.src)
 				if np < 3 and st.item ~= "grenade" and st.src ~= LocalPlayer.UserId and not (who and sameTeam(who)) and nowS - st.at < 1.2 then
-					local v = Mark.projViz(st, nowS, root)
-					if v then
-						np += 1
-						Mark.projArt(pool.seg, v, clk)
-					end
+					-- (projectile art: P gallery variants until one is picked)
+					np += 1
 				end
 			end
 		end
@@ -21521,7 +21608,377 @@ Mark.galToggle = function()
 end
 
 -- stations: x = offset along G.right, art(seg, C, t, st, G) with C the station's ground centre
+
+-- VISUAL VARIANTS (gallery P only, pick one to wire live). Three subjects, three directions each:
+--   fake aim point (Direction Spoof): mirage rings / bolt hop / spring brackets
+--   boomerang throw (SilentAim): time thread / comet / ghost loop + silent tracer
+--   incoming projectile (AutoDodge): impact ripple / bolt / fuse rail
+-- Strokes: LIP (ink bed under a paper line). Our own deceit uses an ice family; enemy threats the kick threat palette.
+Mark.vPal = {
+	ice = { Color3.fromRGB(150, 220, 255), Color3.fromRGB(215, 242, 255), Color3.fromRGB(90, 170, 255) },
+}
+Mark.vLip = function(seg, a, b, col, al, w)
+	seg(a, b, COL.Ink, 0.55 * al, w + 2.4, 44)
+	seg(a, b, col, al, w, 45)
+end
+Mark.vGrad = function(pal, f)
+	local x = (f % 1) * 3
+	local i = math.floor(x)
+	local u = x - i
+	u = u * u * (3 - 2 * u)
+	return pal[i + 1]:Lerp(pal[(i + 1) % 3 + 1], u)
+end
+-- ring in the plane (ax, ay): the ripple of kickRipple stood up on the goal mouth
+Mark.vRing = function(seg, c, ax, ay, r, pal, flow, al, w, n)
+	n = n or 20
+	local prev
+	for s = 0, n do
+		local a = s / n * math.pi * 2
+		local p = c + ax * (math.cos(a) * r) + ay * (math.sin(a) * r)
+		if prev then
+			seg(prev, p, Mark.vGrad(pal, s / n + flow), al, w, 44)
+		end
+		prev = p
+	end
+end
+Mark.vStep = function(st, t)
+	local dt = math.clamp(t - (st.lastT or t), 0, 0.1)
+	st.lastT = t
+	return dt
+end
+
+-- the station's fake goal and the decoy script: 3 hops inside 0.6 s, then the lie is over (0.6..1.6 s)
+Mark.vSpoofScene = function(seg, C, t, st, G)
+	local up = Vector3.new(0, 1, 0)
+	local m0 = C + G.fw * 6
+	local W, H = 16, 7
+	local lb, rb = m0 - G.right * (W / 2), m0 + G.right * (W / 2)
+	seg(lb, lb + up * H, COL.Chalk, 0.35, 1, 43)
+	seg(rb, rb + up * H, COL.Chalk, 0.35, 1, 43)
+	seg(lb + up * H, rb + up * H, COL.Chalk, 0.35, 1, 43)
+	local ph = t % 1.6
+	local spots = { { -0.75, 0.75 }, { 0.7, 0.25 }, { -0.6, 0.3 } }
+	local real = m0 + G.right * (0.55 * W / 2) + up * (0.7 * H)
+	local idx = ph < 0.6 and (math.floor(ph / 0.2) + 1) or nil
+	local q = idx and (m0 + G.right * (spots[idx][1] * W / 2) + up * (spots[idx][2] * H)) or nil
+	-- the truth: a small paper tick
+	seg(real - G.right * 0.35, real + G.right * 0.35, COL.Paper, 0.6, 1.2, 45)
+	seg(real - up * 0.35, real + up * 0.35, COL.Paper, 0.6, 1.2, 45)
+	return q, idx, real, 1 - math.clamp(ph / 0.6, 0, 1), up
+end
+
+-- A. MIRAGE: rings born at the decoy on the goal plane, a tether of dashes running from the truth to the lie
+Mark.vSpoofMirage = function(seg, C, t, st, G)
+	local dt = Mark.vStep(st, t)
+	local q, _, real, left, up = Mark.vSpoofScene(seg, C, t, st, G)
+	if not q then
+		st.ph = nil
+		return
+	end
+	st.ph = (st.ph or 0) + dt * 3
+	local pal = Mark.vPal.ice
+	local born = math.floor(st.ph)
+	for k = 0, 2 do
+		local u = math.clamp((st.ph - (born - k)) / 3, 0, 1)
+		local r = 0.3 + 2.1 * (1 - (1 - u) ^ 3)
+		local al = (1 - u) ^ 1.6
+		if al > 0.04 then
+			Mark.vRing(seg, q, G.right, up, r, pal, t * 0.35 + k * 0.17, al, 1 + 2 * (1 - u), 18)
+		end
+	end
+	local D = q - real
+	local L = D.Magnitude
+	if L > 1 then
+		local dir = D / L
+		local s = (t * 14) % 1.6
+		while s < L - 0.8 do
+			Mark.vLip(seg, real + dir * s, real + dir * math.min(s + 0.7, L), pal[2], 0.35 + 0.5 * left, 1.1)
+			s += 1.6
+		end
+	end
+end
+
+-- B. BOLT HOP: every hop of the decoy is a bolt from the old spot to the new, sparks where it lands
+Mark.vSpoofBolt = function(seg, C, t, st, G)
+	local q, idx, _, left, up = Mark.vSpoofScene(seg, C, t, st, G)
+	if idx ~= st.idx then
+		if q and st.q then
+			st.bolt = { A = st.q, B = q, born = t, seed = (idx or 0) * 7 + math.floor(t) }
+		end
+		st.idx, st.q = idx, q
+	end
+	local pal = Mark.vPal.ice
+	local b = st.bolt
+	if b then
+		local age = t - b.born
+		if age > 0.35 then
+			st.bolt = nil
+		else
+			local fade = 1 - math.clamp((age - 0.1) / 0.25, 0, 1)
+			Mark.boltLine(seg, b.A, b.B, t, b.seed, pal[1], fade, 1.2 + 1.4 * fade, math.clamp(age / 0.06, 0, 1))
+			if age > 0.06 then
+				local sp = 0.5 + 1.4 * math.clamp((age - 0.06) / 0.15, 0, 1)
+				for k = 0, 3 do
+					local a = b.seed + k * 1.5708
+					seg(b.B, b.B + (G.right * math.cos(a) + up * math.sin(a)) * sp, Color3.new(1, 1, 1), 0.8 * fade, 1.3, 46)
+				end
+			end
+		end
+	end
+	if q then
+		local r = 0.55 + 0.25 * left
+		local d = { q + up * r, q + G.right * r, q - up * r, q - G.right * r }
+		for i = 1, 4 do
+			Mark.vLip(seg, d[i], d[i % 4 + 1], pal[2], 0.9, 1.3)
+		end
+	end
+end
+
+-- C. SPRING BRACKETS: four corners chase the decoy on a spring (overshoot, settle); the top edge is the fuse of the
+-- time the aim may still lie
+Mark.vSpoofBrackets = function(seg, C, t, st, G)
+	local dt = Mark.vStep(st, t)
+	local q, _, _, left, up = Mark.vSpoofScene(seg, C, t, st, G)
+	if not q then
+		st.bq, st.bv = nil, nil
+		return
+	end
+	if not st.bq then
+		st.bq, st.bv = q, Vector3.zero
+	end
+	local k, c = 260, 18
+	st.bv = st.bv + ((q - st.bq) * k - st.bv * c) * dt
+	st.bq = st.bq + st.bv * dt
+	local p = st.bq
+	local s, e = 1.5, 0.6
+	local pal = Mark.vPal.ice
+	for _, sx in { -1, 1 } do
+		for _, sy in { -1, 1 } do
+			local cn = p + G.right * (sx * s) + up * (sy * s)
+			Mark.vLip(seg, cn, cn - G.right * (sx * e), pal[2], 0.95, 1.4)
+			Mark.vLip(seg, cn, cn - up * (sy * e), pal[2], 0.95, 1.4)
+		end
+	end
+	local a0 = p + up * (s + 0.45) - G.right * s
+	local a1 = a0 + G.right * (2 * s * left)
+	seg(a0, a1, pal[1], 0.9, 1.6, 46)
+	seg(a1 - up * 0.2, a1 + up * 0.2, Color3.new(1, 1, 1), 0.9, 1.4, 46)
+end
+
+-- boomerang station scene: the loop of Boomerang.GetPosition's kind, the throw from S, the target on it
+Mark.vBoomScene = function(st, C, t, G)
+	if not st.tab then
+		local tab = { a = {}, b = {}, h = {}, dt = 0.025, n = 76 }
+		for i = 0, 76 do
+			local th = i / 76 * math.pi * 2
+			tab.a[i], tab.b[i], tab.h[i] = 30 * math.sin(th), -18 * (1 - math.cos(th)), 1.2 * math.sin(th * 0.5)
+		end
+		st.tab = tab
+	end
+	local tab = st.tab
+	local f = G.fw
+	local side = Vector3.new(f.Z, 0, -f.X)
+	local S = C - f * 14 + Vector3.new(0, 3.5, 0)
+	local iT = 22
+	local pts = {}
+	for i = 0, iT do
+		pts[i] = S + f * tab.a[i] + side * tab.b[i] + Vector3.new(0, tab.h[i], 0)
+	end
+	return pts, iT, S
+end
+
+-- A. TIME THREAD: only ticks every 0.1 s of flight (the rhythm of the throw), a bead running it, ripple at his feet
+Mark.vBoomThread = function(seg, C, t, st, G)
+	local dt = Mark.vStep(st, t)
+	local pts, iT = Mark.vBoomScene(st, C, t, G)
+	local col = Color3.fromRGB(90, 220, 255)
+	local u = (t % 1.1) / 0.8
+	local head = math.min(u, 1) * iT
+	for i = 0, iT - 2, 4 do
+		local a, b = pts[i], pts[i + 1]
+		local past = i < head
+		Mark.vLip(seg, a, b, past and COL.Chalk or col, past and 0.35 or 0.9, 1.4)
+	end
+	if u < 1 then
+		local i = math.floor(head)
+		local p = pts[i]:Lerp(pts[math.min(i + 1, iT)], head - i)
+		seg(p - G.fw * 0.4, p + G.fw * 0.4, Color3.new(1, 1, 1), 1, 2.4, 46)
+	end
+	local P = pts[iT]
+	st.ph = (st.ph or 0) + dt * (1 / 0.6)
+	Mark.kickRipple(seg, Vector3.new(P.X, G.gy + 0.1, P.Z), 2.4, { col, col:Lerp(Color3.new(1, 1, 1), 0.5), Color3.fromRGB(60, 140, 255) }, st.ph, t, 4)
+end
+
+-- B. COMET: nothing but a bead with a tapering tail flying the real loop to him, a burst where it meets him
+Mark.vBoomComet = function(seg, C, t, st, G)
+	local pts, iT = Mark.vBoomScene(st, C, t, G)
+	local col = Color3.fromRGB(90, 220, 255)
+	local ph = t % 1.2
+	local u = math.min(ph / 0.8, 1)
+	u = 1 - (1 - u) ^ 1.4
+	local head = u * iT
+	local function at(x)
+		x = math.clamp(x, 0, iT)
+		local i = math.floor(x)
+		return pts[i]:Lerp(pts[math.min(i + 1, iT)], x - i)
+	end
+	if ph < 0.8 then
+		local prev = at(head)
+		for k = 1, 8 do
+			local p = at(head - k * 0.5)
+			local w = 3 * (1 - k / 9)
+			seg(prev, p, Color3.new(1, 1, 1):Lerp(col, k / 8), 1 - k / 10, w, 46 - (k > 4 and 1 or 0))
+			prev = p
+		end
+	else
+		local age = ph - 0.8
+		local P = pts[iT]
+		local sp = 0.5 + 2.2 * math.clamp(age / 0.15, 0, 1)
+		local fade = 1 - math.clamp(age / 0.4, 0, 1)
+		for k = 0, 5 do
+			local a = k * math.pi / 3
+			seg(P, P + Vector3.new(math.cos(a), 0.3, math.sin(a)) * sp, col, fade, 1.4, 46)
+		end
+	end
+	local P = pts[iT]
+	local g = Vector3.new(P.X, G.gy + 0.1, P.Z)
+	local d = { g + G.fw * 0.8, g + G.right * 0.8, g - G.fw * 0.8, g - G.right * 0.8 }
+	for i = 1, 4 do
+		Mark.vLip(seg, d[i], d[i % 4 + 1], col, 0.8, 1.2)
+	end
+end
+
+-- C. GHOST LOOP: the usual silent tracer to his chest; the loop only as a faint ghost line (it reads, it does not shout)
+Mark.vBoomGhost = function(seg, C, t, st, G)
+	local pts, iT, S = Mark.vBoomScene(st, C, t, G)
+	local col = Color3.fromRGB(90, 220, 255)
+	for i = 1, iT do
+		seg(pts[i - 1], pts[i], col, 0.18, 1, 43)
+	end
+	local P = pts[iT]
+	if Mark.silentArt then
+		Mark.silentArt(seg, S, P + Vector3.new(0, 0.6, 0), Vector3.new(P.X, G.gy, P.Z), col, os.clock())
+	end
+end
+
+-- projectile scene: an arc from an enemy 40 st out to the impact at C, the projectile running it every 1.4 s
+Mark.vProjScene = function(st, C, t, G)
+	if not st.pts then
+		local pts = {}
+		local A = C + G.fw * 40 + G.right * 8 + Vector3.new(0, 4, 0)
+		for k = 0, 20 do
+			local s = k / 20
+			pts[k] = A:Lerp(C + Vector3.new(0, 1, 0), s) + Vector3.new(0, 6 * math.sin(s * math.pi), 0)
+		end
+		st.pts = pts
+	end
+	local u = (t % 1.4) / 1.1
+	return st.pts, math.min(u, 1) * 20, u < 1
+end
+
+-- A. IMPACT RIPPLE: the threat ripple where it will land, a thin line from the projectile to it, nothing else
+Mark.vProjRipple = function(seg, C, t, st, G)
+	local dt = Mark.vStep(st, t)
+	local pts, head, flying = Mark.vProjScene(st, C, t, G)
+	local pal = Mark.kickPalette.live
+	if flying then
+		local i = math.floor(head)
+		local p = pts[i]:Lerp(pts[math.min(i + 1, 20)], head - i)
+		local prev = p
+		for k = i + 1, 20 do
+			Mark.vLip(seg, prev, pts[k], pal[1], 0.55, 1)
+			prev = pts[k]
+		end
+		seg(p - G.fw * 0.5, p + G.fw * 0.5, Color3.new(1, 1, 1), 1, 2.6, 46)
+	end
+	st.ph = (st.ph or 0) + dt * (flying and 2 or 0.6)
+	Mark.kickRipple(seg, Vector3.new(C.X, G.gy + 0.1, C.Z), 3.4, pal, st.ph, t, 2)
+end
+
+-- B. BOLT: a bolt from the projectile to the impact every 0.16 s (the language of the air duel)
+Mark.vProjBolt = function(seg, C, t, st, G)
+	local pts, head, flying = Mark.vProjScene(st, C, t, G)
+	if not flying then
+		return
+	end
+	local i = math.floor(head)
+	local p = pts[i]:Lerp(pts[math.min(i + 1, 20)], head - i)
+	st.bs = st.bs or { list = {}, nextAt = 0, n = 0 }
+	if st.bs.nextAt > t + 1 then
+		st.bs.nextAt = 0
+	end
+	local hit = Vector3.new(C.X, G.gy + 0.2, C.Z)
+	Mark.duelBolts(seg, t, "live", Mark.kickPalette.live[1], G.gy, function()
+		return p, p:Lerp(hit, 0.55) + Vector3.new(0, 1.2, 0), hit
+	end, st.bs)
+	seg(p - G.fw * 0.5, p + G.fw * 0.5, Color3.new(1, 1, 1), 1, 2.6, 46)
+end
+
+-- C. FUSE RAIL: the remaining path as dashes running at us, a spark on the projectile, the impact rim burning down
+Mark.vProjFuse = function(seg, C, t, st, G)
+	local pts, head, flying = Mark.vProjScene(st, C, t, G)
+	local pal = Mark.kickPalette.armed
+	local hit = Vector3.new(C.X, G.gy + 0.1, C.Z)
+	if flying then
+		local i = math.floor(head)
+		local off = (t * 6) % 1
+		for k = i + 1, 19 do
+			local a = pts[k]:Lerp(pts[k + 1], off * 0.5)
+			local b = pts[k]:Lerp(pts[k + 1], off * 0.5 + 0.5)
+			Mark.vLip(seg, a, b, pal[1], 0.8, 1.2)
+		end
+		local p = pts[i]:Lerp(pts[math.min(i + 1, 20)], head - i)
+		local hn = (math.sin(t * 97.3) * 43758.5) % 1
+		for k = 0, 2 do
+			local a = hn * 6.28 + k * 2.09
+			seg(p, p + Vector3.new(math.cos(a), 0.5, math.sin(a)) * (0.5 + hn * 0.5), Color3.new(1, 1, 1), 0.9, 1.3, 46)
+		end
+		local left = 1 - head / 20
+		local prev
+		local n = math.max(2, math.floor(left * 24))
+		for s = 0, n do
+			local a = math.pi / 2 + s / n * left * math.pi * 2
+			local q = hit + G.right * (math.cos(a) * 3) + G.fw * (math.sin(a) * 3)
+			if prev then
+				Mark.vLip(seg, prev, q, pal[2], 0.9, 1.4)
+			end
+			prev = q
+		end
+	else
+		local age = (t % 1.4) - 1.1
+		local r = 3 + age * 14
+		Mark.vRing(seg, hit, G.right, G.fw, r, pal, 0, math.max(0, 1 - age / 0.3), 2, 22)
+	end
+end
+
 Mark.galStations = {
+	{ name = "Fake aim A: mirage rings", x = 116, art = function(seg, C, t, st, G)
+		Mark.vSpoofMirage(seg, C, t, st, G)
+	end },
+	{ name = "Fake aim B: bolt hop", x = 148, art = function(seg, C, t, st, G)
+		Mark.vSpoofBolt(seg, C, t, st, G)
+	end },
+	{ name = "Fake aim C: spring brackets", x = 180, art = function(seg, C, t, st, G)
+		Mark.vSpoofBrackets(seg, C, t, st, G)
+	end },
+	{ name = "Boomerang A: time thread", x = 212, art = function(seg, C, t, st, G)
+		Mark.vBoomThread(seg, C, t, st, G)
+	end },
+	{ name = "Boomerang B: comet", x = 244, art = function(seg, C, t, st, G)
+		Mark.vBoomComet(seg, C, t, st, G)
+	end },
+	{ name = "Boomerang C: ghost loop", x = 276, art = function(seg, C, t, st, G)
+		Mark.vBoomGhost(seg, C, t, st, G)
+	end },
+	{ name = "Projectile A: impact ripple", x = 308, art = function(seg, C, t, st, G)
+		Mark.vProjRipple(seg, C, t, st, G)
+	end },
+	{ name = "Projectile B: bolt", x = 340, art = function(seg, C, t, st, G)
+		Mark.vProjBolt(seg, C, t, st, G)
+	end },
+	{ name = "Projectile C: fuse rail", x = 372, art = function(seg, C, t, st, G)
+		Mark.vProjFuse(seg, C, t, st, G)
+	end },
 	{ name = "SilentAim bazooka: blast area", x = -40, art = function(seg, C, t, st)
 		st.area = st.area or Mark.areaNew()
 		st.area.gal = true
@@ -21589,41 +22046,6 @@ Mark.galStations = {
 		if ph < 3.1 then
 			st.used = Mark.hazArt(seg, G.tris, G.triN, ev, ph, os.clock())
 		end
-	end },
-	{ name = "AutoDodge: incoming projectile", x = 148, art = function(seg, C, t, st, G)
-		-- rocket arc coming at the station centre from 40 studs, 1.4 s loop; the ripple marks where it meets you
-		local pts, len = {}, { 0 }
-		local A = C + G.fw * 40 + G.right * 8 + Vector3.new(0, 4, 0)
-		for k = 0, 20 do
-			local s = k / 20
-			pts[k + 1] = A:Lerp(C + Vector3.new(0, 1, 0), s) + Vector3.new(0, 6 * math.sin(s * math.pi), 0)
-		end
-		for k = 2, #pts do
-			len[k] = len[k - 1] + (pts[k] - pts[k - 1]).Magnitude
-		end
-		Mark.projArt(seg, { pts = pts, len = len, speed = 60, hit = (t % 3 < 2) and C or nil, key = "gal" }, os.clock())
-	end },
-	{ name = "Direction Spoof: the fake aim point", x = 180, art = function(seg, C, t, st, G)
-		local q = C + G.right * (math.sin(t * 1.7) * 5) + Vector3.new(0, 4 + math.sin(t * 2.3) * 1.5, 0)
-		Mark.spoofArt(seg, q, G.right, C - G.fw * 22 + Vector3.new(0, 1, 0), os.clock(), 1 - (t % 1.5) / 1.5)
-	end },
-	{ name = "SilentAim boomerang: the throw to him", x = 116, art = function(seg, C, t, st, G)
-		if not st.tab then
-			-- a loop of the same kind as Boomerang.GetPosition (out to the left, back): 1.9 s sampled at 0.025
-			local tab = { a = {}, b = {}, h = {}, rho = {}, dt = 0.025, n = 76 }
-			for i = 0, 76 do
-				local th = i / 76 * math.pi * 2
-				tab.a[i], tab.b[i], tab.h[i] = 30 * math.sin(th), -18 * (1 - math.cos(th)), 1.2 * math.sin(th * 0.5)
-				tab.rho[i] = math.sqrt(tab.a[i] ^ 2 + tab.b[i] ^ 2)
-			end
-			st.tab = tab
-		end
-		local f = G.fw
-		local S = C - G.fw * 14 + Vector3.new(0, 3.5, 0)
-		local i = 14 + math.floor((math.sin(t * 0.7) + 1) * 4)
-		local side = Vector3.new(f.Z, 0, -f.X)
-		local P = S + f * st.tab.a[i] + side * st.tab.b[i]
-		Mark.boomArt(seg, f, { tab = st.tab, S = S, P = Vector3.new(P.X, S.Y - 0.5, P.Z), t = i * 0.025 }, Color3.fromRGB(90, 220, 255), os.clock(), S - side * 1.2 - f * 1.5)
 	end },
 	{ name = "AutoDodge: bazooka impact / hammer slam", x = 84, art = function(seg, C, t, st, G)
 		local ph = t % 2.2
@@ -22260,6 +22682,8 @@ return function(_Lib, _Core)
 			tog(b, "Pass Solver", "BlockSmart", "If he cannot score, cuts the pass to his teammate.")
 			tog(b, "Read His Charge", "BlockPassRead", "Cuts his pass when he charges it.")
 			tog(b, "Cover Shadow", "BlockShade", "Covers the goal and his best pass.")
+			tog(b, "Press Alone", "BlockPressIso", "Closes in on a carrier who has nobody to pass to.")
+			tog(b, "Press Open Shot", "BlockPressOpen", "Closes in on a carrier with a clear shot at your goal.")
 			tog(b, "Shot Danger", "BlockDanger", "Blocks a carrier who has an open shot.")
 			tog(b, "Show Marking", "DrawBlock", "The pass lane and where you cut it.")
 			tog(b, "Behind Logic", "BlockBehindLogic", "Behind the carrier: take the next attacker, else cut him off.")
