@@ -345,6 +345,7 @@ local CFG = {
 	AerialJumpLead = 0.3, -- jump when arrival <= this: the whole ~0.27 s rise sits inside the 0.4 s volley window
 	CounterAirSlide = 11, -- CounterJump: longest slide from the air at a raised target (st)
 	GkDiveLate = 0.07, -- dive only when a dive started this much later would miss (s)
+	GkDiveRobust = 0.05, -- a dive must still connect when it leaves this much later (s) to beat an earlier one (guess)
 	GkWalkSlack = 0.12, -- humanoid accel/turn before full WalkSpeed (not from dump)
 	GkReactSeconds = 0.15, -- keeper reaction after release; he sees GoalCrossingPreview (not from dump)
 	ShotReachMargin = 0.05,
@@ -6488,6 +6489,21 @@ local function paintHud()
 	end
 end
 
+-- AutoShoot owns this kick: the namecall rewrite below sends Shoot.aim instead of the camera. The Direction and Body
+-- spoofs only make sense on such a kick (the real shot is ours, the replicated aim / body are free to lie); on a kick
+-- AutoShoot does not rewrite the shot comes from the camera and the body pose, so a lie there is pure desync with no
+-- gain and a sideways body puts the ball off target. One predicate for the rewrite and for both spoofs.
+Mark.autoShotOn = function()
+	if not CFG.AutoShoot or MatchSettings.IsGoalkeeperCharacter(LocalPlayer.Character) then
+		return false
+	end
+	local a = Shoot.aim
+	if not (a and a.Direction) or Shoot.lob then
+		return false
+	end
+	return (Mark.flickStrike or (Shoot.launch and Shoot.launch.Y > 1) or a.Direction.Y > 0.05) and true or false
+end
+
 local function shotRemote(self)
 	if typeof(self) ~= "Instance" then
 		return nil
@@ -6644,7 +6660,7 @@ oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
 			local r = live.ray
 			cmd.AimDirection = { Origin = r.Origin, Direction = r.Direction, CameraCFrame = r.CameraCFrame, CameraFieldOfView = r.CameraFieldOfView, IsAirborne = false }
 			cmd.TargetUserId = nil
-		elseif type(cmd) == "table" and not MatchSettings.IsGoalkeeperCharacter(LocalPlayer.Character) and (packet.Phase == "Start" or packet.Phase == "Release" or packet.Phase == "Update") and Shoot.aim and Shoot.aim.Direction and not Shoot.lob and not (liveOwnerId() == LocalPlayer.UserId and (cmd.PassType == "FreeLowPass" or cmd.PassType == "FreeLobPass" or cmd.PassType == "AssistedPass")) and (Mark.flickStrike or (Shoot.launch and Shoot.launch.Y > 1) or Shoot.aim.Direction.Y > 0.05) then
+		elseif type(cmd) == "table" and (packet.Phase == "Start" or packet.Phase == "Release" or packet.Phase == "Update") and Mark.autoShotOn() and not (liveOwnerId() == LocalPlayer.UserId and (cmd.PassType == "FreeLowPass" or cmd.PassType == "FreeLobPass" or cmd.PassType == "AssistedPass")) then
 			if which == "kick" and packet.Phase == "Start" and cmd.PassType == "Shot" and not Mark.sp then
 				Mark.spoofPlan()
 			end
@@ -7061,6 +7077,7 @@ local function onProjectile(kind, proj)
 			id = proj.Id, item = id, src = proj.SourceUserId, pos = pos, vel = typeof(vel) == "Vector3" and vel or Vector3.zero,
 			at = nowS, born = type(proj.StartedAt) == "number" and proj.StartedAt or nowS, grav = g, rad = rad,
 			homing = id == "rocketPunch", throw = type(proj.BoomerangThrow) == "table" and proj.BoomerangThrow or nil,
+			ballId = proj.BallId,
 		}
 		do
 			local stN = Mark.projLive[proj.Id]
@@ -7098,8 +7115,9 @@ Mark.projBatch = function(rows, batchAt)
 				if type(row[6]) == "number" and row[6] > 0 then
 					st.det = row[6]
 				end
-				-- explosives: the zone follows every correction (a grenade bounces off bodies and the server re-sends it)
-				if (st.item == "grenade" or st.item == "bazooka") and Mark.hazEv[st.id] then
+				-- explosives: the zone follows every correction (a grenade bounces off bodies and the server re-sends it); a
+				-- zone that could not be built at the start is built from the first row that can
+				if (st.item == "grenade" or st.item == "bazooka") and not (st.det and st.det < nowS - 0.3) then
 					st.fp, st.fv, st.ft = p, st.vel, rowAt
 					if os.clock() - (st.hazAt or 0) > 0.12 or st.det ~= st.hazDet then
 						Mark.hazAdd(st)
@@ -8224,18 +8242,33 @@ Mark.npcDiveWatch = function(root)
 	if closing < (CFG.WallTrapBurst or 35) then
 		return
 	end
-	local still = ring[1]
-	local tStart = ring[#ring].t
-	for i = 1, #ring do
-		if flat(ring[i].p - still.p).Magnitude > 0.6 then
-			tStart = ring[i].t
+	-- Dive start = the end of the newest >= 0.08 s window in which he still closed slower than a run. The old start was
+	-- "the first sample that left the standing spot": a keeper who RUNS out at us and then dives left it long before
+	-- the dive (log: closing 18 -> 37, el 0.53, d 8.0 -> "dive no no line": the dive was taken as 60 % done from a
+	-- point 0.6 s behind him, so the solved path never reached the wall circle).
+	local runMax = (CFG.WallTrapBurst or 35) * 0.8
+	local si = 1
+	local j = #ring
+	while j > 1 do
+		local i = j - 1
+		while i > 1 and ring[j].t - ring[i].t < 0.08 do
+			i -= 1
+		end
+		local dtj = ring[j].t - ring[i].t
+		if dtj <= 1e-3 then
 			break
 		end
+		if flat(ring[j].p - ring[i].p):Dot(toUs) / dtj < runMax then
+			si = j
+			break
+		end
+		j = i
 	end
 	Mark.gkDiveMod = Mark.gkDiveMod or require(Modules.Actions.GoalkeeperDive)
-	local el0 = math.clamp(now - tStart, 0, Mark.gkDiveMod.Constants.DurationSeconds or 0.875)
-	Mark.trapDive = { uid = k.key, at = now, el0 = el0, P0 = still.p }
-	logFile("wall trap", "npc dive seen", "closing", string.format("%.0f", closing), "el", string.format("%.2f", el0), "d", string.format("%.1f", k.d))
+	local el0 = math.clamp(now - ring[si].t, 0, Mark.gkDiveMod.Constants.DurationSeconds or 0.875)
+	-- P0 = where the dive started (travel 0), el0 = how far into it he is now
+	Mark.trapDive = { uid = k.key, at = now, el0 = el0, P0 = ring[si].p }
+	logFile("wall trap", "npc dive seen", "closing", string.format("%.0f", closing), "el", string.format("%.2f", el0), "d", string.format("%.1f", k.d), "from", string.format("%.1f", flat(ring[si].p - root.Position).Magnitude))
 end
 
 Mark.wallTrap = function(root, diving)
@@ -8280,23 +8313,37 @@ Mark.wallTrap = function(root, diving)
 		local ourV = flat(root.AssemblyLinearVelocity)
 		local rate = -flat(vK - ourV):Dot(toK)
 		local trig = CFG.WallTrapTrigger or 8
-		if rate < 6 or k.d > trig + 14 or k.d < 3 then
+		-- A keeper who comes out on a DIAGONAL (log: "stands at an angle") closes slowly until he turns at us, then the
+		-- closing rate jumps (log: rate < 13 -> 22 in one tick: tt went from "too early" straight to 0.14 < ready 0.19 ->
+		-- no line, he dived through). He chases the carrier, so the time to his trigger comes from his SPEED turned at us
+		-- whenever he is coming out at all (not running back), and the path below is that pursuit.
+		local spdK = vK.Magnitude
+		local comingOut = -vK:Dot(toK) > -2
+		local chase = comingOut and spdK + ourV:Dot(toK) or rate
+		local eff = math.max(rate, chase)
+		if eff < 6 or k.d > trig + 14 or k.d < 3 then
 			return false
 		end
 		local use = Mark.itemUse
 		local equipped = use and use.IsEquipped and use.IsEquipped() and Mark.equippedId() == "barricades"
 		local ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
 		local ready = ping * 0.5 + (CFG.WallLatency or 0.06) + (CFG.WallMargin or 0.05) + (equipped and 0 or (CFG.WallEquipDelay or 0.04))
-		local tt = math.max((k.d - trig) / rate, 0)
+		local tt = math.max((k.d - trig) / eff, 0)
 		if tt > ready + 0.05 then
 			return false -- too early: he would still have time to see it and stop
 		end
 		local P0b = k.r.Position
 		local O, ourV2 = root.Position, flat(root.AssemblyLinearVelocity)
-		local Pd = P0b + vK * tt
+		-- his run until the trigger: straight at where we will be (pursuit) when that is the faster read, else his line
+		local runV = vK
+		if chase > rate then
+			local aimU = unitOrNil(flat(O + ourV2 * tt - P0b))
+			runV = aimU and aimU * spdK or vK
+		end
+		local Pd = P0b + runV * tt
 		local function pathBait(t)
 			if t <= tt then
-				return P0b + vK * t
+				return P0b + runV * t
 			end
 			local to = unitOrNil(flat(O + ourV2 * t - Pd)) or toK * -1
 			local el = math.min(t - tt, dur)
@@ -8305,15 +8352,18 @@ Mark.wallTrap = function(root, diving)
 		local ok, why = Mark.wallVsPath(root, pathBait, tt + dur, "keeper bait" .. (k.npc and " npc" or ""), { rad = 2, equip = true, actor = k.actor, model = k.model, trap = true, contact = 3 })
 		if not ok and why and (not Mark.trapLog or now - Mark.trapLog > 0.6) then
 			Mark.trapLog = now
-			logFile("wall trap", "bait no", why, "d", string.format("%.1f", k.d), "rate", string.format("%.0f", rate), "tt", string.format("%.2f", tt), "ready", string.format("%.2f", ready))
+			logFile("wall trap", "bait no", why, "d", string.format("%.1f", k.d), "rate", string.format("%.0f", rate), "spd", string.format("%.0f", spdK), "eff", string.format("%.0f", eff), "tt", string.format("%.2f", tt), "ready", string.format("%.2f", ready))
 		end
 		return ok
 	end
 	local O, ourV = root.Position, flat(root.AssemblyLinearVelocity)
-	local base = D.GetTravel(el0, reach)
+	-- P0 is the dive START (travel 0): NPC = the burst start, player = his displayed pose at the DiveStarted packet (the
+	-- display lags the server by more than the packet's own age, so it still shows the start). The old path put the
+	-- start at P0 AND subtracted the travel already done, i.e. it restarted the dash from where it began - every later
+	-- frame of the 0.5 s re-solve (and the whole NPC case) had him that far behind his real body.
 	local function path(t)
 		local to = unitOrNil(flat(O + ourV * t - P0)) or Vector3.new(0, 0, 1)
-		return P0 + to * (D.GetTravel(math.min(el0 + t, dur), reach) - base) + Vector3.new(0, D.GetVerticalTravel(el0 + t), 0)
+		return P0 + to * D.GetTravel(math.min(el0 + t, dur), reach) + Vector3.new(0, D.GetVerticalTravel(el0 + t), 0)
 	end
 	local ok, why = Mark.wallVsPath(root, path, dur - el0, (diving and "keeper dive" or "keeper bait") .. (k.npc and " npc" or ""), { rad = 2, equip = true, actor = k.actor, model = k.model, trap = true, contact = 3, lagReady = not diving })
 	if not ok and why and (not Mark.trapLog or os.clock() - Mark.trapLog > 0.6) then
@@ -8682,39 +8732,62 @@ Mark.gkOwnDive = function(root, td, noJump)
 			dirs[#dirs + 1] = { name = "exact", wd = f * math.cos(a) + Vector3.new(-f.Z, 0, f.X) * math.sin(a), exact = true }
 		end
 	end
+	local mouth = Mark.gkMouth
+	local gf = Mark.gkFwd
+	local ballR = Physics.BallRadius or 1
+	local hold = { CFrame = root.CFrame }
+	-- first contact time of a dive along wd that leaves `extra` seconds later than planned (nil = no contact)
+	local function contact(wd, extra)
+		for i = 2, #samples do
+			local t = ts[i] - delay - td - extra
+			if t > win then
+				return nil
+			end
+			-- goal line: a save at or behind the mouth plane is already a goal (user: dived inward diagonally,
+			-- touched the ball after it crossed). Ball sample and keeper pose must both stay in front of the line.
+			if mouth and gf and (samples[i] - mouth.c):Dot(gf) < ballR + 0.3 then
+				return nil
+			end
+			if t > 0 then
+				local pos = root.Position + wd * D.GetTravel(t, dist) + Vector3.new(0, D.GetVerticalTravel(t) + yJ, 0)
+				if mouth and gf and (pos - mouth.c):Dot(gf) < 0.3 then
+					return nil
+				end
+				hold.CFrame = CFrame.lookAlong(pos, wd)
+				-- segment test: path samples are ~6 studs apart at shot speed, a point test skips through the box
+				if HitboxSettings.GetSegmentEnterAlpha(hold, box, samples[i - 1], samples[i]) then
+					return t
+				end
+			end
+		end
+		return nil
+	end
+	-- TIMING MARGIN. The earliest contact is not the best one: a dive that meets a close, fast shot right at its start
+	-- (forward, at the shooter) misses the moment the dash leaves a little later than modelled (ping jitter, server
+	-- step) - the ball is already behind us (user: powered shot from close range flew through a forward dive; a
+	-- sideways / covering dive would have held). So every contact is re-tested with the dive leaving GkDiveRobust later
+	-- (not in the dump: a guess, logged as robust yes|no in "gk dive"); a dive that survives it wins over an earlier
+	-- one that does not.
+	local rob = CFG.GkDiveRobust or 0.05
 	for _, dv in dirs do
 		local name, wd = dv.name, dv.wd
 		-- no backward dives: the backward dive arches the body back and lowers the save box (user: the ball went over
 		-- the head on a "B" dive); our box model does not have that pose
-		if typeof(wd) == "Vector3" and (not Mark.gkFwd or wd:Dot(Mark.gkFwd) > -0.3) then
-			local hold = { CFrame = CFrame.lookAlong(root.Position, wd) }
-			for i = 2, #samples do
-				local t = ts[i] - delay - td
-				if t > win then
-					break
+		if typeof(wd) == "Vector3" and (not gf or wd:Dot(gf) > -0.3) then
+			local t = contact(wd, 0)
+			if t then
+				local robust = rob <= 0 or contact(wd, rob) ~= nil
+				local better
+				if not best then
+					better = true
+				elseif robust ~= best.robust then
+					better = robust
+				else
+					-- a camera choice wins ties (no turn); an exact one must be clearly earlier
+					better = t < best.t - ((dv.exact and not best.exact) and 0.03 or 0)
 				end
-				-- goal line: a save at or behind the mouth plane is already a goal (user: dived inward diagonally,
-				-- touched the ball after it crossed). Ball sample and keeper pose must both stay in front of the line.
-				local mouth = Mark.gkMouth
-				local gf = Mark.gkFwd
-				local ballR = Physics.BallRadius or 1
-				if mouth and gf and (samples[i] - mouth.c):Dot(gf) < ballR + 0.3 then
-					break
-				end
-				if t > 0 then
-					local pos = root.Position + wd * D.GetTravel(t, dist) + Vector3.new(0, D.GetVerticalTravel(t) + yJ, 0)
-					if mouth and gf and (pos - mouth.c):Dot(gf) < 0.3 then
-						break
-					end
-					hold.CFrame = CFrame.lookAlong(pos, wd)
-					-- segment test: path samples are ~6 studs apart at shot speed, a point test skips through the box
-					if HitboxSettings.GetSegmentEnterAlpha(hold, box, samples[i - 1], samples[i]) then
-						-- a camera choice wins ties (no turn); an exact one must be clearly earlier
-						if not best or t < best.t - ((dv.exact and not best.exact) and 0.03 or 0) then
-							best = { name = name, wd = wd, t = t, miss = 0, own = true, td = td, exact = dv.exact }
-						end
-						break
-					end
+				if better then
+					best = { name = name, wd = wd, t = t, miss = 0, own = true, td = td, exact = dv.exact, robust = robust }
 				end
 			end
 		end
@@ -9544,11 +9617,16 @@ Mark.gkPress = function(character, root, c)
 		TurnControl.LockAutoRotate("Goalkeeper", best.dir)
 		Mark.gkPreFace = { at = c.now }
 	end
-	-- a charging carrier releases within KickCore's 0.4 s: the dive must land before that, otherwise the save logic owns it
+	-- a charging carrier releases within his max charge: the dive must land before that, otherwise the save logic owns
+	-- it. The max is HIS (KickPowerups.GetChargeConstants: a kick powerup, the "fire" boost, cuts it 0.4 -> 0.3 s and
+	-- multiplies the shot speed); the flat 0.4 let a press dive go at a powered shooter who fired 0.1 s earlier, and
+	-- the ball flew through the dive.
 	local crec = Mark.charges and Mark.charges[pl.UserId]
 	if crec and crec.live and c.now - (crec.seen or 0) < 0.6 and not committed then
-		if best.t + ping * 0.5 > (crec.at or c.now) + 0.4 - c.now then
-			return note("skip charging t " .. fmt(best.t) .. " " .. info)
+		Mark.kickPow = Mark.kickPow or require(Modules.Actions.KickPowerups)
+		local maxC = Mark.kickPow.GetChargeConstants(pl, KickCore.Constants).MaximumChargeSeconds
+		if best.t + ping * 0.5 > (crec.at or c.now) + maxC - c.now then
+			return note(string.format("skip charging max %.2f mult %.2f t %s %s", maxC, Mark.kickPow.GetMultiplier(pl), fmt(best.t), info))
 		end
 	end
 	-- never a dive at a man whose height we cannot predict: about to launch, just launched (slope not measured yet), or
@@ -10569,9 +10647,13 @@ Mark.tickGk = function(character, root)
 		-- dive) may open up as the ball comes (log: jump + dive at eta 0.83 while a walk save at 0.35 existed).
 		local late = CFG.GkDiveLate or 0.07
 		local deferred = false
-		if hit and hit.own and late > 0 and Mark.gkOwnDive(root, late, true) then
-			hit = nil
-			deferred = true
+		if hit and hit.own and late > 0 then
+			-- wait only for a later dive that keeps the timing margin of this one (a later fragile dive is no dive)
+			local lateHit = Mark.gkOwnDive(root, late, true)
+			if lateHit and (lateHit.robust or not hit.robust) then
+				hit = nil
+				deferred = true
+			end
 		end
 		if not hit and not deferred and CFG.GkJumpDive ~= false then
 			-- nothing a ground dive touches (the high corner: the dive rises ~1.7 studs): jump first, dive from the air
@@ -10620,7 +10702,7 @@ Mark.tickGk = function(character, root)
 			if ok then
 				Mark.gkDiveRec = { at = os.clock(), name = hit.name, minD = math.huge, eta = crossT or -1 }
 			end
-			logFile("gk dive", ok and "ok" or "no", "model", hit.own and "own" or "assist", "choice", hit.name, "miss", string.format("%.2f", hit.miss), "t", string.format("%.2f", hit.t or -1), "assist", tostring(hit.assisted), "eta", string.format("%.2f", crossT or -1), "dir", fmtV(hit.wd))
+			logFile("gk dive", ok and "ok" or "no", "model", hit.own and "own" or "assist", "choice", hit.name, "miss", string.format("%.2f", hit.miss), "t", string.format("%.2f", hit.t or -1), "assist", tostring(hit.assisted), "eta", string.format("%.2f", crossT or -1), "dir", fmtV(hit.wd), "robust", hit.own and (hit.robust and "yes" or "no") or "-", "fwd", string.format("%.2f", hit.wd:Dot(fwd)), "ballSpd", string.format("%.0f", typeof(ballVel) == "Vector3" and ballVel.Magnitude or 0))
 		elseif not deferred and (not Mark.gkNoDiveLog or now - Mark.gkNoDiveLog > 0.3) then
 			Mark.gkNoDiveLog = now
 			logFile("gk dive none", "eta", string.format("%.2f", crossT or -1), "cross", string.format("%.1f", crossSide or 0))
@@ -11491,7 +11573,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v165")
+	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v166")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -14694,6 +14776,13 @@ Mark.spoofTick = function()
 		return
 	end
 	local now = os.clock()
+	-- AutoShoot lost the shot mid-charge (re-solve failed, Shoot.aim cleared): the release is the camera's now, the decoy
+	-- must not leak into it (the aim-ray hook would still hand the decoy to the game)
+	if ChargedKick.IsCharging and ChargedKick.IsCharging() and not Mark.autoShotOn() then
+		logFile("spoof", "drop", sp.name, "autoshoot off this kick", "held", string.format("%.2f", now - sp.t0))
+		Mark.sp = nil
+		return
+	end
 	if not (ChargedKick.IsCharging and ChargedKick.IsCharging()) and now - sp.t0 > 0.05 then
 		logFile("spoof", "done", sp.name, "held", string.format("%.2f", now - sp.t0), "decoy packets", sp.sent or 0, "real in window", sp.real or 0, sp.realWhy or "-", "echo", sp.echo or 0)
 		Mark.sp = nil
@@ -14744,8 +14833,13 @@ Mark.faceActive = function(character)
 	end
 	local own = liveOwnerId() == LocalPlayer.UserId
 	local when = CFG.FaceSpoofWhen or "charge"
+	local charging = ChargedKick.IsCharging and ChargedKick.IsCharging() and true or false
+	-- a kick AutoShoot does not own is struck from the body pose and the camera: no lie on it (any When mode)
+	if own and charging and not Mark.autoShotOn() then
+		return false
+	end
 	if when == "charge" then
-		return own and ChargedKick.IsCharging and ChargedKick.IsCharging() and true or false
+		return own and charging
 	elseif when == "ball" then
 		return own
 	end
@@ -19409,10 +19503,18 @@ Mark.hazAdd = function(st)
 	local ev = nil
 	if item == "grenade" then
 		-- GrenadeEffects.refreshFlight: Flight = NewFlight(row Position, Velocity, UpdatedAt), DetonatesAt from the row or
-		-- GetDetonationTime (bounces with the movement world, TimeScale 0.7, the fuse starts at the first contact)
+		-- GetDetonationTime (bounces with the movement world, TimeScale 0.7, the fuse starts at the first contact).
+		-- The world is the game's own source for it: ChargePathPreview.GetBallBoundaryWorld(projectile BallId). It used to be
+		-- Renderer.GetMovementState(), which is nil whenever the ball is not in free flight (carried, held by a keeper):
+		-- every grenade thrown at a carrier made no zone at all, and no later row retried it ("sees grenades every other time").
 		Mark.grenMod = Mark.grenMod or require(Modules.Items.Grenade)
-		local _, world = Renderer.GetMovementState()
+		Mark.pathPreview = Mark.pathPreview or require(Client.Gameplay.Actions.ChargePathPreview)
+		local world = Mark.pathPreview.GetBallBoundaryWorld(st.ballId)
 		if not world then
+			if not Mark.grenNoWorld or os.clock() - Mark.grenNoWorld > 1 then
+				Mark.grenNoWorld = os.clock()
+				logFile("blast skip", "grenade", "no boundary world", "ball", tostring(st.ballId))
+			end
 			return
 		end
 		local flight = Mark.grenMod.NewFlight(st.fp, st.fv, st.ft)
@@ -20069,11 +20171,14 @@ Mark.projTick = function(character, root)
 	local O = root.Position
 	local ourV = flat(root.AssemblyLinearVelocity)
 	for id, st in live do
-		if nowS - st.at > 1.2 or nowS - st.born > 8 then
+		-- explosives live until ProjectileFinish (a grenade flies up to MaximumFlightSeconds 5 with rows only at the
+		-- bounces): dropped after 1.2 s without a row, its later corrections had no state to land in
+		local explosive = st.item == "grenade" or st.item == "bazooka"
+		if (not explosive and nowS - st.at > 1.2) or nowS - st.born > 8 then
 			live[id] = nil
 			continue
 		end
-		if st.item == "grenade" or st.item == "bazooka" then
+		if explosive then
 			continue -- explosives are events (Mark.hazEv / Mark.hazFlee), not a corridor
 		end
 		local who = st.src and playerOf(st.src)
