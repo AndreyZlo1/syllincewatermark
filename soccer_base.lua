@@ -5433,13 +5433,16 @@ solveShotRaw = function(root, forced)
 				radius = radius, post = post, mouthH = mouthH, packShot = packShot, root = root, goal = goal, world = chkWorld, fail = fail,
 			}
 			local order = {}
-			if CFG.BounceFAKE ~= false and CFG.PriorityBounceFAKE then
+			-- Allowed Types: with both bounce families unchecked the Bounce FAKE (a bounce shot) is off too
+			local sban = CFG.ShotBan
+			local bounceOk = not (type(sban) == "table" and sban.bounceHigh and sban.bounceLow)
+			if CFG.BounceFAKE ~= false and bounceOk and CFG.PriorityBounceFAKE then
 				order[#order + 1] = { "b", true }
 			end
 			if CFG.FakeShot ~= false and CFG.PriorityFAKE then
 				order[#order + 1] = { "f", (Shoot.fakeFirst or 0) < (CFG.FakeFirstChance or 0.85) }
 			end
-			if CFG.BounceFAKE ~= false and not CFG.PriorityBounceFAKE then
+			if CFG.BounceFAKE ~= false and bounceOk and not CFG.PriorityBounceFAKE then
 				order[#order + 1] = { "b", false }
 			end
 			if CFG.FakeShot ~= false then
@@ -6620,6 +6623,16 @@ oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
 			-- Direction Spoof: until the aim lock the replicated aim is a decoy; the lock packet (AimLockedAt) and the
 			-- release carry the real shot
 			local dec = packet.Phase ~= "Release" and (cmd.AimLockedAt == nil or CFG.DirSpoofHideLock) and Mark.spoofRay() or nil
+			if Mark.sp and packet.Phase ~= "Release" then
+				-- what really went out inside the decoy window (log at "spoof done")
+				local sp = Mark.sp
+				if dec then
+					sp.sent = (sp.sent or 0) + 1
+				elseif os.clock() < sp.endAt then
+					sp.real = (sp.real or 0) + 1
+					sp.realWhy = cmd.AimLockedAt ~= nil and "lock" or "no decoy"
+				end
+			end
 			if dec then
 				cmd.AimDirection = dec
 				cmd.KickDirection = AimFacing.GetFlatDirection(dec.Direction) or dec.Direction
@@ -8107,11 +8120,48 @@ Mark.foeKeeper = function(root, maxD)
 			local r = ActorTargeting.GetActorRoot(a)
 			local dd = r and flat(r.Position - root.Position).Magnitude
 			if dd and dd < bd then
-				best, bd = { actor = a, model = model, r = r, d = dd }, dd
+				best, bd = { actor = a, model = model, r = r, d = dd, key = a.UserId }, dd
+			end
+		end
+	end
+	-- NPC keepers (practice / bots: Workspace.Characters.NPCs, the same list the shot solver reads): the one tagged
+	-- ActiveGoalkeeper or standing in the mouth of the goal we attack
+	local npcs = Workspace:FindFirstChild("Characters")
+	npcs = npcs and npcs:FindFirstChild("NPCs")
+	local g = npcs and enemyGoalPart()
+	if npcs and g then
+		for _, model in npcs:GetChildren() do
+			local r = model:IsA("Model") and model:FindFirstChild("HumanoidRootPart")
+			if r and (model:GetAttribute("ActiveGoalkeeper") == true or flat(r.Position - g.Position).Magnitude < 16) then
+				local dd = flat(r.Position - root.Position).Magnitude
+				if dd < bd then
+					best, bd = { model = model, r = r, d = dd, key = model, npc = true }, dd
+				end
 			end
 		end
 	end
 	return best
+end
+
+-- An NPC keeper's dive sends no GoalkeeperDiveStarted we can tie to a player: read it from his body. The dive speed
+-- is the derivative of the cubic-out travel, v(t) = 3 D / T * (1 - t / T)^2, so a burst toward us gives the dive time.
+Mark.npcDiveWatch = function(root)
+	local k = Mark.foeKeeper(root, 40)
+	if not (k and k.npc) or (Mark.trapDive and Mark.trapDive.uid == k.key and os.clock() - Mark.trapDive.at < 1.2) then
+		return
+	end
+	local v = flat(k.r.AssemblyLinearVelocity)
+	local toUs = unitOrNil(flat(root.Position - k.r.Position))
+	if not toUs or v:Dot(toUs) < 30 then
+		return
+	end
+	Mark.gkDiveMod = Mark.gkDiveMod or require(Modules.Actions.GoalkeeperDive)
+	local D = Mark.gkDiveMod
+	local T = D.Constants.DurationSeconds or 0.875
+	local dist = 20 * 1.3 + 3
+	local el0 = T * (1 - math.sqrt(math.clamp(v.Magnitude * T / (3 * dist), 0, 1)))
+	Mark.trapDive = { uid = k.key, at = os.clock(), el0 = el0, P0 = k.r.Position - toUs * D.GetTravel(el0, dist) }
+	logFile("wall trap", "npc dive seen", "speed", string.format("%.0f", v.Magnitude), "el", string.format("%.2f", el0), "d", string.format("%.1f", k.d))
 end
 
 Mark.wallTrap = function(root, diving)
@@ -8125,12 +8175,12 @@ Mark.wallTrap = function(root, diving)
 	Mark.gkDiveMod = Mark.gkDiveMod or require(Modules.Actions.GoalkeeperDive)
 	local D = Mark.gkDiveMod
 	local dur = D.Constants.DurationSeconds or 0.875
-	local reach = (D.GetDistance(k.actor) or 20) * 1.3 + 3
+	local reach = ((k.actor and D.GetDistance(k.actor)) or 20) * 1.3 + 3
 	local el0 = 0
 	local P0 = k.r.Position
 	if diving then
 		local td = Mark.trapDive
-		if not (td and td.uid == k.actor.UserId) then
+		if not (td and td.uid == k.key) then
 			return false
 		end
 		el0 = math.min(td.el0 + (os.clock() - td.at), dur)
@@ -8140,7 +8190,8 @@ Mark.wallTrap = function(root, diving)
 		end
 	else
 		local wp = Mark.wallPend
-		if CFG.WallTrapBait == false or Mark.foeDiveLeft() > 0 or k.d > (CFG.WallTrapDist or 16) or k.d < 7 or (wp and wp.trap and os.clock() - wp.at < 3) then
+		local td = Mark.trapDive
+		if (td and td.uid == k.key and os.clock() - td.at < 2) or CFG.WallTrapBait == false or Mark.foeDiveLeft() > 0 or k.d > (CFG.WallTrapDist or 16) or k.d < 7 or (wp and wp.trap and os.clock() - wp.at < 3) then
 			return false
 		end
 		-- he stands between us and his goal and we close in on each other
@@ -8160,7 +8211,7 @@ Mark.wallTrap = function(root, diving)
 		local to = unitOrNil(flat(O + ourV * t - P0)) or Vector3.new(0, 0, 1)
 		return P0 + to * (D.GetTravel(math.min(el0 + t, dur), reach) - base) + Vector3.new(0, D.GetVerticalTravel(el0 + t), 0)
 	end
-	local ok, why = Mark.wallVsPath(root, path, dur - el0, diving and "keeper dive" or "keeper bait", { rad = 2, equip = true, actor = k.actor, model = k.model, trap = true, contact = 3, lagReady = not diving })
+	local ok, why = Mark.wallVsPath(root, path, dur - el0, (diving and "keeper dive" or "keeper bait") .. (k.npc and " npc" or ""), { rad = 2, equip = true, actor = k.actor, model = k.model, trap = true, contact = 3, lagReady = not diving })
 	if not ok and why and (not Mark.trapLog or os.clock() - Mark.trapLog > 0.6) then
 		Mark.trapLog = os.clock()
 		logFile("wall trap", diving and "dive" or "bait", "no", why, "d", string.format("%.1f", k.d), "el", string.format("%.2f", el0))
@@ -8179,6 +8230,9 @@ Mark.wallTick = function(root, oid, own)
 	end
 	local now = os.clock()
 	-- a keeper dive at us is decided every frame (0.15 s of it is all the time there is)
+	if own and CFG.WallTrap ~= false then
+		Mark.npcDiveWatch(root)
+	end
 	if Mark.trapDive and now - Mark.trapDive.at < 0.5 and Mark.wallTrap(root, true) then
 		return
 	end
@@ -11119,6 +11173,16 @@ Mark.chargeSpot = function(character, root, uid)
 end
 
 local function onFx(kind, userId, a, b, c, aimDir, ...)
+	-- Direction Spoof check: the server's presentation of OUR charge (what the keeper's client draws)
+	if Mark.sp and userId == LocalPlayer.UserId and (kind == "KickChargeStarted" or kind == "KickChargeUpdated") then
+		local sp = Mark.sp
+		local d0 = typeof(aimDir) == "Vector3" and aimDir or (type(aimDir) == "table" and aimDir.Direction)
+		sp.echo = (sp.echo or 0) + 1
+		if typeof(d0) == "Vector3" and (sp.echo <= 6) then
+			local real = Shoot.aim and Shoot.aim.Direction
+			logFile("spoof echo", kind, "t", string.format("%.2f", os.clock() - sp.t0), "dir", fmtV(d0), "vs real", real and string.format("%.0f deg", math.deg(math.acos(math.clamp(d0.Unit:Dot(real.Unit), -1, 1)))) or "-")
+		end
+	end
 	if kind == "GoalkeeperDiveStarted" and type(userId) == "number" and userId ~= LocalPlayer.UserId then
 		-- the dive cooldown is GoalkeeperDive.Constants.RepeatDelaySeconds from the START of the dive
 		local who = playerOf(userId)
@@ -11282,7 +11346,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v148")
+	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v149")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -14099,14 +14163,17 @@ Mark.shotFilter = function(pool)
 	-- while a flick / volley is being aimed its own list decides (FlickBan), the normal list does not apply
 	local flick = Mark.flickAim or Mark.aerial or Mark.flickStrike
 	local ban = flick and CFG.FlickBan or CFG.ShotBan
-	if type(ban) ~= "table" or next(ban) == nil then
+	local sw = not flick and CFG.ShotWeight or nil
+	if (type(ban) ~= "table" or next(ban) == nil) and not sw then
 		return pool
 	end
+	ban = type(ban) == "table" and ban or {}
 	local out = {}
 	for i = 1, #pool do
 		local p = pool[i]
 		local key = p.lob and "chip" or (p.band == "mid" and "high" or p.band)
-		if not ban[key] then
+		-- a weight of 0% means never (the UI says so), not "least likely"
+		if not ban[key] and not (sw and sw[key] == 0) then
 			out[#out + 1] = p
 		end
 	end
@@ -14397,7 +14464,7 @@ Mark.spoofTick = function()
 	end
 	local now = os.clock()
 	if not (ChargedKick.IsCharging and ChargedKick.IsCharging()) and now - sp.t0 > 0.05 then
-		logFile("spoof", "done", sp.name, "held", string.format("%.2f", now - sp.t0))
+		logFile("spoof", "done", sp.name, "held", string.format("%.2f", now - sp.t0), "decoy packets", sp.sent or 0, "real in window", sp.real or 0, sp.realWhy or "-", "echo", sp.echo or 0)
 		Mark.sp = nil
 	end
 end
@@ -14455,6 +14522,21 @@ Mark.faceActive = function(character)
 	return own or not (ChargedKick.IsCharging and ChargedKick.IsCharging())
 end
 
+-- FORCED: the facing others see is the yaw of our root CFrame that CharacterReplication writes into every motion
+-- entry (CharacterMotion.WriteEntry, byte 11 = atan2 of root.LookVector, sent every CharacterSendIntervalSeconds). The
+-- TurnControl lock alone only sets the ground controller's FacingDirection, which turns the body at the TURN SPEED: a
+-- jitter / flip faster than that never reaches the root, so the wire shows a small wobble (only spin read as real).
+-- So the root is rotated directly (position kept) and the lock holds the controller on the same heading.
+Mark.faceSet = function(root, face)
+	TurnControl.LockAutoRotate("GoKart", face)
+	local lv = root.CFrame.LookVector
+	local lf = Vector3.new(lv.X, 0, lv.Z)
+	if lf.Magnitude < 0.1 or lf.Unit:Dot(face) < 0.999 then
+		local p = root.Position
+		root.CFrame = CFrame.lookAt(p, p + face)
+	end
+end
+
 Mark.faceTick = function(character, root)
 	local fs = Mark.fs
 	if not (character and root) or not Mark.faceActive(character) then
@@ -14490,7 +14572,7 @@ Mark.faceTick = function(character, root)
 		local d = Mark.spoofDir()
 		local f = d and unitOrNil(flat(d))
 		if f then
-			TurnControl.LockAutoRotate("GoKart", f)
+			Mark.faceSet(root, f)
 			return
 		end
 		cur = "flip"
@@ -14523,7 +14605,7 @@ Mark.faceTick = function(character, root)
 	end
 	fs.lastT = now
 	local c, s = math.cos(off), math.sin(off)
-	TurnControl.LockAutoRotate("GoKart", Vector3.new(ref.X * c - ref.Z * s, 0, ref.X * s + ref.Z * c))
+	Mark.faceSet(root, Vector3.new(ref.X * c - ref.Z * s, 0, ref.X * s + ref.Z * c))
 end
 
 
