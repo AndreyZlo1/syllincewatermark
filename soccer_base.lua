@@ -115,6 +115,7 @@ local CFG = {
 	GunPushFlintRange = 70, -- max distance to the keeper for the flintlock (studs, guess)
 	GunPushShotgunRange = 22, -- ... for the shotgun (8 deg cone of 12 pellets: only close, guess)
 	GunPushKeeperZone = 14, -- the keeper "holds the goal": within this of his mouth segment
+	GunPushPathReach = 10, -- ... or (came out) stands within this of the shot path
 	GunPushTravel = 18, -- knock-back travel used for the depth check (log push travel 25-54 on us; conservative)
 	TackleSpeed = 1.2,
 	DribbleClose = 13,
@@ -215,6 +216,7 @@ local CFG = {
 	WallEquip = false, -- Auto Use: AutoWall takes the barricades out itself (item slot press) when a threat is coming; off = only when already in hand
 	WallEquipDelay = 0.04, -- the equip is a local state change + an ordered remote: about a frame
 	WallTrapBait = true, -- put the wall up before the keeper's dive when he runs out at you
+	WallTrapAuto = true, -- Keeper Trap: learn the distance he dives at from the dives seen (else WallTrapTrigger)
 	WallTrapForwardOnly = true, -- Keeper Trap: only a dive aimed at us (within WallTrapCone) gets a wall
 	WallTrapCone = 50, -- degrees between his dive direction and the line to us
 	WallTrapTrigger = 8, -- distance (st) at which the keeper starts his dive (NPC: ~7)
@@ -7354,6 +7356,12 @@ do
 		local oldRay = reticle.GetCameraAimRay
 		local oldBare = reticle.GetCameraAimRayWithoutHit
 		reticle.GetCameraAimRay = function(...)
+			-- Keeper Push goes first: right after OUR release the shot lock (strikeRay: aerial / volley / bicycle) and the
+			-- direction spoof still answer this function - the gun went along the SHOT, at the goal, not at the keeper.
+			-- oldRay builds the payload from GetCameraRay, which returns the push ray.
+			if Mark.pushAim and os.clock() < Mark.pushAim.untilT then
+				return oldRay(...)
+			end
 			if Mark.skillRay then
 				return Mark.skillRay
 			end
@@ -8259,8 +8267,17 @@ Mark.gunPushTry = function(root, tag, key, pts)
 	local K = k.r.Position
 	local relK = flat(K - mouth)
 	local segK = (relK - side * math.clamp(relK:Dot(side), -half, half)).Magnitude
-	if segK > (CFG.GunPushKeeperZone or 14) or relK:Dot(out) < -2 then
-		return skip(string.format("keeper off his goal seg %.1f", segK))
+	-- holds the goal, or came out but stands where the shot passes (a keeper rushing the shooter is the saver too:
+	-- log "keeper off his goal seg 35.6" right after a bait wall - he was on the path)
+	local onPath = math.huge
+	for i = 1, #pts do
+		onPath = math.min(onPath, flat(pts[i] - K).Magnitude)
+		if flat(pts[i] - mouth):Dot(out) <= 0.3 then
+			break
+		end
+	end
+	if (segK > (CFG.GunPushKeeperZone or 14) and onPath > (CFG.GunPushPathReach or 10)) or relK:Dot(out) < -2 then
+		return skip(string.format("keeper off his goal seg %.1f path %.1f", segK, onPath))
 	end
 	if k.actor and Mark.mateDown(k.actor, k.model) then
 		return skip("keeper already down")
@@ -8302,6 +8319,15 @@ Mark.gunPushTry = function(root, tag, key, pts)
 		local v = r.AssemblyLinearVelocity
 		return r.Position + (typeof(v) == "Vector3" and flat(v) or Vector3.zero) * (ping * 0.5) + Vector3.new(0, 0.4, 0)
 	end)
+	if ok then
+		local rec = { at = os.clock(), gun = gun, tag = tag, d = d }
+		Mark.gunPushRec = rec
+		task.delay(1.2, function()
+			if Mark.gunPushRec == rec and not rec.hit then
+				logFile("gunpush result", "NO knock-back seen", rec.gun, rec.tag, "d", string.format("%.1f", rec.d), "equipped now", tostring(Mark.equippedId()), "fired", tostring(Mark.itemUse and Mark.itemUse.IsEquippedItemFired and Mark.itemUse.IsEquippedItemFired()))
+			end
+		end)
+	end
 	logFile("gunpush", tag, gun, ok and "fired" or "no", tostring(how or ""), "keeper", k.npc and "npc" or actorName(k.actor), "d", string.format("%.1f", d), "seg", string.format("%.1f", segK), "cross lat", string.format("%.1f", flat(C - mouth):Dot(side)))
 	return ok
 end
@@ -8377,10 +8403,43 @@ end
 -- crossing of its plane AFTER `ready` (the wall exists) counts when it falls inside the width minus the threat's radius and
 -- inside the height. window: a man must reach the wall within it after it appears (earlier and he walks around it).
 -- Best = the widest margin, then the earliest crossing. Returns { u, C, t, lat, q } or nil.
-Mark.wallSolve = function(O, pts, dtS, ready, rad, window)
+-- The ground under us (the wall stands on it, not under our root): O.Y - 3 is only right while we stand. In the air
+-- (jump, launch, a bump) the wall's band was solved 3 studs under our ROOT, i.e. in the air - a keeper dive on the grass
+-- passed "under" it -> "no line". Raycast down, characters / placed items excluded; memo 0.05 s.
+Mark.groundUnder = function(O)
+	local m = Mark.groundMemo
+	if m and os.clock() - m.at < 0.05 and (m.O - O).Magnitude < 1 then
+		return m.y
+	end
+	local params = Mark.groundParams
+	if not params then
+		params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+		Mark.groundParams = params
+	end
+	local ex = {}
+	local chars = Workspace:FindFirstChild("Characters")
+	if chars then
+		ex[#ex + 1] = chars
+	end
+	if LocalPlayer.Character then
+		ex[#ex + 1] = LocalPlayer.Character
+	end
+	local misc = Workspace:FindFirstChild("Misc")
+	if misc then
+		ex[#ex + 1] = misc
+	end
+	params.FilterDescendantsInstances = ex
+	local hit = Workspace:Raycast(O, Vector3.new(0, -80, 0), params)
+	local y = hit and math.min(hit.Position.Y, O.Y - 3) or (O.Y - 3)
+	Mark.groundMemo = { at = os.clock(), O = O, y = y }
+	return y
+end
+
+Mark.wallSolve = function(O, pts, dtS, ready, rad, window, floorY)
 	local hw = CFG.WallHalf or 5.75
 	local H = CFG.WallHeight or 6.4
-	local floorY = O.Y - 3
+	floorY = floorY or (O.Y - 3)
 	local i0 = math.ceil(ready / dtS) + 1 -- first sample at or after the wall exists
 	local best = nil
 	for k = 0, 47 do
@@ -8427,10 +8486,10 @@ Mark.wallVsPath = function(root, pathFn, tEnd, tag, o)
 	end
 	local now = os.clock()
 	if now - (Mark.skillAt or 0) < (CFG.WallCooldown or 0.7) then
-		return false
+		return false, "wall cooldown"
 	end
 	if Mark.wallPend and Mark.wallPend.seenAt == nil and now - Mark.wallPend.at < 0.5 then
-		return false -- the last one has not appeared yet
+		return false, "last wall not seen yet" -- the last one has not appeared yet
 	end
 	local equipped = use.IsEquipped and use.IsEquipped() and Mark.equippedId() == "barricades"
 	if equipped and Mark.wallEqSent then
@@ -8439,7 +8498,7 @@ Mark.wallVsPath = function(root, pathFn, tEnd, tag, o)
 	end
 	local canEquip = o.equip ~= false and not equipped and Mark.slotOfItem("barricades") ~= nil
 	if not equipped and not canEquip then
-		return false
+		return false, Mark.slotOfItem("barricades") and "auto use off" or "no barricades"
 	end
 	local ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
 	-- the press reaches the server after ping/2, the wall exists WallLatency later (seen 0.11-0.14 s after the press at
@@ -8464,7 +8523,7 @@ Mark.wallVsPath = function(root, pathFn, tEnd, tag, o)
 		pts[i] = nil
 	end
 	local O = root.Position
-	local best = Mark.wallSolve(O, pts, dtS, ready, o.rad or 1, o.window)
+	local best = Mark.wallSolve(O, pts, dtS, ready, o.rad or 1, o.window, Mark.groundUnder(O))
 	if not best then
 		return false, "no line"
 	end
@@ -8686,7 +8745,38 @@ Mark.npcDiveWatch = function(root)
 	local el0 = math.clamp(now - ring[si].t, 0, Mark.gkDiveMod.Constants.DurationSeconds or 0.875)
 	-- P0 = where the dive started (travel 0), el0 = how far into it he is now
 	Mark.trapDive = { uid = k.key, at = now, el0 = el0, P0 = ring[si].p, wd = unitOrNil(flat(k.r.Position - ring[si].p)), name = "npc" }
+	Mark.trapLearn(true, flat(ring[si].p - root.Position).Magnitude)
 	logFile("wall trap", "npc dive seen", "closing", string.format("%.0f", closing), "el", string.format("%.2f", el0), "d", string.format("%.1f", k.d), "from", string.format("%.1f", flat(ring[si].p - root.Position).Magnitude))
+end
+
+-- WHERE HE DIVES. The bait wall goes down `ready` before he reaches his trigger distance, so that distance is the whole
+-- timing. The old fixed WallTrapTrigger 8 ("NPC ~7") was wrong for the live NPC keeper: every "npc dive seen" of the
+-- log started at 13.0-15.1 studs from us (from 15.1 / 14.6 / 13.0 / 15.1 / 15.1) - the bait thought it had 6 studs of
+-- run left when the dive was already on, so a straight run at him never got a wall. Each dive AT us (NPC burst start /
+-- player GoalkeeperDiveStarted within the cone) is recorded; the trigger is the median of the last 7 (5..22), seeded
+-- 14 for NPCs and WallTrapTrigger for players. WallTrapAuto off = the slider value.
+Mark.trapSeen = { npc = { 14 }, player = {} }
+Mark.trapLearn = function(npc, from)
+	if type(from) ~= "number" or from < 4 or from > 30 then
+		return
+	end
+	local l = Mark.trapSeen[npc and "npc" or "player"]
+	l[#l + 1] = from
+	while #l > 7 do
+		table.remove(l, 1)
+	end
+end
+Mark.trapTrig = function(npc)
+	if CFG.WallTrapAuto == false then
+		return CFG.WallTrapTrigger or 8
+	end
+	local l = Mark.trapSeen[npc and "npc" or "player"]
+	if #l == 0 then
+		return CFG.WallTrapTrigger or 8
+	end
+	local s = table.clone(l)
+	table.sort(s)
+	return math.clamp(s[math.floor((#s + 1) / 2)], 5, 22)
 end
 
 Mark.wallTrap = function(root, diving)
@@ -8732,18 +8822,35 @@ Mark.wallTrap = function(root, diving)
 		-- 0.03 s - the wall has to exist before he starts. So it goes down `ready` seconds before the predicted trigger:
 		-- time to trigger = (gap - trigger) / closing speed, from his own velocity and ours.
 		local wp, td, now = Mark.wallPend, Mark.trapDive, os.clock()
-		if CFG.WallTrapBait == false or (td and td.uid == k.key and now - td.at < 2) or Mark.foeDiveLeft() > 0 or (wp and wp.trap and now - wp.at < 3) then
+		-- every silent "no" of the bait is a reason in the log now (the straight-run misses left no line at all)
+		local function wait(why)
+			if k.d <= Mark.trapTrig(k.npc) + 14 and (not Mark.trapWaitLog or now - Mark.trapWaitLog > 0.4 or Mark.trapWaitWhy ~= why) then
+				Mark.trapWaitLog, Mark.trapWaitWhy = now, why
+				logFile("wall trap", "bait wait", why, "d", string.format("%.1f", k.d), "trig", string.format("%.1f", Mark.trapTrig(k.npc)))
+			end
 			return false
+		end
+		if CFG.WallTrapBait == false then
+			return false
+		end
+		if td and td.uid == k.key and now - td.at < 2 then
+			return wait("his dive is recent")
+		end
+		if Mark.foeDiveLeft() > 0 then
+			return wait("his dive on cooldown")
+		end
+		if wp and wp.trap and now - wp.at < 3 then
+			return wait("a trap wall is up")
 		end
 		local tr = Mark.kpTrack
 		local vK = tr and tr.key == k.key and tr.vK
 		local toK = unitOrNil(flat(k.r.Position - root.Position))
 		if not (vK and toK) then
-			return false
+			return wait("no keeper track")
 		end
 		local ourV = flat(root.AssemblyLinearVelocity)
 		local rate = -flat(vK - ourV):Dot(toK)
-		local trig = CFG.WallTrapTrigger or 8
+		local trig = Mark.trapTrig(k.npc)
 		-- A keeper who comes out on a DIAGONAL (log: "stands at an angle") closes slowly until he turns at us, then the
 		-- closing rate jumps (log: rate < 13 -> 22 in one tick: tt went from "too early" straight to 0.14 < ready 0.19 ->
 		-- no line, he dived through). He chases the carrier, so the time to his trigger comes from his SPEED turned at us
@@ -8752,8 +8859,11 @@ Mark.wallTrap = function(root, diving)
 		local comingOut = -vK:Dot(toK) > -2
 		local chase = comingOut and spdK + ourV:Dot(toK) or rate
 		local eff = math.max(rate, chase)
-		if eff < 6 or k.d > trig + 14 or k.d < 3 then
+		if k.d > trig + 14 then
 			return false
+		end
+		if eff < 6 or k.d < 3 then
+			return wait(string.format("closing %.0f", eff))
 		end
 		local use = Mark.itemUse
 		local equipped = use and use.IsEquipped and use.IsEquipped() and Mark.equippedId() == "barricades"
@@ -8783,7 +8893,7 @@ Mark.wallTrap = function(root, diving)
 		local ok, why = Mark.wallVsPath(root, pathBait, tt + dur, "keeper bait" .. (k.npc and " npc" or ""), { rad = 2, equip = true, actor = k.actor, model = k.model, trap = true, contact = 3 })
 		if not ok and why and (not Mark.trapLog or now - Mark.trapLog > 0.6) then
 			Mark.trapLog = now
-			logFile("wall trap", "bait no", why, "d", string.format("%.1f", k.d), "rate", string.format("%.0f", rate), "spd", string.format("%.0f", spdK), "eff", string.format("%.0f", eff), "tt", string.format("%.2f", tt), "ready", string.format("%.2f", ready))
+			logFile("wall trap", "bait no", why, "d", string.format("%.1f", k.d), "trig", string.format("%.1f", trig), "rate", string.format("%.0f", rate), "spd", string.format("%.0f", spdK), "eff", string.format("%.0f", eff), "tt", string.format("%.2f", tt), "ready", string.format("%.2f", ready))
 		end
 		return ok
 	end
@@ -11934,11 +12044,28 @@ local function onFx(kind, userId, a, b, c, aimDir, ...)
 			end
 			Mark.trapDive = { uid = userId, at = os.clock(), el0 = type(st) == "number" and math.clamp(srvNow - st, 0, 0.4) or 0, P0 = hr and hr.Position, wd = wd, name = type(a) == "string" and a or "?" }
 			local myR = ActorTargeting.GetActorRoot(LocalPlayer)
+			if myR and hr and wd and isGoalkeeper(who) then
+				local toUsL = unitOrNil(flat(myR.Position - hr.Position))
+				if toUsL and wd:Dot(toUsL) >= math.cos(math.rad(CFG.WallTrapCone or 50)) then
+					Mark.trapLearn(false, flat(myR.Position - hr.Position).Magnitude)
+				end
+			end
 			if myR and isGoalkeeper(who) then
 				Mark.wallTrap(myR, true)
 			end
 			logFile("keeper dive seen", actorName(who), "gk", tostring(isGoalkeeper(who)), "-> fakes off for", string.format("%.2f", Mark.foeDiveLeft()))
 		end
+	end
+	-- Keeper Push / AutoShield ground truth (dump TackleEffects.presentEffect): ViolenceKnockback = victim actor id,
+	-- (a), attacker actor id, knock velocity; ForcefieldBlocked = the shield ate a hit
+	if kind == "ViolenceKnockback" and (b == LocalPlayer.UserId or userId == LocalPlayer.UserId) then
+		local gp = Mark.gunPushRec
+		logFile("gunpush result", b == LocalPlayer.UserId and "we hit" or "we were hit", "victim", tostring(userId), "by", tostring(b), "vel", typeof(c) == "Vector3" and string.format("%.0f", c.Magnitude) or "-", gp and string.format("%.2f s after the shot", os.clock() - gp.at) or "")
+		if gp and b == LocalPlayer.UserId then
+			gp.hit = true
+		end
+	elseif kind == "ForcefieldBlocked" then
+		logFile("shield blocked", "actor", tostring(userId), "a", tostring(a), "by", tostring(b))
 	end
 	if kind == "TackleStarted" then
 		onEnemyTackleStarted(userId, b)
@@ -12086,7 +12213,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v169")
+	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v170")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -23406,6 +23533,7 @@ return function(_Lib, _Core)
 			sld(kp, "Shotgun Range", "GunPushShotgunRange", 5, 60, { suffix = " st" })
 			advanced(kp, "Keeper Push", function()
 				sld(kp, "Keeper Zone", "GunPushKeeperZone", 4, 40, { suffix = " st", text = "Only a keeper this close to his goal." })
+				sld(kp, "Shot Path Reach", "GunPushPathReach", 2, 30, { suffix = " st", text = "...or one standing this close to the shot path." })
 				sld(kp, "Push Travel", "GunPushTravel", 5, 50, { suffix = " st", text = "How far a hit throws him (depth check)." })
 			end)
 
@@ -23418,7 +23546,8 @@ return function(_Lib, _Core)
 			head(w, "Keeper Trap")
 			tog(w, "Enabled", "WallTrap", "Puts a wall between you and the enemy keeper's dive.")
 			tog(w, "Bait", "WallTrapBait", "Puts the wall up just before the keeper dives at you.")
-			sld(w, "Keeper Dive Range", "WallTrapTrigger", 4, 16, { prec = 1, suffix = " st" })
+			tog(w, "Learn Dive Range", "WallTrapAuto", "Measures where the keeper starts his dive.")
+			sld(w, "Keeper Dive Range", "WallTrapTrigger", 4, 22, { prec = 1, suffix = " st" })
 			tog(w, "Only Dives At You", "WallTrapForwardOnly", "Ignores keeper dives that do not go at you.")
 			sld(w, "Dive Cone", "WallTrapCone", 20, 90, { suffix = " deg" })
 			advanced(w, "Wall", function()
