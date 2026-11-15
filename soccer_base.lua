@@ -116,6 +116,8 @@ local CFG = {
 	GunPushShotgunRange = 22, -- ... for the shotgun (8 deg cone of 12 pellets: only close, guess)
 	GunPushKeeperZone = 14, -- the keeper "holds the goal": within this of his mouth segment
 	GunPushPathReach = 10, -- ... or (came out) stands within this of the shot path
+	GunPushRoll = false, -- ... a free ball rolling into the goal: shoot the enemy who would stop it on the way
+	GunPushRollReach = 6, -- ... "on the way" = within this of the ball path
 	GunPushTravel = 18, -- knock-back travel used for the depth check (log push travel 25-54 on us; conservative)
 	TackleSpeed = 1.2,
 	DribbleClose = 13,
@@ -366,7 +368,12 @@ local CFG = {
 	CounterAirSlide = 11, -- CounterJump: longest slide from the air at a raised target (st)
 	GkDiveLate = 0.07, -- dive only when a dive started this much later would miss (s)
 	GkDiveRobust = 0.05, -- a dive must still connect when it leaves this much later (s) to beat an earlier one (guess)
-	GkPassRead = true, -- a pass flying to an enemy near our goal: shift to his cone before he touches it
+	GkPassRead = true,
+	GkHome = true, -- AutoGK: run back to the goal when far out and an attack comes
+	GkHomeDist = 20, -- ... "far out" = this far in front of the line (studs)
+	GkHomeDanger = 110, -- ... "attack" = enemy carrier / free ball this close to our mouth
+	GkChaseDepth = 12, -- a free ball going away is not chased past this depth
+	GkPressFlierShot = true, -- no press dive at a flier with the ball unless it lands before he can kick -- a pass flying to an enemy near our goal: shift to his cone before he touches it
 	GkPassReadZone = 45, -- ... receiver within this of our mouth segment (studs)
 	GkPassReadDepth = 3, -- ... stand this far in front of the line on his bisector
 	GkWalkSlack = 0.12, -- humanoid accel/turn before full WalkSpeed (not from dump)
@@ -8332,8 +8339,138 @@ Mark.gunPushTry = function(root, tag, key, pts)
 	return ok
 end
 
+-- ROLLING BALL (Keeper Push > Rolling Ball, default off): a free ball whose path ends in the enemy goal but runs through
+-- an enemy (keeper or field player) who would stop it on the way - shoot HIM, the ball rolls in. Blocker = the first
+-- enemy within GunPushRollReach of the path before the crossing, reached by the ball no sooner than our push lands
+-- (ping/2 + 0.1). Depth check as for the keeper: the knock-back must not leave him on the remaining path.
+Mark.gunPushRoll = function(root)
+	if not (CFG.GunPush and CFG.GunPushRoll) then
+		return
+	end
+	local oid = liveOwnerId()
+	if type(oid) == "number" and oid ~= 0 then
+		return
+	end
+	local _, _, pts, ts = Mark.ballPath(root)
+	if not (pts and ts and #pts >= 3) then
+		return
+	end
+	local g = enemyGoalPart()
+	local lb, lt, rb = goalMouthCorners(g)
+	if not (lb and lt and rb) then
+		return
+	end
+	local mouth = (lb + rb) * 0.5
+	local side = unitOrNil(flat(rb - lb))
+	if not side then
+		return
+	end
+	local half = flat(rb - lb).Magnitude * 0.5
+	local out = Vector3.new(-side.Z, 0, side.X)
+	if flat(root.Position - mouth):Dot(out) < 0 then
+		out = -out
+	end
+	local iC = nil
+	for i = 2, #pts do
+		if flat(pts[i] - mouth):Dot(out) <= 0.3 then
+			if math.abs(flat(pts[i] - mouth):Dot(side)) <= half + 0.5 and pts[i].Y <= math.max(lt.Y, lb.Y) + 1 then
+				iC = i
+			end
+			break
+		end
+	end
+	if not iC then
+		return
+	end
+	local ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
+	local tLand = ping * 0.5 + 0.1
+	local reach = CFG.GunPushRollReach or 6
+	local best, bestI = nil, math.huge
+	local function consider(model, actor, key)
+		local r = model:FindFirstChild("HumanoidRootPart")
+		if not r or (actor and Mark.mateDown(actor, model)) then
+			return
+		end
+		for i = 2, iC do
+			if ts[i] >= tLand and flat(pts[i] - r.Position).Magnitude <= reach and math.abs(pts[i].Y - r.Position.Y) <= 6 then
+				if i < bestI then
+					best, bestI = { model = model, actor = actor, r = r, key = key }, i
+				end
+				return
+			end
+		end
+	end
+	for _, model in Mark.models() do
+		local a = Actors.GetFromCharacter(model)
+		if a and a ~= LocalPlayer and not sameTeam(a) then
+			consider(model, a, a.UserId)
+		end
+	end
+	local npcs = Workspace:FindFirstChild("Characters")
+	npcs = npcs and npcs:FindFirstChild("NPCs")
+	if npcs then
+		for _, model in npcs:GetChildren() do
+			if model:IsA("Model") then
+				consider(model, nil, model)
+			end
+		end
+	end
+	if not best then
+		return
+	end
+	local now = os.clock()
+	Mark.rollShotAt = Mark.rollShotAt or setmetatable({}, { __mode = "k" })
+	local kk = type(best.key) == "number" and tostring(best.key) or best.key
+	if now - (Mark.rollShotAt[kk] or 0) < 1.5 then
+		return
+	end
+	local inv = best.model:GetAttribute("ItemInvulnerableUntil")
+	if type(inv) == "number" and inv > Workspace:GetServerTimeNow() then
+		return
+	end
+	local K = best.r.Position
+	local d = (K - root.Position).Magnitude
+	local use = Mark.itemUse
+	local held = use and use.IsEquipped and use.IsEquipped() and Mark.equippedId() or nil
+	local gun = nil
+	if (held == "shotgun" or Mark.slotOfItem("shotgun")) and d <= (CFG.GunPushShotgunRange or 22) then
+		gun = "shotgun"
+	elseif (held == "flintlock" or Mark.slotOfItem("flintlock")) and d <= (CFG.GunPushFlintRange or 70) then
+		gun = "flintlock"
+	end
+	if not gun then
+		return
+	end
+	local pushDir = unitOrNil(flat(K - root.Position))
+	local K2 = pushDir and K + pushDir * (CFG.GunPushTravel or 18) or K
+	for i = bestI, iC do
+		if flat(pts[i] - K2).Magnitude <= reach then
+			Mark.rollShotAt[kk] = now
+			logFile("gunpush skip", "roll", "the push leaves him on the path", "d", string.format("%.1f", d))
+			return
+		end
+	end
+	Mark.rollShotAt[kk] = now
+	local r = best.r
+	local ok, how = Mark.itemNow(gun, "gunpush roll", function()
+		local v = r.AssemblyLinearVelocity
+		return r.Position + (typeof(v) == "Vector3" and flat(v) or Vector3.zero) * (ping * 0.5) + Vector3.new(0, 0.4, 0)
+	end)
+	if ok then
+		local rec = { at = now, gun = gun, tag = "roll", d = d }
+		Mark.gunPushRec = rec
+		task.delay(1.2, function()
+			if Mark.gunPushRec == rec and not rec.hit then
+				logFile("gunpush result", "NO knock-back seen", rec.gun, rec.tag, "d", string.format("%.1f", rec.d))
+			end
+		end)
+	end
+	logFile("gunpush", "roll", gun, ok and "fired" or "no", tostring(how or ""), "blocker", best.actor and actorName(best.actor) or "npc", "d", string.format("%.1f", d), "ball reaches him", string.format("%.2f", ts[bestI]), "goal at", string.format("%.2f", ts[iC]))
+end
+
 -- teammates: the moment one charges a shot that goes in (or already charges when he gets the ball)
 Mark.gunPushTick = function(root)
+	Mark.gunPushRoll(root)
 	if not CFG.GunPush or CFG.GunPushMates == false or not Mark.charges then
 		return
 	end
@@ -10196,6 +10333,17 @@ Mark.gkPress = function(character, root, c)
 			return note(string.format("skip charging max %.2f mult %.2f t %s %s", maxC, Mark.kickPow.GetMultiplier(pl), fmt(best.t), info))
 		end
 	end
+	-- A FLIER WITH THE BALL SHOOTS FROM THE AIR. Jetpack / launched carrier: his kick from above needs no landing (log:
+	-- press dive at a jetpacker dy 21.9, contact t 0.23; he released a 124 st/s shot 0.07 s after our dash - stunned
+	-- after the ball had gone, keeper on the floor, goal). A dive is only worth it when it lands before he can complete a
+	-- fresh kick: contact within the game's minimum release time minus what we see of him late (display delay).
+	if (airborne or jet) and not committed and CFG.GkPressFlierShot ~= false then
+		local minRel = (KickCore.GetMinimumReleaseSeconds and KickCore.GetMinimumReleaseSeconds()) or 0.2
+		local seen = math.clamp(CharacterMotion.GetDisplayDelaySeconds(model) or 0, 0, 0.25)
+		if best.t + ping * 0.5 > minRel - seen then
+			return note(string.format("flier can shoot first t %s > %.2f %s", fmt(best.t), minRel - seen - ping * 0.5, info))
+		end
+	end
 	-- never a dive at a man whose height we cannot predict: about to launch, just launched (slope not measured yet), or
 	-- flying on something that is not a ballistic arc (lift rigs, grapple). Exception for powered: he is at our height
 	-- right now and the contact is immediate. The jetpack has its own timeline (jet ~= false) and skips this.
@@ -10992,6 +11140,17 @@ Mark.tickGk = function(character, root)
 					end
 				end
 			end
+			-- A free ball going AWAY from our goal is no threat; chasing it deep is the risk (log: "jump d 23.7" at a
+			-- cleared ball moving out at 44 st/s, the jump missed, an enemy took it 35 out and scored into the empty goal).
+			-- Past GkChaseDepth only a ball that comes at the goal is chased.
+			-- (same for a ball that goes over the bar: "cross bad-y" - it was that ball, chased 23.7 out, that bounced back)
+			if plan and not shot and (into < -2 or crossWhy == "bad-y") and flat(plan.p - mouthP):Dot(fwd) > (CFG.GkChaseDepth or 12) then
+				if not Mark.gkChaseLog or now - Mark.gkChaseLog > 0.8 then
+					Mark.gkChaseLog = now
+					logFile("gk intercept skip", into < -2 and "ball going away" or "ball over the bar", "depth", string.format("%.1f", flat(plan.p - mouthP):Dot(fwd)), "into", string.format("%.1f", into), "plan", plan.kind)
+				end
+				plan = nil
+			end
 			-- A free ball that is NOT a shot: an enemy near the intercept point takes it before we are there (log: we ran
 			-- out, he picked it up, nothing left to do). Stay in the goal.
 			if plan and not shot and enemies then
@@ -11184,6 +11343,22 @@ Mark.tickGk = function(character, root)
 	end
 	if not stand and retTarget then
 		stand, why, stopAt, urgent = retTarget, "return", 1.0, true
+	end
+	-- HOME. The keeper left far up the field stays there while an attack comes (log: "gk pos free d 54.5" for 7 s as the
+	-- carrier ran 140 -> 55, shot, keeper 47 studs from the crossing). With danger near our goal (an enemy carrier, or a
+	-- free ball, inside GkHomeDanger of the mouth) and no stick input, a keeper further than GkHomeDist from the line
+	-- runs back to the mouth on the ball's side.
+	if not stand and CFG.GkHome ~= false and not Mark.userInputDir() then
+		local relU = flat(root.Position - mouthP)
+		local outU = relU:Dot(fwd)
+		local latU = math.abs(relU:Dot(side))
+		if outU > (CFG.GkHomeDist or 20) or latU > half + 15 then
+			local danger = ballPos and along < (CFG.GkHomeDanger or 110) and (free or ownerRoot ~= nil)
+			if danger then
+				stand = mouthP + fwd * 3 + side * math.clamp(ballSide * 0.15, -(half - 2), half - 2)
+				why, stopAt, urgent = "home", 1.5, true
+			end
+		end
 	end
 	-- No positioning: without a ball to chase the player keeps full control of where the keeper stands.
 
@@ -12060,7 +12235,9 @@ local function onFx(kind, userId, a, b, c, aimDir, ...)
 	-- (a), attacker actor id, knock velocity; ForcefieldBlocked = the shield ate a hit
 	if kind == "ViolenceKnockback" and (b == LocalPlayer.UserId or userId == LocalPlayer.UserId) then
 		local gp = Mark.gunPushRec
-		logFile("gunpush result", b == LocalPlayer.UserId and "we hit" or "we were hit", "victim", tostring(userId), "by", tostring(b), "vel", typeof(c) == "Vector3" and string.format("%.0f", c.Magnitude) or "-", gp and string.format("%.2f s after the shot", os.clock() - gp.at) or "")
+		gp = gp and os.clock() - gp.at < 1.5 and b == LocalPlayer.UserId and gp or nil
+		-- tackles / slides / other guns knock too: only a knock-back of ours right after a push is its result
+		logFile(gp and "gunpush result" or "knock", b == LocalPlayer.UserId and "we hit" or "we were hit", "victim", tostring(userId), "by", tostring(b), "vel", typeof(c) == "Vector3" and string.format("%.0f", c.Magnitude) or "-", gp and string.format("%.2f s after the shot", os.clock() - gp.at) or "")
 		if gp and b == LocalPlayer.UserId then
 			gp.hit = true
 		end
@@ -12213,7 +12390,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v170")
+	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v171")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -23472,6 +23649,7 @@ return function(_Lib, _Core)
 			tog(p, "Come Out", "GkPressMove", "Steps out to cut his angle.")
 			tog(p, "Last Man Only", "GkPressLastMan", "No press while another attacker can take the pass.")
 			tog(p, "Read Passes", "GkPassRead", "Moves to the player a pass is going to.")
+			tog(p, "Return Home", "GkHome", "Runs back to the goal when far out and an attack comes.")
 			tog(p, "Face Him", "GkPressFace", "Turns your body to him for the dive.")
 			tog(p, "Show Press", "DrawGk", "His possible paths and your dive.")
 			sld(p, "Confidence", "GkPressConf", 0.3, 0.95, { prec = 2, text = "How sure the dive must be." })
@@ -23529,8 +23707,9 @@ return function(_Lib, _Core)
 			note(kp, "Shoots the enemy keeper with a flintlock / shotgun when a shot that goes in is on its way.")
 			tog(kp, "Your Shots", "GunPushOwn")
 			tog(kp, "Teammate Shots", "GunPushMates", "Fires as soon as a teammate charges a shot on target.")
-			sld(kp, "Flintlock Range", "GunPushFlintRange", 10, 150, { suffix = " st" })
-			sld(kp, "Shotgun Range", "GunPushShotgunRange", 5, 60, { suffix = " st" })
+			tog(kp, "Rolling Ball", "GunPushRoll", "A ball going into the goal: shoots the enemy who would stop it.")
+			sld(kp, "Flintlock Range", "GunPushFlintRange", 10, 400, { suffix = " st" })
+			sld(kp, "Shotgun Range", "GunPushShotgunRange", 5, 120, { suffix = " st" })
 			advanced(kp, "Keeper Push", function()
 				sld(kp, "Keeper Zone", "GunPushKeeperZone", 4, 40, { suffix = " st", text = "Only a keeper this close to his goal." })
 				sld(kp, "Shot Path Reach", "GunPushPathReach", 2, 30, { suffix = " st", text = "...or one standing this close to the shot path." })
