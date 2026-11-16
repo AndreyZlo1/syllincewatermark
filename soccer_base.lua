@@ -261,7 +261,6 @@ local CFG = {
 	AirIntercept = true, -- Air Intercept module: plans run / jump / face to meet a flying ball and volleys / bicycles it first
 	AirWithBall = true, -- ...also runs whenever AutoBall is on
 	AirWithBlock = true, -- ...also runs whenever AutoBlock is on
-	AirRange = 45, -- meet points farther than this (flat studs) are not planned
 	AirSlack = 0.5, -- studs added to the box reach on top of the game's miss-angle tolerance
 	AirTolT = 0.3, -- the miss angle is turned into studs at this time before the meet (s); guessed
 	VolleyGoalZone = 90, -- a teammate's pass is struck at their goal only within this of it
@@ -3079,13 +3078,23 @@ end
 
 local slideAim = nil
 local slideAimUntil = 0
+-- The slide holds the BODY only until the jump is restored: SlideTackleInput.lockLocalPlayer unblocks the jump at
+-- TotalVelocityReleaseStartsAt + VelocityReleaseSeconds - ActionMotion.JumpRestoreLeadSeconds (1.02 + 0.5 - 0.25 = 1.27 s)
+-- and releases the walk speed from 1.02 s. ClientSlide.IsSlideTackling() stays true for TotalMotionSeconds + EndLagSeconds
+-- (2.415 s): every agent gated on it stood dead for ~1.15 s with a free body (log: state "slide=true ws=25.6 jh=7.2
+-- jblock=-"), which is exactly the flick over our slide. Agents gate on this; the slide cooldown / input hooks keep
+-- IsSlideTackling.
+Mark.slideFree = C.TotalVelocityReleaseStartsAt + C.VelocityReleaseSeconds - ActionMotion.Constants.JumpRestoreLeadSeconds
+Mark.slideBody = function()
+	return ClientSlide.IsSlideTackling() and os.clock() - (Mark.slideStartAt or -9) < Mark.slideFree
+end
 local origGetMove = CharacterControllers.GetMoveCommand
 local origSetMove = CharacterControllers.SetMoveCommand
 CharacterControllers.GetMoveCommand = function(ch)
 	if slideAim and ch == LocalPlayer.Character and os.clock() < slideAimUntil then
 		return slideAim
 	end
-	if ch == LocalPlayer.Character and ClientSlide.IsSlideTackling() then
+	if ch == LocalPlayer.Character and Mark.slideBody() then
 		return origGetMove(ch)
 	end
 	-- the player's own stick (no agent mode live): AutoDodge keeps it out of a blast about to go off and off mines
@@ -3107,7 +3116,21 @@ CharacterControllers.GetMoveCommand = function(ch)
 	end
 	local move = Mark.move
 	if move and move.dir and move.mode and ch == LocalPlayer.Character and move.dir.Magnitude > 0.2 and Mark.moveLive(move) then
+		Mark.coast = nil
 		return move.dir
+	end
+	-- air coast: the controller still holds our last agent direction (moveStop did not zero it mid-air); on landing it
+	-- is cleared unless the player has put his own stick in since
+	local co = Mark.coast
+	if co and ch == LocalPlayer.Character then
+		local hum = ch:FindFirstChildOfClass("Humanoid")
+		if not hum or CharacterControllers.IsLanded(ch, hum) or os.clock() - co.at > 1.5 then
+			Mark.coast = nil
+			local cur = origGetMove(ch)
+			if typeof(cur) == "Vector3" and (cur - co.dir).Magnitude < 0.05 then
+				origSetMove(ch, Vector3.zero, Vector3.zero, false)
+			end
+		end
 	end
 	return origGetMove(ch)
 end
@@ -3183,7 +3206,7 @@ CharacterControllers.SetMoveCommand = function(ch, move, look, rot)
 			look = Mark.move.look or cut
 		end
 	end
-	if ch == LocalPlayer.Character and ClientSlide.IsSlideTackling() and not (slideAim and os.clock() < slideAimUntil) then
+	if ch == LocalPlayer.Character and Mark.slideBody() and not (slideAim and os.clock() < slideAimUntil) then
 		return origSetMove(ch, move, look, rot)
 	end
 	if Mark.move.dir and Mark.move.mode and ch == LocalPlayer.Character and Mark.move.dir.Magnitude > 0.2 and Mark.moveLive(Mark.move) then
@@ -5897,12 +5920,15 @@ local function stepLogic()
 	-- cooldown ended), and each retry called moveStop, which dropped the block.
 	do
 		local sliding = ClientSlide.IsSlideTackling()
-		if sliding and not Mark.slideWasOn and os.clock() - lastTackleAt > 0.5 then
-			lastTackleAt = os.clock()
+		if sliding and not Mark.slideWasOn then
+			Mark.slideStartAt = os.clock()
+			if os.clock() - lastTackleAt > 0.5 then
+				lastTackleAt = os.clock()
+			end
 		end
 		Mark.slideWasOn = sliding
 	end
-	if ClientSlide.IsSlideTackling() and not slideAim then
+	if Mark.slideBody() and not slideAim then
 		if Mark.move.mode and Mark.move.mode ~= "block" then
 			Mark.moveStop()
 		end
@@ -6059,7 +6085,7 @@ local function stepLogic()
 		note("d", dribbleWhy)
 	end
 
-	if CFG.AutoDodge and not own and not ClientSlide.IsSlideTackling() and not slideAim and Mark.move.mode ~= "dodge" and Mark.dodgeSteer and not Mark.meKeeper() then
+	if CFG.AutoDodge and not own and not Mark.slideBody() and not slideAim and Mark.move.mode ~= "dodge" and Mark.dodgeSteer and not Mark.meKeeper() then
 		local threat = dribbleThreat(root)
 		if threat and threat.fire and not Mark.dodgeDone then
 			dribbleDanger = threat
@@ -11789,7 +11815,7 @@ end
 
 -- One extra ground step. false = nothing to add this frame (the caller clears the stream velocity).
 Mark.speedStep = function(dt, ch, root, hum)
-	if Ragdoll.IsEnabled(ch) or ClientSlide.IsSlideTackling() or Mark.dashLive() or Mark.moveLive(Mark.move) then
+	if Ragdoll.IsEnabled(ch) or Mark.slideBody() or Mark.dashLive() or Mark.moveLive(Mark.move) then
 		return false
 	end
 	-- the charge walk (ActionMovement.GetChargingWalkSpeed) stays slow: AutoKick models our speed while it charges
@@ -12571,7 +12597,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v176")
+	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v177")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -13362,7 +13388,7 @@ Mark.tickLob = function(character, root)
 		Mark.lobEnd("taken")
 		Mark.lob = nil
 		return
-	elseif not hum or Ragdoll.IsActorRagdolled(LocalPlayer) or ClientDodge.IsDribbling() or ClientSlide.IsSlideTackling() then
+	elseif not hum or Ragdoll.IsActorRagdolled(LocalPlayer) or ClientDodge.IsDribbling() or Mark.slideBody() then
 		return -- our slide is out / we are down: nothing to plan this tick
 	end
 	local landed = CharacterControllers.IsLanded(character, hum)
@@ -13501,7 +13527,7 @@ Mark.tickCounterJump = function(character, root)
 		return
 	end
 	local hum = character:FindFirstChildOfClass("Humanoid")
-	if not hum or Ragdoll.IsActorRagdolled(LocalPlayer) or ClientSlide.IsSlideTackling() or ClientDodge.IsDribbling() then
+	if not hum or Ragdoll.IsActorRagdolled(LocalPlayer) or Mark.slideBody() or ClientDodge.IsDribbling() then
 		if Mark.duel then
 			Mark.duelEnd("busy")
 		end
@@ -14166,7 +14192,7 @@ Mark.tickBlock = function(character, root)
 		Mark.blockSkip("mode", tostring(Mark.move.mode))
 		return
 	end
-	if slideAim or ClientSlide.IsSlideTackling() then
+	if slideAim or Mark.slideBody() then
 		Mark.blockSkip("sliding")
 		return
 	end
@@ -15655,7 +15681,7 @@ Mark.faceActive = function(character)
 	if not CFG.FaceSpoof or Mark.meKeeper() or Ragdoll.IsActorRagdolled(LocalPlayer) then
 		return false
 	end
-	if ClientSlide.IsSlideTackling() or ClientDodge.IsDribbling() or Mark.ak or Mark.volleyInput or Mark.aerial or Mark.forceBike or Mark.flickStrike then
+	if Mark.slideBody() or ClientDodge.IsDribbling() or Mark.ak or Mark.volleyInput or Mark.aerial or Mark.forceBike or Mark.flickStrike then
 		return false
 	end
 	if Mark.pa and Mark.pa.live then
@@ -17126,6 +17152,10 @@ Mark.airBusy = function()
 end
 
 Mark.airEnd = function(why)
+	if Mark.airFaced then
+		Mark.airFaced = nil
+		TurnControl.ReleaseAutoRotate("Aim")
+	end
 	if Mark.airPlan then
 		logFile("air", "end", why)
 		Mark.moveStop("air")
@@ -17154,6 +17184,15 @@ end
 --     goal before the enemy gets it), else he passed it to us to receive;
 --   our own / nobody's ball: only above the receive box (a ball AutoBall can just walk into is received).
 Mark.airWant = function(root, B, kicker, floorY)
+	-- user rule: near EITHER goal (we or the meet point within CompetitorGoalZone) every flying ball is ours to take
+	local z = CFG.CompetitorGoalZone or 45
+	if z > 0 then
+		for _, gp in { Mark.defendGoal(), enemyGoalPart() } do
+			if gp and (flat(B - gp.Position).Magnitude <= z or flat(root.Position - gp.Position).Magnitude <= z) then
+				return true, "goal zone"
+			end
+		end
+	end
 	if kicker ~= nil and kicker ~= LocalPlayer and not sameTeam(kicker) then
 		return true, "foe ball"
 	end
@@ -17224,36 +17263,49 @@ Mark.airPath = function(root)
 	return pts, "flight", type(kid) == "number" and playerOf(kid) or nil
 end
 
--- Plan: the earliest path sample our FrontAssist box can be on. o = { O, v0, spd, landed, vy, floor, g, vJ, pts, DT,
--- tolDeg, ballR }. Per sample: the box faces the incoming ball, its centre on the ball -> root spot Q = B - inc * 1.5;
--- we may stand off-centre by the half width + tolerance (miss angle at ~0.3 s out, + AirSlack). Height: ground, a jump
--- at td (latest td first: rising at the contact = the bicycle upgrade), or our current arc. Returns best, nearMiss.
+-- our root height t s from now: "ground", a jump at td (s from now), or false = the arc we are on
+Mark.airY = function(o, t, td)
+	local g, vJ = o.g, o.vJ
+	if td == "ground" then
+		return o.floor
+	elseif td == false then
+		return math.max(o.O.Y + o.vy * t - 0.5 * g * t * t, o.floor)
+	end
+	local x = t - td
+	if x <= 0 then
+		return o.floor
+	end
+	return o.floor + math.max(vJ * x - 0.5 * g * x * x, 0)
+end
+
+-- Candidates: per path sample, a root spot where our FrontAssist box (facing the incoming ball) sits on the ball, that
+-- we reach in time - running at o.spd on the ground and at o.spdAir after a take-off (the game drops the sprint in the
+-- air: state lines show ws 16 in Freefall) - and a height option (ground, a jump at td with the latest td first =
+-- rising at the contact = the bicycle upgrade, or our current arc). Only a SHORTLIST: the game's own Evaluate
+-- (Mark.airOracle) decides which of them really gets an offer. Returns first, nearMiss, list (by T).
 Mark.airSolve = function(o)
 	local front = HitboxSettings.FrontAssist
 	local fz = -front.CFrameOffset.Z
 	local cy = front.CFrameOffset.Y
 	local hx = front.Size.X * 0.5 + o.ballR
 	local hy = front.Size.Y * 0.5 + o.ballR
-	local g, vJ = o.g, o.vJ
 	local ramp = math.max(CFG.BallRamp or 0.2, 0.05)
-	local function run(u, t)
-		local v0 = u and math.clamp(o.v0:Dot(u), 0, o.spd) or 0
+	local spdAir = o.spdAir or o.spd
+	local function run(u, t, s)
+		local v0 = u and math.clamp(o.v0:Dot(u), 0, s) or 0
 		if t <= ramp then
-			return v0 * t + (o.spd - v0) * t * t / (2 * ramp)
+			return v0 * t + (s - v0) * t * t / (2 * ramp)
 		end
-		return v0 * ramp + (o.spd - v0) * ramp * 0.5 + o.spd * (t - ramp)
+		return v0 * ramp + (s - v0) * ramp * 0.5 + s * (t - ramp)
 	end
-	local function yUs(t, td)
-		if td == "ground" then
-			return o.floor
-		elseif td == false then
-			return math.max(o.O.Y + o.vy * t - 0.5 * g * t * t, o.floor)
+	local function reach(u, T, td)
+		if td == false then
+			return spdAir * T
+		elseif td == "ground" then
+			return run(u, T, o.spd)
 		end
-		local x = t - td
-		if x <= 0 then
-			return o.floor
-		end
-		return o.floor + math.max(vJ * x - 0.5 * g * x * x, 0)
+		-- never more than running on: the air only takes speed away
+		return math.min(run(u, T, o.spd), run(u, math.min(td, T), o.spd) + spdAir * math.max(T - td, 0))
 	end
 	local tds = { false }
 	if o.landed then
@@ -17264,7 +17316,7 @@ Mark.airSolve = function(o)
 	end
 	local pts, DT = o.pts, o.DT
 	local tanT = math.tan(math.rad(o.tolDeg)) * (CFG.AirTolT or 0.3)
-	local near = nil
+	local near, list = nil, {}
 	for k = 5, #pts - 1 do
 		local T = (k - 1) * DT
 		local B = pts[k]
@@ -17274,31 +17326,60 @@ Mark.airSolve = function(o)
 		local Q = B - inc * fz
 		local toQ = flat(Q - o.O)
 		local u = unitOrNil(toQ)
-		local gapXZ = math.max(toQ.Magnitude - (hx + tol) - run(u, T), 0)
-		local bestY, bestTd = math.huge, nil
+		local need = math.max(toQ.Magnitude - (hx + tol), 0)
+		local bestY, bestTd, gapXZ = math.huge, nil, math.huge
 		for _, td in tds do
 			if td == "ground" or td == false or td + 0.03 <= T then
-				local dy = math.abs(B.Y - yUs(T, td) - cy) - (hy + tol)
-				if dy <= 0 then
-					bestY, bestTd = 0, td
+				local gx = math.max(need - reach(u, T, td), 0)
+				local dy = math.max(math.abs(B.Y - Mark.airY(o, T, td) - cy) - (hy + tol), 0)
+				if gx <= 0 and dy <= 0 then
+					bestY, bestTd, gapXZ = 0, td, 0
 					break
-				elseif dy < bestY then
-					bestY = dy
+				end
+				if gx + dy < gapXZ + bestY then
+					bestY, gapXZ = dy, gx
 				end
 			end
 		end
-		if gapXZ <= 0 and bestY <= 0 then
-			return { td = bestTd, T = T, B = B, Q = Vector3.new(Q.X, o.O.Y, Q.Z), inc = inc, tol = tol, k = k }, near
-		end
-		local gap = gapXZ + bestY
-		if not near or gap < near.gap then
-			near = { gap = gap, gapXZ = gapXZ, gapY = bestY, T = T, h = B.Y - o.floor, d = flat(B - o.O).Magnitude }
+		if bestTd ~= nil then
+			list[#list + 1] = { td = bestTd, T = T, B = B, Q = Vector3.new(Q.X, o.O.Y, Q.Z), inc = inc, tol = tol, k = k }
+		else
+			local gap = gapXZ + bestY
+			if not near or gap < near.gap then
+				near = { gap = gap, gapXZ = gapXZ, gapY = bestY, T = T, h = B.Y - o.floor, d = flat(B - o.O).Magnitude }
+			end
 		end
 	end
-	return nil, near
+	return list[1], near, list
 end
 
--- What the game itself says right now (VolleyLockOn.Evaluate, no competitors): the reason a planned meet gets no prompt.
+-- THE GAME'S OWN ANSWER for a planned pose (user: "the game says when it can - so make it say it"). VolleyLockOn.Evaluate
+-- takes a claim pose (RootCFrame, Velocity) and an evaluation time: we ask it at time te, our root at the spot (height of
+-- our jump there), facing the incoming ball - the exact rule the prompt and the server's claim validation use (box,
+-- swept velocity, miss angle, approach <= 0.4 s, flight gate, lock, grounded-ball / rising-kicker). The flight cache it
+-- writes is time-keyed: the real prompt re-evaluates at its own time.
+Mark.airOracle = function(character, st, world, te, Qr, inc)
+	local VL = require(Modules.Ball.VolleyLockOn)
+	local cf = CFrame.lookAt(Qr, Qr + inc)
+	local ev, _, info = VL.Evaluate(st, world, character, CharacterMotionSmoothing.GetSmoothedServerTime() + te, nil, ActorTeams.GetCharacterTeamName(character), nil, CommandTime.GetPlayerVolleyOneWaySeconds(LocalPlayer), { RootCFrame = cf, Velocity = Vector3.zero }, nil)
+	return ev, info
+end
+
+Mark.airInfo = function(info)
+	if not info then
+		return "no approach (ball not coming at the box within 0.4 s / flight gate)"
+	end
+	local f = {}
+	for _, k in { "BlockedByDive", "BlockedBySpentJump", "BlockedByRisingKicker", "BlockedByCompetitor" } do
+		if info[k] then
+			f[#f + 1] = k
+		end
+	end
+	return string.format("approach %.2f miss %.1f deg %.2f st%s", info.ApproachSeconds or -1, info.MissAngleDegrees or -1, info.MissDistance or -1, #f > 0 and (" " .. table.concat(f, ",")) or "")
+end
+
+-- What the game says for our REAL pose on the way in (every 0.1 s while the meet is < 0.7 s away): the prompt either
+-- comes (OFFER) or this line says why not.
 Mark.airDiag = function(character, plan)
 	local now = os.clock()
 	if now - (Mark.airDiagAt or 0) < 0.1 then
@@ -17311,17 +17392,18 @@ Mark.airDiag = function(character, plan)
 	end
 	local VL = require(Modules.Ball.VolleyLockOn)
 	local ev, _, info = VL.Evaluate(st, world, character, CharacterMotionSmoothing.GetSmoothedServerTime(), nil, ActorTeams.GetCharacterTeamName(character), nil, CommandTime.GetPlayerVolleyOneWaySeconds(LocalPlayer), nil, nil)
-	local flags = {}
-	if info then
-		for _, k in { "BlockedByDive", "BlockedBySpentJump", "BlockedByRisingKicker", "BlockedByAirborneKicker", "BlockedByCompetitor" } do
-			if info[k] then
-				flags[#flags + 1] = k
-			end
-		end
+	local root = ActorTargeting.GetActorRoot(LocalPlayer)
+	local look = root and unitOrNil(flat(root.CFrame.LookVector))
+	logFile("air eval", ev and "OFFER" or "nil", Mark.airInfo(info), "locked", tostring(VL.IsLocked(st)), "plan T", string.format("%.2f", plan.T), "td", tostring(plan.td),
+		"to spot", root and string.format("%.1f", flat(plan.Q - root.Position).Magnitude) or "-", "face err", look and string.format("%.0f", math.deg(math.acos(math.clamp(look:Dot(plan.inc), -1, 1)))) or "-")
+end
+
+Mark.airSkipLog = function(why, extra)
+	local now = os.clock()
+	if Mark.airSkipWhy ~= why or now - (Mark.airSkipAt or 0) > 0.5 then
+		Mark.airSkipWhy, Mark.airSkipAt = why, now
+		logFile("air skip", why, extra or "")
 	end
-	local flightAge = st.FlightStartedAt and (CharacterMotionSmoothing.GetSmoothedServerTime() - st.FlightStartedAt) or -1
-	logFile("air eval", ev and "OFFER" or "nil", info and string.format("approach %.2f miss %.1f deg %.2f st", info.ApproachSeconds or -1, info.MissAngleDegrees or -1, info.MissDistance or -1) or "no approach in 0.4 s / ball going away / too slow / flight < 0.25 s",
-		#flags > 0 and table.concat(flags, ",") or "-", "locked", tostring(VL.IsLocked(st)), "flight", string.format("%.2f", flightAge), "plan T", string.format("%.2f", plan.T), "td", tostring(plan.td))
 end
 
 Mark.tickAir = function(character, root)
@@ -17331,14 +17413,15 @@ Mark.tickAir = function(character, root)
 		end
 		return
 	end
-	if Mark.weOwn() or (ChargedKick.IsCharging and ChargedKick.IsCharging()) then
+	-- our own volley claim is out (Mark.volleyAt): it is the press of this module or the player's - nothing to plan
+	if Mark.weOwn() or (Mark.volleyAt and os.clock() - Mark.volleyAt < 1.2) then
 		if Mark.airPlan then
-			Mark.airEnd(Mark.weOwn() and "ours" or "charging")
+			Mark.airEnd(Mark.weOwn() and "ours" or "pressed")
 		end
 		return
 	end
 	local hum = character:FindFirstChildOfClass("Humanoid")
-	if not hum or Ragdoll.IsActorRagdolled(LocalPlayer) or ClientSlide.IsSlideTackling() or ClientDodge.IsDribbling() then
+	if not hum or Ragdoll.IsActorRagdolled(LocalPlayer) or Mark.slideBody() or ClientDodge.IsDribbling() then
 		if Mark.airPlan then
 			Mark.airEnd("busy")
 		end
@@ -17364,55 +17447,88 @@ Mark.tickAir = function(character, root)
 		local pts, src, kicker = Mark.airPath(root)
 		if not pts then
 			Mark.airMemo = { at = now }
+			if src ~= "carried" or (Mark.lob and now < Mark.lob.untilT) then
+				Mark.airSkipLog(src)
+			end
 			if Mark.airPlan then
 				Mark.airEnd(src)
 			end
 			return
 		end
-		local spd = math.max(Mark.akSpeeds(character), hum.WalkSpeed)
-		local foeFlight = kicker ~= nil and kicker ~= LocalPlayer and not sameTeam(kicker)
-		local near
-		plan, near = Mark.airSolve({
-			O = root.Position, v0 = flat(root.AssemblyLinearVelocity), spd = spd, landed = landed, vy = root.AssemblyLinearVelocity.Y,
-			floor = floor, g = g, vJ = math.sqrt(2 * g * (Mark.jumpH or 7.2)), pts = pts, DT = 0.025,
-			tolDeg = foeFlight and 6 or 10, ballR = Physics.BallRadius or 1,
-		})
-		if plan and flat(plan.B - root.Position).Magnitude > (CFG.AirRange or 45) then
-			near = { gap = -1, d = flat(plan.B - root.Position).Magnitude, T = plan.T, h = plan.B.Y - floor, gapXZ = 0, gapY = 0 }
-			plan = nil
-		end
-		local want = false
-		if plan then
-			want, why = Mark.airWant(root, plan.B, kicker, floor)
-			if not want then
-				plan = nil
+		local st, world = Renderer.GetAuthoritativeMovementState()
+		if st and st.VolleyUserId and st.VolleyUserId ~= 0 and st.VolleyUserId ~= LocalPlayer.UserId then
+			-- somebody's volley / bicycle claim locked the ball (the flicker re-claiming his own flick gets 0.15 s of
+			-- flight against our 0.25 s - MinimumOwnFlightSeconds vs MinimumOpponentFlightSeconds): nobody else gets an offer
+			local who = playerOf(st.VolleyUserId)
+			Mark.airMemo = { at = now }
+			Mark.airSkipLog("locked by " .. (who and actorName(who) or tostring(st.VolleyUserId)))
+			if Mark.airPlan then
+				Mark.airEnd("locked")
 			end
-		else
-			why = near and (near.gap < 0 and string.format("out of range d %.0f", near.d)
-				or string.format("no meet: best T %.2f d %.1f h %.1f short xz %.1f y %.1f", near.T, near.d, near.h, near.gapXZ, near.gapY)) or "no samples"
+			return
 		end
-		if plan then
-			plan.why, plan.src, plan.kicker = why, src, kicker
-			plan.aim = Mark.volleyClearAim(plan.B)
-			local foeT = math.huge
-			for _, model in Mark.models() do
-				local actor = Actors.GetFromCharacter(model)
-				if actor and actor ~= LocalPlayer and not sameTeam(actor) and not Mark.mateDown(actor, model) then
-					local r = ActorTargeting.GetActorRoot(actor)
-					if r then
-						foeT = math.min(foeT, math.max(flat(r.Position - plan.B).Magnitude - 4, 0) / 24)
+		Mark.mover = Mark.mover or require(Modules.Actions.ActionMovement)
+		local spd = math.max(Mark.akSpeeds(character), hum.WalkSpeed)
+		local spdAir = landed and Mark.mover.GetBaseWalkSpeed(character) or hum.WalkSpeed
+		local foeFlight = kicker ~= nil and kicker ~= LocalPlayer and not sameTeam(kicker)
+		local o = {
+			O = root.Position, v0 = flat(root.AssemblyLinearVelocity), spd = spd, spdAir = (type(spdAir) == "number" and spdAir > 4) and spdAir or 16,
+			landed = landed, vy = root.AssemblyLinearVelocity.Y, floor = floor, g = g, vJ = math.sqrt(2 * g * (Mark.jumpH or 7.2)),
+			pts = pts, DT = 0.025, tolDeg = foeFlight and 6 or 10, ballR = Physics.BallRadius or 1,
+		}
+		local first, near, list = Mark.airSolve(o)
+		-- the rules on the earliest reachable meet (user: near a goal every ball)
+		local want = false
+		if first then
+			want, why = Mark.airWant(root, first.B, kicker, floor)
+		end
+		if first and want then
+			-- the game's verdict on the shortlist: the earliest candidate whose pose gets an offer 0.25-0.4 s before the
+			-- meet. In the wind-up (he still owns it) there is no flight to evaluate yet: the earliest reachable spot.
+			local inFlight = src == "flight" and st ~= nil and world ~= nil
+			local verdict, firstInfo, tried = nil, nil, 0
+			if inFlight then
+				local step = math.max(1, math.floor(#list / 12))
+				for i = 1, #list, step do
+					local c = list[i]
+					for _, lead in { 0.32, 0.27 } do
+						local te = math.max(c.T - lead, 0)
+						local Qr = Vector3.new(c.Q.X, Mark.airY(o, te, c.td), c.Q.Z)
+						local ev, info = Mark.airOracle(character, st, world, te, Qr, c.inc)
+						tried += 1
+						if ev then
+							verdict = c
+							c.lead = lead
+							break
+						end
+						firstInfo = firstInfo or { info = info, c = c, lead = lead }
+					end
+					if verdict or tried >= 18 then
+						break
 					end
 				end
+				plan = verdict
+			else
+				plan = first
 			end
-			plan.foeT = foeT
+			if plan then
+				plan.verified = inFlight
+				plan.why, plan.src, plan.kicker = why, src, kicker
+				plan.aim = Mark.volleyClearAim(plan.B)
+			else
+				local fi = firstInfo
+				why = "game says no: " .. Mark.airInfo(fi and fi.info) .. (fi and string.format(" (T %.2f td %s h %.1f d %.1f, %d poses)", fi.c.T, tostring(fi.c.td), fi.c.B.Y - floor, flat(fi.c.B - root.Position).Magnitude, tried) or "")
+			end
+		elseif first then
+			plan = nil
+		else
+			why = near and string.format("no reach: best T %.2f d %.1f h %.1f short xz %.1f y %.1f", near.T, near.d, near.h, near.gapXZ, near.gapY) or "no samples"
 		end
 		Mark.airMemo = { at = now, plan = plan, why = why }
-		-- the ball is in reach of the module but no plan: say why (throttled) - this is the line to read when it "never works"
-		if not plan and Mark.airOn() and (not Mark.airSkipAt or now - Mark.airSkipAt > 0.5) then
+		if not plan then
 			local bp = pts[1]
 			if bp.Y - floor > 3 or flat(bp - root.Position).Magnitude < 40 then
-				Mark.airSkipAt = now
-				logFile("air skip", why, "src", src, "kicker", kicker and actorName(kicker) or "-", "ball d", string.format("%.1f", flat(bp - root.Position).Magnitude), "h", string.format("%.1f", bp.Y - floor), "landed", tostring(landed))
+				Mark.airSkipLog(tostring(why), string.format("src %s kicker %s ball d %.1f h %.1f landed %s", src, kicker and actorName(kicker) or "-", flat(bp - root.Position).Magnitude, bp.Y - floor, tostring(landed)))
 			end
 		end
 	end
@@ -17424,19 +17540,27 @@ Mark.tickAir = function(character, root)
 	end
 	local st = Renderer.GetAuthoritativeMovementState()
 	local key = st and (st.FlightStartedAt or st.StartedAt) or 0
-	local fresh = not Mark.airPlan or Mark.airPlan.key ~= key or (Mark.airPlan.td == "ground") ~= (plan.td == "ground")
+	local fresh = not Mark.airPlan or Mark.airPlan.key ~= key or (Mark.airPlan.td == "ground") ~= (plan.td == "ground") or Mark.airPlan.verified ~= plan.verified
 	plan.seen, plan.key = now, key
-	plan.at = (Mark.airPlan and not fresh) and Mark.airPlan.at or now
 	plan.jumped = Mark.airPlan and not fresh and Mark.airPlan.jumped or nil
 	Mark.airPlan = plan
 	if fresh then
-		logFile("air plan", plan.why, "src", plan.src, "kicker", plan.kicker and actorName(plan.kicker) or "-", "T", string.format("%.2f", plan.T), "td", tostring(type(plan.td) == "number" and string.format("%.2f", plan.td) or plan.td),
-			"meet d", string.format("%.1f", flat(plan.B - root.Position).Magnitude), "h", string.format("%.1f", plan.B.Y - floor), "tol", string.format("%.1f", plan.tol), "foeT~", plan.foeT < 99 and string.format("%.2f", plan.foeT) or "-")
+		logFile("air plan", plan.why, plan.verified and "GAME OK" or "wind-up (not checkable yet)", "src", plan.src, "kicker", plan.kicker and actorName(plan.kicker) or "-", "T", string.format("%.2f", plan.T), "lead", tostring(plan.lead or "-"),
+			"td", tostring(type(plan.td) == "number" and string.format("%.2f", plan.td) or plan.td), "meet d", string.format("%.1f", flat(plan.B - root.Position).Magnitude), "h", string.format("%.1f", plan.B.Y - floor), "landed", tostring(landed))
 	end
-	-- move to the spot facing the incoming ball (air control after the jump: same steer)
+	-- move to the spot; face the incoming ball once we are close (the box is in FRONT of the root; facing it from afar
+	-- would backpedal)
 	local toQ = flat(plan.Q - root.Position)
-	Mark.move.look = plan.inc
-	Mark.moveSteer(toQ.Magnitude > 0.8 and toQ.Unit or Vector3.zero, "air")
+	local close = toQ.Magnitude < 8 or plan.T < 0.6
+	Mark.move.look = close and plan.inc or unitOrNil(toQ) or plan.inc
+	if close then
+		TurnControl.LockAutoRotate("Aim", plan.inc)
+		Mark.airFaced = true
+	elseif Mark.airFaced then
+		Mark.airFaced = nil
+		TurnControl.ReleaseAutoRotate("Aim")
+	end
+	Mark.moveSteer(toQ.Magnitude > 0.6 and toQ.Unit or Vector3.zero, "air")
 	if landed and type(plan.td) == "number" and plan.td <= 0.035 and not plan.jumped then
 		if Mark.doJump("air") then
 			plan.jumped = true
@@ -17708,7 +17832,7 @@ Mark.akUserTick = function(character, root)
 	if not (Mark.realKick and Mark.realKick.down and ChargedKick.IsCharging and ChargedKick.IsCharging()) then
 		return false
 	end
-	if MatchSettings.IsGoalkeeperCharacter(character) or ClientSlide.IsSlideTackling() or Ragdoll.IsActorRagdolled(LocalPlayer) then
+	if MatchSettings.IsGoalkeeperCharacter(character) or Mark.slideBody() or Ragdoll.IsActorRagdolled(LocalPlayer) then
 		return false
 	end
 	local own = liveOwnerId()
@@ -17768,7 +17892,7 @@ Mark.akTry = function(tag, model, r, urgent)
 	if (ChargedKick.IsCharging and ChargedKick.IsCharging()) or Mark.volleyInput or (Mark.realKick and Mark.realKick.down) then
 		return false, "charging"
 	end
-	if slideAim or ClientSlide.IsSlideTackling() or ClientDodge.IsDribbling() or Ragdoll.IsActorRagdolled(LocalPlayer) or Mark.aerial then
+	if slideAim or Mark.slideBody() or ClientDodge.IsDribbling() or Ragdoll.IsActorRagdolled(LocalPlayer) or Mark.aerial then
 		return false, "busy2"
 	end
 	Mark.akDrib = Mark.akDrib or {}
@@ -17878,7 +18002,7 @@ Mark.akTick = function(character, root)
 	if not (ChargedKick.IsCharging and ChargedKick.IsCharging()) then
 		return finish("end")
 	end
-	if not (ak.model and ak.model.Parent and ak.root and ak.root.Parent) or liveOwnerId() == LocalPlayer.UserId or ClientSlide.IsSlideTackling() or Ragdoll.IsActorRagdolled(LocalPlayer) then
+	if not (ak.model and ak.model.Parent and ak.root and ak.root.Parent) or liveOwnerId() == LocalPlayer.UserId or Mark.slideBody() or Ragdoll.IsActorRagdolled(LocalPlayer) then
 		return finish("abort", true)
 	end
 	if Mark.realKick and Mark.realKick.down and Mark.realKick.at and Mark.realKick.at > ak.at then
@@ -18110,7 +18234,7 @@ Mark.tickVolley = function(character, root)
 			return
 		end
 	end
-	if slideAim or ClientSlide.IsSlideTackling() or ClientDodge.IsDribbling() then
+	if slideAim or Mark.slideBody() or ClientDodge.IsDribbling() or Ragdoll.IsActorRagdolled(LocalPlayer) then
 		return
 	end
 	local inst = Mark.chargeInst()
@@ -19074,7 +19198,7 @@ Mark.tickBall = function(character, root)
 			return
 		end
 	end
-	if slideAim or ClientSlide.IsSlideTackling() then
+	if slideAim or Mark.slideBody() then
 		return
 	end
 	if ClientDodge.IsDribbling() or Mark.weOwn() then
@@ -21915,13 +22039,21 @@ Mark.moveStop = function(only)
 		return
 	end
 	local was = m.mode
+	local lastDir = m.dir
 	m.mode = nil
 	m.dir = nil
 	m.want = nil
 	m.look = nil
 	m.pts = nil
 	local ch = LocalPlayer.Character
-	if ch then
+	-- AIR COAST (user: "after the script's jump it stops moving"): a plan that ends while we are in the air (Air
+	-- Intercept / AutoBall / lob re-solve from the arc and drop it) used to zero the stick mid-jump - the body stalled and
+	-- fell straight down. In the air the last agent direction is kept until we land (GetMoveCommand hook).
+	local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+	if ch and hum and lastDir and lastDir.Magnitude > 0.2 and not CharacterControllers.IsLanded(ch, hum)
+		and (was == "air" or was == "ball" or was == "block" or was == "lob" or was == "duel" or was == "kick") then
+		Mark.coast = { dir = lastDir, at = os.clock() }
+	elseif ch then
 		origSetMove(ch, Vector3.zero, Vector3.zero, false)
 	end
 	if was == "walk" or was == "take" or was == "dodge" or was == "block" or was == "ball" or was == "gk" or was == "kick" or was == "flee" or was == "air" then
@@ -23989,7 +24121,6 @@ return function(_Lib, _Core)
 			tog(ai, "With AutoBall", "AirWithBall", "Also runs whenever AutoBall is on.")
 			tog(ai, "With AutoBlock", "AirWithBlock", "Also runs whenever AutoBlock is on.")
 			tog(ai, "Ignore Volley Competitors", "VolleyNoCompetitor", "The game hides your volley when anyone (even a teammate) gets there first; the server does not check it.")
-			sld(ai, "Range", "AirRange", 10, 80, { prec = 0, suffix = " st" })
 			sld(ai, "Mate Pass Goal Zone", "VolleyGoalZone", 30, 160, { prec = 0, suffix = " st", text = "A teammate's pass is struck at goal only this close to their goal..." })
 			sld(ai, "Enemy Near Meet", "VolleyPressRadius", 5, 40, { prec = 0, suffix = " st", text = "...and only with an enemy this close to the meet point." })
 			advanced(ai, "Air", function()
