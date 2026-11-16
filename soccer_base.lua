@@ -145,7 +145,9 @@ local CFG = {
 	BlockBehind = 22,
 	TackleGoalZone = 40,
 	CompetitorRadius = 12,
-	CompetitorGoalZone = 45, -- AutoBlock / AutoBall: ball and we both this close to OUR goal -> Competitor Check is ignored (0 = always apply)
+	CompetitorGoalZone = 45, -- we or the ball this close to EITHER goal -> every Competitor Check is off (0 = never off by zone)
+	BallYieldKeeper = false, -- AutoBall stops when the enemy keeper gets to the ball first (off: keep pressing him)
+	CompetitorEnemyNear = 15, -- ... and off when an enemy is this close to the ball / target
 	CounterJump = true,
 	ShootMaxDist = 160,
 	-- Perf probe: on in the raw file (testers send the perf lines), OFF in an obfuscated build (LPH_OBFUSCATED folds to true
@@ -254,6 +256,7 @@ local CFG = {
 	BlockPassSpeed = 80, -- assumed pass speed for the intercept timing
 	BlockInterceptMargin = 0.25, -- we must reach the intercept point this much earlier than the ball
 	BlockPassMax = 130, -- receivers beyond this from the carrier are not a pass option
+	VolleyNoCompetitor = true, -- volley prompts ignore other players reaching first (client-only check; the server takes the first press)
 	VolleySteal = true, -- volley / bicycle on any ball the game offers us first: enemy passes, flicks, lobs (steal), mates' passes near their goal
 	VolleyGoalZone = 90, -- a teammate's pass is struck at their goal only within this of it
 	VolleyPressRadius = 20, -- ...and only with an enemy this close to the meet point (else it is received)
@@ -380,6 +383,7 @@ local CFG = {
 	GkRushZone = 35, -- ... inside this distance of the mouth segment
 	GkRushConf = 0.35, -- ... with this share of his futures caught
 	GkPressMinT = 0.06, -- a contact earlier than this into the dash is a pass-through (too close), not a catch (estimate)
+	GkKnockDive = true, -- AutoGK: knocked back by a gun (Keeper Push on us): dive at once (the only press the stun lets through)
 	GkKick = true, -- AutoGK: no dive line and he is close -> the keeper charges a full Kick at him
 	GkKickRange = 8, -- ... within kick reach + this
 	GkHomeDist = 20, -- ... "far out" = this far in front of the line (studs)
@@ -6189,7 +6193,7 @@ local function stepLogic()
 					end
 				elseif CFG.TackleOnDribble and not Mark.tackleNaked(player, cch, solved) then
 					tackleWhy = "wait dribble"
-				elseif CFG.TackleCompetitor and Mark.mateNear(croot.Position, CFG.TackleCompetitorRadius or 8) then
+				elseif CFG.TackleCompetitor and not Mark.competitorFree(root, croot.Position) and Mark.mateNear(croot.Position, CFG.TackleCompetitorRadius or 8) then
 					tackleWhy = "mate"
 				elseif Mark.kickCmd then
 					tackleWhy = "kick"
@@ -9385,6 +9389,74 @@ end
 -- (GoalkeeperActions: max(1.25, 2*BallRadius)) and 2*SaveReachStuds along the dive. Every ball path sample
 -- (Mark.ballPath, world collisions) inside SaveWindowSeconds is tested after our input delay. Independent of the
 -- game's assist, which only nudges.
+-- KNOCKED KEEPER (Keeper Push used on US). ViolenceKnockback is the Stun source "ViolenceKnockback" (Stun.StumbleSourceName):
+-- while it lasts we touch no ball (VolleyLockOn drops stunned characters, a body block is gone), and the dive press is
+-- refused by ActionLocks.HasGoalkeeperDiveBlock -> Stun.IsActorStunnedForPress, EXCEPT a press whose command time is
+-- <= stumble start + our one-way delivery allowance. So the only save is a dive sent the moment the knock arrives - not
+-- the walk / receive plan tickGk still believed in (log 770.33: knocked twice, "plan walk", dive 0.37 s later, goal).
+-- Dive: the own model on the current path; none -> straight at the path point where the ball crosses in front of us
+-- (forward-ish, never backward). The local press gate is passed with Mark.knockDiving (stunHook).
+Mark.gkKnockDive = function(vel)
+	local character = LocalPlayer.Character
+	local root = character and ActorTargeting.GetActorRoot(LocalPlayer)
+	local role, D = Mark.gkRole, Mark.gkDiveMod
+	if CFG.GkKnockDive == false or not (root and role and role.Dive and D) or not MatchSettings.IsGoalkeeperCharacter(character) then
+		return
+	end
+	local now = os.clock()
+	Mark.gkKnockAt = now
+	Mark.knockMod = Mark.knockMod or require(Modules.Characters.KnockbackMotion)
+	Mark.gkKnockUntil = now + Mark.knockMod.GetDuration(typeof(vel) == "Vector3" and vel or Vector3.new(0, 0, 25))
+	if now - (Mark.gkDive or 0) <= D.Constants.RepeatDelaySeconds then
+		logFile("gk knock", "dive on cooldown")
+		return
+	end
+	local _, _, samples, ts = Mark.ballPath(root)
+	local threat = samples and Mark.goalThreat(samples, ts)
+	if not threat then
+		logFile("gk knock", "no shot at goal")
+		return
+	end
+	local hit = Mark.gkOwnDive(root)
+	local wd = hit and hit.wd
+	local why = hit and ("model " .. tostring(hit.name)) or "path"
+	if not wd then
+		-- the first path sample in front of us that the ball reaches after our dive could: dive at it
+		local gf = Mark.gkFwd
+		for i = 2, #samples do
+			local d = flat(samples[i] - root.Position)
+			if ts[i] >= 0.05 and d.Magnitude > 2 then
+				local u = d.Unit
+				if not gf or u:Dot(gf) > -0.3 then
+					wd = u
+					break
+				end
+			end
+		end
+	end
+	if not wd then
+		logFile("gk knock", "no dive line")
+		return
+	end
+	local face = wd
+	TurnControl.LockAutoRotate("Goalkeeper", face)
+	Mark.gkDiveAim = { dir = wd, at = now, untilT = now + D.Constants.DurationSeconds + 0.05, fwd = Mark.gkFwd or wd, faceF = true }
+	Mark.diveSet(character, wd, face)
+	Mark.gkDive = now
+	Mark.knockDiving = true
+	local ok = role.Dive()
+	Mark.knockDiving = false
+	Mark.diveRestore(character, wd)
+	if ok then
+		Mark.gkDiveAim.faceLock = true
+		Mark.gkDiveRec = { at = now, name = "knock", minD = math.huge, eta = threat.t }
+	else
+		Mark.gkDiveAim = nil
+		TurnControl.ReleaseAutoRotate("Goalkeeper")
+	end
+	logFile("gk knock", "dive", ok and "ok" or "refused", why, "goal t", string.format("%.2f", threat.t), "lat", string.format("%.1f", threat.lat), "dir", fmtV(wd))
+end
+
 Mark.gkOwnDive = function(root, td, noJump)
 	td = td or 0
 	local yJ = 0
@@ -11229,6 +11301,13 @@ Mark.tickGk = function(character, root)
 		end
 	end
 
+	-- knocked (Keeper Push on us): no body touches the ball while the stumble lasts - a walk / jump / receive plan is
+	-- fiction. Only the dive branch stays (Mark.gkKnockDive already fired one in the allowed window).
+	local knocked = Mark.gkKnockUntil ~= nil and now < Mark.gkKnockUntil
+	if knocked and plan and plan.kind ~= "dive" then
+		plan = nil
+	end
+
 	-- PASS READ. A free ball on its way into an enemy's receive box near our goal is a pass to a man who shoots the moment
 	-- it lands (log: cross from side -46 to a receiver at side +31 / 26 out, one-touch shot 0.21 s from the first shot
 	-- frame, keeper still at lat -1.5: "gk dive none", goal). After the touch there is no time; during the pass flight
@@ -11455,7 +11534,7 @@ Mark.tickGk = function(character, root)
 			local jumped = Mark.doJump("gk")
 			logFile("gk jump", jumped and "ok" or "no", "h", string.format("%.1f", jp.h), "t", string.format("%.2f", jp.t), "rise", string.format("%.2f", jp.rise))
 		end
-	elseif shot and (not plan or plan.kind == "dive" or (plan.slack or 1) < (CFG.GkWalkMargin or 0.08)) and role and role.Dive and landed and now - (Mark.gkDive or 0) > diveMod.Constants.RepeatDelaySeconds then
+	elseif shot and (not plan or plan.kind == "dive" or (plan.slack or 1) < (CFG.GkWalkMargin or 0.08)) and role and role.Dive and (landed or knocked) and now - (Mark.gkDive or 0) > diveMod.Constants.RepeatDelaySeconds then
 		-- (the old gate: no dive while a walk / jump plan was seen in the last 0.2 s and the cross was > 0.18 s away. A
 		-- walk that is only just in time flips to "no plan" a frame later, the gate held the dive for 0.2 s more and the
 		-- dive was too late = the keeper "froze". Now a walk / jump with less than GkWalkMargin to spare does not block.)
@@ -11831,13 +11910,46 @@ Mark.stunHook = function()
 		return Mark.stunOrig.chk(c)
 	end
 	S.IsActorStunnedForPress = function(a, t, c)
-		if CFG.NoStun and (a == LocalPlayer or (c ~= nil and c == LocalPlayer.Character)) then
+		if (CFG.NoStun or Mark.knockDiving) and (a == LocalPlayer or (c ~= nil and c == LocalPlayer.Character)) then
 			return false
 		end
 		return Mark.stunOrig.press(a, t, c)
 	end
 end
 Mark.stunHook()
+
+-- VOLLEY WITHOUT COMPETITORS (user: the competitor checks killed every interception). VolleyOpportunity.GetEvaluation
+-- hands VolleyLockOn.GetCompetitorCharacters (every player and NPC, TEAMMATES too) to UpdateOpportunity: anyone whose
+-- FrontAssist box meets the flight earlier turns OUR prompt off (BlockedByCompetitor). The server never re-checks it -
+-- VolleyLockOn.ValidateOpportunityClaim runs Evaluate with competitors = nil - and the ball goes to the first claim. So
+-- the local evaluation runs without competitors (CFG.VolleyNoCompetitor): the first press wins, as on the server.
+Mark.volleyHook = function()
+	local VO = require(Client.Gameplay.Actions.VolleyOpportunity)
+	if Mark.volleyEvalOrig then
+		return
+	end
+	local VL = require(Modules.Ball.VolleyLockOn)
+	Mark.volleyEvalOrig = VO.GetEvaluation
+	local lastBall = nil
+	VO.GetEvaluation = function(ch, ...)
+		if CFG.VolleyNoCompetitor ~= false and ch ~= nil and ch == LocalPlayer.Character then
+			local st, world = Renderer.GetAuthoritativeMovementState()
+			if not st then
+				return nil
+			end
+			local id = Renderer.GetMatchBallId()
+			if lastBall ~= id then
+				if lastBall then
+					VL.ClearOpportunities(lastBall)
+				end
+				lastBall = id
+			end
+			return VL.UpdateOpportunity(id, st, world, ch, CharacterMotionSmoothing.GetSmoothedServerTime(), nil, nil, ActorTeams.GetCharacterTeamName(ch), nil, CommandTime.GetPlayerVolleyOneWaySeconds(LocalPlayer), nil)
+		end
+		return Mark.volleyEvalOrig(ch, ...)
+	end
+end
+Mark.volleyHook()
 
 RunService.Heartbeat:Connect(function(dt)
 	Mark.dt = dt
@@ -12287,6 +12399,9 @@ local function onFx(kind, userId, a, b, c, aimDir, ...)
 		if gp and b == LocalPlayer.UserId then
 			gp.hit = true
 		end
+		if userId == LocalPlayer.UserId then
+			Mark.gkKnockDive(c)
+		end
 	elseif kind == "ForcefieldBlocked" then
 		logFile("shield blocked", "actor", tostring(userId), "a", tostring(a), "by", tostring(b))
 	end
@@ -12436,7 +12551,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v173")
+	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v174")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -13433,7 +13548,7 @@ Mark.tickCounterJump = function(character, root)
 		return
 	end
 	-- a flick wind-up: the slide, if it lands before the detach; the ball after it is AutoBall's
-	if CFG.CounterCompetitor and not grap then
+	if CFG.CounterCompetitor and not grap and not Mark.competitorFree(root, r.Position) then
 		local myD = flat(r.Position - root.Position).Magnitude
 		for _, m2 in Mark.models() do
 			local a2 = Actors.GetFromCharacter(m2)
@@ -13636,12 +13751,31 @@ Mark.blockSkip = function(why, extra)
 	Mark.blockSkipWhy, Mark.blockSkipAt = why, os.clock()
 	logFile("block skip", why, extra or "")
 end
--- Competitor Check does not apply at our own goal: with the ball (carrier) AND us both within CompetitorGoalZone of it, a
--- teammate being nearer is no reason to stand aside - the next miss is a goal.
-Mark.atHomeGoal = function(root, ballPos)
-	local g = Mark.defendGoal()
+-- COMPETITOR CHECKS ARE OFF (user rule, repeated many times): when we OR the ball / target are near OUR goal, when we OR
+-- the ball are near THEIR goal (CompetitorGoalZone, both ends), or when an enemy is within CompetitorEnemyNear of the
+-- ball / target. "A teammate is nearer" only lets him have it in open midfield with no enemy on it. The old rule needed
+-- the ball AND us at our goal only - every attack and every contested ball still yielded (log: 34 "ball teammate").
+Mark.competitorFree = function(root, pos)
 	local z = CFG.CompetitorGoalZone or 45
-	return z > 0 and g ~= nil and flat(ballPos - g.Position).Magnitude <= z and flat(root.Position - g.Position).Magnitude <= z
+	if z > 0 then
+		local g, eg = Mark.defendGoal(), enemyGoalPart()
+		for _, gp in { g, eg } do
+			if gp and (flat(pos - gp.Position).Magnitude <= z or flat(root.Position - gp.Position).Magnitude <= z) then
+				return true
+			end
+		end
+	end
+	local rE = CFG.CompetitorEnemyNear or 15
+	for _, model in Mark.models() do
+		local actor = Actors.GetFromCharacter(model)
+		if actor and actor ~= LocalPlayer and not sameTeam(actor) and not Mark.mateDown(actor, model) then
+			local r = ActorTargeting.GetActorRoot(actor)
+			if r and flat(r.Position - pos).Magnitude <= rE then
+				return true
+			end
+		end
+	end
+	return false
 end
 
 -- Who AutoBlock takes. Two situations:
@@ -13819,7 +13953,7 @@ Mark.blockChoose = function(root, carrier, cr, P, V, g, danger)
 	local closedNear = danger ~= nil and not danger.on and dC <= 40
 	local passer = far or behind or closedNear or (dC > 40 and width < (CFG.BlockShotAngle or 9))
 	local comp = nil
-	if not passer and CFG.BlockCompetitor ~= false and not Mark.atHomeGoal(root, P) then
+	if not passer and CFG.BlockCompetitor ~= false and not Mark.competitorFree(root, P) then
 		comp = Mark.mateNear(P, CFG.CompetitorRadius or 12)
 	end
 	if not passer and not comp then
@@ -14485,7 +14619,7 @@ Mark.tickBlock = function(character, root)
 	local dangerOn = pick and pick.danger ~= nil
 	for _, model in Mark.models() do
 		local actor = Actors.GetFromCharacter(model)
-		if CFG.BlockCompetitor ~= false and not Mark.atHomeGoal(root, P) and actor and actor ~= LocalPlayer and sameTeam(actor) and not isGoalkeeper(actor) and not Mark.mateDown(actor, model) then
+		if CFG.BlockCompetitor ~= false and not Mark.competitorFree(root, P) and actor and actor ~= LocalPlayer and sameTeam(actor) and not isGoalkeeper(actor) and not Mark.mateDown(actor, model) then
 			local ar = ActorTargeting.GetActorRoot(actor)
 			if ar and dangerOn then
 				-- an open shot: only a mate standing IN the open lane (goal side of him, within 3 studs of it) owns it
@@ -15632,6 +15766,8 @@ Mark.spoofPlan = function()
 		-- PRO TRIPLE (user: aim the real corner, flick to the other, come back): real side first, the other corner up to
 		-- the window end, then real again for the lock - the last flick is as late as the server allows (spoofWin)
 		triple = { w = 3, steps = { { sr, hr, win * 0.35 }, { opp * 0.85, hr, win * 0.65 } } },
+		-- PRO REVERSE: the fake corner first, then across through the middle, then the real one at the lock
+		reverse = { w = 2.5, steps = { { opp * 0.85, hr, win * 0.55 }, { 0, hr, win * 0.45 } } },
 		-- left, right, then the real one (made for a middle shot, high or low)
 		late = { w = math.abs(sr) < 0.35 and 2.5 or 0, steps = { { -opp * 0.8, hi and 0.2 or 0.8, win / 2 }, { opp * 0.8, hi and 0.2 or 0.8, win / 2 } } },
 	}
@@ -15640,7 +15776,7 @@ Mark.spoofPlan = function()
 	-- Pro Patterns: only what a human does with the camera (triple flick, the mirror corner, left-right for a middle shot)
 	local proOnly = CFG.DirSpoofPro ~= false
 	for name, p in pats do
-		local w = (proOnly and not (name == "triple" or name == "mirror" or name == "late")) and 0 or p.w
+		local w = (proOnly and not (name == "triple" or name == "reverse" or name == "mirror" or name == "late")) and 0 or p.w
 		for i = 1, #hist do
 			if hist[i] == name then
 				w *= 0.3
@@ -17557,7 +17693,7 @@ Mark.akUserTick = function(character, root)
 	end
 	local own = liveOwnerId()
 	local who = own ~= LocalPlayer.UserId and playerOf(own) or nil
-	if not who or sameTeam(who) then
+	if not who or sameTeam(who) or isGoalkeeper(who) then
 		return false
 	end
 	local model = Actors.GetCharacter(who)
@@ -17580,7 +17716,9 @@ Mark.akAutoTick = function(character, root)
 	end
 	local own = liveOwnerId()
 	local who = type(own) == "number" and own ~= 0 and own ~= LocalPlayer.UserId and playerOf(own) or nil
-	if not who or sameTeam(who) then
+	-- a keeper holding the ball is not kickable off it (the keeper exemptions: no strip, no stun) - log: AutoKick ran at
+	-- the enemy keeper
+	if not who or sameTeam(who) or isGoalkeeper(who) then
 		return
 	end
 	local model = Actors.GetCharacter(who)
@@ -18689,6 +18827,10 @@ end
 -- us or is already within KillerRadius of the ball. The old version measured "near the ball" to OUR intercept point
 -- (often the ball's rest point 60-200 studs away) and never fired once.
 Mark.killerSlide = function(root, routeDir, foes, ballNow, ourT, mLo, mHi, guard)
+	-- our own kick charge locks the slide (log: 3 "killer no game-reject" in 20 ms while the player charged)
+	if ChargedKick.IsCharging and ChargedKick.IsCharging() then
+		return nil, "our kick charge"
+	end
 	local O = root.Position
 	local t0, t1 = C.HitboxDelaySeconds, C.HitboxDelaySeconds + C.HitboxSeconds
 	local box = HitboxSettings.SlideTackle
@@ -19174,7 +19316,7 @@ Mark.tickBall = function(character, root)
 	end
 	local gap = flat(aimP - root.Position).Magnitude
 	local beaten = false
-	local homeDef = Mark.atHomeGoal(root, pos)
+	local homeDef = Mark.competitorFree(root, aimP)
 	local ourNeed = math.max(0, gap - receiveHalf)
 	for _, model in Mark.models() do
 		local actor = Actors.GetFromCharacter(model)
@@ -19196,8 +19338,10 @@ Mark.tickBall = function(character, root)
 	end
 	-- Enemy keeper gets to our contact point first (run, or a GoalkeeperDive whose curve time beats us): the chase is
 	-- pointless, he claims it.
+	-- the enemy keeper claiming the ball first stopped the chase in their half (log: 22 "ball keeper") - a pressed keeper
+	-- fumbles / spends his dive / gets volleyed; standing still gives nothing. Only with BallYieldKeeper on.
 	local keeperFirst = false
-	if not beaten and not threat then
+	if not beaten and not threat and CFG.BallYieldKeeper then
 		local diveMod = Mark.gkDiveMod or require(Modules.Actions.GoalkeeperDive)
 		Mark.gkDiveMod = diveMod
 		local ourT = ourNeed / math.max(spd, 8)
@@ -23559,7 +23703,7 @@ return function(_Lib, _Core)
 			tog(ds, "Show Fake Marker", "DrawSpoof", "Marks the fake aim point on the goal.")
 			drop(ds, "Preset", "DirSpoofPreset", { "Safe", "Normal", "Long", "Custom" }, "How long the fake shows and the body lies. Longer fools more but can pull the shot off target.")
 			tog(ds, "Smart Select", "DirSpoofSmart", "No spoof once the keeper has dived.")
-			tog(ds, "Pro Patterns", "DirSpoofPro", "Only human flicks: real corner - other corner - real, mirror corner, left-right.")
+			tog(ds, "Pro Patterns", "DirSpoofPro", "Only human flicks: real-fake-real, fake-middle-real, fake-real, left-right.")
 			head(ds, "Body Spoof")
 			tog(ds, "Enabled", "FaceSpoof", "Your body faces the wrong way to fool the keeper.")
 			drop(ds, "Mode", "FaceSpoofMode", { "smart", "spin", "side", "lookoff", "away", "decoy" })
@@ -23702,7 +23846,9 @@ return function(_Lib, _Core)
 			sld(b, "Range", "BlockRange", 15, 80, { suffix = " st" })
 			tog(b, "Competitor Check", "BlockCompetitor", "Stops when a teammate is already on the carrier.")
 			sld(b, "Competitor Radius", "CompetitorRadius", 4, 30, { suffix = " st" })
-			sld(b, "Ignore Near Our Goal", "CompetitorGoalZone", 0, 90, { suffix = " st", text = "Near our goal, chase even if a teammate is on him. 0 = off." })
+			sld(b, "Ignore Near Goals", "CompetitorGoalZone", 0, 120, { suffix = " st", text = "You or the ball this close to EITHER goal: no competitor checks at all. 0 = off." })
+			sld(b, "Ignore With Enemy Near", "CompetitorEnemyNear", 0, 40, { suffix = " st", text = "An enemy this close to the ball: no competitor checks." })
+			tog(b, "Yield To Enemy Keeper", "BallYieldKeeper", "AutoBall stops when their keeper gets to the ball first.")
 			head(b, "High Shots")
 			tog(b, "Pre-Release Jump", "BlockPreJump", "Jumps before the release, timed to his charge.")
 			tog(b, "Slide Block", "BlockSlide")
@@ -23711,6 +23857,7 @@ return function(_Lib, _Core)
 			tog(b, "Close The Goal", "BlockDefense", "Near your goal, covers the shooter's angle.")
 			tog(b, "Shot Block First", "BlockShotFirst", "He charges a shot at your goal: you stand on its path (jump for a high one) before anything else.")
 			head(b, "Air Intercept")
+			tog(b, "Ignore Volley Competitors", "VolleyNoCompetitor", "The game hides your volley when anyone (even a teammate) gets there first; the server does not check it.")
 			tog(b, "Steal Flying Balls", "VolleySteal", "Volley / bicycle a pass, flick or lob before the enemy does; a mate's pass near their goal goes at goal.")
 			sld(b, "Mate Pass Goal Zone", "VolleyGoalZone", 30, 160, { prec = 0, suffix = " st" })
 			sld(b, "Enemy Near Meet", "VolleyPressRadius", 5, 40, { prec = 0, suffix = " st" })
@@ -23848,6 +23995,7 @@ return function(_Lib, _Core)
 			sld(p, "Rush Confidence", "GkRushConf", 0.1, 0.9, { prec = 2 })
 			sld(p, "Too Close", "GkPressMinT", 0, 0.15, { prec = 2, suffix = " s", text = "A contact earlier than this into the dash passes through him." })
 			tog(p, "Keeper Kick", "GkKick", "No dive line and he is close: charges a full kick at him.")
+			tog(p, "Dive When Knocked", "GkKnockDive", "Shot at by a gun while the ball comes: dives at once (you cannot touch the ball while knocked).")
 			advanced(p, "GkPress", function()
 				sld(p, "Press Zone", "GkPressZone", 20, 140, { suffix = " st" })
 				sld(p, "Hit Margin", "GkPressRadiusFrac", 0.4, 1, { prec = 2 })
