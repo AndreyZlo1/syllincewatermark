@@ -142,7 +142,6 @@ local CFG = {
 	AutoDodge = true,
 	AutoBlock = true,
 	AutoBall = true,
-	BlockRange = 40,
 	TackleGoalZone = 40,
 	CompetitorRadius = 12,
 	CompetitorGoalZone = 45, -- we or the ball this close to EITHER goal -> every Competitor Check is off (0 = never off by zone)
@@ -207,7 +206,6 @@ local CFG = {
 	PressDist = nil, -- max dive travel to contact (default: dive distance - 2)
 	PressReach = 2.6, -- horizontal body-to-body contact radius of the dive (server value unknown: calibrate from `gk press result`)
 	PressVert = 4, -- vertical contact window
-	ChargeTackleRange = 10, -- slide at a kick-charging carrier / his shot line only within this many studs of him
 	KillerGuard = true, -- ball near OUR goal and we are close to it: slide the enemy nearest to the ball first, keep chasing
 	KillerGuardGoal = 55, -- ball this close to our goal (studs)
 	KillerGuardNear = 22, -- we are this close to the ball
@@ -242,10 +240,11 @@ local CFG = {
 	RoleTakenR = 10, -- a teammate goal-side within this of the carrier is already pressing him
 	RoleBehindPen = 0.8, -- press cost (s) for a defender behind the carrier (he runs at our goal as fast as we do)
 	RoleDeepZone = 90, -- enemies within this of our mouth are the deep defender's threats
+	RoleCoverMax = 12, -- deepest median stand (studs in front of the carrier on the bisector of his lines to the posts)
+	RoleMarkMin = 4, -- standing distance from the enemy we mark, on his line to the middle of our mouth
+	RoleMarkMax = 9,
 	RoleDeepMin = 8, -- deep defender depth from the mouth: nearest threat * 0.45, clamped here
 	RoleDeepMax = 24,
-	RoleDeepCenter = 0.3, -- deep defender pull to the middle of the goal (0 = pure threat direction)
-	RoleDeepTrigger = 110, -- two defenders, not pressing: deep while the carrier is within this of our mouth, else screen
 	RoleScreenDepth = 16, -- screen without a receiver: this far behind the press spot on his goal line
 	BlockDanger = true, -- AutoBlock near our goal: block only a carrier who has an open shot past our keeper
 	BlockOpenAngle = 5, -- degrees of open mouth (past the keeper) that make him a shooter
@@ -261,6 +260,7 @@ local CFG = {
 	AirIntercept = true, -- Air Intercept module: plans run / jump / face to meet a flying ball and volleys / bicycles it first
 	AirWithBall = true, -- ...also runs whenever AutoBall is on
 	AirWithBlock = true, -- ...also runs whenever AutoBlock is on
+	AirMinHeight = 1.5, -- the ball must be this far above our hip (studs) at the meet: lower is on the grass = not an AIR ball
 	AirSlack = 0.5, -- studs added to the box reach on top of the game's miss-angle tolerance
 	AirTolT = 0.3, -- the miss angle is turned into studs at this time before the meet (s); guessed
 	VolleyGoalZone = 90, -- a teammate's pass is struck at their goal only within this of it
@@ -275,7 +275,6 @@ local CFG = {
 	KickHelperRange = 42,
 	AutoKickCooldown = 0.5,
 	AutoKickAway = 3, -- no kick when HE moves away from us faster than this (urgent air/counter kicks: twice)
-	AutoKickFlee = 9, -- no kick when the gap would open faster than this (he runs away, we are slowed to ~8 by the charge)
 	SlideCenterWindow = 0.2, -- AutoBall slide: keep scanning this long after the first press that holds the ball, take the one with the most box hits
 	SlideGoodHits = 7, -- hits (of 11) that count as centred
 	SlideLag = 0.03, -- extra seconds the ball is taken ahead when a slide is planned (on top of ping/2)
@@ -354,10 +353,6 @@ local CFG = {
 	BounceFakeSlack = 3.5, -- accepted remaining gap at the return (was 2.5)
 	IntentTackleRadius = 60, -- deliberate slides AT enemies (CandidateKiller) only when the enemy is within this of the ball
 	SlideTravelCal = true, -- slide travel model corrected by the measured dash (phase 2 ~0.8-0.86 of the dump formula) -- rolled every solve even when a normal shot exists
-	ChargeTackleGuard = true, -- AutoTackle on a charging carrier only if the slide lands before the release, else try a slide-block on the shot line
-	ChargeRelease = 0.34, -- assumed seconds from charge start to release (KickCore window 0.2..0.4)
-	ChargeBallSpeed = 95, -- assumed shot speed for the slide-block geometry
-	ChargeSlideBlock = true,
 	FakeShot = true, -- AutoShoot FAKE: a shot that flies through a teammate in front of their goal (he receives it, the keeper has already dived)
 	FakeChance = 0.12, -- share of shots that become a FAKE when one is possible (x2.2 for a friend / party / club mate, cap 0.35)
 	FakeSlop = 6, -- studs of slack: depth window, mouth-line prefilter, receive-box miss
@@ -433,7 +428,6 @@ local Log = {
 	ring = table.create(480),
 	n = 0,
 	head = 1,
-	file = "illegalsoccerlog.txt",
 	pending = {},
 }
 
@@ -465,9 +459,33 @@ local function dbg(...)
 	return line
 end
 
--- One file write per ~2 s instead of isfile + appendfile for every line: each call is a synchronous disk round trip
--- that blocks the whole Lua thread (tester log: single tickBlock / paintWorld calls of 1.2 s that only log lines can
--- explain). A script error line flushes at once.
+-- DEBUG FOLDER "Illegal Soccer/": one file per module, so a complaint about AutoBlock is read from AutoBlock.txt alone.
+--   Global.txt       every line in time order (the full story, also what H dumps)
+--   <Section>.txt    only that module's lines (+ its world snapshots, Mark.snap)
+-- A new session moves each file to <Section>_prev.txt (AutoGK.txt keeps growing across sessions up to 400 KB). Lines are
+-- buffered and written every ~2 s (one synchronous disk round trip per file, not per line); a script error flushes now.
+-- Section = the first word(s) of the log tag (Log.sections); an unknown tag goes to Misc.
+Log.dir = "Illegal Soccer"
+Log.file = Log.dir .. "/Global.txt"
+Log.sections = {
+	block = "AutoBlock", ["kick helper"] = "AutoBlock", snap = nil,
+	tackle = "AutoTackle", killer = "AutoTackle", verdict = "AutoTackle", ["slide audit"] = "AutoTackle", ["charge tackle"] = "AutoTackle",
+	ball = "AutoBall", air = "AirIntercept", volley = "AirIntercept",
+	duel = "CounterJump", lob = "CounterJump", counter = "CounterJump", grapple = "CounterJump",
+	gk = "AutoGK", autokick = "AutoKick",
+	shoot = "AutoShoot", spoof = "AutoShoot", feint = "AutoShoot", aerial = "AutoShoot", flick = "CounterJump",
+	dodge = "AutoDodge", dribble = "AutoDodge", enemy = "AutoDodge", hazard = "AutoDodge", proj = "AutoDodge", blast = "AutoDodge", mine = "AutoDodge",
+	skill = "Skills", shield = "Skills", gunpush = "Skills", push = "Skills", knock = "Skills", wall = "Skills",
+}
+Log.sectionOf = function(tag)
+	local s = Log.sections[tag]
+	if s then
+		return s
+	end
+	local w = tag:match("^(%S+)")
+	return w and Log.sections[w] or nil
+end
+Log.sbuf = {}
 Log.wbuf, Log.wn, Log.wAt, Log.started = {}, 0, os.clock(), false
 Log.flush = function()
 	if Log.wn == 0 then
@@ -475,59 +493,71 @@ Log.flush = function()
 	end
 	local text = table.concat(Log.wbuf, "\n", 1, Log.wn) .. "\n"
 	table.clear(Log.wbuf)
-	if Log.gn > 0 then
-		local g = table.concat(Log.gbuf, "\n", 1, Log.gn) .. "\n"
-		table.clear(Log.gbuf)
-		Log.gn = 0
-		pcall(function()
-			local f = "illegalsoccer_gk.txt"
-			if not Log.gkOpen then
-				Log.gkOpen = true
-				local old = isfile(f) and readfile(f) or ""
-				if #old > 400000 then
-					writefile("illegalsoccer_gk_prev.txt", old)
-					old = ""
-				end
-				writefile(f, old .. "-- session " .. os.date("%Y-%m-%d %H:%M:%S") .. "\n" .. g)
-			else
-				appendfile(f, g)
-			end
-		end)
-	end
 	Log.wn, Log.wAt = 0, os.clock()
-	if Log.started and isfile(Log.file) then
-		appendfile(Log.file, text)
-	else
+	if not Log.started then
 		Log.started = true
-		-- the previous session's log is kept (a restart used to wipe the very episode the user wanted to show)
-		if isfile(Log.file) then
-			writefile("illegalsoccerlog_prev.txt", readfile(Log.file))
+		if makefolder and not isfolder(Log.dir) then
+			makefolder(Log.dir)
 		end
-		writefile(Log.file, text)
+		-- the previous session's files are kept as _prev (a restart used to wipe the very episode the user wanted to show)
+		if listfiles and isfolder(Log.dir) then
+			for _, path in listfiles(Log.dir) do
+				local name = path:match("([^/\\]+)%.txt$")
+				if name and not name:find("_prev", 1, true) and name ~= "AutoGK" then
+					writefile(Log.dir .. "/" .. name .. "_prev.txt", readfile(path))
+					delfile(path)
+				end
+			end
+		end
+	end
+	appendfile(Log.file, text)
+	for sec, buf in Log.sbuf do
+		if #buf > 0 then
+			local f = Log.dir .. "/" .. sec .. ".txt"
+			if sec == "AutoGK" and not Log.gkOpen then
+				Log.gkOpen = true
+				if isfile(f) and #readfile(f) > 400000 then
+					writefile(Log.dir .. "/AutoGK_prev.txt", readfile(f))
+					delfile(f)
+				end
+				appendfile(f, "-- session " .. os.date("%Y-%m-%d %H:%M:%S") .. "\n")
+			end
+			appendfile(f, table.concat(buf, "\n") .. "\n")
+			table.clear(buf)
+		end
 	end
 end
 
-local function persist(line)
+local function persist(line, section)
 	Log.wn += 1
 	Log.wbuf[Log.wn] = line
+	if section then
+		local b = Log.sbuf[section]
+		if not b then
+			b = {}
+			Log.sbuf[section] = b
+		end
+		b[#b + 1] = line
+	end
 	if Log.wn >= 200 or os.clock() - Log.wAt > 2 or line:find("SCRIPT ERROR", 1, true) then
 		Log.flush()
 	end
 end
 
--- Keeper / goal-defence lines also go to illegalsoccer_gk.txt, which is NOT rotated per session (illegalsoccerlog.txt
--- becomes _prev on every start, so two restarts lost the very keeper episode the user wanted to show). Capped: past
--- ~400 KB it moves to illegalsoccer_gk_prev.txt.
-Log.gbuf, Log.gn = {}, 0
 local function logFile(...)
 	local line = dbg(...)
 	local k = select(1, ...)
-	-- + the context a keeper episode needs (who used what: skill / mine / blast / push / enemy keeper dive)
-	if type(k) == "string" and (k:sub(1, 3) == "gk " or k:sub(1, 11) == "block clear" or k:sub(1, 10) == "block goal" or k:sub(1, 9) == "block def" or k == "skill activate" or k:sub(1, 5) == "mine " or k:sub(1, 6) == "blast " or k == "push" or k:sub(1, 6) == "shield" or k:sub(1, 7) == "gunpush") then
-		Log.gn += 1
-		Log.gbuf[Log.gn] = line
+	-- keeper context: who used what (skill / mine / blast / push) also lands in AutoGK
+	local sec = type(k) == "string" and Log.sectionOf(k) or nil
+	persist(line, sec)
+	if sec ~= "AutoGK" and type(k) == "string" and (k == "skill activate" or k:sub(1, 5) == "mine " or k:sub(1, 6) == "blast " or k == "push" or k:sub(1, 6) == "shield" or k:sub(1, 7) == "gunpush" or k:sub(1, 11) == "block clear" or k:sub(1, 10) == "block goal") then
+		local b = Log.sbuf.AutoGK
+		if not b then
+			b = {}
+			Log.sbuf.AutoGK = b
+		end
+		b[#b + 1] = line
 	end
-	persist(line)
 end
 
 -- Potassium catalog (debug.md): debug.getupvalue(fn, i) -> any (value only)
@@ -1915,7 +1945,16 @@ end
 -- What his dribble does to a slide box live at hitAt (os.clock): "iframe" (inside his dribble), "spent" (used, cooldown
 -- still running at hitAt + 0.15), "noball" (he will not own the ball while the box is live: no dribble without it),
 -- "ready" (he owns it and can dribble).
+Mark.foeCharging = function(uid)
+	local rec = Mark.charges and Mark.charges[uid]
+	return rec ~= nil and rec.live and os.clock() - (rec.seen or 0) < 0.6
+end
+
 Mark.dribState = function(actor, model, hitAt, hasBall)
+	-- stunned / ragdolled / frozen: no dribble and no movement - the most predictable state there is
+	if model and Mark.mateDown(actor, model) then
+		return "down", nil
+	end
 	local rec = dribbleSeen[actor.UserId] or (model and dribbleSeen[model])
 	if rec and hitAt < rec.untilT + 0.03 then
 		return "iframe", rec
@@ -2102,7 +2141,6 @@ Mark.carrierPose = function(carrierRoot, carrierChar)
 				local u = unitOrNil(rawVel)
 				if type(cw) == "number" and u and rawVel.Magnitude > cw then
 					rawVel = u * cw
-					Mark.chargeClamped = os.clock()
 				end
 			end
 		end
@@ -6247,44 +6285,15 @@ local function stepLogic()
 					tackleWhy = "dodge"
 				else
 					Mark.manualTackle = { aim = solved.aim, mult = solved.mult, char = cch, root = croot, at = os.clock() }
-					local use = solved
-					local late = nil
-					do
-						local rec = Mark.charges and Mark.charges[player.UserId]
-						local ct = Mark.chargeTackle(root, croot, rec, solved)
-						if ct then
-							if ct.skip then
-								late = ct.why
-							elseif ct.block and Mark.onShotLine(root, solved, rec) then
-								late = "block holds the line"
-							elseif ct.block then
-								use = table.clone(solved)
-								use.aim, use.mult, use.eta, use.hit = ct.aim, ct.mult, ct.eta, ct.X
-								if not Mark.chargeBlockLog or os.clock() - Mark.chargeBlockLog > 0.5 then
-									Mark.chargeBlockLog = os.clock()
-									logFile("charge tackle", "slide-block", "eta", string.format("%.2f", ct.eta), "dX", string.format("%.1f", ct.dX), "mult", string.format("%.2f", ct.mult), "X", fmtV(ct.X))
-								end
-							end
-						end
-					end
-					if late then
-						if not Mark.chargeLateLog or os.clock() - Mark.chargeLateLog > 0.5 then
-							Mark.chargeLateLog = os.clock()
-							local rec = Mark.charges and Mark.charges[player.UserId]
-							logFile("charge tackle", "skip", late, "eta", string.format("%.2f", solved.eta or 0), "left", string.format("%.2f", rec and (rec.at + (CFG.ChargeRelease or 0.34) - os.clock()) or 0))
-						end
-						tackleWhy = late
+					local go, gate = Mark.tackleGate(character, root, player, cch, solved)
+					if not go then
+						tackleWhy = gate
 					else
-						local go, gate = Mark.tackleGate(character, root, player, cch, use)
-						if not go then
-							tackleWhy = gate
-						else
-							local _, why = tryTackle(character, root, use.aim, use.mult, { char = cch, root = croot })
-							if why == "sent" then
-								logFile("tackle gate", gate, use ~= solved and "block" or "", "drib", Mark.tackleDrib, "conf", string.format("%.2f", solved.conf or 0))
-							end
-							tackleWhy = why
+						local _, why = tryTackle(character, root, solved.aim, solved.mult, { char = cch, root = croot })
+						if why == "sent" then
+							logFile("tackle gate", gate, "drib", Mark.tackleDrib, "conf", string.format("%.2f", solved.conf or 0))
 						end
+						tackleWhy = why
 					end
 				end
 		end
@@ -9450,7 +9459,6 @@ Mark.gkKnockDive = function(vel)
 		return
 	end
 	local now = os.clock()
-	Mark.gkKnockAt = now
 	Mark.knockMod = Mark.knockMod or require(Modules.Characters.KnockbackMotion)
 	Mark.gkKnockUntil = now + Mark.knockMod.GetDuration(typeof(vel) == "Vector3" and vel or Vector3.new(0, 0, 25))
 	if now - (Mark.gkDive or 0) <= D.Constants.RepeatDelaySeconds then
@@ -12455,7 +12463,6 @@ local function onFx(kind, userId, a, b, c, aimDir, ...)
 		onEnemyTackleStarted(userId, b)
 	elseif kind == "KickChargeStarted" or kind == "KickChargeUpdated" then
 		if type(userId) == "number" and userId ~= LocalPlayer.UserId then
-			Mark.chargeLive = true
 			Mark.charges = Mark.charges or {}
 			local rec = Mark.charges[userId]
 			if kind == "KickChargeStarted" or not rec or not rec.live then
@@ -12476,15 +12483,11 @@ local function onFx(kind, userId, a, b, c, aimDir, ...)
 				dir = aimDir.Direction
 			end
 			if dir then
-				Mark.chargeDir = dir
 				Mark.chargeId = userId
-				Mark.chargeUntil = os.clock() + 1.6
 			end
 		end
 	elseif kind == "KickReleased" or kind == "KickChargeCanceled" then
 		if userId == Mark.chargeId then
-			Mark.chargeUntil = os.clock() + 0.5
-			Mark.chargeLive = false
 		end
 		if Mark.charges and type(userId) == "number" and Mark.charges[userId] then
 			Mark.charges[userId].live = false
@@ -12597,7 +12600,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- illegalsoccerlog " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v177")
+	add("-- Illegal Soccer dump " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v178")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -12719,7 +12722,7 @@ local function dumpLog()
 		end
 	end
 	Log.wbuf, Log.wn = {}, 0
-	writefile("illegalsoccerlog.txt", table.concat(lines, "\n") .. "\n")
+	writefile(Log.dir .. "/Dump.txt", table.concat(lines, "\n") .. "\n")
 	Log.started = true
 end
 
@@ -12822,6 +12825,51 @@ Mark.models = function()
 	local list = Actors.GetAllCharacterModels()
 	Mark.modelCache = { id = id, list = list }
 	return list
+end
+
+-- World snapshot for a section: one line with every player (team, role, position relative to OUR mouth: x = across, z =
+-- out of the goal) and the ball. This is the detail positioning bugs need ("where were the mates when it chose that").
+Mark.snap = function(section, label, extra)
+	local now = os.clock()
+	Mark.snapAt = Mark.snapAt or {}
+	if now - (Mark.snapAt[section] or 0) < 0.5 then
+		return
+	end
+	Mark.snapAt[section] = now
+	local g = Mark.defendGoal()
+	local lb, rb, nrm
+	if g then
+		local a, _, b, _, _, c = goalMouthCorners(g)
+		lb, rb, nrm = a, b, c
+	end
+	local n = nrm and unitOrNil(flat(nrm))
+	local side = lb and rb and unitOrNil(flat(rb - lb))
+	local M = lb and (lb + rb) * 0.5
+	local function rel(p)
+		if not (M and n and side) then
+			return string.format("%.0f,%.0f", p.X, p.Z)
+		end
+		local d = flat(p - M)
+		return string.format("%.0f,%.0f", d:Dot(side), d:Dot(n))
+	end
+	local parts = {}
+	local me = ActorTargeting.GetActorRoot(LocalPlayer)
+	if me then
+		parts[#parts + 1] = "ME " .. rel(me.Position)
+	end
+	for _, model in Mark.models() do
+		local a = Actors.GetFromCharacter(model)
+		local r = a and a ~= LocalPlayer and ActorTargeting.GetActorRoot(a)
+		if r then
+			local v = flat(r.AssemblyLinearVelocity)
+			parts[#parts + 1] = string.format("%s%s %s %s v%.0f", sameTeam(a) and "M:" or "F:", isGoalkeeper(a) and "GK" or "", actorName(a):sub(1, 10), rel(r.Position), v.Magnitude)
+		end
+	end
+	local bp = Renderer.GetPosition()
+	if bp then
+		parts[#parts + 1] = "BALL " .. rel(bp) .. string.format(" h%.0f own %s", bp.Y - (me and me.Position.Y or 0), tostring(liveOwnerId()))
+	end
+	logFile(section:lower() .. " snap", label or "-", "(x across mouth, z out of it)", table.concat(parts, " | "), extra or "")
 end
 
 Mark.defendGoal = function()
@@ -14111,15 +14159,6 @@ Mark.shotOpen = function(P, g, uid)
 	local keepers = {}
 	Mark.gkDiveMod = Mark.gkDiveMod or require(Modules.Actions.GoalkeeperDive)
 	local DC = Mark.gkDiveMod.Constants
-	for _, model in Mark.models() do
-		local actor = Actors.GetFromCharacter(model)
-		if actor and sameTeam(actor) and isGoalkeeper(actor) and not Mark.mateDown(actor, model) then
-			local r = ActorTargeting.GetActorRoot(actor)
-			if r then
-				keepers[#keepers + 1] = Vector3.new(r.Position.X, 0, r.Position.Z)
-			end
-		end
-	end
 	local N, open, sum = 17, 0, Vector3.zero
 	local a1, a2 = unitOrNil(flat(lb - P)), unitOrNil(flat(rb - P))
 	local width = (a1 and a2) and math.deg(math.acos(math.clamp(a1:Dot(a2), -1, 1))) or 0
@@ -14328,8 +14367,14 @@ Mark.rolePlan = function(o)
 	local prevFresh = prev and now - prev.at < 0.6
 	local takenR = CFG.RoleTakenR or 10
 	-- 1) PRESS
+	-- MEDIAN stand (within shot range): on the bisector of his lines to both posts (the median of his view from where the
+	-- ball starts), at the depth where our body spans the whole post-to-post cone (Mark.blockCone) - the ball then meets
+	-- the body whichever corner he picks. Tight press (nobody to pass to / open shot) = kick reach; no cone = RolePressGap.
 	local gapP = o.tight and o.gap or math.max(CFG.RolePressGap or 6, o.gap)
-	local pressSpot = C + ug * gapP
+	if o.bis and not o.tight then
+		gapP = math.clamp(o.cover, o.gap, CFG.RoleCoverMax or 12)
+	end
+	local pressSpot = C + (o.bis or ug) * gapP
 	local defs = { { me = true, pos = o.me, name = "me" } }
 	for _, m in o.mates do
 		defs[#defs + 1] = { pos = m.pos, name = m.name, actor = m.actor }
@@ -14338,9 +14383,12 @@ Mark.rolePlan = function(o)
 	for _, d in defs do
 		local rel = flat(d.pos - C)
 		local goalSide = rel:Dot(ug) > -2
-		local cost = flat(pressSpot - d.pos).Magnitude / spd + (goalSide and 0 or (CFG.RoleBehindPen or 0.8))
-		if goalSide and rel.Magnitude <= takenR then
-			cost -= 0.5 -- already on him goal-side (us too: the same rule for everyone)
+		local engaged = rel.Magnitude <= takenR + 2
+		-- a man within reach of the carrier is ON him, whichever side (a mate slightly behind him is chasing, not
+		-- absent: log - we ran at the carrier while his unmarked receivers stood nearer our goal)
+		local cost = flat(pressSpot - d.pos).Magnitude / spd + ((goalSide or engaged) and 0 or (CFG.RoleBehindPen or 0.8))
+		if engaged then
+			cost -= 0.9
 		end
 		if d.me and prevFresh and prev.role == "press" then
 			cost -= 0.25
@@ -14354,32 +14402,69 @@ Mark.rolePlan = function(o)
 	if CFG.BlockCompetitor == false then
 		presser = defs[1]
 	end
-	local pressed = presser and flat(presser.pos - C).Magnitude <= takenR + 4
-	-- 2) DEEP spot
+	-- 2) THREATS and who covers them. Every enemy field player (carrier excluded: the presser has him) nearer our goal
+	-- than the carrier + slack, or inside the deep zone, is a threat. COVERED = one of ours (presser excluded) stands
+	-- between him and the MIDDLE of our mouth: within 5 studs of the line threat -> mouth middle and within 16 of him.
+	-- Uncovered threats are handed out by danger to the nearest free defender, who stands ON that line, goal side of
+	-- him, leaning to the middle - the pros' "stand between the attackers": a spot a mate holds is taken, we go to
+	-- the next one. The keeper is not a defender here (not in mates / foes).
 	local zone = CFG.RoleDeepZone or 90
-	local sum, dMin, openNear = Vector3.zero, math.huge, false
+	local threats = {}
 	for _, f in o.foes do
-		local r = flat(f.pos - M)
-		local d = r.Magnitude
-		if d <= zone and d > 0.5 then
-			local w = 1.2 - d / zone
-			if f.carrier then
-				w *= pressed and 0.6 or 1.3
-			elseif f.marked then
-				w *= 0.4
-			else
-				openNear = true
+		if not f.carrier then
+			local dR = flat(f.pos - M).Magnitude
+			if dR <= zone or dR <= dC + (CFG.BlockLevelSlack or 8) then
+				local toM = flat(M - f.pos)
+				local L = toM.Magnitude
+				local u = L > 0.5 and toM / L or n
+				local covered, coverName = false, nil
+				for _, d in defs do
+					if d ~= presser and not d.me then -- (our own stand never "covers": it is the assignment itself)
+						local r = flat(d.pos - f.pos)
+						local s = r:Dot(u)
+						if s > -1 and s < L + 2 and r.Magnitude <= 16 and (r - u * s).Magnitude <= 5 then
+							covered, coverName = true, d.name
+							break
+						end
+					end
+				end
+				local face = (o.face and flat(f.pos - C).Magnitude > 1) and math.clamp(flat(f.pos - C).Unit:Dot(o.face), -1, 1) or 0
+				local danger = (1 - math.clamp(dR / zone, 0, 1)) * 3 + face * 0.8 + (1 - math.clamp(math.abs(flat(f.pos - C).Magnitude - 30) / 80, 0, 1))
+				threats[#threats + 1] = { f = f, u = u, L = L, dR = dR, covered = covered, by = coverName, danger = danger, id = f.id }
 			end
-			sum += (r / d) * w
-			dMin = math.min(dMin, d)
 		end
 	end
-	local dir = unitOrNil(sum) or unitOrNil(flat(C - M)) or n
-	dir = unitOrNil(dir * (1 - (CFG.RoleDeepCenter or 0.3)) + n * (CFG.RoleDeepCenter or 0.3)) or n
-	if dir:Dot(n) < 0.3 then
-		dir = unitOrNil(n * 0.3 + side * dir:Dot(side)) or n
+	table.sort(threats, function(a, b) return a.danger > b.danger end)
+	local free = {}
+	for _, d in defs do
+		if d ~= presser then
+			free[#free + 1] = d
+		end
 	end
-	local depth = math.clamp((dMin < math.huge and dMin or dC) * 0.45, CFG.RoleDeepMin or 8, CFG.RoleDeepMax or 24)
+	local assigned = {}
+	local function spotFor(t)
+		local depth = math.clamp(t.L * 0.3, CFG.RoleMarkMin or 4, CFG.RoleMarkMax or 9)
+		return t.f.pos + t.u * depth
+	end
+	for _, t in threats do
+		if not t.covered and #free > 0 then
+			local bi, bc = nil, math.huge
+			for i, d in free do
+				local c = flat(spotFor(t) - d.pos).Magnitude
+				if prevFresh and d.me and prev.mark == t.id then
+					c -= 4
+				end
+				if c < bc then
+					bi, bc = i, c
+				end
+			end
+			assigned[free[bi]] = t
+			table.remove(free, bi)
+		end
+	end
+	local myThreat = assigned[defs[1]]
+	local dir = unitOrNil(flat(C - M)) or n
+	local depth = math.clamp(math.min(dC, zone) * 0.35, CFG.RoleDeepMin or 8, CFG.RoleDeepMax or 24)
 	local deepSpot = M + dir * depth
 	do
 		local lat = flat(deepSpot - M):Dot(side)
@@ -14387,6 +14472,14 @@ Mark.rolePlan = function(o)
 		if math.abs(lat) > lim then
 			deepSpot = deepSpot - side * (lat - math.sign(lat) * lim)
 		end
+	end
+	if myThreat then
+		deepSpot = spotFor(myThreat)
+	elseif #threats > 0 then
+		-- every threat is covered: stand between the two most dangerous ones (the pass chain goes between them)
+		local t1, t2 = threats[1], threats[2] or threats[1]
+		local mid = (t1.f.pos + t2.f.pos) * 0.5
+		deepSpot = M + (unitOrNil(flat(mid - M)) or n) * math.clamp(flat(mid - M).Magnitude * 0.4, CFG.RoleDeepMin or 8, CFG.RoleDeepMax or 24)
 	end
 	-- 3) SCREEN spot
 	local rcv, rcvV = nil, -math.huge
@@ -14440,38 +14533,16 @@ Mark.rolePlan = function(o)
 	local role, why
 	if presser and presser.me then
 		role, why = "press", (#defs == 1 and "alone" or "best cost")
+	elseif myThreat then
+		role, why = "mark", "uncovered " .. myThreat.f.name
+	elseif #threats > 0 then
+		role, why = "deep", "all covered"
 	else
-		local others = {}
-		for _, d in defs do
-			if d ~= presser then
-				others[#others + 1] = d
-			end
-		end
-		if #others <= 1 then
-			local trig = (CFG.RoleDeepTrigger or 110) + ((prevFresh and prev.role == "deep") and 10 or 0)
-			if dC <= trig or openNear then
-				role, why = "deep", openNear and "open man near goal" or "carrier near goal"
-			else
-				role, why = "screen", "carrier far"
-			end
-		else
-			local deepBy, bestD = nil, math.huge
-			for _, d in others do
-				local dd = flat(deepSpot - d.pos).Magnitude - ((d.me and prevFresh and prev.role == "deep") and 4 or 0)
-				if dd < bestD then
-					deepBy, bestD = d, dd
-				end
-			end
-			if deepBy and deepBy.me then
-				role, why = "deep", "nearest deep"
-			else
-				role, why = "screen", "mate deep"
-			end
-		end
+		role, why = "screen", "no threat"
 	end
 	return {
 		role = role, why = why, presser = presser, costs = table.concat(costs, ", "), pressSpot = pressSpot, gapP = gapP,
-		deepSpot = deepSpot, depth = depth, screenSpot = screenSpot, rcv = rcv, lane = lane, ug = ug, dC = dC,
+		deepSpot = deepSpot, depth = depth, screenSpot = screenSpot, mark = myThreat and myThreat.id, threats = threats, rcv = rcv, lane = lane, ug = ug, dC = dC,
 	}
 end
 
@@ -14512,6 +14583,17 @@ Mark.flightTarget = function(root)
 	return best
 end
 
+-- sprint off while we stand on the block spot (Sprint.SetBlocked is a per-source block table; our source is released
+-- the moment we move on / the block ends, see moveStop)
+Mark.sprintStand = function(on)
+	if (Mark.sprintStandOn or false) == on then
+		return
+	end
+	Mark.sprintStandOn = on
+	Mark.sprint = Mark.sprint or require(Client.Gameplay.Player.Sprint)
+	Mark.sprint.SetBlocked("AgentStand", on)
+end
+
 Mark.blockRoleTick = function(character, root, carrier, cr, chE, P, V, g, flightT)
 	local lb, _, rb, _, _, nrm = goalMouthCorners(g)
 	local n = nrm and unitOrNil(flat(nrm))
@@ -14545,13 +14627,21 @@ Mark.blockRoleTick = function(character, root, carrier, cr, chE, P, V, g, flight
 	local so = CFG.BlockDanger ~= false and Mark.shotOpen(C, g, carrier.UserId) or nil
 	local openShot = so ~= nil and so.dist <= (CFG.BlockGoalRange or 70) and so.open >= (CFG.BlockOpenAngle or 5) and CFG.BlockPressOpen ~= false
 	local gap = math.max(CFG.BlockGapMin or 2.2, Mark.kickReach() - 1 - (CFG.BlockCloser or 1.0))
+	local bis, cover = nil, nil
+	if flat(C - M).Magnitude <= (CFG.BlockGoalRange or 70) then
+		bis, cover = Mark.blockCone(C, g)
+		if bis and not (cover and cover < math.huge) then
+			bis, cover = nil, nil
+		end
+	end
 	local plan = Mark.rolePlan({
+		bis = bis, cover = cover,
 		M = M, n = n, side = side, half = flat(rb - lb).Magnitude * 0.5, C = C, me = root.Position, spd = mySpd, now = now,
 		prev = Mark.roleLast, mates = mates, foes = foes, gap = gap, tight = iso or openShot, ping = ping,
 		face = unitOrNil(flat(Vc)) or (cr and unitOrNil(flat(cr.CFrame.LookVector))),
 	})
 	local role = plan.role
-	local S = role == "press" and plan.pressSpot or role == "deep" and plan.deepSpot or plan.screenSpot
+	local S = role == "press" and plan.pressSpot or (role == "deep" or role == "mark") and plan.deepSpot or plan.screenSpot
 	S = Vector3.new(S.X, root.Position.Y, S.Z)
 	local last = Mark.roleLast
 	if not last or last.role ~= role or now - last.at > 0.6 or (role == "screen" and last.rcv ~= (plan.rcv and plan.rcv.id)) then
@@ -14559,7 +14649,14 @@ Mark.blockRoleTick = function(character, root, carrier, cr, chE, P, V, g, flight
 			"dC", string.format("%.0f", plan.dC), "tight", tostring(iso or openShot), "deep d", string.format("%.1f", plan.depth),
 			"rcv", plan.rcv and plan.rcv.name or "-", "mates", tostring(#mates), "foes", tostring(#foes))
 	end
-	Mark.roleLast = { role = role, at = now, rcv = plan.rcv and plan.rcv.id }
+	Mark.roleLast = { role = role, at = now, rcv = plan.rcv and plan.rcv.id, mark = plan.mark }
+	do
+		local tl = {}
+		for _, t in plan.threats do
+			tl[#tl + 1] = string.format("%s d%.0f %s", t.f.name:sub(1, 8), t.dR, t.covered and ("cov:" .. t.by) or "OPEN")
+		end
+		Mark.snap("AutoBlock", role .. " " .. plan.why, "threats: " .. table.concat(tl, ", ") .. " | costs " .. plan.costs)
+	end
 	-- movement: the presser orbits him onto his goal line and mirrors his sideways run; the others walk to their spot and
 	-- stand (no sprint drift), orbiting him only when he is close
 	local off = flat(S - root.Position)
@@ -14572,13 +14669,19 @@ Mark.blockRoleTick = function(character, root, carrier, cr, chE, P, V, g, flight
 		key = "block", us = root.Position, vUs = flat(root.AssemblyLinearVelocity), center = (role == "press" or nearHim) and C or nil,
 		vC = Vc, target = S, spd = mySpd, ff = ff, minR = HitboxSettings.Receive.Size.X * 0.5 + 1.5,
 	})
-	if role ~= "press" then
-		if off.Magnitude <= 0.8 then
-			cmd = Vector3.zero
-		elseif off.Magnitude < 3 then
+	-- ON the spot: stand still and drop the sprint (even the one the player holds) - no wobble around a perfect stand,
+	-- and a standing body is what the ball bounces off. Leaves the stand only when the spot moves > 1.8 studs away.
+	local standing = Mark.standing
+	if off.Magnitude <= 1.0 or (standing and off.Magnitude <= 1.8) then
+		cmd = Vector3.zero
+		Mark.standing = true
+	else
+		Mark.standing = false
+		if role ~= "press" and off.Magnitude < 3 then
 			cmd = cmd * math.clamp(off.Magnitude / 3, 0.35, 1)
 		end
 	end
+	Mark.sprintStand(Mark.standing)
 	if role ~= "press" then
 		Mark.blockMarkAt = now -- not on the carrier: the tackle is not held for this block (tackleGate)
 	end
@@ -14586,7 +14689,6 @@ Mark.blockRoleTick = function(character, root, carrier, cr, chE, P, V, g, flight
 	Mark.blkViz = { at = now, pick = { lane = role == "screen" and plan.lane or { from = C, to = S, spot = S, ok = true, slack = 0 } }, S = S, carrier = P }
 	if not Mark.blockLogged then
 		Mark.blockLogged = true
-		Mark.blockAt = now
 		logFile("block start", role, "dist", string.format("%.1f", flat(C - root.Position).Magnitude), "spot", string.format("%.1f", off.Magnitude))
 	end
 	if not Mark.blockTraceAt or now - Mark.blockTraceAt > 0.5 then
@@ -16207,96 +16309,6 @@ Mark.bounceFakeRaw = function(c)
 	return nil, info
 end
 
--- AutoTackle on a CHARGING carrier. The release is at most KickCore's full charge (0.4 s) after the charge starts; a slide
--- that lands later hits a ball that has already left (log: ~60% of the charge tackles). Returns
---   nil                      - not charging / guard off: normal behaviour
---   { ok = true }            - the slide lands before the expected release: go
---   { block = true, aim, mult, eta, X } - too late for him, but the slide box can be at the shot line when the ball
---                              passes (the user reports a slide knocks even a full-power ball away)
---   { skip = true, why }     - too late and no block geometry: do not slide
--- AutoBlock is already on his shot line (goal side of him, within a body width of the charge aim): the body is the
--- block, the slide-block from 25 studs only cancelled it (log: block start -> 1 s -> tackle sent "charge block").
-Mark.onShotLine = function(root, solved, rec)
-	if not CFG.AutoBlock or Mark.move.mode ~= "block" or not (Mark.blockHold and os.clock() - Mark.blockHold < 0.3) then
-		return false
-	end
-	local dir = rec and typeof(rec.dir) == "Vector3" and unitOrNil(flat(rec.dir))
-	local P = solved and solved.serverPos
-	if not (dir and P) then
-		return false
-	end
-	local rel = flat(root.Position - P)
-	local along = rel:Dot(dir)
-	local lat = math.abs(rel:Dot(Vector3.new(-dir.Z, 0, dir.X)))
-	return along >= 2.5 and along <= (CFG.BlockRange or 40) and lat <= HitboxSettings.Receive.Size.X * 0.5 + 1.0
-end
-
-Mark.chargeTackle = function(root, croot, rec, solved)
-	if not CFG.ChargeTackleGuard or not (rec and rec.live) or os.clock() - (rec.seen or 0) > 0.6 then
-		return nil
-	end
-	local now = os.clock()
-	-- a slide AT the charging carrier only close to him (far away it is a lunge into nothing); the slide-BLOCK on the
-	-- predicted shot path below works from any distance
-	local near = (solved.dist or 0) <= (CFG.ChargeTackleRange or 10)
-	local ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
-	local remain = rec.at + (CFG.ChargeRelease or 0.34) - now
-	local eta = solved.eta or C.HitboxDelaySeconds
-	if near and eta + ping <= remain - 0.02 then
-		return { ok = true }
-	end
-	if not CFG.ChargeSlideBlock then
-		return { skip = true, why = "charge late" }
-	end
-	local dir = rec.dir
-	local P = solved.serverPos
-	local dirF = typeof(dir) == "Vector3" and unitOrNil(flat(dir))
-	if not (dirF and P) then
-		return { skip = true, why = "charge late" }
-	end
-	local origin = root.Position
-	local mid = Mark.slideBox()
-	local mHi = math.max(0.4, CFG.TackleSpeed)
-	local mLo = math.min(mHi, CFG.TackleMinSpeed or 0.6)
-	local vb = CFG.ChargeBallSpeed or 95
-	local tRel = math.max(remain, 0)
-	local cs = rec.uid and Mark.chargeShot(rec.uid) or nil
-	if cs and cs.speed > 20 then
-		vb = cs.speed
-	end
-	local best = nil
-	local t = C.HitboxDelaySeconds
-	while t <= C.HitboxDelaySeconds + C.HitboxSeconds + 1e-4 do
-		-- the ball passes distance dX from the carrier at tb (server clock); our press reaches the server ping/2 later
-		local tb = t + ping * 0.5
-		local tAfter = tb - tRel - ping * 0.5
-		local dX = tAfter * vb
-		-- the real predicted flight (replicated charge) when we have it: where the ball IS tAfter seconds after the release
-		local pathX = cs and Mark.chargeAt(cs, tAfter)
-		if pathX then
-			dX = flat(pathX - P).Magnitude
-		end
-		if dX >= 5 and dX <= 55 and (not cs or pathX) then
-			local X = pathX and Vector3.new(pathX.X, origin.Y, pathX.Z) or (P + dirF * dX)
-			local to = flat(X - origin)
-			local T = Mark.dumpTravel(t)
-			local m = (to.Magnitude - mid) / math.max(T, 1)
-			if m >= mLo and m <= mHi then
-				local score = math.abs(m - (mLo + mHi) * 0.5)
-				if not best or score < best.score then
-					best = { score = score, aim = to.Unit, mult = m, eta = t, X = X, dX = dX }
-				end
-			end
-		end
-		t += 0.02
-	end
-	if best then
-		best.block = true
-		return best
-	end
-	return { skip = true, why = "charge late" }
-end
-
 -- ManualTackle target: the enemy carrier inside CFG.ManualRadius. Returns aim, speed multiplier, {char, root}, how.
 -- how = "solve" (a real intercept inside the 0.6..TackleSpeed multiplier window) or "best" (no window: the carrier is
 -- too close/too far for the solver - slide at where he will be mid hitbox, multiplier clamped to the legal range).
@@ -16792,7 +16804,14 @@ Mark.tackleShield = function(player, ch, solved)
 	local hitAt = now + (solved.eta or C.HitboxDelaySeconds) + ping * 0.5
 	local ds, rec = Mark.dribState(player, ch, hitAt, true)
 	Mark.tackleDrib = ds
-	Mark.tackleNeed = ds == "spent" and (CFG.TackleNakedConf or 0.35) or (CFG.TackleConfidence or 0)
+	-- the confidence the state asks for: he cannot dribble (spent / no ball) -> the naked number; he cannot even move
+	-- (down) -> any window; a dribble that is still possible -> the strict one
+	Mark.tackleNeed = ds == "down" and 0.15 or ((ds == "spent" or ds == "noball") and (CFG.TackleNakedConf or 0.35) or (CFG.TackleConfidence or 0))
+	-- no slide into a man who is charging an attack either (it only fed his dribble / shot; AutoBlock blocks the shot)
+	if Mark.foeCharging(player.UserId) then
+		Mark.tackleDrib = "charge"
+		return true
+	end
 	local hold = ds == "iframe" or (ds == "ready" and CFG.TackleOnDribble ~= false)
 	if hold and now - (Mark.todLog or 0) > 0.8 then
 		Mark.todLog = now
@@ -16807,9 +16826,6 @@ Mark.tackleGate = function(character, root, player, ch, solved)
 	end
 	local now = os.clock()
 	local eta = solved.eta or C.HitboxDelaySeconds
-	if Mark.chargeLive and Mark.chargeUntil and now < Mark.chargeUntil and Mark.chargeId == liveOwnerId() then
-		return true, "charge"
-	end
 	local key = (typeof(player) == "Instance" and player:IsA("Player") and player.UserId) or nil
 	if Mark.dribState(player, ch, now + eta, true) == "spent" then
 		return true, "naked"
@@ -17184,6 +17200,12 @@ end
 --     goal before the enemy gets it), else he passed it to us to receive;
 --   our own / nobody's ball: only above the receive box (a ball AutoBall can just walk into is received).
 Mark.airWant = function(root, B, kicker, floorY)
+	-- AIR intercept: only a ball that is in the air at the meet. A ball rolling on the grass (hip height of ours -2) is
+	-- AutoBall's / the body's: the old "foe ball: always strike" punted flat passes in midfield (user log). Ground rest of
+	-- the ball centre is ~ floor - 2.1; the game's own "grounded" line is 4 above the ground (GroundedBallClearance).
+	if B.Y - floorY < (CFG.AirMinHeight or 1.5) then
+		return false, string.format("ball on the ground h %.1f", B.Y - floorY)
+	end
 	-- user rule: near EITHER goal (we or the meet point within CompetitorGoalZone) every flying ball is ours to take
 	local z = CFG.CompetitorGoalZone or 45
 	if z > 0 then
@@ -17394,8 +17416,14 @@ Mark.airDiag = function(character, plan)
 	local ev, _, info = VL.Evaluate(st, world, character, CharacterMotionSmoothing.GetSmoothedServerTime(), nil, ActorTeams.GetCharacterTeamName(character), nil, CommandTime.GetPlayerVolleyOneWaySeconds(LocalPlayer), nil, nil)
 	local root = ActorTargeting.GetActorRoot(LocalPlayer)
 	local look = root and unitOrNil(flat(root.CFrame.LookVector))
-	logFile("air eval", ev and "OFFER" or "nil", Mark.airInfo(info), "locked", tostring(VL.IsLocked(st)), "plan T", string.format("%.2f", plan.T), "td", tostring(plan.td),
+	logFile("air eval", ev and "OFFER" or "nil", "flick age", Mark.flickAge(), Mark.airInfo(info), "locked", tostring(VL.IsLocked(st)), "plan T", string.format("%.2f", plan.T), "td", tostring(plan.td),
 		"to spot", root and string.format("%.1f", flat(plan.Q - root.Position).Magnitude) or "-", "face err", look and string.format("%.0f", math.deg(math.acos(math.clamp(look:Dot(plan.inc), -1, 1)))) or "-")
+end
+
+-- seconds since the enemy flick started (the animation: detach at 0.4, ball touchable from detach + 0.25) or "-"
+Mark.flickAge = function()
+	local lb = Mark.lob
+	return (lb and os.clock() < lb.untilT) and string.format("%.2f", os.clock() - lb.at) or "-"
 end
 
 Mark.airSkipLog = function(why, extra)
@@ -17476,7 +17504,15 @@ Mark.tickAir = function(character, root)
 			landed = landed, vy = root.AssemblyLinearVelocity.Y, floor = floor, g = g, vJ = math.sqrt(2 * g * (Mark.jumpH or 7.2)),
 			pts = pts, DT = 0.025, tolDeg = foeFlight and 6 or 10, ballR = Physics.BallRadius or 1,
 		}
-		local first, near, list = Mark.airSolve(o)
+		local _, near, all = Mark.airSolve(o)
+		-- only meets IN THE AIR (a ball that is on the grass at the sample is nobody's air ball)
+		local list = {}
+		for _, c in all do
+			if c.B.Y - floor >= (CFG.AirMinHeight or 1.5) then
+				list[#list + 1] = c
+			end
+		end
+		local first = list[1]
 		-- the rules on the earliest reachable meet (user: near a goal every ball)
 		local want = false
 		if first then
@@ -17545,7 +17581,7 @@ Mark.tickAir = function(character, root)
 	plan.jumped = Mark.airPlan and not fresh and Mark.airPlan.jumped or nil
 	Mark.airPlan = plan
 	if fresh then
-		logFile("air plan", plan.why, plan.verified and "GAME OK" or "wind-up (not checkable yet)", "src", plan.src, "kicker", plan.kicker and actorName(plan.kicker) or "-", "T", string.format("%.2f", plan.T), "lead", tostring(plan.lead or "-"),
+		logFile("air plan", plan.why, plan.verified and "GAME OK" or "wind-up (not checkable yet)", "flick age", Mark.flickAge(), "src", plan.src, "kicker", plan.kicker and actorName(plan.kicker) or "-", "T", string.format("%.2f", plan.T), "lead", tostring(plan.lead or "-"),
 			"td", tostring(type(plan.td) == "number" and string.format("%.2f", plan.td) or plan.td), "meet d", string.format("%.1f", flat(plan.B - root.Position).Magnitude), "h", string.format("%.1f", plan.B.Y - floor), "landed", tostring(landed))
 	end
 	-- move to the spot; face the incoming ball once we are close (the box is in FRONT of the root; facing it from afar
@@ -17561,10 +17597,15 @@ Mark.tickAir = function(character, root)
 		TurnControl.ReleaseAutoRotate("Aim")
 	end
 	Mark.moveSteer(toQ.Magnitude > 0.6 and toQ.Unit or Vector3.zero, "air")
-	if landed and type(plan.td) == "number" and plan.td <= 0.035 and not plan.jumped then
+	-- JUMP: the take-off time td counts down from the plan; press when it is due (the solver steps td by 0.05, so
+	-- "<= 0.035" was only true for one frame in two and a refused press was never retried: the module never jumped).
+	if landed and type(plan.td) == "number" and plan.td <= 0.06 and not plan.jumped then
 		if Mark.doJump("air") then
 			plan.jumped = true
-			logFile("air", "jump", "T", string.format("%.2f", plan.T), "h", string.format("%.1f", plan.B.Y - floor))
+			logFile("air", "jump", "flick age", Mark.flickAge(), "T", string.format("%.2f", plan.T), "td", string.format("%.2f", plan.td), "h", string.format("%.1f", plan.B.Y - floor))
+		elseif not Mark.airJumpLog or now - Mark.airJumpLog > 0.3 then
+			Mark.airJumpLog = now -- (Mark.doJump logs the blocking source itself: "jump fail <why>")
+			logFile("air", "jump REFUSED", "td", string.format("%.2f", plan.td), "T", string.format("%.2f", plan.T))
 		end
 	end
 	if plan.T < 0.7 then
@@ -18257,6 +18298,9 @@ Mark.tickVolley = function(character, root)
 	-- Mark.airWant rules.
 	local hum = character:FindFirstChildOfClass("Humanoid")
 	local landedNow = hum and CharacterControllers.IsLanded(character, hum)
+	if ev.BallGrounded then
+		return -- the game itself calls it grounded (bicycle / volley of a ground ball just launches it)
+	end
 	local ap = Mark.airBusy() and Mark.airPlan or nil
 	local meet, why
 	if ap then
@@ -19016,6 +19060,10 @@ Mark.killerSlide = function(root, routeDir, foes, ballNow, ourT, mLo, mHi, guard
 			local own = liveOwnerId()
 			local hasBall = (f.actor and own == f.actor.UserId) or (f.first ~= nil and f.first <= t1 + ping * 0.5 + 0.1)
 			local ds = f.actor and Mark.dribState(f.actor, f.model, os.clock() + ping * 0.5 + (t0 + t1) * 0.5, hasBall) or "noball"
+			if f.actor and Mark.foeCharging(f.actor.UserId) then
+				why[#why + 1] = name .. " charging"
+				continue
+			end
 			if ds == "iframe" or (ds == "ready" and CFG.TackleOnDribble ~= false) then
 				why[#why + 1] = name .. " dribble " .. ds
 				continue
@@ -19667,9 +19715,7 @@ Mark.tickBall = function(character, root)
 		if Mark.doJump("ball") then
 			logFile("ball jump", "t", string.format("%.2f", jumpAt), "h", string.format("%.1f", jumpMeet))
 		end
-		Mark.ballTackleLog = nil
 	else
-		Mark.ballTackleLog = nil
 	end
 end
 
@@ -22060,9 +22106,10 @@ Mark.moveStop = function(only)
 		Mark.agentHold(false)
 	end
 	if was == "block" then
+		Mark.standing = false
+		Mark.sprintStand(false)
 		Mark.blockLogged = nil
 		Mark.blockDest = nil
-		Mark.blockAt = nil
 		TurnControl.ReleaseAutoRotate("Aim")
 		TurnControl.SetTurnSpeedFactor(1)
 		logFile("block stop")
@@ -22449,6 +22496,10 @@ Mark.moveTick = function(character, root)
 		Mark.dodgeLockOn = nil
 		Mark.dodgeFaced = nil
 		logFile("dodge lock", "released-orphan")
+	end
+	if Mark.sprintStandOn and not (m and m.mode == "block") then
+		Mark.standing = false
+		Mark.sprintStand(false) -- the block ended without moveStop (another mode took the steer): give the sprint back
 	end
 	if not (m and m.mode and root) then
 		return
@@ -23984,8 +24035,6 @@ return function(_Lib, _Core)
 			tog(s, "Tackle On Dribble", "TackleOnDribble", "Never slides into a ready dribble: only a man without the ball or with the dribble spent.")
 			sld(s, "Competitor Radius", "TackleCompetitorRadius", 3, 25, { suffix = " st" })
 			head(s, "Charging Carrier")
-			tog(s, "Charge Guard", "ChargeTackleGuard", "Slide only if it lands before his release.")
-			tog(s, "Slide Across The Shot", "ChargeSlideBlock")
 			head(s, "Manual Tackle")
 			tog(s, "Manual Tackle", "ManualTackle", "Your own tackle press is aimed at the carrier.")
 			bind(s, "Manual Tackle Key", "KB_ManualTackle", function()
@@ -23999,7 +24048,6 @@ return function(_Lib, _Core)
 				sld(s, "Max Block Wait", "TackleHoldMax", 0.2, 2, { prec = 1, suffix = " s", text = "Block First: longest the tackle waits for the block." })
 				sld(s, "Track Radius", "TrackStuds", 30, 160, { suffix = " st" })
 				sld(s, "Min Slide Power", "TackleMinSpeed", 0.3, 1.2, { prec = 2, suffix = "x" })
-				sld(s, "Charge Range", "ChargeTackleRange", 4, 20, { suffix = " st" })
 				sld(s, "Manual Radius", "ManualRadius", 8, 50, { suffix = " st" })
 			end)
 
@@ -24007,7 +24055,6 @@ return function(_Lib, _Core)
 			local b = card(tab, "Left")
 			head(b, "AutoBlock")
 			feature(b, "AutoBlock", "AutoBlock")
-			sld(b, "Range", "BlockRange", 15, 80, { suffix = " st" })
 			note(b, "Team roles: one presser on the carrier (goal-side, on his line to the middle of your goal), a deep defender at the goal, a screen on his best pass. Your teammates' positions decide which role is yours.")
 			tog(b, "Respect Mates' Roles", "BlockCompetitor", "Off: you always press the carrier.")
 			sld(b, "Competitor Radius", "CompetitorRadius", 4, 30, { suffix = " st" })
@@ -24032,8 +24079,6 @@ return function(_Lib, _Core)
 				sld(b, "Deep Zone", "RoleDeepZone", 40, 140, { suffix = " st" })
 				sld(b, "Deep Min", "RoleDeepMin", 4, 20, { suffix = " st" })
 				sld(b, "Deep Max", "RoleDeepMax", 10, 40, { suffix = " st" })
-				sld(b, "Deep To Middle", "RoleDeepCenter", 0, 0.8, { prec = 2 })
-				sld(b, "Deep Trigger", "RoleDeepTrigger", 50, 200, { suffix = " st", text = "Not pressing: deep while the carrier is this close to your goal, else screen." })
 				sld(b, "Screen Depth", "RoleScreenDepth", 6, 30, { suffix = " st" })
 				sld(b, "Near Goal Range", "BlockGoalRange", 30, 120, { suffix = " st" })
 				sld(b, "Open Goal Angle", "BlockOpenAngle", 1, 20, { suffix = "°", text = "How much open goal past our keeper makes him a shooter." })
@@ -24448,7 +24493,7 @@ return function(_Lib, _Core)
 				Name = "Dump Log To File",
 				Callback = function()
 					local ok, err = Mark.try(dumpLog)
-					notify("Log", ok and "Saved: illegalsoccerlog.txt" or ("Failed: " .. tostring(err)))
+					notify("Log", ok and "Saved: Illegal Soccer/Dump.txt" or ("Failed: " .. tostring(err)))
 				end,
 			})
 
