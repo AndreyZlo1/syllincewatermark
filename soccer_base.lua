@@ -87,6 +87,7 @@ local CFG = {
 	FaceSpoofMode = "smart",
 	FaceSpoofWhen = "charge", -- charge | ball | always
 	FaceSpinSpeed = 3, -- turns per second for spin
+	FeintGoalDist = 20, -- no feint within this of either goal mouth (studs)
 	FeintCompetitor = true, -- an outfield enemy within FeintCompetitorRange of the ball: no feint, the shot goes
 	FeintCompetitorRange = 10, -- Smart Select: no feint once the enemy keeper has dived (his dive is on cooldown): the shot goes as it is
 	AutoFlick = true, -- the flick key starts the scripted flick -> jump -> volley; off = the game's own flick, aim help only
@@ -122,6 +123,7 @@ local CFG = {
 	GunPushShotgunRange = 22, -- ... for the shotgun (8 deg cone of 12 pellets: only close, guess)
 	GunPushKeeperZone = 14, -- the keeper "holds the goal": within this of his mouth segment
 	GunPushPathReach = 10, -- ... or (came out) stands within this of the shot path
+	GunPushDelay = 0.1, -- the equip + shot go out this long after the decision (s)
 	GunPushRoll = false, -- ... a free ball rolling into the goal: shoot the enemy who would stop it on the way
 	GunPushRollReach = 6, -- ... "on the way" = within this of the ball path
 	GunPushTravel = 18, -- knock-back travel used for the depth check (log push travel 25-54 on us; conservative)
@@ -8541,21 +8543,24 @@ Mark.gunPushTry = function(root, tag, key, pts)
 	Mark.gunPushKeys[key] = true
 	local r = k.r
 	local ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
-	local ok, how = Mark.itemNow(gun, "gunpush " .. tag, function()
-		local v = r.AssemblyLinearVelocity
-		return r.Position + (typeof(v) == "Vector3" and flat(v) or Vector3.zero) * (ping * 0.5) + Vector3.new(0, 0.4, 0)
-	end)
-	if ok then
-		local rec = { at = os.clock(), gun = gun, tag = tag, d = d }
-		Mark.gunPushRec = rec
-		task.delay(1.2, function()
-			if Mark.gunPushRec == rec and not rec.hit then
-				logFile("gunpush result", "NO knock-back seen", rec.gun, rec.tag, "d", string.format("%.1f", rec.d), "equipped now", tostring(Mark.equippedId()), "fired", tostring(Mark.itemUse and Mark.itemUse.IsEquippedItemFired and Mark.itemUse.IsEquippedItemFired()))
-			end
+	-- GunPushDelay (user: 0.1 s) before the equip + shot: the press / equip goes out a beat after the decision
+	task.delay(CFG.GunPushDelay or 0.1, function()
+		local ok, how = Mark.itemNow(gun, "gunpush " .. tag, function()
+			local v = r.AssemblyLinearVelocity
+			return r.Position + (typeof(v) == "Vector3" and flat(v) or Vector3.zero) * (ping * 0.5) + Vector3.new(0, 0.4, 0)
 		end)
-	end
-	logFile("gunpush", tag, gun, ok and "fired" or "no", tostring(how or ""), "keeper", k.npc and "npc" or actorName(k.actor), "d", string.format("%.1f", d), "seg", string.format("%.1f", segK), "cross lat", string.format("%.1f", flat(C - mouth):Dot(side)))
-	return ok
+		if ok then
+			local rec = { at = os.clock(), gun = gun, tag = tag, d = d }
+			Mark.gunPushRec = rec
+			task.delay(1.2, function()
+				if Mark.gunPushRec == rec and not rec.hit then
+					logFile("gunpush result", "NO knock-back seen", rec.gun, rec.tag, "d", string.format("%.1f", rec.d), "equipped now", tostring(Mark.equippedId()), "fired", tostring(Mark.itemUse and Mark.itemUse.IsEquippedItemFired and Mark.itemUse.IsEquippedItemFired()))
+				end
+			end)
+		end
+		logFile("gunpush", tag, gun, ok and "fired" or "no", tostring(how or ""), "keeper", k.npc and "npc" or actorName(k.actor), "d", string.format("%.1f", d), "seg", string.format("%.1f", segK), "cross lat", string.format("%.1f", flat(C - mouth):Dot(side)))
+	end)
+	return true
 end
 
 -- ROLLING BALL (Keeper Push > Rolling Ball, default off): a free ball whose path ends in the enemy goal but runs through
@@ -8671,20 +8676,22 @@ Mark.gunPushRoll = function(root)
 	end
 	Mark.rollShotAt[kk] = now
 	local r = best.r
-	local ok, how = Mark.itemNow(gun, "gunpush roll", function()
-		local v = r.AssemblyLinearVelocity
-		return r.Position + (typeof(v) == "Vector3" and flat(v) or Vector3.zero) * (ping * 0.5) + Vector3.new(0, 0.4, 0)
-	end)
-	if ok then
-		local rec = { at = now, gun = gun, tag = "roll", d = d }
-		Mark.gunPushRec = rec
-		task.delay(1.2, function()
-			if Mark.gunPushRec == rec and not rec.hit then
-				logFile("gunpush result", "NO knock-back seen", rec.gun, rec.tag, "d", string.format("%.1f", rec.d))
-			end
+	task.delay(CFG.GunPushDelay or 0.1, function()
+		local ok, how = Mark.itemNow(gun, "gunpush roll", function()
+			local v = r.AssemblyLinearVelocity
+			return r.Position + (typeof(v) == "Vector3" and flat(v) or Vector3.zero) * (ping * 0.5) + Vector3.new(0, 0.4, 0)
 		end)
-	end
-	logFile("gunpush", "roll", gun, ok and "fired" or "no", tostring(how or ""), "blocker", best.actor and actorName(best.actor) or "npc", "d", string.format("%.1f", d), "ball reaches him", string.format("%.2f", ts[bestI]), "goal at", string.format("%.2f", ts[iC]))
+		if ok then
+			local rec = { at = now, gun = gun, tag = "roll", d = d }
+			Mark.gunPushRec = rec
+			task.delay(1.2, function()
+				if Mark.gunPushRec == rec and not rec.hit then
+					logFile("gunpush result", "NO knock-back seen", rec.gun, rec.tag, "d", string.format("%.1f", rec.d))
+				end
+			end)
+		end
+		logFile("gunpush", "roll", gun, ok and "fired" or "no", tostring(how or ""), "blocker", best.actor and actorName(best.actor) or "npc", "d", string.format("%.1f", d), "ball reaches him", string.format("%.2f", ts[bestI]), "goal at", string.format("%.2f", ts[iC]))
+	end)
 end
 
 -- teammates: the moment one charges a shot that goes in (or already charges when he gets the ball)
@@ -9661,6 +9668,21 @@ Mark.gkKnockDive = function(vel)
 		TurnControl.ReleaseAutoRotate("Goalkeeper")
 	end
 	logFile("gk knock", "dive", ok and "ok" or "refused", why, "goal t", string.format("%.2f", threat.t), "lat", string.format("%.1f", threat.lat), "dir", fmtV(wd))
+	if ok then
+		-- did the server take the dive? 0.25 s on: how far the body went along the dive against the dive's own travel curve
+		-- (a refused press = no dive motion, the knock-back alone moves us), and whether the stun is still on
+		local O0, ping0 = root.Position, LocalPlayer:GetNetworkPing() or 0
+		Mark.stunMod = Mark.stunMod or require(Modules.Characters.Stun)
+		task.delay(0.25, function()
+			local r2 = ActorTargeting.GetActorRoot(LocalPlayer)
+			if r2 then
+				local mv = flat(r2.Position - O0)
+				local want = D.GetTravel(0.25, D.GetDistance(LocalPlayer))
+				Mark.teleAdd("gk.knockdive", mv:Dot(wd) >= want * 0.5)
+				logFile("gk knock", "check 0.25 s", "along dive", string.format("%.1f", mv:Dot(wd)), "of", string.format("%.1f", want), "moved", string.format("%.1f", mv.Magnitude), "ping", string.format("%.0f ms", ping0 * 1000), "stunned", tostring(Mark.stunMod.IsActorStunned(LocalPlayer)))
+			end
+		end)
+	end
 end
 
 Mark.gkOwnDive = function(root, td, noJump)
@@ -12874,7 +12896,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- Illegal Soccer dump " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v182")
+	add("-- Illegal Soccer dump " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v183")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -15828,6 +15850,30 @@ end
 -- (his dive is on cooldown: the feint has nothing left to bait and only burns the chance).
 -- A feint applies to the PLAYER's own Kick charge (real input object) while we own the ball or owned it a moment ago
 -- (a charge pressed just before the ball arrives). Scripted charges (volley / bicycle / flick / AutoKick) never feint.
+-- Near a goal (either mouth, flat distance from our root < r) a feint is never worth it: the charge is the shot (user: < 20 studs).
+Mark.nearMouth = function(p, mouths, r)
+	for _, m in mouths do
+		if flat(p - m).Magnitude < r then
+			return true
+		end
+	end
+	return false
+end
+Mark.feintNearGoal = function()
+	local root = ActorTargeting.GetActorRoot(LocalPlayer)
+	if not root then
+		return false
+	end
+	local mouths = {}
+	for _, g in { enemyGoalPart(), ourGoalPart() } do
+		local lb, _, rb = goalMouthCorners(g)
+		if lb and rb then
+			mouths[#mouths + 1] = (lb + rb) * 0.5
+		end
+	end
+	return Mark.nearMouth(root.Position, mouths, CFG.FeintGoalDist or 20)
+end
+
 Mark.feintEligible = function(own)
 	local now = os.clock()
 	-- a feint is part of AutoShoot: off with it, and only for a shot AutoShoot has actually solved (aim exists)
@@ -15841,6 +15887,9 @@ Mark.feintEligible = function(own)
 		return false
 	end
 	if (Mark.realChargeAt or 0) < (Mark.scriptChargeAt or 0) then
+		return false
+	end
+	if Mark.feintNearGoal() then
 		return false
 	end
 	return own or now - (Mark.ownSeenAt or -100) < 1.0
@@ -15885,7 +15934,9 @@ Mark.feintNow = function(why)
 		return false
 	end
 	local skip = nil
-	if (nm == "BOUNCE FAKE" and CFG.FeintSkipBounce ~= false) or ((nm == "FAKE" or nm == "FAKE CORNER") and CFG.FeintSkipFake ~= false) then
+	if Mark.feintNearGoal() then
+		skip = "near goal" -- (the press was decided farther out and we ran in: no feint anymore)
+	elseif (nm == "BOUNCE FAKE" and CFG.FeintSkipBounce ~= false) or ((nm == "FAKE" or nm == "FAKE CORNER") and CFG.FeintSkipFake ~= false) then
 		skip = nm
 	elseif CFG.FeintSmart ~= false and Mark.foeDiveLeft() > 0 then
 		skip = "keeper dived"
@@ -21742,6 +21793,26 @@ Mark.blastR = function()
 	return m
 end
 
+-- The keeper does not run from grenades (user): his place is the goal, the stun / knock does not decide a save the way a
+-- missed save does. Other zones (bazooka, hammer) still count. Dynamic: the role can change while the grenade flies.
+Mark.hazSkip = function(ev)
+	return ev.item == "grenade" and Mark.meKeeper()
+end
+
+-- Distance covered in t seconds along a heading by a body that runs up to spd from a start speed v0 (along that heading,
+-- negative = coming the other way): the speed ramps linearly over `ramp` (BallRamp, the same body model as routePlan), then holds.
+-- The old flee gain was spd * t - the full speed from the first frame - and "could run out" was true by ~3 studs too often.
+Mark.runGain = function(spd, v0, t, ramp)
+	if t <= 0 then
+		return 0
+	end
+	v0 = math.clamp(v0, -spd, spd)
+	if t <= ramp then
+		return v0 * t + (spd - v0) * t * t / (2 * ramp)
+	end
+	return v0 * ramp + (spd - v0) * ramp * 0.5 + spd * (t - ramp)
+end
+
 Mark.hazAdd = function(st)
 	local item = st.item
 	if item ~= "grenade" and item ~= "bazooka" and item ~= "freezeGun" then
@@ -21873,6 +21944,9 @@ Mark.hazardHits = function(posAt, tMax)
 	local ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
 	local margin = CFG.BlastMargin or 1.5
 	for id, ev in list do
+		if Mark.hazSkip(ev) then
+			continue
+		end
 		if ev.kind == "blast" then
 			local ta = ev.t - nowS
 			if ta < -0.6 then
@@ -21942,7 +22016,7 @@ Mark.hazFlee = function(character, root)
 			local ta = ev.t - nowS
 			if ta < -0.6 then
 				list[id] = nil
-			elseif ta > -0.15 and ta < 3.5 and not ev.boomAt then
+			elseif ta > -0.15 and ta < 3.5 and not ev.boomAt and not Mark.hazSkip(ev) then
 				local d = flat(O + ourV * math.max(ta - ping * 0.5, 0) - ev.p).Magnitude
 				if d < ev.r + margin and (not worst or ta < worst.ta) then
 					worst = { ev = ev, ta = ta, d = d }
@@ -21966,7 +22040,7 @@ Mark.hazFlee = function(character, root)
 	if hum and hum.WalkSpeed > spd then
 		spd = hum.WalkSpeed
 	end
-	local gain = spd * math.max(ta - ping * 0.5 - 0.05, 0)
+	local gain = Mark.runGain(spd, ourV:Dot(away), ta - ping * 0.5 - 0.05, math.max(CFG.BallRamp or 0.2, 0.05))
 	local need = ev.r + margin
 	local slack = d0 + gain - need
 	local byRun = slack >= 0
@@ -22055,7 +22129,7 @@ Mark.blastClamp = function(ch, cmd)
 	local margin = CFG.BlastMargin or 1.5
 	local out = c
 	for _, ev in list do
-		if ev.kind == "blast" and not ev.boomAt then
+		if ev.kind == "blast" and not ev.boomAt and not Mark.hazSkip(ev) then
 			local ta = ev.t - nowS
 			if ta > 0 and ta < 3.5 then
 				local P = flat(ev.p)
@@ -25008,6 +25082,7 @@ return function(_Lib, _Core)
 			tog(kp, "Rolling Ball", "GunPushRoll", "Shoots the enemy who would stop a rolling ball.")
 			sld(kp, "Flintlock Range", "GunPushFlintRange", 10, 400, { suffix = " st" })
 			sld(kp, "Shotgun Range", "GunPushShotgunRange", 5, 120, { suffix = " st" })
+			sld(kp, "Delay", "GunPushDelay", 0, 0.5, { prec = 2, suffix = " s", text = "Wait before the equip and shot." })
 			advanced(kp, "Keeper Push", function()
 				sld(kp, "Keeper Zone", "GunPushKeeperZone", 4, 40, { suffix = " st", text = "Only a keeper this close to his goal." })
 				sld(kp, "Shot Path Reach", "GunPushPathReach", 2, 30, { suffix = " st", text = "...or one standing this close to the shot path." })
