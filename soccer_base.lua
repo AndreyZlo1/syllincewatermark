@@ -111,6 +111,7 @@ local CFG = {
 	GunWallRange = 80, -- ...only inside this distance (studs)
 	GunAimHold = 0.12, -- ...once he has aimed at us this long (s)
 	GunBodyR = 3.5, -- ...aim counts when the line passes within this of our body (studs)
+	KeeperTrapZone = 110, -- an NPC keeper we already track stays "the keeper" this far from his goal
 	AutoShield = false, -- Skills > AutoShield: the forcefield on an item hit that nothing else answers (never as keeper)
 	ShieldRocket = true, -- ... preemptive: an enemy holding Rocket Punch near us while we carry the ball
 	ShieldRocketDist = 24, -- ... within this (studs): closer than a reaction to the punch can land (guess, tune)
@@ -150,6 +151,7 @@ local CFG = {
 	TackleGoalZone = 40,
 	CompetitorRadius = 12,
 	CompetitorGoalZone = 45, -- we or the ball this close to EITHER goal -> every Competitor Check is off (0 = never off by zone)
+	BallMaxDist = 60, -- AutoBall does not chase a ball (or its contact point) farther than this
 	BallYieldKeeper = false, -- AutoBall stops when the enemy keeper gets to the ball first (off: keep pressing him)
 	CompetitorEnemyNear = 15, -- ... and off when an enemy is this close to the ball / target
 	CounterJump = true,
@@ -240,6 +242,9 @@ local CFG = {
 	BlockGapMin = 2.0,
 	TrendVel = true, -- long predictions follow where a zig-zag goes, not the last zig
 	TrendWindow = 0.7,
+	FullDefensive = false, -- AutoBlock: 2+ enemies near the goal -> hold the goal like a keeper (the roles stand down)
+	FullDefRange = 60, -- ... enemies within this of the mouth count (guessed)
+	FullDefDepth = 14, -- ... the stand zone in front of the mouth (guessed)
 	BlockGoalRange = 70,
 	RolePressGap = 6, -- AutoBlock presser: distance in front of the carrier on his line to our mouth (tight = kick reach)
 	RoleTakenR = 10, -- a teammate goal-side within this of the carrier is already pressing him
@@ -267,6 +272,7 @@ local CFG = {
 	VolleyKeep = true, -- nobody near the meet: lock the ball and keep it (cancel the charge once it is ours) instead of kicking it away
 	VolleyKeepReach = 4.5, -- locked to us and the ball this close: cancel the charge (the receive keeps it)
 	VolleyKeepRadius = 22, -- ...an enemy within this of the meet point (or 55 % of it of us later) means strike
+	AirReachFar = 140, -- a ball that never comes within this of us is not planned (cheap pre-gate)
 	AirMinHeight = 1.5, -- the ball must be this far above our hip (studs) at the meet: lower is on the grass = not an AIR ball
 	AirSlack = 0.5, -- studs added to the box reach on top of the game's miss-angle tolerance
 	AirTolT = 0.3, -- the miss angle is turned into studs at this time before the meet (s); guessed
@@ -285,6 +291,7 @@ local CFG = {
 	SlideCenterWindow = 0.2, -- AutoBall slide: keep scanning this long after the first press that holds the ball, take the one with the most box hits
 	SlideGoodHits = 7, -- hits (of 11) that count as centred
 	SlideLag = 0.03, -- extra seconds the ball is taken ahead when a slide is planned (on top of ping/2)
+	SlideBend = true, -- slides may turn once before the hand-off (reverse / quarter turn) when no straight slide reaches the ball
 	SlideMinHits = 3, -- of 11 samples of the live window the box must hold the ball (was 2)
 	BlockPreJump = true, -- jump for a high shot BEFORE the release, timed to the replicated charge path
 	BlockSlide = true, -- AutoBlock: slide the flying shot when the body cannot reach it (ground slide, or jump + air slide)
@@ -359,7 +366,6 @@ local CFG = {
 	BounceFakeRun = 14, -- studs we may run for the returning ball (was 10)
 	BounceFakeSlack = 3.5, -- accepted remaining gap at the return (was 2.5)
 	IntentTackleRadius = 60, -- deliberate slides AT enemies (CandidateKiller) only when the enemy is within this of the ball
-	SlideTravelCal = true, -- slide travel model corrected by the measured dash (phase 2 ~0.8-0.86 of the dump formula) -- rolled every solve even when a normal shot exists
 	FakeShot = true, -- AutoShoot FAKE: a shot that flies through a teammate in front of their goal (he receives it, the keeper has already dived)
 	FakeChance = 0.12, -- share of shots that become a FAKE when one is possible (x2.2 for a friend / party / club mate, cap 0.35)
 	FakeSlop = 6, -- studs of slack: depth window, mouth-line prefilter, receive-box miss
@@ -386,6 +392,8 @@ local CFG = {
 	GkRushConf = 0.35, -- ... with this share of his futures caught
 	GkPressMinT = 0.06, -- a contact earlier than this into the dash is a pass-through (too close), not a catch (estimate)
 	GkKnockDive = true, -- AutoGK: knocked back by a gun (Keeper Push on us): dive at once (the only press the stun lets through)
+	GkMirror = true, -- AutoGK: a carrier near the goal drags the keeper across with him (more the closer he is)
+	GkMirrorRange = 60, -- ... from this far out (guessed)
 	GkKick = true, -- AutoGK: no dive line and he is close -> the keeper charges a full Kick at him
 	GkKickRange = 8, -- ... within kick reach + this
 	GkHomeDist = 20, -- ... "far out" = this far in front of the line (studs)
@@ -477,7 +485,7 @@ Log.file = Log.dir .. "/Global.txt"
 Log.sections = {
 	block = "AutoBlock", ["kick helper"] = "AutoBlock", snap = nil,
 	tackle = "AutoTackle", killer = "AutoTackle", verdict = "AutoTackle", ["slide audit"] = "AutoTackle", ["charge tackle"] = "AutoTackle",
-	ball = "AutoBall", air = "AirIntercept", volley = "AirIntercept",
+	tele = "Telemetry", ball = "AutoBall", air = "AirIntercept", volley = "AirIntercept",
 	duel = "CounterJump", lob = "CounterJump", counter = "CounterJump", grapple = "CounterJump",
 	gk = "AutoGK", autokick = "AutoKick",
 	shoot = "AutoShoot", spoof = "AutoShoot", feint = "AutoShoot", aerial = "AutoShoot", flick = "CounterJump",
@@ -768,20 +776,50 @@ for i = 1, 8 do
 	Mark.mockTri[i] = newTri(46)
 end
 -- Enemy slide travel at dump 1.0. GetTravel() uses SetSpeedMultiplier(TackleSpeed=1.2) because TuningScope.Applies(nil) is true.
+-- Slide travel at multiplier 1.0 (callers scale by the multiplier: StartupDashDistance and Distance both scale, durations do not).
+-- EXACT, from SlideTackle.runSplitCFrameAction / runCFrameAction (replaces the measured 0.79 / 0.86 percentages):
+--   startup dash : cubic-out StartupDashDistance over 0.5 s, NOT cancelled at the hand-off (0.27) but 0.1 s later (0.37)
+--   main dash    : starts at the hand-off, cubic-out Distance over MotionSeconds with the velocity release from 0.75 s
+--                  (getReleasedDashTravel), its displacement weighted GetMotionWeight(e) = e / 0.1 for the first 0.1 s -
+--                  that crossfade LOSES  A * (e - e^2/T + e^3/3T^2 - e^2/2h + 2e^3/3hT - e^4/4hT^2)  studs (A = 3D/T, h = 0.1),
+--                  a constant 2.5 studs at multiplier 1.2 once e >= h. Check: mult 1.2, t 0.42 -> 16.43 (measured 16.5),
+--                  t 0.57 -> 22.31 (measured 22.2); the old model said 18.0 / 23.9.
 Mark.dumpTravel = function(t)
 	t = math.max(t or 0, 0)
-	local hand = C.HitboxDelaySeconds
-	local a = ActionMotion.GetQuadOutTravel(C.StartupDashDistance, 0.5, math.min(t, hand))
-	if t > hand then
-		-- MEASURED (`slide audit`, 12 slides, mult 0.72..1.2, ratios identical): the first phase matches the model to 0.2 studs,
-		-- the second delivers only ~79% of it at +0.15 s and ~86% at +0.30 s (e.g. mult 1.2: 16.5 got vs 18.0 at 0.42 s,
-		-- 22.2 vs 23.9 at 0.57 s). A box planned on the raw model sits 1.5-2 studs behind where it was supposed to be:
-		-- "the ball has already rolled past". Factor = lerp over the second phase, toward 0.95 near the end.
-		local e = t - hand
-		local k = e <= 0.15 and 0.79 or (e <= 0.30 and (0.79 + (e - 0.15) / 0.15 * 0.07) or math.min(0.86 + (e - 0.30) * 0.13, 0.95))
-		a += ActionMotion.GetQuadOutTravel(C.Distance, C.MotionSeconds, e) * (CFG.SlideTravelCal == false and 1 or k)
+	local a = ActionMotion.GetQuadOutTravel(C.StartupDashDistance, 0.5, math.min(t, C.StartupDashHandoffSeconds + 0.1))
+	if t > C.StartupDashHandoffSeconds then
+		local e = t - C.StartupDashHandoffSeconds
+		local D, T, h = C.Distance, C.MotionSeconds, 0.1
+		local rel0, relS = C.VelocityReleaseStartsAt, C.VelocityReleaseSeconds
+		local main
+		if e < rel0 then
+			main = ActionMotion.GetQuadOutTravel(D, T, e)
+		else
+			local v0 = ActionMotion.GetQuadOutSpeed(D, T, rel0)
+			local u = 1 - math.clamp((e - rel0) / relS, 0, 1)
+			main = ActionMotion.GetQuadOutTravel(D, T, rel0) + v0 * relS * (1 - u * u * u * u * u) / 5
+		end
+		local ee = math.min(e, h)
+		local A = 3 * D / T
+		local loss = A * (ee - ee * ee / T + ee * ee * ee / (3 * T * T) - ee * ee / (2 * h) + 2 * ee * ee * ee / (3 * h * T) - ee * ee * ee * ee / (4 * h * T * T))
+		a += main - loss
 	end
 	return a
+end
+
+-- MID-SLIDE REDIRECT (dump SlideTackleInput.GetDirection / SlideTackle.runSplitCFrameAction): the startup dash reads the
+-- direction EVERY frame until the hand-off at 0.27 s, the main dash is then locked to the direction read at that moment. Our
+-- GetMoveCommand hook owns that direction (slideAim), so a slide can be pressed along a1 and turned to a2 before the hand-off:
+-- the box path is  O + a1 * m * S(min(tau, tb)) + a2 * m * (travel(tau) - S(min(tau, tb)))  (S = startup dash travel). With a2 = -a1
+-- the net travel shrinks by 2 * m * S(tb) ~ 17 studs (a ball CLOSE to us, behind-left: press back, then turn), any other angle gives
+-- a bent route. tb = BendAt: late enough that the startup dash has covered most of its distance, early enough for the hook.
+Mark.bendT = 0.23
+Mark.slideStartTravel = function(tau)
+	return ActionMotion.GetQuadOutTravel(C.StartupDashDistance, 0.5, math.min(math.max(tau, 0), C.StartupDashHandoffSeconds + 0.1))
+end
+Mark.bendDisp = function(a1, a2, m, tau)
+	local s1 = Mark.slideStartTravel(math.min(tau, Mark.bendT))
+	return a1 * (m * s1) + a2 * (m * (Mark.dumpTravel(tau) - s1))
 end
 -- CharacterControllers: JumpHeight 7.2, vy = sqrt(2 * workspace.Gravity * H). Ball gravity -100 is not this.
 Mark.jumpH = 7.2
@@ -3522,12 +3560,16 @@ Mark.lofting = function(ch, enemyRoot)
 end
 
 
-tryTackle = function(character, root, dir, mult, target, skipHazard)
+tryTackle = function(character, root, dir, mult, target, skipHazard, bend)
 	if MatchSettings.IsGoalkeeperCharacter(character) then
 		return false, "keeper" -- the keeper has no slide: the key is the dive
 	end
 	if os.clock() - lastTackleAt < tackleEnforced then
 		return false, "cd"
+	end
+	-- the game refused the last press for a reason we do not mirror: do not hammer it every frame (log: 5 rejects in 50 ms)
+	if os.clock() - (Mark.tackleRejectAt or -9) < 0.3 then
+		return false, "reject-wait"
 	end
 	if Ragdoll.IsActorRagdolled(LocalPlayer) then
 		return false, "ragdoll"
@@ -3619,7 +3661,8 @@ tryTackle = function(character, root, dir, mult, target, skipHazard)
 			Mark.moveStop()
 		end
 		origSetMove(character, dir, dir, true)
-		Mark.slideTrack = { at = os.clock(), O = root.Position, dir = dir, m = mul, tag = (type(target) == "table" and target.char) and "carrier" or "ball" }
+		Mark.slideBend = bend and { at = os.clock(), a2 = bend.a2, t = Mark.bendT } or nil
+		Mark.slideTrack = { at = os.clock(), O = root.Position, dir = dir, m = mul, bent = bend ~= nil, pc = Mark.slidePlanTc, tag = (type(target) == "table" and target.char) and "carrier" or "ball" }
 		Mark.slideHome = (type(target) == "table" and target.char) and {
 			at = os.clock(),
 			last = os.clock(),
@@ -3654,7 +3697,9 @@ tryTackle = function(character, root, dir, mult, target, skipHazard)
 			"usLive",
 			fmtV(root.Position),
 			"iframe",
-			p and string.format("%.2f", p.iframe or 0) or "-"
+			p and string.format("%.2f", p.iframe or 0) or "-",
+			"bend",
+			bend and fmtV(bend.a2) or "-"
 		)
 		Log.pending[#Log.pending + 1] = {
 			kind = "tackle",
@@ -3673,7 +3718,8 @@ tryTackle = function(character, root, dir, mult, target, skipHazard)
 	end
 	slideAim = nil
 	slideAimUntil = 0
-	logFile("tackle reject", "aim", fmtV(dir), "mult", string.format("%.2f", mul))
+	Mark.tackleRejectAt = os.clock()
+	logFile("tackle reject", "aim", fmtV(dir), "mult", string.format("%.2f", mul), "state", Mark.stateLine(), "sinceLast", string.format("%.2f", os.clock() - lastTackleAt), "stamina", tostring(Mark.sprint.CanSpendStamina(SlideTackle.Constants.StaminaCost, true)), "kickCharge", tostring(ChargedKick.IsCharging and ChargedKick.IsCharging()), "dribbling", tostring(ClientDodge.IsDribbling()))
 	return false, "game-reject"
 end
 
@@ -3682,6 +3728,17 @@ end
 -- MoveCommand hook (slideAim), so re-aim slideAim at the carrier until handoff, at most the dump's assist turn rate
 -- (SlideTackleInput u4 = 1.5*pi / HitboxDelaySeconds rad/s).
 Mark.homeSlide = function(root)
+	local bd = Mark.slideBend
+	if bd then
+		local el = os.clock() - bd.at
+		if el >= bd.t and slideAim then
+			slideAim = bd.a2
+			Mark.slideBend = nil
+			logFile("tackle bend", "turned at", string.format("%.2f", el), "to", fmtV(bd.a2))
+		elseif el > 0.5 or not slideAim then
+			Mark.slideBend = nil
+		end
+	end
 	local h = Mark.slideHome
 	if not h then
 		return
@@ -7143,7 +7200,10 @@ Mark.wallHit = function(origin, dir, dist)
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Include
 	params.FilterDescendantsInstances = parts
-	return Workspace:Raycast(origin, dir.Unit * dist, params)
+	-- A SPHERE of body size, not a ray: a ray that starts inside / beside a barricade part never reports it (a raycast has no
+	-- backface hit), which is why the tackle aim "stopped seeing" the wall when we stood close to it and slid into it. A
+	-- shapecast starting in contact returns the hit at distance 0.
+	return Workspace:Spherecast(origin, Mark.wallBodyR or 1.6, dir.Unit * dist, params)
 end
 
 -- Barricade avoidance for agent steering. Old version: hit -> "left" whenever both sides were blocked, with no
@@ -8129,6 +8189,7 @@ Mark.wallWatch = function()
 	-- a man: still on his side of the wall plane = it held him
 	local tp = CharacterMotion.GetPosition(p.model) or p.wallPos
 	local side = flat(tp - p.wallPos):Dot(p.u)
+	Mark.teleAdd("wall." .. p.kind, side > 0)
 	logFile("wall result", p.kind, p.name, "side", string.format("%.1f", side), "dist", string.format("%.1f", flat(tp - p.wallPos).Magnitude), side > 0 and "held" or "passed")
 end
 
@@ -8953,13 +9014,19 @@ Mark.foeKeeper = function(root, maxD)
 	if npcs and g then
 		for _, model in npcs:GetChildren() do
 			local r = model:IsA("Model") and model:FindFirstChild("HumanoidRootPart")
-			if r and (model:GetAttribute("ActiveGoalkeeper") == true or flat(r.Position - g.Position).Magnitude < 16) then
+			-- The NPC keeper is the one tagged ActiveGoalkeeper, else the one near the goal we attack. He is REMEMBERED: a keeper who
+			-- ran out past the goal line (log: the trap stopped seeing him beyond 16 studs of the mouth) stays the keeper while he
+			-- lives and is within KeeperTrapZone of it, whatever his tag does.
+			if r and (model:GetAttribute("ActiveGoalkeeper") == true or Mark.npcKeeperModel == model or flat(r.Position - g.Position).Magnitude < 16) then
 				local dd = flat(r.Position - root.Position).Magnitude
-				if dd < bd then
+				if dd < bd and (model == Mark.npcKeeperModel or model:GetAttribute("ActiveGoalkeeper") == true or flat(r.Position - g.Position).Magnitude < 16 or flat(r.Position - g.Position).Magnitude < (CFG.KeeperTrapZone or 110)) then
 					best, bd = { model = model, r = r, d = dd, key = model, npc = true }, dd
 				end
 			end
 		end
+	end
+	if best and best.npc then
+		Mark.npcKeeperModel = best.model
 	end
 	return best
 end
@@ -10996,6 +11063,7 @@ Mark.gkDiveWatch = function(root)
 	if now - r.at >= 1.1 then
 		Mark.gkDiveRec = nil
 		local o = liveOwnerId()
+		Mark.teleAdd("gk.dive", not r.goal)
 		logFile("gk dive result", r.name, "closest", string.format("%.1f", r.minD), "at", string.format("%.2f", r.minAt or -1), "goal", r.goal and string.format("%.2f", r.goal) or "no", "owner", o == LocalPlayer.UserId and "us" or (type(o) == "number" and o ~= 0 and "enemy/other" or "free"), "eta", string.format("%.2f", r.eta))
 	end
 end
@@ -11019,6 +11087,7 @@ Mark.gkPressWatch = function(root)
 	if now - rec.at >= 1.0 then
 		Mark.gkPressRec = nil
 		local down, left = Mark.mateDown(rec.pl, rec.model)
+		Mark.teleAdd("gk.press", down)
 		logFile("gk press result", rec.name, "stunned", tostring(down), "left", string.format("%.2f", left or 0), "closest", string.format("%.1f", rec.minD), "dy", string.format("%.1f", rec.minY or 0))
 	end
 end
@@ -11053,6 +11122,17 @@ end
 Mark.knockHook()
 
 -- the spot the keeper stands on: remembered while he stands still near his goal
+-- MIRROR (user): a carrier running at the goal drags the keeper across with him, the closer the more. weight 0.15 at `range`
+-- (a pass can still go the other way) -> 0.9 from 10 studs in; depth in front of the line 35 % of his depth, 2..6, never within
+-- 3 studs of him (goal-side: a kick / dive at him then sends the ball away from the mouth, not into it). Pure.
+Mark.gkMirror = function(along, side, half, range)
+	local k = math.clamp((along - 10) / math.max(range - 10, 1), 0, 1)
+	local w = 0.9 - 0.75 * k
+	local lat = math.clamp(side * w, -(half - 1), half - 1)
+	local depth = math.min(math.clamp(along * 0.35, 2, 6), math.max(along - 3, 1.5))
+	return depth, lat
+end
+
 Mark.gkHomeTrack = function(root, c)
 	local recent = Mark.knock and c.now - Mark.knock.at < 6
 	if not recent and c.landed and flat(root.AssemblyLinearVelocity).Magnitude < 3 and flat(root.Position - c.mouthP).Magnitude <= 24 and c.now - (Mark.gkHomeAt or 0) > 0.4 then
@@ -11679,6 +11759,11 @@ Mark.tickGk = function(character, root)
 		stand = recvStand
 		why = "recv"
 		stopAt, urgent = 0.5, true
+	elseif not plan and not shot and ownerRoot and CFG.GkMirror ~= false and not Mark.userInputDir() and along < (CFG.GkMirrorRange or 60) and along > -2 then
+		local dm, lm = Mark.gkMirror(along, ballSide, half, CFG.GkMirrorRange or 60)
+		stand = mouthP + fwd * dm + side * lm
+		why = "mirror"
+		stopAt, urgent = 0.6, true
 	end
 	if plan then
 		stand = plan.p
@@ -12789,7 +12874,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- Illegal Soccer dump " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v180")
+	add("-- Illegal Soccer dump " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v182")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -14377,6 +14462,81 @@ Mark.shotOpen = function(P, g, uid)
 	return { open = width * open / N, width = width, bis = open > 0 and unitOrNil(sum) or nil, dist = flat(mouth - P).Magnitude, keeper = #keepers > 0, mouth = mouth, n = open }
 end
 
+-- FULL DEFENSIVE (user): with two or more enemies near our goal the body holds the goal like a keeper would, with run / jump /
+-- slide / air intercept instead of a dive. Where to stand = the point in the zone in front of the mouth that is closest to
+-- EVERY shot line (threat -> 7 points across the mouth, posts and the middle between them), weighted by how soon he can shoot
+-- (the carrier now, the others after a pass), with each line already held by a mate counting as that mate's distance (a spot a
+-- mate holds is taken). Smooth minimax: the 4-norm of w * min(our distance, best mate's distance) over the lines.
+-- Guessed: the weights, FullDefDepth 14, the 7 mouth points, the 4-norm.
+Mark.segDist = function(P, a, b)
+	local ab = flat(b - a)
+	local L2 = ab.X * ab.X + ab.Z * ab.Z
+	local ap = flat(P - a)
+	local s = L2 > 1e-6 and math.clamp((ap.X * ab.X + ap.Z * ab.Z) / L2, 0, 1) or 0
+	local dx, dz = ap.X - ab.X * s, ap.Z - ab.Z * s
+	return math.sqrt(dx * dx + dz * dz)
+end
+
+-- o: lb, rb (posts), M (mouth middle), n (field-ward), side (lb -> rb), half, threats {{pos, w}}, mates {pos}, depth, y (our height), prev (last spot)
+-- -> spot, score | nil
+Mark.fullDef = function(o)
+	local K = 7
+	local reach = o.reach or 3
+	local lines = {}
+	for _, t in o.threats do
+		for j = 0, K - 1 do
+			local G = o.lb + (o.rb - o.lb) * (j / (K - 1))
+			local mate = math.huge
+			for _, m in o.mates do
+				mate = math.min(mate, Mark.segDist(m, t.pos, G))
+			end
+			local abx, abz = G.X - t.pos.X, G.Z - t.pos.Z
+			lines[#lines + 1] = { ax = t.pos.X, az = t.pos.Z, abx = abx, abz = abz, L2 = abx * abx + abz * abz, w = t.w, mate = mate }
+		end
+	end
+	if #lines == 0 then
+		return nil
+	end
+	-- scalar maths only: ~300 spots x up to 28 lines per solve, no vector allocations in the loop
+	local function score(P)
+		local px, pz = P.X, P.Z
+		local s = 0
+		for _, l in lines do
+			local apx, apz = px - l.ax, pz - l.az
+			local k = l.L2 > 1e-6 and math.clamp((apx * l.abx + apz * l.abz) / l.L2, 0, 1) or 0
+			local dx, dz = apx - l.abx * k, apz - l.abz * k
+			-- a line that passes within the body's reach is held (distance 0): standing IN the cone beats standing beside it
+			local d = math.max(math.min(math.sqrt(dx * dx + dz * dz), l.mate) - reach, 0) * l.w
+			s += d * d * d * d
+		end
+		-- (tie-break: the spot nearest to where we already are)
+		return s ^ 0.25 + 0.05 * math.sqrt((px - o.me.X) ^ 2 + (pz - o.me.Z) ^ 2)
+	end
+	local best, bs = nil, math.huge
+	local lim = o.half + 4
+	local x = -lim
+	while x <= lim + 1e-6 do
+		local z = 1.5
+		while z <= o.depth + 1e-6 do
+			local P = o.M + o.n * z + o.side * x
+			local sc = score(P)
+			if sc < bs then
+				best, bs = P, sc
+			end
+			z += 1.5
+		end
+		x += 1.5
+	end
+	-- hysteresis: the old spot stays unless the new one is clearly better (no dance on a changing world)
+	if o.prev then
+		local so = score(o.prev)
+		if so <= bs * 1.06 then
+			return Vector3.new(o.prev.X, o.y, o.prev.Z), so
+		end
+	end
+	return Vector3.new(best.X, o.y, best.Z), bs
+end
+
 Mark.blockCone = function(Pt, g)
 	local lb, _, rb = goalMouthCorners(g)
 	if not (lb and rb) then
@@ -14814,6 +14974,44 @@ Mark.blockRoleTick = function(character, root, carrier, cr, chE, P, V, g, flight
 	local role = plan.role
 	local S = role == "press" and plan.pressSpot or plan.deepSpot
 	S = Vector3.new(S.X, root.Position.Y, S.Z)
+	-- FULL DEFENSIVE: the carrier and at least one more enemy near the mouth -> hold the goal (Mark.fullDef) instead of the roles
+	if CFG.FullDefensive then
+		local range = CFG.FullDefRange or 60
+		local th = {}
+		for _, f in foes do
+			local dR = flat(f.pos - M).Magnitude
+			if f.carrier or dR <= range then
+				th[#th + 1] = { pos = f.pos, w = f.carrier and 1 or (0.35 + 0.35 * (1 - math.clamp(dR / range, 0, 1))), name = f.name }
+			end
+		end
+		if #th >= 2 and flat(C - M).Magnitude <= range then
+			local fc = Mark.fullCache
+			local mp = {}
+			for _, m in mates do
+				mp[#mp + 1] = m.pos
+			end
+			-- re-solved at 10 Hz (the solve is a few thousand segment tests); the old spot is the hysteresis reference
+			local spot, sc
+			if fc and now - fc.at < 0.1 then
+				spot, sc = fc.p, fc.sc
+			else
+				spot, sc = Mark.fullDef({ lb = lb, rb = rb, M = M, n = n, side = side, half = flat(rb - lb).Magnitude * 0.5, threats = th, mates = mp, depth = CFG.FullDefDepth or 14, y = root.Position.Y, me = root.Position, reach = HitboxSettings.Receive.Size.X * 0.5 + (Physics.BallRadius or 1), prev = fc and now - fc.at < 0.6 and fc.p or nil })
+				Mark.fullCache = { p = spot, at = now, sc = sc }
+			end
+			role, S = "full", spot
+			plan.why = string.format("%d threats", #th)
+			if not fc or now - (Mark.fullLog or 0) > 0.8 then
+				Mark.fullLog = now
+				local names = {}
+				for _, t in th do
+					names[#names + 1] = t.name:sub(1, 8)
+				end
+				logFile("block full", "spot", fmtV(spot), "score", string.format("%.1f", sc), "lat", string.format("%.1f", flat(spot - M):Dot(side)), "out", string.format("%.1f", flat(spot - M):Dot(n)), "threats", table.concat(names, ","), "mates", tostring(#mp))
+			end
+		else
+			Mark.fullCache = nil
+		end
+	end
 	local last = Mark.roleLast
 	if not last or last.role ~= role or now - last.at > 0.6 then
 		logFile("block role", role, plan.why, actorName(carrier), flightT and string.format("ball arrives %.2f", flightT) or "carrier", "presser", plan.presser and plan.presser.name or "-", "costs", plan.costs,
@@ -17731,6 +17929,25 @@ Mark.tickAir = function(character, root)
 			end
 			return
 		end
+		-- CHEAP PRE-GATE before the 77-sample solve (it ran every 0.05 s for every ball in flight anywhere: 296 "no reach" lines
+		-- in one short log): a path that never rises above AirMinHeight over our hip (a shot into our mouth excepted), or never
+		-- comes within AirReachFar of us, is nobody's air ball
+		do
+			local hmax, dmin = -math.huge, math.huge
+			local O = root.Position
+			for i = 1, #pts, 3 do
+				local p = pts[i]
+				hmax = math.max(hmax, p.Y - floor)
+				dmin = math.min(dmin, flat(p - O).Magnitude)
+			end
+			if (hmax < (CFG.AirMinHeight or 1.5) and not Mark.airGoalShot(root, kicker)) or dmin > (CFG.AirReachFar or 140) then
+				Mark.airMemo = { at = now }
+				if Mark.airPlan then
+					Mark.airEnd("not an air ball")
+				end
+				return
+			end
+		end
 		Mark.mover = Mark.mover or require(Modules.Actions.ActionMovement)
 		local spd = math.max(Mark.akSpeeds(character), hum.WalkSpeed)
 		local spdAir = landed and Mark.mover.GetBaseWalkSpeed(character) or hum.WalkSpeed
@@ -18150,6 +18367,29 @@ Mark.akAutoTick = function(character, root)
 	end
 end
 
+-- Does the ray from `from` along `aim` (flat) cross the goal mouth lb..rb (extended by pad on both sides) within `reach` studs?
+-- The kick sends the ball along the facing: a kick that hits the carrier is fine, one whose line ends in OUR mouth is an own goal.
+Mark.aimsAtMouth = function(from, aim, lb, rb, pad, reach)
+	local seg = flat(rb - lb)
+	local len = seg.Magnitude
+	if len < 1e-3 then
+		return false
+	end
+	local su = seg / len
+	local a = unitOrNil(flat(aim))
+	if not a then
+		return false
+	end
+	local den = a.X * su.Z - a.Z * su.X
+	if math.abs(den) < 1e-4 then
+		return false
+	end
+	local d = flat(lb - from)
+	local t = (d.X * su.Z - d.Z * su.X) / den
+	local s = (d.X * a.Z - d.Z * a.X) / den
+	return t > 0 and t <= reach and s >= -pad and s <= len + pad
+end
+
 Mark.akTry = function(tag, model, r, urgent)
 	if CFG.AutoKick == false then
 		return false, "off"
@@ -18214,8 +18454,10 @@ Mark.akTry = function(tag, model, r, urgent)
 	local ball = Renderer.GetPosition()
 	local goal = Mark.defendGoal()
 	if ball and goal and flat(ball - r.Position).Magnitude < 7 then
-		local own = unitOrNil(flat(goal.Position - root.Position))
-		if own and own:Dot(plan.aim) > 0.5 and flat(goal.Position - root.Position).Magnitude < 70 then
+		-- the old test refused any aim within 60 degrees of "toward our goal" (log: kick ownside at a carrier 6.8 away, the keeper
+		-- stood and did nothing). The ball goes along the aim: refuse only a line that actually ends in our mouth (4 studs of pad).
+		local lb, _, rb = goalMouthCorners(goal)
+		if lb and rb and Mark.aimsAtMouth(ball, plan.aim, lb, rb, 4, 90) then
 			Mark.akApproach = nil
 			return false, "ownside"
 		end
@@ -18353,6 +18595,7 @@ Mark.akTick = function(character, root)
 		task.delay(0.35, function()
 			local st = Renderer.GetAuthoritativeMovementState()
 			local won = st ~= nil and st.LastKickerUserId == LocalPlayer.UserId
+			Mark.teleAdd("kick." .. tag, won)
 			logFile("autokick result", won and "WON" or "no", tag, "owner", tostring(liveOwnerId()), "iframe", tostring(victim.Parent ~= nil and Dodge.IsDribbling(victim)))
 		end)
 	end
@@ -18642,6 +18885,7 @@ Mark.tickVolley = function(character, root)
 		Mark.airEnd("pressed")
 		task.delay((ev.ApproachSeconds or 0.3) + 0.25, function()
 			local st = Renderer.GetAuthoritativeMovementState()
+			Mark.teleAdd("air.volley", st ~= nil and st.LastKickerUserId == LocalPlayer.UserId)
 			logFile("volley result", st ~= nil and st.LastKickerUserId == LocalPlayer.UserId and "STRUCK" or "lost", why, "owner", tostring(liveOwnerId()), "volleyUser", tostring(st and st.VolleyUserId))
 		end)
 		logFile("volley", "press", why, shotFrom and ("shot " .. shotFrom) or "clear", "goalD", string.format("%.0f", goalD), "approach", string.format("%.2f", ev.ApproachSeconds or -1), "miss", string.format("%.1f", ev.MissAngleDegrees or -1), "grounded", tostring(ev.BallGrounded), "air", tostring(not landedNow), "bike", tostring(hum and BicycleKick.CanBicycleKick(character, hum)), "enemyOwner", tostring(type(oid) == "number" and oid ~= 0))
@@ -18823,6 +19067,44 @@ Mark.preJump = function(character, root, oid)
 	end
 end
 
+-- TELEMETRY: attempt -> result per feature, one `tele` line every 30 s (session totals + the last window, file Telemetry.txt).
+-- feat = "module.what"; ok = the outcome the feature exists for; x = an optional error to average (seconds / studs, signed).
+Mark.tele = { c = {}, at = os.clock() }
+Mark.teleAdd = function(feat, ok, x)
+	local c = Mark.tele.c[feat]
+	if not c then
+		c = { n = 0, ok = 0, wn = 0, wok = 0, xs = 0, xn = 0 }
+		Mark.tele.c[feat] = c
+	end
+	c.n += 1
+	c.wn += 1
+	if ok then
+		c.ok += 1
+		c.wok += 1
+	end
+	if x then
+		c.xs += x
+		c.xn += 1
+	end
+end
+Mark.teleTick = function()
+	local now = os.clock()
+	if now - Mark.tele.at < 30 then
+		return
+	end
+	Mark.tele.at = now
+	local names = {}
+	for k, c in Mark.tele.c do
+		names[#names + 1] = k
+	end
+	table.sort(names)
+	for _, k in names do
+		local c = Mark.tele.c[k]
+		logFile("tele", k, "all", string.format("%d/%d %.0f%%", c.ok, c.n, 100 * c.ok / math.max(c.n, 1)), "30s", string.format("%d/%d", c.wok, c.wn), c.xn > 0 and string.format("err %+.2f (n %d)", c.xs / c.xn, c.xn) or "")
+		c.wn, c.wok = 0, 0
+	end
+end
+
 -- measured, not modelled: what did the slide really cover, and how close did the ball come to its box? (`slide audit`)
 Mark.slideTrackTick = function(root)
 	local tr = Mark.slideTrack
@@ -18850,7 +19132,14 @@ Mark.slideTrackTick = function(root)
 	end
 	if tau >= 0.95 then
 		Mark.slideTrack = nil
-		logFile("slide audit", tr.tag or "ball", "mult", string.format("%.2f", tr.m),
+		if tr.tag == "ball" then
+			-- planned contact time vs the time the box was closest to the ball: the TTI error of the planner (signed, + = late)
+			Mark.teleAdd(tr.bent and "tackle.ball.bent" or "tackle.ball", tr.minD ~= nil and tr.minD <= 1.5, (tr.minD ~= nil and tr.minD <= 1.5 and tr.pc) and (tr.minT - tr.pc) or nil)
+		else
+			local o = liveOwnerId()
+			Mark.teleAdd("tackle.carrier", o == LocalPlayer.UserId or not (type(o) == "number" and o ~= 0))
+		end
+		logFile("slide audit", tr.tag or "ball", tr.bent and "BENT" or "straight", "planned", tr.pc and string.format("%.2f", tr.pc) or "-", "mult", string.format("%.2f", tr.m),
 			"travel@0.27", string.format("%.1f/%.1f", tr["g0.27"] or -1, Mark.dumpTravel(0.27) * tr.m),
 			"@0.42", string.format("%.1f/%.1f", tr["g0.42"] or -1, Mark.dumpTravel(0.42) * tr.m),
 			"@0.57", string.format("%.1f/%.1f", tr["g0.57"] or -1, Mark.dumpTravel(0.57) * tr.m),
@@ -18971,10 +19260,40 @@ Mark.blockSlide = function(character, root)
 			end
 		end
 	end
+	-- no straight slide: press along a1, turn to a2 before the hand-off (Mark.bendDisp) - reverse and quarter turns
+	if not best and CFG.SlideBend ~= false then
+		for a = 0, 345, 15 do
+			local r = math.rad(a)
+			local a2 = Vector3.new(math.cos(r), 0, math.sin(r))
+			for _, rot in { math.pi, math.pi * 0.5, -math.pi * 0.5 } do
+				local ca, sa = math.cos(rot), math.sin(rot)
+				local a1 = Vector3.new(a2.X * ca - a2.Z * sa, 0, a2.X * sa + a2.Z * ca)
+				for mi = 0, 4 do
+					local m = mLo + (mHi - mLo) * mi / 4
+					local hits = 0
+					for _, f in fine do
+						local B = f[3]
+						if B then
+							local oy = landed and 0 or (vy * f[1] - 0.5 * g * f[1] * f[1])
+							local ctr = O + Mark.bendDisp(a1, a2, m, f[1]) + a2 * boxMid
+							local rel = flat(B - ctr)
+							local dy = B.Y - (O.Y + oy)
+							if math.abs(rel:Dot(a2)) <= hz and math.abs(rel.X * a2.Z - rel.Z * a2.X) <= hx and dy >= yLo and dy <= yHi then
+								hits += 1
+							end
+						end
+					end
+					if hits >= (CFG.SlideMinHits or 3) and (not best or hits > best.hits) then
+						best = { aim = a1, bend = { a2 = a2 }, mult = m, hits = hits, ang = a }
+					end
+				end
+			end
+		end
+	end
 	if best then
 		Mark.blockSlideAt = now
-		local sent, why = Mark.tryTackle(character, root, best.aim, best.mult)
-		logFile("block slide", landed and "ground" or "air", sent and "sent" or ("no " .. tostring(why)), "hits", best.hits, "mult", string.format("%.2f", best.mult), "cross", string.format("%.2f", crossT), "speed", string.format("%.0f", vel.Magnitude))
+		local sent, why = Mark.tryTackle(character, root, best.aim, best.mult, nil, nil, best.bend)
+		logFile("block slide", landed and "ground" or "air", sent and "sent" or ("no " .. tostring(why)), best.bend and "BENT" or "straight", "hits", best.hits, "mult", string.format("%.2f", best.mult), "cross", string.format("%.2f", crossT), "speed", string.format("%.0f", vel.Magnitude))
 		return
 	end
 end
@@ -19328,6 +19647,66 @@ Mark.routePlan = function(c)
 				end
 			end
 			tp += 0.05
+		end
+		-- BENT SLIDES (only when no straight one reaches): press along a1, turn to a2 = the heading at the ball before the
+		-- hand-off (Mark.bendDisp). Reverse (a ball too close for the minimum travel: the shortest straight slide overshoots
+		-- it by ~17 studs) and quarter turns. Same contact test, the box / body centre follows the bent path.
+		if not slide and (CFG.SlideBend ~= false) then
+			local function touchB(W, a1, a2, m, k, B)
+				local h = B.Y - O.Y
+				local rel = flat(B - (W + Mark.bendDisp(a1, a2, m, fine[k])))
+				local lon = rel:Dot(a2)
+				local lat = rel.X * a2.Z - rel.Z * a2.X
+				if fineBox[k] and h >= hLo and h <= hHi and math.abs(lon - boxMid) <= hz and math.abs(lat) <= hx then
+					return true
+				end
+				return h >= c.recvLo - 0.6 and h <= c.recvHi and lon * lon + lat * lat <= rb * rb
+			end
+			local bentRots = { math.pi, math.pi * 0.5, -math.pi * 0.5 }
+			local mids = { mLo, (mLo + mHi) * 0.5, mHi }
+			local tpB = 0
+			while tpB <= 1.0 + 1e-6 do
+				if tpB + fine[1] >= limit then
+					break
+				end
+				local Cc, r = reach(tpB)
+				for k = 2, NF, 3 do
+					local B = ballAt(tpB + slideLag + fine[k])
+					if B then
+						local h = B.Y - O.Y
+						local boxK = fineBox[k] and h >= hLo and h <= hHi
+						if boxK or (h >= c.recvLo - 0.6 and h <= c.recvHi) then
+							local toB = flat(B - Cc)
+							local u = unitOrNil(toB) or Vector3.new(1, 0, 0)
+							for _, a in bentRots do
+								local ca, sa = math.cos(a), math.sin(a)
+								local a1 = Vector3.new(u.X * ca - u.Z * sa, 0, u.X * sa + u.Z * ca)
+								for _, m in mids do
+									local W = Vector3.new(B.X, O.Y, B.Z) - Mark.bendDisp(a1, u, m, fine[k]) - (boxK and u * boxMid or Vector3.zero)
+									if flat(W - Cc).Magnitude <= r + 0.05 then
+										local first, hits = nil, 0
+										for kk = math.max(k - 4, 1), math.min(k + 4, NF) do
+											local Bk = ballAt(tpB + slideLag + fine[kk])
+											if Bk and touchB(W, a1, u, m, kk, Bk) then
+												first = first or fine[kk]
+												hits += 1
+											end
+										end
+										if first and hits >= minHits then
+											local tc = tpB + first
+											if not slide or tc < slide.tc - 0.04 then
+												local off = flat(W - Cc).Magnitude
+												slide = { kind = "slide", p = B, tc = tc, t = tc, tp = tpB, W = W, phi = a1, bend = { a2 = u }, mult = m, hits = hits, rot = math.deg(a), heading = off > 0.3 and unitOrNil(flat(W - Cc)) or nil, way = W, body = not boxK }
+											end
+										end
+									end
+								end
+							end
+						end
+					end
+				end
+				tpB += 0.05
+			end
 		end
 	end
 	-- The slide costs 3 s of cooldown and the ball after it is a scramble: it is spent when it WINS something - no run
@@ -19862,6 +20241,16 @@ Mark.tickBall = function(character, root)
 		Mark.ballStop("no aim")
 		return
 	end
+	-- TOO FAR: no chase for a ball (and a contact point) farther than BallMaxDist - anywhere on the map, enemy goal included
+	-- (log: starts at 73-86 studs, every one lost to the man standing next to it). A shot into OUR goal is the guard's, not
+	-- this rule's. Already running = 10 studs of hysteresis, so the chase does not flicker on the edge.
+	if not threat then
+		local lim = (CFG.BallMaxDist or 60) + (Mark.move.mode == "ball" and 10 or 0)
+		if dist > lim and flat(aimP - root.Position).Magnitude > lim then
+			Mark.ballStop("far")
+			return
+		end
+	end
 	local dir = unitOrNil(flat(aimP - root.Position))
 	if plan and plan.kind == "slide" and not slidePress then
 		dir = plan.heading or unitOrNil(flat(plan.W - root.Position)) or dir
@@ -20059,7 +20448,9 @@ Mark.tickBall = function(character, root)
 		logFile(kill.guard and "killer guard" or "killer", sent and "sent" or ("no " .. tostring(why)), kill.name, "also", kill.also or "-", "ballD", string.format("%.1f", kill.dBall or -1), "ang", string.format("%.0f", kill.ang), "hits", tostring(kill.hits), "mult", string.format("%.2f", kill.mult), "dist", string.format("%.1f", kill.dist), "ballD", string.format("%.1f", kill.dBall), "hisFirst", string.format("%.2f", f.first or -1), "ourT", string.format("%.2f", steerT or -1), "drib", tostring(f.drib))
 	elseif CFG.AutoTackle and slideDir and not allyBlock and not noTouch and (landed or (airborne and nowBox)) then
 		logFile("ball tackle", "route", "tc", string.format("%.2f", slideT or 0), "h", string.format("%.1f", slideP.Y - root.Position.Y), "rot", string.format("%.0f", slidePress.rot or 0), "hits", tostring(slidePress.hits), "mult", string.format("%.2f", slidePress.mult), "by", slidePress.body and "body" or "box")
-		tryTackle(character, root, slideDir, slidePress.mult)
+		Mark.slidePlanTc = slideT
+		tryTackle(character, root, slideDir, slidePress.mult, nil, nil, slidePress.bend)
+		Mark.slidePlanTc = nil
 	elseif jumpAt then
 		if Mark.doJump("ball") then
 			logFile("ball jump", "t", string.format("%.2f", jumpAt), "h", string.format("%.1f", jumpMeet))
@@ -22364,6 +22755,7 @@ Mark.tickHazard = function(character, root)
 	Mark.slideAudit(root)
 	Mark.tickKickDodge(root, own)
 	Mark.slideTrackTick(root)
+	Mark.teleTick()
 	if not CFG.AutoDodge then
 		return
 	end
@@ -24443,6 +24835,7 @@ return function(_Lib, _Core)
 			sld(b, "Ignore With Enemy Near", "CompetitorEnemyNear", 0, 40, { suffix = " st", text = "An enemy this close to the ball: no competitor checks." })
 			tog(b, "Yield To Enemy Keeper", "BallYieldKeeper", "AutoBall stops when their keeper gets to the ball first.")
 			sld(b, "Press Distance", "RolePressGap", 2, 14, { prec = 1, suffix = " st", text = "Gap in front of the carrier." })
+			tog(b, "Full Defense", "FullDefensive", "2+ enemies at the goal: hold it like a keeper.")
 			tog(b, "Show Marking", "DrawBlock", "Shows your spot.")
 
 			-- AutoKick -------------------------------------------------------------------------------------
@@ -24558,7 +24951,8 @@ return function(_Lib, _Core)
 			sld(p, "Rush Zone", "GkRushZone", 10, 80, { prec = 0, suffix = " st" })
 			sld(p, "Rush Confidence", "GkRushConf", 0.1, 0.9, { prec = 2 })
 			sld(p, "Too Close", "GkPressMinT", 0, 0.15, { prec = 2, suffix = " s", text = "A contact earlier than this into the dash passes through him." })
-			tog(p, "Keeper Kick", "GkKick", "No dive line and he is close: charges a full kick at him.")
+			tog(p, "Mirror Runner", "GkMirror", "Follows a carrier near the goal sideways.")
+		tog(p, "Keeper Kick", "GkKick", "No dive line and he is close: charges a full kick at him.")
 			advanced(p, "GkPress", function()
 				sld(p, "Press Zone", "GkPressZone", 20, 140, { suffix = " st" })
 				sld(p, "Hit Margin", "GkPressRadiusFrac", 0.4, 1, { prec = 2 })
@@ -24652,6 +25046,7 @@ return function(_Lib, _Core)
 			head(ba, "AutoBall")
 			feature(ba, "AutoBall", "AutoBall")
 			tog(ba, "Competitor Check", "BallCompetitor", "Stops when a teammate is clearly closer to the ball.")
+			sld(ba, "Max Distance", "BallMaxDist", 20, 200, { suffix = " st", text = "No chase beyond this." })
 			tog(ba, "Catch Flicks", "BallFlick", "Wins the ball from enemy flicks.")
 			sld(ba, "Body Range", "LobBodyRange", 0, 20, { suffix = " st", text = "Closer than this, take the lob with the body." })
 			sld(ba, "Competitor Gap", "BallYieldGap", 2, 20, { suffix = " st", text = "How much closer he must be." })
