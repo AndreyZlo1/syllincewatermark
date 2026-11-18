@@ -210,7 +210,6 @@ local CFG = {
 	GkPressReachFrac = 0.85, -- contact only in the first part of the dive curve (the end is a threshold)
 	GkPressRadiusFrac = 0.75, -- share of the catch radius that must hold: centred hits, not edge hits
 	GkPressFace = true, -- turn the keeper's body to the carrier before and during a press dive
-	GkPressExact = true, -- dive at any angle (not only the 8 camera directions)
 	GkPressHome = true, -- steer the dive at him while it runs (what turning the camera does)
 	GkPressTurn = 6, -- rad/s of that steering
 	LobBodyRange = 9, -- flick lob catch: a contact this close goes with the body (receive), farther with a jump-slide
@@ -3221,7 +3220,7 @@ local function tryDribble(force)
 	if not dashDir then
 		dashDir = root and unitOrNil(flat(root.CFrame.LookVector))
 	end
-	if CFG.AgentAddon and dir and Mark.moveSteer then
+	if CFG.AgentAddon and dir then
 		Mark.moveSteer(dir, "dribble")
 	end
 	ClientDodge.HandleInputBegan(Controls.CreateInput("Dribble"), false)
@@ -3405,7 +3404,7 @@ CharacterControllers.SetMoveCommand = function(ch, move, look, rot)
 			rot = true
 		end
 	end
-	if ch == LocalPlayer.Character and Mark.chargeFace and ChargedKick.IsCharging and ChargedKick.IsCharging() then
+	if ch == LocalPlayer.Character and Mark.chargeFace and ChargedKick.IsCharging() then
 		look = Mark.chargeFace
 		rot = true
 	end
@@ -3445,9 +3444,7 @@ ClientSlide.HandleInputBegan = function(input, processed, ...)
 				logFile("tackle manual", "own dir", "no carrier within", tostring(CFG.ManualRadius))
 			end
 		end
-		if Mark.moveStop then
-			Mark.moveStop()
-		end
+		Mark.moveStop()
 	end
 	return Mark.origSlideBegan(input, processed, ...)
 end
@@ -3476,14 +3473,17 @@ end
 
 Mark.chargeInst = function()
 	local fn = ChargedKick.IsCharging
-	if type(fn) ~= "function" then
-		return nil
+	local c = Mark.chargeInstC
+	if c and c.fn == fn then
+		return c.inst
 	end
+	-- the charge state object is the first upvalue of IsCharging: read once per function, not every frame
 	local inst = upvalue(fn, 1)
-	if type(inst) == "table" and type(inst.IsLocalOwner) == "function" then
-		return inst
+	if type(inst) ~= "table" or type(inst.IsLocalOwner) ~= "function" then
+		inst = nil
 	end
-	return nil
+	Mark.chargeInstC = { fn = fn, inst = inst }
+	return inst
 end
 
 -- The real auto-release moment of OUR kick charge: ChargedKick.StartCharge task.delay(MaximumChargeSeconds) ->
@@ -3623,7 +3623,7 @@ tryTackle = function(character, root, dir, mult, target, skipHazard, bend)
 		return false, "ragdoll"
 	end
 	-- SlideTackleInput.HandleInputBegan returns early while the kick charges (u8 = IsKickCharging).
-	if ChargedKick.IsCharging and ChargedKick.IsCharging() then
+	if ChargedKick.IsCharging() then
 		return false, "charging"
 	end
 	if ActionLocks.HasTackleBlock(LocalPlayer) then
@@ -3657,7 +3657,7 @@ tryTackle = function(character, root, dir, mult, target, skipHazard, bend)
 	end
 	local wallRoot = ActorTargeting.GetActorRoot(LocalPlayer)
 	local wallReach = math.min(Mark.dumpTravel(C.HitboxDelaySeconds) + 4, 14)
-	if wallRoot and Mark.wallHit and Mark.wallHit(wallRoot.Position, dir, wallReach) then
+	if wallRoot and Mark.wallHit(wallRoot.Position, dir, wallReach) then
 		return false, "wall"
 	end
 	if ClientSlide.IsSlideTackling() then
@@ -3705,9 +3705,7 @@ tryTackle = function(character, root, dir, mult, target, skipHazard, bend)
 		lastTackleAt = os.clock()
 		-- the slide took the body: the chase / block order ends NOW, not before the game had accepted the input (a rejected
 		-- slide used to drop the chase every frame)
-		if Mark.moveStop then
-			Mark.moveStop()
-		end
+		Mark.moveStop()
 		origSetMove(character, dir, dir, true)
 		Mark.slideBend = bend and { at = os.clock(), a2 = bend.a2, t = Mark.bendT } or nil
 		Mark.slideTrack = { at = os.clock(), O = root.Position, dir = dir, m = mul, bent = bend ~= nil, pc = Mark.slidePlanTc, tag = (type(target) == "table" and target.char) and "carrier" or "ball" }
@@ -3767,7 +3765,7 @@ tryTackle = function(character, root, dir, mult, target, skipHazard, bend)
 	slideAim = nil
 	slideAimUntil = 0
 	Mark.tackleRejectAt = os.clock()
-	logFile("tackle reject", "aim", fmtV(dir), "mult", string.format("%.2f", mul), "state", Mark.stateLine(), "sinceLast", string.format("%.2f", os.clock() - lastTackleAt), "stamina", tostring(Mark.sprint.CanSpendStamina(SlideTackle.Constants.StaminaCost, true)), "kickCharge", tostring(ChargedKick.IsCharging and ChargedKick.IsCharging()), "dribbling", tostring(ClientDodge.IsDribbling()))
+	logFile("tackle reject", "aim", fmtV(dir), "mult", string.format("%.2f", mul), "state", Mark.stateLine(), "sinceLast", string.format("%.2f", os.clock() - lastTackleAt), "stamina", tostring(Mark.sprint.CanSpendStamina(SlideTackle.Constants.StaminaCost, true)), "kickCharge", tostring(ChargedKick.IsCharging()), "dribbling", tostring(ClientDodge.IsDribbling()))
 	return false, "game-reject"
 end
 
@@ -3988,10 +3986,8 @@ local function flightBlocked(pts, ignore)
 	if type(parts) == "table" then
 		table.move(parts, 1, #parts, 1, all)
 	end
-	if Mark.wallParts then
-		local placed = Mark.wallParts()
-		table.move(placed, 1, #placed, #all + 1, all)
-	end
+	local placed = Mark.wallParts()
+	table.move(placed, 1, #placed, #all + 1, all)
 	parts = all
 	-- the placed barricade MODELS themselves (any part, any size): a ball-radius spherecast along every segment.
 	-- Boundary parts alone missed low floor-skimming DIPs into a barricade.
@@ -6085,7 +6081,7 @@ local function stepLogic()
 		return
 	end
 	ghostPos, ghostDir = ourRewindPosition(root, nil), unitOrNil(flat(root.CFrame.LookVector))
-	if Mark.tickGk and Mark.tickGk(character, root) then
+	if Mark.tickGk(character, root) then
 		predict = nil
 		dribbleDanger = nil
 		-- an AutoBall / block / kick order left over from before we became keeper would keep steering us (GetMoveCommand
@@ -6103,15 +6099,9 @@ local function stepLogic()
 		-- the keeper's kick (gkPress "kick"): its charge is run by the same tick as the field kick
 		Mark.akTick(character, root)
 		-- items / hazards are not field-player only: a keeper can hold a shotgun (SilentAim, AutoWall) and stand in oil
-		if Mark.tickSkill then
-			Mark.tickSkill(character, root)
-		end
-		if Mark.tickHazard then
-			Mark.tickHazard(character, root)
-		end
-		if Mark.drawOil then
-			Mark.drawOil(root)
-		end
+		Mark.tickSkill(character, root)
+		Mark.tickHazard(character, root)
+		Mark.drawOil(root)
 		return
 	end
 	Mark.homeSlide(root)
@@ -6232,7 +6222,7 @@ local function stepLogic()
 					logFile("dribble kick", ok and "sent" or tostring(why), "e", string.format("%.2f", kt.elapsed), "d", string.format("%.1f", kt.dist), "name", actorName(kt.actor))
 				end
 				dribbleWhy = ok and "kick" or tostring(why)
-			elseif kt and kt.facing > 0.8 and kt.dist <= 10 and CFG.AgentAddon and Mark.dribbleLeft() <= 0 and not Mark.aerial and Mark.moveSteer then
+			elseif kt and kt.facing > 0.8 and kt.dist <= 10 and CFG.AgentAddon and Mark.dribbleLeft() <= 0 and not Mark.aerial then
 				-- dribble ready: walk into his kick box so the release lands on the iframe (speed boost)
 				local to = unitOrNil(flat(kt.center - root.Position))
 				if to then
@@ -6252,7 +6242,7 @@ local function stepLogic()
 			elseif not threat then
 			dribbleWhy = "no threat"
 			Mark.dodgeDone = nil
-			if Mark.move.mode == "walk" and Mark.moveStop and os.clock() - (Mark.kickWalkAt or 0) > 0.3 then
+			if Mark.move.mode == "walk" and os.clock() - (Mark.kickWalkAt or 0) > 0.3 then
 				Mark.moveStop("walk")
 			end
 			else
@@ -6272,7 +6262,7 @@ local function stepLogic()
 						local ok, why = tryDribble()
 						if ok then
 							dribbleWhy = why or "kick"
-						elseif CFG.AutoDodge and not Mark.dodgeDone and not used and Mark.dodgeSteer then
+						elseif CFG.AutoDodge and not Mark.dodgeDone and not used then
 							logFile("dribble", why or "fail", "dodge instead")
 							Mark.dodgeSteer(root, threat)
 							dribbleWhy = "dodge"
@@ -6281,13 +6271,13 @@ local function stepLogic()
 						end
 					elseif used then
 						dribbleWhy = "handled"
-					elseif CFG.AutoDodge and not Mark.dodgeDone and Mark.dodgeSteer then
+					elseif CFG.AutoDodge and not Mark.dodgeDone then
 						Mark.dodgeSteer(root, threat)
 						dribbleWhy = dribbleReady and "dodge" or "dodge cd"
 					end
 				else
 					dribbleWhy = "slide miss"
-					if Mark.move.mode == "walk" and Mark.moveStop then
+					if Mark.move.mode == "walk" then
 						Mark.moveStop("walk")
 					end
 				end
@@ -6296,7 +6286,7 @@ local function stepLogic()
 		note("d", dribbleWhy)
 	end
 
-	if CFG.AutoDodge and not own and not Mark.slideBody() and not slideAim and Mark.move.mode ~= "dodge" and Mark.dodgeSteer and not Mark.meKeeper() then
+	if CFG.AutoDodge and not own and not Mark.slideBody() and not slideAim and Mark.move.mode ~= "dodge" and not Mark.meKeeper() then
 		local threat = dribbleThreat(root)
 		if threat and threat.fire and not Mark.dodgeDone then
 			dribbleDanger = threat
@@ -6306,7 +6296,7 @@ local function stepLogic()
 
 	if CFG.AgentAddon and ClientDodge.IsDribbling() then
 		local dir, phase, target = Mark.dribblePlan(root)
-		if dir and Mark.moveSteer then
+		if dir then
 			if phase ~= Mark.dribblePhase then
 				Mark.dribblePhase = phase
 				logFile("dribble agent", phase, "dir", fmtV(dir), "dist", string.format("%.1f", flat(target - root.Position).Magnitude))
@@ -6315,22 +6305,20 @@ local function stepLogic()
 			Mark.moveSteer(dir, "dribble")
 			Mark.move.pts = { root.Position, target }
 			Mark.move.born = Mark.move.born or os.clock()
-		elseif Mark.move.mode == "dribble" and Mark.moveStop then
+		elseif Mark.move.mode == "dribble" then
 			Mark.moveStop("dribble")
 		end
 	else
 		Mark.dribblePhase = nil
-		if Mark.move.mode == "dribble" and Mark.moveStop then
+		if Mark.move.mode == "dribble" then
 			Mark.moveStop("dribble")
 		end
 	end
 
 	if Mark.move.mode == "dodge" then
 		if ClientDodge.IsDribbling() then
-			if Mark.moveStop then
-				Mark.moveStop("dodge")
-			end
-		elseif Mark.dodgeSteer then
+			Mark.moveStop("dodge")
+		else
 			Mark.dodgeSteer(root, Mark.dodgeThreat or dribbleDanger)
 		end
 	end
@@ -6347,7 +6335,7 @@ local function stepLogic()
 		-- from the moved ball (or the ownership flicker at contact) wiped Shoot.aim and the preview at the strike
 		setShootWhy("lock")
 	elseif CFG.AutoShoot and own then
-		local charging = ChargedKick.IsCharging and ChargedKick.IsCharging()
+		local charging = ChargedKick.IsCharging()
 		if charging and Shoot.aim then
 			Shoot.locked = true
 			local ballNow = Renderer.GetPosition() or root.Position
@@ -6414,12 +6402,8 @@ local function stepLogic()
 		Shoot.faced = nil
 	end
 
-	if Mark.bfTrack then
-		Mark.bfTrack()
-	end
-	if Mark.passTick and character and root then
-		Mark.passTick(character, root)
-	end
+	Mark.bfTrack()
+	Mark.passTick(character, root)
 	Mark.manualTackle = nil
 	if CFG.AutoTackle or CFG.ManualTackle then
 		if own then
@@ -6476,42 +6460,22 @@ else
 		predict = nil
 	end
 
-	if character and root then
-		if Mark.tickAerial then
-			Mark.tickAerial(character, root)
-		end
-		if Mark.tickBike then
-			Mark.tickBike(character, root)
-		end
-		if Mark.moveTick then
-			Mark.moveTick(character, root)
-		end
-		if Mark.tickSkill then
-			Mark.tickSkill(character, root)
-		end
-		if Mark.tickHazard then
-			Mark.tickHazard(character, root)
-		end
-		if Mark.drawOil then
-			Mark.drawOil(root)
-		end
-		if Mark.tickVolley then
-			Mark.tickVolley(character, root)
-		end
-		if Mark.tickBlock then
-			Mark.tickBlock(character, root)
-		end
-		if Mark.tickBall then
-			Mark.tickBall(character, root)
-		end
-		Mark.tickBox(character, root)
-		Mark.boxResult()
-		Mark.shotWatch()
-		if Mark.jumpHoldUntil and os.clock() > Mark.jumpHoldUntil then
-			Mark.jumpHoldUntil = nil
-			CharacterControllers.SetJumpCommand(character, false)
-			Mark.endJump()
-		end
+	Mark.tickAerial(character, root)
+	Mark.tickBike(character, root)
+	Mark.moveTick(character, root)
+	Mark.tickSkill(character, root)
+	Mark.tickHazard(character, root)
+	Mark.drawOil(root)
+	Mark.tickVolley(character, root)
+	Mark.tickBlock(character, root)
+	Mark.tickBall(character, root)
+	Mark.tickBox(character, root)
+	Mark.boxResult()
+	Mark.shotWatch()
+	if Mark.jumpHoldUntil and os.clock() > Mark.jumpHoldUntil then
+		Mark.jumpHoldUntil = nil
+		CharacterControllers.SetJumpCommand(character, false)
+		Mark.endJump()
 	end
 
 	local now = os.clock()
@@ -6646,7 +6610,7 @@ local function paintWorld()
 			local slidePts = predict.our
 			if not (slidePts and #slidePts >= 2) then
 				local aimU = predict.aim or unitOrNil(flat(predict.hit - live))
-				local travel = Mark.dumpTravel and Mark.dumpTravel(predict.eta or 0.42) or flat(predict.hit - live).Magnitude
+				local travel = Mark.dumpTravel(predict.eta or 0.42) or flat(predict.hit - live).Magnitude
 				slidePts = {}
 				if aimU then
 					for i = 0, 8 do
@@ -6765,12 +6729,8 @@ local function paintWorld()
 			end
 		end
 	end
-	if Mark.paDraw then
-		Mark.paDraw(gy)
-	end
-	if Mark.drawRoute then
-		Mark.drawRoute(root, gy)
-	end
+	Mark.paDraw(gy)
+	Mark.drawRoute(root, gy)
 	Mark.drawGk(gy)
 	Mark.drawBlk(gy)
 	Mark.drawDuel(gy)
@@ -6908,8 +6868,8 @@ Reticle.GetCameraRay = function(...)
 	local pa = Mark.pushAim
 	if pa and os.clock() < pa.untilT then
 		local cam = Workspace.CurrentCamera
-		local okP, P = Mark.try(pa.fn)
-		if cam and okP and typeof(P) == "Vector3" then
+		local P = pa.fn()
+		if cam and typeof(P) == "Vector3" then
 			-- the gun hits the FIRST character the ray meets (Reticle: TargetPosition = the aim hit). From the camera - 15-30 studs behind
 			-- and above us - the line to a keeper 77 st away crosses other players: log, flintlock (ONE accurate pellet) at the keeper
 			-- from the camera: "we hit victim ... = NOT the keeper" twice; from the body (v190/191): "= THE KEEPER" twice.
@@ -6921,7 +6881,7 @@ Reticle.GetCameraRay = function(...)
 			end
 		end
 	end
-	if Mark.silentRay and not (ChargedKick.IsCharging and ChargedKick.IsCharging()) then
+	if Mark.silentRay and not (ChargedKick.IsCharging()) then
 		return Mark.silentRay
 	end
 	return oldCamRay(...)
@@ -6948,13 +6908,13 @@ Reticle.GetCameraAimRayWithoutHit = function()
 			return spoof
 		end
 		local a = Shoot.aim
-		if a and a.Direction and ChargedKick.IsCharging and ChargedKick.IsCharging() then
+		if a and a.Direction and ChargedKick.IsCharging() then
 			return { Origin = a.Origin, Direction = a.Direction, CameraCFrame = a.CameraCFrame, CameraFieldOfView = a.CameraFieldOfView, IsAirborne = a.IsAirborne }
 		end
 	end
 	local ray = oldAimRay()
 	local aim = Mark.volleyAim or Mark.blockAim
-	if aim and type(ray) == "table" and ChargedKick.IsCharging and ChargedKick.IsCharging() and liveOwnerId() ~= LocalPlayer.UserId then
+	if aim and type(ray) == "table" and ChargedKick.IsCharging() and liveOwnerId() ~= LocalPlayer.UserId then
 		local out = table.clone(ray)
 		local camPos = typeof(out.CameraCFrame) == "CFrame" and out.CameraCFrame.Position or (typeof(out.Origin) == "Vector3" and out.Origin) or Vector3.zero
 		out.Direction = aim
@@ -7177,7 +7137,7 @@ oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
 	return oldNamecall(self, ...)
 end))
 
-if ChargedKick.IsCharging and ChargedKick.IsCharging() then
+if ChargedKick.IsCharging() then
 	ChargedKick.CancelCharge()
 end
 
@@ -7692,8 +7652,8 @@ end
 Mark.equippedId = function()
 	local use = Mark.itemUse
 	if use and use.UsesZoom then
-		local ok, id = Mark.try(upvalue, use.UsesZoom, 2)
-		if ok and type(id) == "string" then
+		local id = upvalue(use.UsesZoom, 2)
+		if type(id) == "string" then
 			return id
 		end
 	end
@@ -8304,8 +8264,8 @@ Mark.itemSlots = function()
 	if sc and os.clock() - sc.at < 0.2 then
 		return sc.slots
 	end
-	local okU, slots = Mark.try(upvalue, Items.UpdateState, 3)
-	if okU and type(slots) == "table" then
+	local slots = upvalue(Items.UpdateState, 3)
+	if type(slots) == "table" then
 		if not Mark.slotsLogged or os.clock() - Mark.slotsLogged > 20 then
 			local parts = {}
 			for i = 1, 4 do
@@ -8728,7 +8688,7 @@ Mark.gunPushTry = function(root, tag, key, pts, ts)
 	task.delay(fireIn, function()
 		local ok, how = Mark.itemNow(gun, "gunpush " .. tag, function()
 			local v = r.AssemblyLinearVelocity
-			return r.Position + (typeof(v) == "Vector3" and flat(v) or Vector3.zero) * (ping * 0.5) + Vector3.new(0, 0.4, 0)
+			return r.Position + flat(v) * (ping * 0.5) + Vector3.new(0, 0.4, 0)
 		end)
 		if ok then
 			local rec = { at = os.clock(), gun = gun, tag = tag, d = d, vid = k.actor and k.actor.UserId or nil }
@@ -8879,7 +8839,7 @@ Mark.gunPushRoll = function(root)
 	task.delay(CFG.GunPushDelay or 0.1, function()
 		local ok, how = Mark.itemNow(gun, "gunpush roll", function()
 			local v = r.AssemblyLinearVelocity
-			return r.Position + (typeof(v) == "Vector3" and flat(v) or Vector3.zero) * (ping * 0.5) + Vector3.new(0, 0.4, 0)
+			return r.Position + flat(v) * (ping * 0.5) + Vector3.new(0, 0.4, 0)
 		end)
 		if ok then
 			local rec = { at = now, gun = gun, tag = "roll", d = d, vid = best.actor and best.actor.UserId or nil }
@@ -9898,7 +9858,7 @@ Mark.gkKnockDive = function(vel)
 	end
 	local face = wd
 	TurnControl.LockAutoRotate("Goalkeeper", face)
-	Mark.gkDiveAim = { dir = wd, at = now, untilT = now + D.Constants.DurationSeconds + 0.05, fwd = Mark.gkFwd or wd, faceF = true }
+	Mark.gkDiveAim = { dir = wd, at = now, untilT = now + D.Constants.DurationSeconds + 0.05, fwd = Mark.gkFwd or wd }
 	Mark.diveSet(character, wd, face)
 	Mark.gkDive = now
 	Mark.knockDiving = true
@@ -9962,7 +9922,7 @@ Mark.gkOwnDive = function(root, td, noJump)
 	for name, choice in Mark.actionMotion.DirectionChoices do
 		dirs[#dirs + 1] = { name = name, wd = (Mark.gkAimOrig or D.GetWorldDirection)(choice, cam.CFrame, facing) }
 	end
-	if CFG.GkPressExact ~= false and Mark.gkFwd then
+	if Mark.gkFwd then
 		local f = Mark.gkFwd
 		for k = -20, 20 do
 			local a = math.rad(k * 7.5)
@@ -10227,7 +10187,7 @@ Mark.gkAimHook = function()
 	Mark.gkAimOrig = D.GetWorldDirection
 	D.GetWorldDirection = function(choice, cf, fb)
 		local a = Mark.gkDiveAim
-		if a and not a.hold and os.clock() < a.untilT then
+		if a and os.clock() < a.untilT then
 			return a.dir
 		end
 		return Mark.gkAimOrig(choice, cf, fb)
@@ -10239,7 +10199,7 @@ Mark.gkAimHook = function()
 	local origChoice = D.GetDirectionChoice
 	D.GetDirectionChoice = function(...)
 		local a = Mark.gkDiveAim
-		if a and a.faceF and os.clock() < a.untilT then
+		if a and os.clock() < a.untilT then
 			return AM.DirectionChoices.F
 		end
 		return origChoice(...)
@@ -10250,7 +10210,7 @@ Mark.gkAimHook = function()
 	local A = require(Modules.Actions.GoalkeeperDiveAssist)
 	local function pressLive()
 		local a = Mark.gkDiveAim
-		return a and a.faceF and os.clock() < a.untilT
+		return a and os.clock() < a.untilT
 	end
 	local oGet, oBody, oRelock = A.GetAssist, A.GetBodyAssist, A.CreateDiveRelock
 	A.GetAssist = function(...)
@@ -10324,10 +10284,6 @@ Mark.gkAimTick = function(root)
 	end
 end
 
-local function gkRot(v, a)
-	return v * math.cos(a) + Vector3.new(-v.Z, 0, v.X) * math.sin(a)
-end
-
 -- JETPACK (dump: Modules.Actions.JetpackMotion.Run, run by HIS client, we see the replicated body):
 --   horizontal RunCFrameDash 55 st over 3.5 s, Quart-Out, along his facing (he steers, ControlledTurnSpeed 2.5 rad/s);
 --   lift: LiftDelaySeconds 0.5, then 25 st over 1 s Cubic-InOut (a CFrame rig: no gravity while it runs), then the rig is
@@ -10349,59 +10305,76 @@ Mark.jetCurveY = function(te, g)
 	local tf = te - 1.5
 	return math.max(25 - 0.5 * g * tf * tf, 0)
 end
+-- his five paths under a jetpack: { turn (rad over the dash), weight }
+Mark.jetFan = { { 0, 1 }, { 0.45, 0.5 }, { -0.45, 0.5 }, { 1, 0.25 }, { -1, 0.25 } }
 Mark.jetFutures = function(P, jet, floorY, lead, g)
 	local DT, N = 0.025, 52
-	local out = {}
+	local te = jet.te
 	local ground = jet.base or floorY
-	for _, h in { { 0, 1 }, { 0.45, 0.5 }, { -0.45, 0.5 }, { 1, 0.25 }, { -1, 0.25 } } do
+	local jx, jz = jet.dir.X, jet.dir.Z
+	-- the dash length and the height at step k do not depend on how he steers: one pass for all five paths
+	local tEnd, dist, yv = table.create(N + 1), table.create(N + 1), table.create(N + 1)
+	tEnd[0] = te + lead
+	local hPrev = Mark.jetCurveH(te + lead)
+	dist[0] = hPrev - Mark.jetCurveH(te)
+	yv[0] = ground + Mark.jetCurveY(te + lead, g)
+	for k = 1, N do
+		local b = te + lead + k * DT
+		local hb = Mark.jetCurveH(b)
+		tEnd[k], dist[k], yv[k] = b, hb - hPrev, math.max(ground + Mark.jetCurveY(b, g), floorY)
+		hPrev = hb
+	end
+	local out = {}
+	local fan = Mark.jetFan
+	for fi = 1, #fan do
+		local h = fan[fi]
+		local A = h[1]
+		local k1 = math.max(math.abs(A), 1e-3)
 		local pts = table.create(N + 1)
 		local x, z = P.X, P.Z
-		local te = jet.te
-		local function step(t0, t1, A)
-			local dist = Mark.jetCurveH(t1) - Mark.jetCurveH(t0)
-			local f = math.min((t1 - jet.te) * 2.5 / math.max(math.abs(A), 1e-3), 1)
-			local dir = A ~= 0 and gkRot(jet.dir, A * f) or jet.dir
-			x += dir.X * dist
-			z += dir.Z * dist
+		for k = 0, N do
+			local dx, dz = jx, jz
+			if A ~= 0 then
+				local ang = A * math.min((tEnd[k] - te) * 2.5 / k1, 1)
+				local c, s = math.cos(ang), math.sin(ang)
+				dx, dz = jx * c - jz * s, jz * c + jx * s
+			end
+			x += dx * dist[k]
+			z += dz * dist[k]
+			pts[k + 1] = Vector3.new(x, yv[k], z)
 		end
-		step(te, te + lead, h[1])
-		pts[1] = Vector3.new(x, ground + Mark.jetCurveY(te + lead, g), z)
-		for k = 1, N do
-			local a, b = te + lead + (k - 1) * DT, te + lead + k * DT
-			step(a, b, h[1])
-			pts[k + 1] = Vector3.new(x, math.max(ground + Mark.jetCurveY(b, g), floorY), z)
-		end
-		out[#out + 1] = { w = h[2], pts = pts, air = true }
+		out[fi] = { w = h[2], pts = pts, air = true }
 	end
 	return out
 end
 
+-- his possible paths on the ground / in the air: { turn rate (rad, over the first 0.3 s) or "goal" / "stop" / "burst", speed scale, weight [, side] }
+Mark.gkFanAir = { { 0, 1, 1 }, { 0.14, 1, 0.5 }, { -0.14, 1, 0.5 }, { 0, 0.85, 0.4 } }
+Mark.gkFanGround = { { 0, 1, 1 }, { 0, 0.6, 0.5 }, { 0.44, 1, 0.6 }, { -0.44, 1, 0.6 }, { 0.87, 0.9, 0.3 }, { -0.87, 0.9, 0.3 }, { 2.8, 0.8, 0.25 }, { -2.8, 0.8, 0.25 }, { "goal", 1, 0.6 }, { "stop", 0, 0.35 } }
+-- his dribble is ready: Dodge = a ~5 stud side dash + iframe, a dive into it is wasted
+Mark.gkFanDribble = table.clone(Mark.gkFanGround)
+Mark.gkFanDribble[11] = { "burst", 1, 0.9, 1 }
+Mark.gkFanDribble[12] = { "burst", 1, 0.9, -1 }
+
 -- weighted futures of his server pose, sampled every 0.025 s from now (index 1 = now)
 Mark.gkFutures = function(P, V, vy, air, jet, floorY, lead, aimP, g, dribReady)
+	if jet then
+		return Mark.jetFutures(P, jet, floorY, lead, g)
+	end
 	local DT, N = 0.025, 52
 	local sp = flat(V).Magnitude
 	local dGoal = unitOrNil(flat(aimP - P)) or Vector3.new(0, 0, 1)
 	local base = sp > 2 and flat(V).Unit or dGoal
-	local list
-	if type(jet) == "table" then
-		return Mark.jetFutures(P, jet, floorY, lead, g)
-	elseif jet then
-		list = { { 0, 1, 1 }, { 0.26, 1, 0.5 }, { -0.26, 1, 0.5 } }
-	elseif air then
-		list = { { 0, 1, 1 }, { 0.14, 1, 0.5 }, { -0.14, 1, 0.5 }, { 0, 0.85, 0.4 } }
-	else
-		list = { { 0, 1, 1 }, { 0, 0.6, 0.5 }, { 0.44, 1, 0.6 }, { -0.44, 1, 0.6 }, { 0.87, 0.9, 0.3 }, { -0.87, 0.9, 0.3 }, { 2.8, 0.8, 0.25 }, { -2.8, 0.8, 0.25 }, { "goal", 1, 0.6 }, { "stop", 0, 0.35 } }
-		if dribReady then
-			-- his dribble is ready: Dodge = a ~5 stud side dash + iframe, a dive into it is wasted
-			list[#list + 1] = { "burst", 1, 0.9, 1 }
-			list[#list + 1] = { "burst", 1, 0.9, -1 }
-		end
+	local bx, bz = base.X, base.Z
+	local fan = air and Mark.gkFanAir or (dribReady and Mark.gkFanDribble or Mark.gkFanGround)
+	local gAng = 0
+	if not air then
+		gAng = math.atan2(dGoal:Dot(Vector3.new(-bz, 0, bx)), dGoal:Dot(base))
 	end
-	local perp = Vector3.new(-base.Z, 0, base.X)
-	local gAng = math.atan2(dGoal:Dot(perp), dGoal:Dot(base))
-	local lift = (Mark.jetM and Mark.jetM.Constants and Mark.jetM.Constants.LiftDistance) or 25
+	local py = P.Y
 	local out = {}
-	for _, h in list do
+	for fi = 1, #fan do
+		local h = fan[fi]
 		local A, sc = h[1], h[2]
 		local burst = nil
 		if A == "burst" then
@@ -10415,35 +10388,51 @@ Mark.gkFutures = function(P, V, vy, air, jet, floorY, lead, aimP, g, dribReady)
 			A = 0
 		end
 		local pts = table.create(N + 1)
-		local x, z = P.X + base.X * sp * lead, P.Z + base.Z * sp * lead
-		local function y(tt)
-			if jet then
-				return math.clamp(P.Y + vy * tt, floorY, floorY + lift)
-			elseif air then
-				return math.max(P.Y + vy * tt - 0.5 * g * tt * tt, floorY)
-			end
-			return P.Y
-		end
-		pts[1] = Vector3.new(x, y(lead), z)
+		local x, z = P.X + bx * sp * lead, P.Z + bz * sp * lead
+		pts[1] = Vector3.new(x, air and math.max(py + vy * lead - 0.5 * g * lead * lead, floorY) or py, z)
 		for k = 1, N do
 			local tt = (k - 0.5) * DT
 			local f = math.min(tt / 0.3, 1)
-			local dir = A ~= 0 and gkRot(base, A * f) or base
-			local spd = (sp + (s1 * sc - sp) * f)
-			x += dir.X * spd * DT
-			z += dir.Z * spd * DT
-			if burst and tt > 0.08 and tt < 0.3 then
-				x += -base.Z * burst * 25 * DT
-				z += base.X * burst * 25 * DT
+			local dx, dz = bx, bz
+			if A ~= 0 then
+				local ang = A * f
+				local c, s = math.cos(ang), math.sin(ang)
+				dx, dz = bx * c - bz * s, bz * c + bx * s
 			end
-			pts[k + 1] = Vector3.new(x, y(lead + k * DT), z)
+			local spd = (sp + (s1 * sc - sp) * f)
+			x += dx * spd * DT
+			z += dz * spd * DT
+			if burst and tt > 0.08 and tt < 0.3 then
+				x += -bz * burst * 25 * DT
+				z += bx * burst * 25 * DT
+			end
+			local ty = lead + k * DT
+			pts[k + 1] = Vector3.new(x, air and math.max(py + vy * ty - 0.5 * g * ty * ty, floorY) or py, z)
 		end
-		out[#out + 1] = { w = h[3], pts = pts, air = air or jet }
+		out[fi] = { w = h[3], pts = pts, air = air }
 	end
 	return out
 end
 
--- best dive against the futures. o: root, vel, futs, D, dist, maxD, R, H, mouth, fwd, g, jumpH, air, exact, camCF, facing
+-- dash start options (T0 = when the dash starts, jump = the jump that precedes it) and the lead fractions: read-only, built once
+Mark.gkOptsGround = { { T0 = 0 }, { T0 = 0.12 }, { T0 = 0.25 } }
+Mark.gkOptsAir = { { T0 = 0 }, { T0 = 0.12 }, { T0 = 0.25 }, { T0 = 0.12, jump = 0.12 }, { T0 = 0.2, jump = 0.2 }, { T0 = 0.28, jump = 0.28 } }
+Mark.gkLeadFrac = { 0, 0.3, 0.6 }
+
+-- the solver's input: the dive is the game's (D), the targets are his futures
+Mark.gkSolveArgs = function(root, futs, D, g, flier, mouth, fwd, slip, minT)
+	local dist = D.GetDistance(LocalPlayer)
+	return {
+		root = root.Position, vel = flat(root.AssemblyLinearVelocity), futs = futs, D = D, dist = dist,
+		maxD = math.min(CFG.PressDist or (dist - 0.5), dist - 0.5), R = (CFG.PressReach or 2.6) * (flier and 1 or (CFG.GkPressRadiusFrac or 0.75)), H = CFG.PressVert or 4,
+		RF = CFG.GkPressReachFrac or 0.85,
+		mouth = mouth, fwd = fwd, g = g, jumpH = Mark.jumpH or 7.2, air = flier,
+		slip = slip,
+		minT = minT,
+	}
+end
+
+-- best dive against the futures. o: root, vel, futs, D, dist, maxD, R, H, mouth, fwd, g, jumpH, air, slip, minT
 Mark.gkPressSolve = function(o)
 	local D, futs = o.D, o.futs
 	local DT = 0.025
@@ -10454,12 +10443,7 @@ Mark.gkPressSolve = function(o)
 	local v0 = D.Constants.InitialVerticalVelocity or 15
 	local gd = -(D.Constants.GravityStudsPerSecondSquared or -65)
 	local vJ = math.sqrt(2 * o.g * o.jumpH)
-	local opts = { { T0 = 0 }, { T0 = 0.12 }, { T0 = 0.25 } }
-	if o.air and CFG.GkPressJump ~= false then
-		for _, td in { 0.12, 0.2, 0.28 } do
-			opts[#opts + 1] = { T0 = td, jump = td }
-		end
-	end
+	local opts = (o.air and CFG.GkPressJump ~= false) and Mark.gkOptsAir or Mark.gkOptsGround
 	-- the weighted centre of his futures: the catch region the bearings are taken at
 	local cen = table.create(#futs[1].pts)
 	for k = 1, #futs[1].pts do
@@ -10473,62 +10457,66 @@ Mark.gkPressSolve = function(o)
 		cen[k] = Vector3.new(sx / wSum, sy / wSum, sz / wSum)
 	end
 	local R2 = o.R * o.R
+	local mX, mZ, fX, fZ = o.mouth.X, o.mouth.Z, o.fwd.X, o.fwd.Z
+	-- the dive curve (how far we are along the dash at step i) is the same for every future, direction and option
+	local trav, tLim = {}, 35
+	for i = 1, 35 do
+		local travel = D.GetTravel(i * DT, o.dist)
+		-- contact on the last stretch of the curve is a threshold: one step back by him and the dash ends short
+		-- (log: the dash did not even reach him). Only the first RF of the dive counts.
+		if travel > o.maxD or travel > o.dist * o.RF then
+			tLim = i - 1
+			break
+		end
+		trav[i] = travel
+	end
+	local Kx, Kz, Ky = {}, {}, {}
 	local bestNow, bestLater = nil, nil
 	for _, op in opts do
 		local T0 = op.T0
 		local p0 = o.root + o.vel * T0
 		local yBase = o.root.Y + (op.jump and math.max(vJ * op.jump - 0.5 * o.g * op.jump * op.jump, 0) or 0)
-		local dirs = {}
-		if o.exact then
-			-- AIM AT HIM, not at where he will be: the line to his server pose at the moment the dash starts (homing keeps
-			-- turning it at him while it runs). A lead toward the main future is tried only after the direct line scored
-			-- >= 0.85, and only a fraction of the way (0.3 / 0.6): a guess about a man who can still turn is what put the
-			-- dash beside him.
-			local kS = math.min(math.floor(T0 / DT + 0.5) + 1, #futs[1].pts)
-			local now = flat(futs[1].pts[kS] - p0)
-			local kC = math.min(math.floor((T0 + 0.32) / DT + 0.5) + 1, #cen)
-			local fut = flat(cen[kC] - p0)
-			for _, fr in { 0, 0.3, 0.6 } do
-				local d1 = unitOrNil(now + (fut - now) * fr)
-				if d1 then
-					dirs[#dirs + 1] = { dir = d1, frac = fr }
-				end
-			end
-		else
-			for _, choice in Mark.actionMotion.DirectionChoices do
-				local wd = Mark.gkAimOrig(choice, o.camCF, o.facing)
-				if typeof(wd) == "Vector3" then
-					dirs[#dirs + 1] = { dir = wd, frac = 0 }
-				end
-			end
-		end
+		-- AIM AT HIM, not at where he will be: the line to his server pose at the moment the dash starts (homing keeps
+		-- turning it at him while it runs). A lead toward the main future is tried only after the direct line scored
+		-- >= 0.85, and only a fraction of the way (0.3 / 0.6): a guess about a man who can still turn is what put the
+		-- dash beside him.
+		local kS = math.min(math.floor(T0 / DT + 0.5) + 1, #futs[1].pts)
+		local aimNow = flat(futs[1].pts[kS] - p0)
+		local kC = math.min(math.floor((T0 + 0.32) / DT + 0.5) + 1, #cen)
+		local aimFut = flat(cen[kC] - p0)
 		local leadOk = false
-		for _, rec in dirs do
-			local dir = rec.dir
-			if dir:Dot(o.fwd) > -0.25 and (rec.frac == 0 or leadOk) then
+		for fi = 1, 3 do
+			local fr = Mark.gkLeadFrac[fi]
+			local dir = unitOrNil(aimNow + (aimFut - aimNow) * fr)
+			if dir and dir:Dot(o.fwd) > -0.25 and (fr == 0 or leadOk) then
+				-- the keeper's own point on the dash at step i and its height do not depend on HIM: built once per direction (they were
+				-- rebuilt for every future: 12 futures x 35 steps x Vector3 + GetTravel + 2 flat() each; the solve was 1.2 ms, now see gen_r198)
+				local lim = tLim
+				for i = 1, tLim do
+					local kx, kz = p0.X + dir.X * trav[i], p0.Z + dir.Z * trav[i]
+					if (kx - mX) * fX + (kz - mZ) * fZ < 0.3 then
+						lim = i - 1 -- we would be behind the line
+						break
+					end
+					local tau = i * DT
+					local ky = op.jump and (yBase + v0 * tau - 0.5 * gd * tau * tau) or (o.root.Y + D.GetVerticalTravel(tau))
+					Kx[i], Kz[i], Ky[i] = kx, kz, math.max(ky, o.root.Y)
+				end
 				local conf, tMain, tAny, hits = 0, nil, nil, nil
 				for fi, f in futs do
 					local pts = f.pts
-					for i = 1, 35 do
+					for i = 1, lim do
 						local tau = i * DT
-						local travel = D.GetTravel(tau, o.dist)
-						-- contact on the last stretch of the curve is a threshold: one step back by him and the dash ends short
-						-- (log: the dash did not even reach him). Only the first RF of the dive counts.
-						if travel > o.maxD or travel > o.dist * o.RF then
-							break
-						end
 						local tAbs = T0 + tau
 						local E = pts[math.floor(tAbs / DT + 0.5) + 1]
 						if not E then
 							break
 						end
-						local Kf = p0 + dir * travel
-						if flat(E - o.mouth):Dot(o.fwd) < 0.5 or flat(Kf - o.mouth):Dot(o.fwd) < 0.3 then
-							break -- he is in (or we would be behind the line) before the contact
+						if (E.X - mX) * fX + (E.Z - mZ) * fZ < 0.5 then
+							break -- he is in the net before the contact
 						end
-						local ky = op.jump and (yBase + v0 * tau - 0.5 * gd * tau * tau) or (o.root.Y + D.GetVerticalTravel(tau))
-						ky = math.max(ky, o.root.Y)
-						local dx, dz = Kf.X - E.X, Kf.Z - E.Z
+						local kx, kz, ky = Kx[i], Kz[i], Ky[i]
+						local dx, dz = kx - E.X, kz - E.Z
 						local touch = dx * dx + dz * dz <= R2 and math.abs(ky - E.Y) <= o.H
 						-- a flier crosses our height at up to ~100 st/s (bazooka jump coming down): the overlap lasts a few
 						-- server frames and his server pose is ahead of our estimate by up to ping/2 + jitter (o.slip). The
@@ -10540,9 +10528,10 @@ Mark.gkPressSolve = function(o)
 							break
 						end
 						if touch and o.slip then
-							for _, off in { o.slip * 0.5, o.slip } do
+							for s = 1, 2 do
+								local off = s == 1 and o.slip * 0.5 or o.slip
 								local E2 = pts[math.floor((tAbs + off) / DT + 0.5) + 1] or pts[#pts]
-								local ex, ez = Kf.X - E2.X, Kf.Z - E2.Z
+								local ex, ez = kx - E2.X, kz - E2.Z
 								if ex * ex + ez * ez > R2 or math.abs(ky - E2.Y) > o.H then
 									touch = false
 									break
@@ -10562,14 +10551,14 @@ Mark.gkPressSolve = function(o)
 					end
 				end
 				conf /= wSum
-				if rec.frac == 0 then
+				if fr == 0 then
 					leadOk = conf >= 0.85
 				end
 				if conf > 0 then
-					local cand = { conf = conf, dir = dir, T0 = T0, jump = op.jump, t = tMain or tAny, hits = hits, frac = rec.frac }
+					local cand = { conf = conf, dir = dir, T0 = T0, jump = op.jump, t = tMain or tAny, hits = hits, frac = fr }
 					local now0 = T0 == 0 or op.jump ~= nil
 					local cur = now0 and bestNow or bestLater
-					if not cur or conf - 0.12 * rec.frac > cur.conf - 0.12 * (cur.frac or 0) + 0.01 or (math.abs(conf - cur.conf) <= 0.01 and cand.t < cur.t) then
+					if not cur or conf - 0.12 * fr > cur.conf - 0.12 * (cur.frac or 0) + 0.01 or (math.abs(conf - cur.conf) <= 0.01 and cand.t < cur.t) then
 						if now0 then
 							bestNow = cand
 						else
@@ -10738,6 +10727,14 @@ Mark.gkFlierEta = function(o)
 	return nil
 end
 
+-- the held fan of a grounded carrier (see gkPress): the same man, the same fan variant, younger than `win` s
+Mark.gkFutsHold = function(fc, model, key, now, win)
+	if fc and fc.model == model and fc.key == key and now - fc.at < win and now >= fc.at then
+		return fc
+	end
+	return nil
+end
+
 -- LAST CHANCE (user: "the enemy used a jetpack, the keeper took a position and did NOT dive forward"). The press solver is cautious on
 -- purpose: it demands the contact to hold with him a ping/2 + 0.03 s further along his path (`slip`) and discards a contact in the
 -- first `minT` 0.06 s of the dash ("passes through him"). A jetpack dash starts at 63 st/s: 0.065 s of slip is 4 studs, more than the
@@ -10797,7 +10794,7 @@ Mark.gkFlierPick = function(root, mouth, side, fwd, half, now, ownerId)
 						local hrp = model:FindFirstChild("HumanoidRootPart")
 						local vD = hrp and hrp.AssemblyLinearVelocity
 						-- a ragdoll thrown at the goal flies; a ragdoll lying there does not
-						down = not (typeof(vD) == "Vector3" and (flat(vD).Magnitude > 8 or math.abs(vD.Y) > 8))
+						down = not (vD and (flat(vD).Magnitude > 8 or math.abs(vD.Y) > 8))
 					end
 					if not down and (airborne or fast or (lr and now - lr.at < 0.6) or (jr and now - jr.at < 4)) then
 						local P, V, W = Mark.carrierPose(er, model)
@@ -10892,7 +10889,7 @@ Mark.gkPress = function(character, root, c)
 	if Mark.mateDown(pl, model) then
 		local hrp = model:FindFirstChild("HumanoidRootPart")
 		local vD = hrp and hrp.AssemblyLinearVelocity
-		if not (typeof(vD) == "Vector3" and (flat(vD).Magnitude > 8 or math.abs(vD.Y) > 8)) then
+		if not (vD and (flat(vD).Magnitude > 8 or math.abs(vD.Y) > 8)) then
 			return note("skip down")
 		end
 		downFly = true
@@ -10993,7 +10990,23 @@ Mark.gkPress = function(character, root, c)
 	-- GkRushZone is dived at without his dribble side-bursts in the fan and with GkRushConf: a dribble against the dive
 	-- is the risk taken. "Only when sure" gave 0-2 press dives per session in every log since v134.
 	local rush = CFG.GkRush ~= false and not bare and not airborne and not jet and not hookPts and going and dSeg <= (CFG.GkRushZone or 35)
-	local futs = hookPts and { { w = 1, pts = hookPts, air = true } } or Mark.gkFutures(P, V, vy, airborne, jet, root.Position.Y, lead, nearP + fwd * 0.5, g, dribReady and not airborne and not jet and not rush)
+	-- gkFutures is 0.2-0.3 ms (5-12 futures x 53 points) and the solve below is held for 33 ms anyway: a GROUNDED carrier's fan is kept
+	-- for the same window (perf log: tickGk 0.7 ms a call, up to 6.5 ms; 4 of 5 frames rebuilt the same fan). A flier / jetpack
+	-- (60 st/s: 33 ms = 2 studs) is rebuilt every frame.
+	local futs
+	local fanKey = (dribReady and not airborne and not jet and not rush) and 1 or 0
+	local holdable = not hookPts and not airborne and not jet
+	local fh = holdable and Mark.gkFutsHold(Mark.gkFutsCache, model, fanKey, c.now, 0.033) or nil
+	if hookPts then
+		futs = { { w = 1, pts = hookPts, air = true } }
+	elseif fh then
+		futs = fh.futs
+	else
+		futs = Mark.gkFutures(P, V, vy, airborne, jet, root.Position.Y, lead, nearP + fwd * 0.5, g, fanKey == 1)
+		if holdable then
+			Mark.gkFutsCache = { model = model, key = fanKey, at = c.now, futs = futs }
+		end
+	end
 
 	-- come out on his line to the mouth: close the angle so the dive reaches him before he reaches the line. Only when it
 	-- matters: he is inside GkPressMoveZone and reaches the mouth within 3.5 s, and the player is not steering himself
@@ -11059,25 +11072,11 @@ Mark.gkPress = function(character, root, c)
 	-- solve at ~30 Hz: one solve is a few thousand box tests
 	local sv = Mark.gkSolveCache
 	local best, later, cen
-	local function solveArgs(slip, minT)
-		local dist = D.GetDistance(LocalPlayer)
-		local cam = Workspace.CurrentCamera
-		Mark.actionMotion = Mark.actionMotion or require(Modules.Actions.ActionMotion)
-		return {
-			root = root.Position, vel = flat(root.AssemblyLinearVelocity), futs = futs, D = D, dist = dist,
-			maxD = math.min(CFG.PressDist or (dist - 0.5), dist - 0.5), R = (CFG.PressReach or 2.6) * ((airborne or jet or hookPts ~= nil) and 1 or (CFG.GkPressRadiusFrac or 0.75)), H = CFG.PressVert or 4,
-			RF = CFG.GkPressReachFrac or 0.85,
-			mouth = mouth, fwd = fwd, g = g, jumpH = Mark.jumpH or 7.2, air = airborne or jet or hookPts ~= nil,
-			exact = CFG.GkPressExact ~= false, camCF = cam and cam.CFrame or root.CFrame,
-			slip = slip,
-			facing = unitOrNil(flat(root.CFrame.LookVector)) or fwd,
-			minT = minT,
-		}
-	end
+	local flier = airborne or jet ~= false or hookPts ~= nil
 	if sv and sv.model == model and c.now - sv.at < 0.033 then
 		best, later, cen = sv.best, sv.later, sv.cen
 	else
-		best, later, cen = Mark.gkPressSolve(solveArgs((airborne or jet or hookPts ~= nil) and (ping * 0.5 + (CFG.GkPressSlip or 0.03)) or nil, CFG.GkPressMinT or 0.06))
+		best, later, cen = Mark.gkPressSolve(Mark.gkSolveArgs(root, futs, D, g, flier, mouth, fwd, flier and (ping * 0.5 + (CFG.GkPressSlip or 0.03)) or nil, CFG.GkPressMinT or 0.06))
 		Mark.gkSolveCache = { model = model, at = c.now, best = best, later = later, cen = cen }
 	end
 	local imminent = committed or imminentT or lastChance
@@ -11093,7 +11092,7 @@ Mark.gkPress = function(character, root, c)
 		if rc and rc.model == model and c.now - rc.at < 0.033 then
 			rb, rcen = rc.best, rc.cen
 		else
-			rb, _rlater, rcen = Mark.gkPressSolve(solveArgs(nil, 0))
+			rb, _rlater, rcen = Mark.gkPressSolve(Mark.gkSolveArgs(root, futs, D, g, flier, mouth, fwd, nil, 0))
 			Mark.gkRelaxCache = { model = model, at = c.now, best = rb, cen = rcen }
 		end
 		local pickB, how = Mark.gkPickDive(best, rb, need, true)
@@ -11131,7 +11130,7 @@ Mark.gkPress = function(character, root, c)
 	-- turn to him before the dive: with the body already on the line the dash and its "F" animation start the same way
 	-- (and the facing lock does not have to swing the body during the dash). Only for a near contact and exact aim (the
 	-- 8 camera choices depend on the facing, turning would change them).
-	if CFG.GkPressFace ~= false and (CFG.GkPressExact ~= false) and best.t <= 0.6 and best.conf >= need * 0.5 and not Mark.gkDiveAim then
+	if CFG.GkPressFace ~= false and best.t <= 0.6 and best.conf >= need * 0.5 and not Mark.gkDiveAim then
 		TurnControl.LockAutoRotate("Goalkeeper", best.dir)
 		Mark.gkPreFace = { at = c.now }
 	end
@@ -11195,10 +11194,9 @@ Mark.gkPress = function(character, root, c)
 	if later and later.conf >= best.conf + 0.15 and not imminent then
 		return note(string.format("wait surer conf %.2f later %.2f in %.2f %s", best.conf, later.conf, later.T0, info))
 	end
-	local exact = CFG.GkPressExact ~= false
 	if best.jump then
 		if Mark.doJump("gkpress") then
-			Mark.gkCombo = { diveAt = c.now + best.jump, untilT = c.now + best.jump + 0.2, dir = exact and best.dir or nil, choice = nil, wd = best.dir, fwd = fwd, role = c.role, name = actorName(pl), pl = pl, model = model, lead = lead, t = best.t }
+			Mark.gkCombo = { diveAt = c.now + best.jump, untilT = c.now + best.jump + 0.2, dir = best.dir, choice = nil, wd = best.dir, fwd = fwd, role = c.role, name = actorName(pl), pl = pl, model = model, lead = lead, t = best.t }
 			Mark.gkPressRec = { at = c.now, pl = pl, model = model, minD = math.huge, name = actorName(pl) }
 			viz.fired = true
 			logFile("gk press", "jump + dive", actorName(pl), "conf", fmt(best.conf), "dive in", fmt(best.jump), "hit t", fmt(best.t), info)
@@ -11206,14 +11204,13 @@ Mark.gkPress = function(character, root, c)
 		end
 		return note("jump refused " .. info)
 	end
-	local face = exact and best.dir or fwd
-	TurnControl.LockAutoRotate("Goalkeeper", face)
-	Mark.gkDiveAim = { dir = best.dir, at = c.now, untilT = c.now + D.Constants.DurationSeconds + 0.05, model = model, lead = lead, fwd = fwd, faceF = exact, hold = not exact }
-	Mark.diveSet(character, best.dir, face)
+	TurnControl.LockAutoRotate("Goalkeeper", best.dir)
+	Mark.gkDiveAim = { dir = best.dir, at = c.now, untilT = c.now + D.Constants.DurationSeconds + 0.05, model = model, lead = lead, fwd = fwd }
+	Mark.diveSet(character, best.dir, best.dir)
 	Mark.gkDive = c.now
 	local ok = c.role.Dive()
 	Mark.diveRestore(character, best.dir)
-	if ok and exact then
+	if ok then
 		-- hold the body on the dash for the whole dive (gkAimTick re-locks it along the homing dir and releases at the
 		-- end). Released right after Dive(), GoalkeeperCameraFacing turned the body back to the camera: a sideways dash
 		-- with the body (and the "F" animation) pointing at the goal-out direction.
@@ -11226,7 +11223,7 @@ Mark.gkPress = function(character, root, c)
 	end
 	viz.fired = ok and true or nil
 	Mark.gkPressRec = { at = c.now, pl = pl, model = model, minD = math.huge, name = actorName(pl) }
-	logFile("gk press", "dive", ok and "ok" or "no", actorName(pl), "conf", fmt(best.conf), "need", fmt(need), "hit t", fmt(best.t), "exact", tostring(exact), "dir", fmtV(best.dir), info)
+	logFile("gk press", "dive", ok and "ok" or "no", actorName(pl), "conf", fmt(best.conf), "need", fmt(need), "hit t", fmt(best.t), "dir", fmtV(best.dir), info)
 	return ok and true or false
 end
 
@@ -11772,7 +11769,7 @@ Mark.gkComboTick = function(character, root)
 	end
 	TurnControl.LockAutoRotate("Goalkeeper", cb.dir or cb.fwd)
 	if cb.dir then
-		Mark.gkDiveAim = { dir = cb.dir, at = now, untilT = now + D.Constants.DurationSeconds + 0.05, model = cb.model, lead = cb.lead or 0.1, fwd = cb.fwd, faceF = true }
+		Mark.gkDiveAim = { dir = cb.dir, at = now, untilT = now + D.Constants.DurationSeconds + 0.05, model = cb.model, lead = cb.lead or 0.1, fwd = cb.fwd }
 	end
 	Mark.diveSet(character, wd, cb.dir or cb.fwd)
 	Mark.gkDive = now
@@ -11917,7 +11914,7 @@ Mark.tickGk = function(character, root)
 			crossWhy = "bad-y"
 		end
 	end
-	if not crossP and ballPos and typeof(ballVel) == "Vector3" then
+	if not crossP and ballPos then
 		local intoNow = -flat(ballVel):Dot(fwd)
 		local relNow = flat(ballPos - defend)
 		local alongNow = relNow:Dot(fwd)
@@ -12499,7 +12496,7 @@ Mark.tickGk = function(character, root)
 			local face = hit.exact and hit.wd or fwd
 			TurnControl.LockAutoRotate("Goalkeeper", face)
 			if hit.exact then
-				Mark.gkDiveAim = { dir = hit.wd, at = now, untilT = now + diveMod.Constants.DurationSeconds + 0.05, fwd = fwd, faceF = true }
+				Mark.gkDiveAim = { dir = hit.wd, at = now, untilT = now + diveMod.Constants.DurationSeconds + 0.05, fwd = fwd }
 			end
 			Mark.diveSet(character, hit.wd, face)
 			Mark.gkDive = now
@@ -12524,7 +12521,7 @@ Mark.tickGk = function(character, root)
 	end
 	-- Auto clear is OFF by default: it sent a GetClearCommand every 1.2 s while we held the ball, which raced the
 	-- player's own throw / kick (user: after a save the keeper could not release the ball himself).
-	if CFG.GkAutoClear and Mark.weOwn and Mark.weOwn() and os.clock() - (Mark.gkClear or 0) > 1.2 then
+	if CFG.GkAutoClear and Mark.weOwn() and os.clock() - (Mark.gkClear or 0) > 1.2 then
 		local aim = acts.GetClearForwardDirection(LocalPlayer, {
 			GetDefendGoalPosition = function()
 				return defend
@@ -12580,7 +12577,7 @@ Mark.perfFlush = function()
 		return x.sum > y.sum
 	end)
 	local out = {}
-	for i = 1, math.min(#rows, 9) do
+	for i = 1, math.min(#rows, 16) do
 		local r = rows[i]
 		out[#out + 1] = string.format("%s %.2fms/s avg %.2f max %.1f n %d", r.name, r.sum / span, r.sum / math.max(r.n, 1), r.max, r.n)
 	end
@@ -12683,7 +12680,7 @@ Mark.speedStep = function(dt, ch, root, hum)
 		return false
 	end
 	-- the charge walk (ActionMovement.GetChargingWalkSpeed) stays slow: AutoKick models our speed while it charges
-	if ChargedKick.IsCharging and ChargedKick.IsCharging() then
+	if ChargedKick.IsCharging() then
 		return false
 	end
 	local k = Mark.knock
@@ -13457,7 +13454,7 @@ SlideTackle.SlidingUntilChanged.Event:Connect(function(ch)
 		if ownBall and at.strong and CFG.AutoDribble and Mark.dribbleLeft() <= 0 then
 			ok = select(1, tryDribble())
 		end
-		if not ok and CFG.AutoDodge and Mark.dodgeSteer then
+		if not ok and CFG.AutoDodge then
 			Mark.dodgeSteer(root, dribbleDanger)
 		end
 	end
@@ -13468,7 +13465,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- Illegal Soccer dump " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v198")
+	add("-- Illegal Soccer dump " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v200")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -13659,7 +13656,7 @@ Mark.doJump = function(why)
 		Mark.sprint.SetUnlimitedStamina("AgentJump", false)
 	end)
 	if not ok and Mark.walk.SetJumpStateBlocked then
-		local blocks = Mark.jumpBlocks and Mark.jumpBlocks()
+		local blocks = Mark.jumpBlocks()
 		if type(blocks) == "table" and blocks.HeldJump and not blocks.Server and not blocks.Ragdoll then
 			Mark.walk.SetJumpStateBlocked("HeldJump", false)
 			ok = Mark.walk.Jump()
@@ -13669,7 +13666,7 @@ Mark.doJump = function(why)
 		if why == "L" or os.clock() - (Mark.jumpFailAt or 0) > 0.6 then
 			Mark.jumpFailAt = os.clock()
 			local names = {}
-			local blocks = Mark.jumpBlocks and Mark.jumpBlocks()
+			local blocks = Mark.jumpBlocks()
 			if type(blocks) == "table" then
 				for k, v in blocks do
 					if v then
@@ -13700,6 +13697,10 @@ end
 
 -- World snapshot for a section: one line with every player (team, role, position relative to OUR mouth: x = across, z =
 -- out of the goal) and the ball. This is the detail positioning bugs need ("where were the mates when it chose that").
+-- true when Mark.snap(section) would write (callers build the text only then)
+Mark.snapDue = function(section)
+	return os.clock() - (Mark.snapAt and Mark.snapAt[section] or 0) >= 0.5
+end
 Mark.snap = function(section, label, extra)
 	local now = os.clock()
 	Mark.snapAt = Mark.snapAt or {}
@@ -13830,7 +13831,7 @@ end
 -- oriented by the charge aim ray (Shoot release -> AimFacing.GetAimedRoot), not by the body. Independent of AutoBlock; the
 -- scripted AutoKick sets its own aim and is skipped here.
 Mark.kickHelper = function(root)
-	local charging = ChargedKick.IsCharging and ChargedKick.IsCharging()
+	local charging = ChargedKick.IsCharging()
 	local aim = nil
 	if CFG.KickHelper ~= false and charging and not Mark.ak and liveOwnerId() ~= LocalPlayer.UserId then
 		local carrier, _, chE, p, v = Mark.blockTarget()
@@ -14339,7 +14340,7 @@ Mark.tickLob = function(character, root)
 		spd = math.max(spd, hum.WalkSpeed)
 		local mHi = math.max(0.4, CFG.TackleSpeed)
 		local slideOk = CFG.AutoTackle and now - lastTackleAt >= tackleEnforced and not ActionLocks.HasTackleBlock(LocalPlayer)
-			and not SlideTackle.IsRepeatBlocked(character, false) and not (ChargedKick.IsCharging and ChargedKick.IsCharging())
+			and not SlideTackle.IsRepeatBlocked(character, false) and not (ChargedKick.IsCharging())
 		local tds = { "ground" }
 		for td = 0, 1.2001, 0.05 do
 			tds[#tds + 1] = td
@@ -14354,7 +14355,7 @@ Mark.tickLob = function(character, root)
 		local detachIn = (lb.detachAt or now) - now
 		local minRel = (KickCore.GetMinimumReleaseSeconds and KickCore.GetMinimumReleaseSeconds()) or 0.2
 		local kickOk = CFG.AutoKick ~= false and detachIn > minRel and not Mark.ak and now - (Mark.akAt or 0) >= (CFG.AutoKickCooldown or 0.5)
-			and not (ChargedKick.IsCharging and ChargedKick.IsCharging())
+			and not (ChargedKick.IsCharging())
 		base.minRel, base.kickUntil = minRel, detachIn
 		base.slideOk, base.bodyOk, base.kickOk = slideOk, false, kickOk
 		local pS = (slideOk or kickOk) and Mark.duelSolve(base) or nil
@@ -14626,7 +14627,7 @@ Mark.tickCounterJump = function(character, root)
 		local mHi = math.max(0.4, CFG.TackleSpeed)
 		local tackleReady = CFG.CounterTackle ~= false and CFG.AutoTackle and now - lastTackleAt >= tackleEnforced
 			and not ActionLocks.HasTackleBlock(LocalPlayer) and not SlideTackle.IsRepeatBlocked(character, false)
-		local charging = ChargedKick.IsCharging and ChargedKick.IsCharging()
+		local charging = ChargedKick.IsCharging()
 		plan = Mark.duelSolve({
 			O = root.Position, v0 = flat(root.AssemblyLinearVelocity), spd = spd, chSpd = chSpd, landed = landed,
 			vy = root.AssemblyLinearVelocity.Y, floor = floor, g = g, vJ = math.sqrt(2 * g * (Mark.jumpH or 7.2)), path = path,
@@ -15347,9 +15348,14 @@ Mark.pressTime = function(pos, spd, C, vel, off)
 		local disc = b * b - 4 * a * c
 		if disc >= 0 then
 			local sq = math.sqrt(disc)
-			for _, t in { (-b - sq) / (2 * a), (-b + sq) / (2 * a) } do
-				if t > 0 and (not best or t < best) then
-					best = t
+			-- c > 0: the roots have the same sign when a > 0 (t1 < t2) and opposite signs when a < 0: the first positive one is the smaller
+			local t1 = (-b - sq) / (2 * a)
+			if t1 > 0 then
+				best = t1
+			else
+				local t2 = (-b + sq) / (2 * a)
+				if t2 > 0 then
+					best = t2
 				end
 			end
 		end
@@ -15358,6 +15364,24 @@ Mark.pressTime = function(pos, spd, C, vel, off)
 		return best
 	end
 	return 6 + math.sqrt(c) / spd
+end
+
+-- the role plan's helpers: built once (they were closures made every tick)
+Mark.roleByDanger = function(a, b)
+	return a.danger > b.danger
+end
+-- where a defender stands to mark threat t: on his line to the middle of our mouth, goal side of him
+Mark.roleSpot = function(t)
+	local depth = math.clamp(t.L * 0.3, CFG.RoleMarkMin or 4, CFG.RoleMarkMax or 9)
+	return t.f.pos + t.u * depth
+end
+-- "me 1.20, Name 3.40": the cost of every defender, for the log only (the string used to be built every tick)
+Mark.roleCosts = function(defs)
+	local parts = table.create(#defs)
+	for i, d in defs do
+		parts[i] = d.name .. string.format(" %.2f", d.cost)
+	end
+	return table.concat(parts, ", ")
 end
 
 Mark.rolePlan = function(o)
@@ -15383,7 +15407,7 @@ Mark.rolePlan = function(o)
 	for _, m in o.mates do
 		defs[#defs + 1] = { pos = m.pos, name = m.name, actor = m.actor }
 	end
-	local presser, costs = nil, {}
+	local presser = nil
 	-- the carrier's run AT OUR GOAL only: his sideways drift and the sign noise of the replicated velocity flipped a defender
 	-- between "meets him" and "never catches him" from one tick to the next (log: my cost 3.4 / 7.7 / 3.4 on consecutive ticks)
 	local vRun = ug * math.max((o.vel or Vector3.zero):Dot(ug), 0)
@@ -15399,7 +15423,6 @@ Mark.rolePlan = function(o)
 			cost -= 0.25
 		end
 		d.cost = cost
-		costs[#costs + 1] = d.name .. string.format(" %.2f", cost)
 		if not presser or cost < presser.cost then
 			presser = d
 		end
@@ -15433,13 +15456,15 @@ Mark.rolePlan = function(o)
 						end
 					end
 				end
-				local face = (o.face and flat(f.pos - C).Magnitude > 1) and math.clamp(flat(f.pos - C).Unit:Dot(o.face), -1, 1) or 0
-				local danger = (1 - math.clamp(dR / zone, 0, 1)) * 3 + face * 0.8 + (1 - math.clamp(math.abs(flat(f.pos - C).Magnitude - 30) / 80, 0, 1))
+				local fromC = flat(f.pos - C)
+				local dFC = fromC.Magnitude
+				local face = (o.face and dFC > 1) and math.clamp(fromC.Unit:Dot(o.face), -1, 1) or 0
+				local danger = (1 - math.clamp(dR / zone, 0, 1)) * 3 + face * 0.8 + (1 - math.clamp(math.abs(dFC - 30) / 80, 0, 1))
 				threats[#threats + 1] = { f = f, u = u, L = L, dR = dR, covered = covered, by = coverName, danger = danger, id = f.id }
 			end
 		end
 	end
-	table.sort(threats, function(a, b) return a.danger > b.danger end)
+	table.sort(threats, Mark.roleByDanger)
 	-- PRESS WITH A PASS LEAN. Standing exactly on the line carrier -> mouth leaves his pass to the man behind / beside him
 	-- open (user: one defender, one enemy behind, one with the ball: stand between "forward is a wall" and "the pass is cut").
 	-- When the most dangerous UNCOVERED receiver is not on that line, the press direction swings from the goal line toward
@@ -15472,15 +15497,12 @@ Mark.rolePlan = function(o)
 		end
 	end
 	local assigned = {}
-	local function spotFor(t)
-		local depth = math.clamp(t.L * 0.3, CFG.RoleMarkMin or 4, CFG.RoleMarkMax or 9)
-		return t.f.pos + t.u * depth
-	end
 	for _, t in threats do
 		if not t.covered and #free > 0 then
 			local bi, bc = nil, math.huge
+			local spotT = Mark.roleSpot(t)
 			for i, d in free do
-				local c = flat(spotFor(t) - d.pos).Magnitude
+				local c = flat(spotT - d.pos).Magnitude
 				if prevFresh and d.me and prev.mark == t.id then
 					c -= 4
 				end
@@ -15504,7 +15526,7 @@ Mark.rolePlan = function(o)
 		end
 	end
 	if myThreat then
-		deepSpot = spotFor(myThreat)
+		deepSpot = Mark.roleSpot(myThreat)
 	elseif #threats > 0 then
 		-- every threat is covered: stand between the two most dangerous ones (the pass chain goes between them)
 		local t1, t2 = threats[1], threats[2] or threats[1]
@@ -15525,7 +15547,7 @@ Mark.rolePlan = function(o)
 		role, why = "press", "lone carrier"
 	end
 	return {
-		role = role, why = why, presser = presser, costs = table.concat(costs, ", "), pressSpot = pressSpot, gapP = gapP,
+		role = role, why = why, presser = presser, defs = defs, pressSpot = pressSpot, gapP = gapP,
 		deepSpot = deepSpot, depth = depth, lean = leanDeg, leanTo = leanTo, mark = myThreat and myThreat.id, threats = threats, ug = ug, dC = dC,
 	}
 end
@@ -15629,7 +15651,7 @@ Mark.blockRoleTick = function(character, root, carrier, cr, chE, P, V, g, flight
 			if sameTeam(actor) then
 				mates[#mates + 1] = { pos = pos, name = actorName(actor), actor = actor }
 			else
-				foes[#foes + 1] = { id = actor.UserId, pos = actor == carrier and C or pos, vel = flat(CharacterMotion.GetVelocity(model) or Vector3.zero), carrier = actor == carrier, marked = actor ~= carrier and Mark.mateNear(pos, CFG.BlockCoverRadius or 8, true) ~= nil, name = actorName(actor) }
+				foes[#foes + 1] = { id = actor.UserId, pos = actor == carrier and C or pos, carrier = actor == carrier, name = actorName(actor) }
 			end
 		end
 	end
@@ -15694,17 +15716,22 @@ Mark.blockRoleTick = function(character, root, carrier, cr, chE, P, V, g, flight
 	end
 	local last = Mark.roleLast
 	if not last or last.role ~= role or now - last.at > 0.6 then
-		logFile("block role", role, plan.why, actorName(carrier), flightT and string.format("ball arrives %.2f", flightT) or "carrier", "presser", plan.presser and plan.presser.name or "-", "costs", plan.costs,
+		logFile("block role", role, plan.why, actorName(carrier), flightT and string.format("ball arrives %.2f", flightT) or "carrier", "presser", plan.presser and plan.presser.name or "-", "costs", Mark.roleCosts(plan.defs),
 			"dC", string.format("%.0f", plan.dC), "tight", tostring(iso or openShot), "deep d", string.format("%.1f", plan.depth), "lean", string.format("%.0f", plan.lean or 0) .. (plan.leanTo and ("->" .. plan.leanTo) or ""),
 			"mates", tostring(#mates), "foes", tostring(#foes))
 	end
-	Mark.roleLast = { role = role, at = now, mark = plan.mark }
-	do
+	local rl = last
+	if not rl then
+		rl = {}
+		Mark.roleLast = rl
+	end
+	rl.role, rl.at, rl.mark = role, now, plan.mark
+	if Mark.snapDue("AutoBlock") then
 		local tl = {}
 		for _, t in plan.threats do
 			tl[#tl + 1] = string.format("%s d%.0f %s", t.f.name:sub(1, 8), t.dR, t.covered and ("cov:" .. t.by) or "OPEN")
 		end
-		Mark.snap("AutoBlock", role .. " " .. plan.why, "threats: " .. table.concat(tl, ", ") .. " | costs " .. plan.costs)
+		Mark.snap("AutoBlock", role .. " " .. plan.why, "threats: " .. table.concat(tl, ", ") .. " | costs " .. Mark.roleCosts(plan.defs))
 	end
 	-- movement: the presser orbits him onto his goal line and mirrors his sideways run; the others walk to their spot and
 	-- stand (no sprint drift), orbiting him only when he is close
@@ -16922,12 +16949,12 @@ Mark.spoofTick = function()
 	local now = os.clock()
 	-- AutoShoot lost the shot mid-charge (re-solve failed, Shoot.aim cleared): the release is the camera's now, the decoy
 	-- must not leak into it (the aim-ray hook would still hand the decoy to the game)
-	if ChargedKick.IsCharging and ChargedKick.IsCharging() and not Mark.autoShotOn() then
+	if ChargedKick.IsCharging() and not Mark.autoShotOn() then
 		logFile("spoof", "drop", sp.name, "autoshoot off this kick", "held", string.format("%.2f", now - sp.t0))
 		Mark.sp = nil
 		return
 	end
-	if not (ChargedKick.IsCharging and ChargedKick.IsCharging()) and now - sp.t0 > 0.05 then
+	if not (ChargedKick.IsCharging()) and now - sp.t0 > 0.05 then
 		logFile("spoof", "done", sp.name, "held", string.format("%.2f", now - sp.t0), "decoy packets", sp.sent or 0, "real in window", sp.real or 0, sp.realWhy or "-", "echo", sp.echo or 0)
 		Mark.sp = nil
 	end
@@ -16977,7 +17004,7 @@ Mark.faceActive = function(character)
 	end
 	local own = liveOwnerId() == LocalPlayer.UserId
 	local when = CFG.FaceSpoofWhen or "charge"
-	local charging = ChargedKick.IsCharging and ChargedKick.IsCharging() and true or false
+	local charging = ChargedKick.IsCharging() and true or false
 	-- a kick AutoShoot does not own is struck from the body pose and the camera: no lie on it (any When mode)
 	if own and charging and not Mark.autoShotOn() then
 		return false
@@ -16988,7 +17015,7 @@ Mark.faceActive = function(character)
 		return own
 	end
 	-- always: not while charging a kick without the ball (the AutoKick / volley aim needs the body)
-	return own or not (ChargedKick.IsCharging and ChargedKick.IsCharging())
+	return own or not (ChargedKick.IsCharging())
 end
 
 -- FORCED: the facing others see is the yaw of our root CFrame that CharacterReplication writes into every motion
@@ -17104,7 +17131,7 @@ end
 
 Mark.faceTick = function(character, root)
 	local fs = Mark.fs
-	local charging = ChargedKick.IsCharging and ChargedKick.IsCharging() or false
+	local charging = ChargedKick.IsCharging() or false
 	if not (character and root) or not Mark.faceActive(character) then
 		Mark.faceNow = nil
 		Mark.faceCur = nil
@@ -17579,9 +17606,7 @@ Mark.friendTier = function(actor)
 		if f == nil then
 			Mark.rbxFriends[uid] = false
 			task.spawn(function()
-				local ok, res = Mark.try(function()
-					return LocalPlayer:IsFriendsWith(uid)
-				end)
+				local ok, res = Mark.try(LocalPlayer.IsFriendsWith, LocalPlayer, uid)
 				Mark.rbxFriends[uid] = ok and res == true
 			end)
 		elseif f then
@@ -18209,14 +18234,14 @@ end
 
 Mark.ballPathRaw = function(root)
 	local pos = Renderer.GetTargetPosition(nil, root.Position) or Renderer.GetMainMatchPosition()
-	if typeof(pos) ~= "Vector3" then
+	if not pos then
 		return nil
 	end
 	local samples, ts = { pos }, { 0 }
 	local state, world
 	if Mark.ballSrcId then
 		state, world = Renderer.GetMovementStateById(Mark.ballSrcId)
-		if state and typeof(state.Position) == "Vector3" then
+		if state then
 			pos = state.Position
 			samples[1] = pos
 		end
@@ -18239,7 +18264,7 @@ Mark.ballPathRaw = function(root)
 	-- Callers only read the arrays. The old memo died at 40 ms, so below ~25 fps every frame re-ran the sim
 	-- (weak-pc log: ballPath p90 9 ms, one stall 386 ms). Same state and the ball has not moved: reuse.
 	local rough = Renderer.GetTargetVelocity(nil, root.Position)
-	if memo and os.clock() - memo.at < 0.09 and (pos - memo.samples[1]).Magnitude < 1.0 and (memo.state == state or (typeof(rough) == "Vector3" and (rough - memo.vel).Magnitude < 8)) then
+	if memo and os.clock() - memo.at < 0.09 and (pos - memo.samples[1]).Magnitude < 1.0 and (memo.state == state or (rough and (rough - memo.vel).Magnitude < 8)) then
 		return pos, memo.vel, memo.samples, memo.ts, true, memo.rest
 	end
 	local vel = nil
@@ -18248,22 +18273,22 @@ Mark.ballPathRaw = function(root)
 		local now = CharacterMotionSmoothing.GetSmoothedServerTime()
 		local s0 = Physics.GetStateAtTime(state, now, world)
 		vel = s0 and s0.Velocity
-		local spd0 = typeof(vel) == "Vector3" and vel.Magnitude or 0
+		local spd0 = vel and vel.Magnitude or 0
 		-- GetStateAtTime integrates up to the asked time, so 90 queries out to 8 s is quadratic. A shot crosses
 		-- inside 3 s; a roller is at rest long before 5 s. Fine steps only inside the slide window.
 		local horizon = spd0 > 28 and 3.2 or 5.2
-		local t, prev = 0, pos
+		local t = 0
 		while t < horizon do
 			t += (t < 0.7 - 1e-6) and 0.05 or ((t < 2.2) and 0.1 or 0.2)
 			local s = Physics.GetStateAtTime(state, now + t, world)
 			local p = s and s.Position
-			if typeof(p) ~= "Vector3" then
+			if not p then
 				break
 			end
 			samples[#samples + 1] = p
 			ts[#ts + 1] = t
 			local v = s.Velocity
-			local vm = typeof(v) == "Vector3" and v.Magnitude or 0
+			local vm = v and v.Magnitude or 0
 			-- a flick / lob is slow at the apex and still in the air: only a ball back down near the start height is resting
 			-- only a ball back at the start height counts as stopped; a lob is slow at the apex and must keep falling.
 			-- t > 0.3 so the first samples of a lob we just started tracking are not cut off
@@ -18272,7 +18297,6 @@ Mark.ballPathRaw = function(root)
 				rest = true
 				break
 			end
-			prev = p
 		end
 		if not Mark.pathLog or os.clock() - Mark.pathLog > 2 then
 			Mark.pathLog = os.clock()
@@ -18285,10 +18309,7 @@ Mark.ballPathRaw = function(root)
 			samples, ts, rest = bent.samples, bent.ts, bent.rest
 		end
 	end
-	if typeof(vel) ~= "Vector3" then
-		vel = Renderer.GetTargetVelocity(nil, root.Position)
-	end
-	vel = typeof(vel) == "Vector3" and vel or Vector3.zero
+	vel = vel or Renderer.GetTargetVelocity(nil, root.Position) or Vector3.zero
 	Mark.ballMemo = state and { state = state, at = os.clock(), samples = samples, ts = ts, vel = vel, rest = rest } or nil
 	return pos, vel, samples, ts, state ~= nil, rest
 end
@@ -18301,7 +18322,12 @@ Mark.ballPath = function(root)
 		return f[1], f[2], f[3], f[4], f[5], f[6]
 	end
 	local a, b, c, d, e, g = Mark.ballPathRaw(root)
-	Mark.ballFrame = { id = Mark.logicId, src = Mark.ballSrcId, root = root, a, b, c, d, e, g }
+	if not f then
+		f = {}
+		Mark.ballFrame = f
+	end
+	f.id, f.src, f.root = Mark.logicId, Mark.ballSrcId, root
+	f[1], f[2], f[3], f[4], f[5], f[6] = a, b, c, d, e, g
 	return a, b, c, d, e, g
 end
 
@@ -19158,7 +19184,7 @@ Mark.akUserTick = function(character, root)
 	if Mark.ak then
 		return false
 	end
-	if not (Mark.realKick and Mark.realKick.down and ChargedKick.IsCharging and ChargedKick.IsCharging()) then
+	if not (Mark.realKick and Mark.realKick.down and ChargedKick.IsCharging()) then
 		return false
 	end
 	if MatchSettings.IsGoalkeeperCharacter(character) or Mark.slideBody() or Ragdoll.IsActorRagdolled(LocalPlayer) then
@@ -19241,7 +19267,7 @@ Mark.akTry = function(tag, model, r, urgent)
 	if (MatchSettings.IsGoalkeeperCharacter(character) and not gk) or liveOwnerId() == LocalPlayer.UserId then
 		return false, "role"
 	end
-	if (ChargedKick.IsCharging and ChargedKick.IsCharging()) or Mark.volleyInput or (Mark.realKick and Mark.realKick.down) then
+	if (ChargedKick.IsCharging()) or Mark.volleyInput or (Mark.realKick and Mark.realKick.down) then
 		return false, "charging"
 	end
 	if slideAim or Mark.slideBody() or ClientDodge.IsDribbling() or Ragdoll.IsActorRagdolled(LocalPlayer) or Mark.aerial then
@@ -19344,7 +19370,7 @@ Mark.akTick = function(character, root)
 	local dt = math.clamp(now - (ak.lastT or now), 0, 0.1)
 	ak.lastT = now
 	local function finish(why, cancel)
-		if cancel and ChargedKick.CancelCharge and ChargedKick.IsCharging and ChargedKick.IsCharging() then
+		if cancel and ChargedKick.CancelCharge and ChargedKick.IsCharging() then
 			ChargedKick.CancelCharge()
 		end
 		Mark.ak = nil
@@ -19353,7 +19379,7 @@ Mark.akTick = function(character, root)
 		TurnControl.ReleaseAutoRotate("AimCharge")
 		logFile("autokick", why, ak.tag, "held", string.format("%.2f", now - ak.at))
 	end
-	if not (ChargedKick.IsCharging and ChargedKick.IsCharging()) then
+	if not (ChargedKick.IsCharging()) then
 		return finish("end")
 	end
 	if not (ak.model and ak.model.Parent and ak.root and ak.root.Parent) or liveOwnerId() == LocalPlayer.UserId or Mark.slideBody() or Ragdoll.IsActorRagdolled(LocalPlayer) then
@@ -19454,7 +19480,7 @@ Mark.volleyPending = function()
 	if not input then
 		return
 	end
-	local charging = ChargedKick.IsCharging and ChargedKick.IsCharging()
+	local charging = ChargedKick.IsCharging()
 	local age = os.clock() - (Mark.volleyAt or 0)
 	if not charging then
 		Mark.volleyInput = nil
@@ -19572,7 +19598,7 @@ Mark.tickVolley = function(character, root)
 	if not (CFG.AutoBall or CFG.AutoBlock or Mark.airOn()) then
 		return
 	end
-	local charging = ChargedKick.IsCharging and ChargedKick.IsCharging()
+	local charging = ChargedKick.IsCharging()
 	-- Our volley charge turned into a normal reception (we own the ball): the delayed release would now shoot our
 	-- own ball away. Cancel it.
 	-- Only a charge that was a KEEP (no shot, nobody near): with enemies near or a shot solved the delayed release is the point
@@ -19743,6 +19769,16 @@ end
 -- block a high shot or lob never made the script jump. A jump holds us above height h from the rise time tr until
 -- the fall back through it (2*apexT - tr): jump as soon as the ball arrives no later than 0.1 s after that rise, not
 -- before -0.03 (too late to get there).
+Mark.jumpWorth = function(root, samples, ts, spd, i, reachHi, reachXZ, gain)
+	for j = i + 1, #samples do
+		local h = samples[j].Y - root.Position.Y
+		if h <= reachHi and flat(samples[j] - root.Position).Magnitude <= reachXZ + spd * math.min(ts[j], 0.5) then
+			return ts[j] - ts[i] >= gain
+		end
+	end
+	return true
+end
+
 Mark.planJump = function(root, samples, ts, spd)
 	local front = HitboxSettings.FrontAssist
 	local reachHi = front.CFrameOffset.Y + front.Size.Y * 0.5
@@ -19752,15 +19788,6 @@ Mark.planJump = function(root, samples, ts, spd)
 	-- A jump is worth it only if the ball would not be standing-reachable soon after the contact: a ball that drops into
 	-- reach 0.1 s after it passes the jump height is on the ground by the time the body is up (log: jump at t 0.25, h 7.0
 	-- of a ball that landed in front of us - the jump only delayed the receive).
-	local function worth(i)
-		for j = i + 1, #samples do
-			local h = samples[j].Y - root.Position.Y
-			if h <= reachHi and flat(samples[j] - root.Position).Magnitude <= reachXZ + spd * math.min(ts[j], 0.5) then
-				return ts[j] - ts[i] >= gain
-			end
-		end
-		return true
-	end
 	for i = 2, #samples do
 		local t = ts[i]
 		if t > 1.25 then
@@ -19774,10 +19801,10 @@ Mark.planJump = function(root, samples, ts, spd)
 			local flatD = flat(p - root.Position).Magnitude
 			-- already under the arc: jump up to 0.28 s early (the hold covers it). Running in: 0.18 s, not the old 0.1 s window that a skipped frame missed.
 			if flatD <= reachXZ + 2 and d >= -0.04 and d <= 0.14 then
-				return worth(i) and t or nil, h
+				return Mark.jumpWorth(root, samples, ts, spd, i, reachHi, reachXZ, gain) and t or nil, h
 			end
 			if d >= -0.04 and d <= 0.10 and flatD <= reachXZ + spd * math.min(t, 0.5) then
-				return worth(i) and t or nil, h
+				return Mark.jumpWorth(root, samples, ts, spd, i, reachHi, reachXZ, gain) and t or nil, h
 			end
 		end
 	end
@@ -19996,7 +20023,7 @@ Mark.tackleReady = function(character)
 	local hum = character:FindFirstChildOfClass("Humanoid")
 	return CFG.AutoTackle ~= false and hum ~= nil and os.clock() - lastTackleAt >= tackleEnforced
 		and not Ragdoll.IsActorRagdolled(LocalPlayer)
-		and not (ChargedKick.IsCharging and ChargedKick.IsCharging())
+		and not (ChargedKick.IsCharging())
 		and not ActionLocks.HasTackleBlock(LocalPlayer)
 		and not SlideTackle.IsRepeatBlocked(character, false)
 		and not ClientDodge.IsDribbling()
@@ -20593,7 +20620,7 @@ end
 -- (often the ball's rest point 60-200 studs away) and never fired once.
 Mark.killerSlide = function(root, routeDir, foes, ballNow, ourT, mLo, mHi, guard)
 	-- our own kick charge locks the slide (log: 3 "killer no game-reject" in 20 ms while the player charged)
-	if ChargedKick.IsCharging and ChargedKick.IsCharging() then
+	if ChargedKick.IsCharging() then
 		return nil, "our kick charge"
 	end
 	local O = root.Position
@@ -21667,7 +21694,7 @@ Mark.tickBall = function(character, root)
 	local readyB = CFG.AutoTackle ~= false and CFG.BallBoost ~= false and humB and CharacterControllers.IsLanded(character, humB)
 		and os.clock() - lastTackleAt >= tackleEnforced
 		and not Ragdoll.IsActorRagdolled(LocalPlayer)
-		and not (ChargedKick.IsCharging and ChargedKick.IsCharging())
+		and not (ChargedKick.IsCharging())
 		and not ActionLocks.HasTackleBlock(LocalPlayer)
 		and not SlideTackle.IsRepeatBlocked(character, false)
 		and not ClientDodge.IsDribbling()
@@ -22070,7 +22097,7 @@ Mark.tickBike = function(character, root)
 	local now = os.clock()
 	local hum = character:FindFirstChildOfClass("Humanoid")
 	if b.input then
-		local charging = ChargedKick.IsCharging and ChargedKick.IsCharging()
+		local charging = ChargedKick.IsCharging()
 		if not charging then
 			logFile("bike", "end", "charge gone")
 			Mark.bike = nil
@@ -22176,7 +22203,7 @@ Mark.tickAerial = function(character, root)
 		logFile("aerial", "detach", string.format("%.1f", launch.Velocity.Y), "noTouch", string.format("%.2f", a.noTouch))
 		return
 	end
-	local charging = ChargedKick.IsCharging and ChargedKick.IsCharging()
+	local charging = ChargedKick.IsCharging()
 	if a.input then
 		if charging and (now - a.pressAt >= 0.05 or liveOwnerId() == LocalPlayer.UserId) then
 			ChargedKick.HandleInputEnded(a.input)
@@ -22991,7 +23018,7 @@ end
 -- Diagnostic for "charge stays full": a charge older than MaximumChargeSeconds + 1.5 s gets one log line with
 -- everything that can hold a release (volley lock / delayed release, our own kick session, dodge / facing locks).
 Mark.chargeWatch = function()
-	local charging = ChargedKick.IsCharging and ChargedKick.IsCharging()
+	local charging = ChargedKick.IsCharging()
 	if not charging then
 		Mark.chargeSeenAt = nil
 		Mark.chargeWarned = nil
@@ -23018,7 +23045,7 @@ Mark.chargeWatch = function()
 	local dodgeT = Mark.dodgeAt or Mark.dodgeEndedAt
 	local afterDodge = dodgeT and os.clock() - dodgeT < 2.5
 	local function stillCharging()
-		return ChargedKick.IsCharging and ChargedKick.IsCharging()
+		return ChargedKick.IsCharging()
 	end
 	local function fireRelease()
 		-- the SAME input object StartCharge stored (IsChargeInput is an identity compare). A fresh Controls.CreateInput
@@ -23039,7 +23066,7 @@ Mark.chargeWatch = function()
 			if Mark.volleyMod.ClearPredictedLock then
 				Mark.volleyMod.ClearPredictedLock()
 			end
-			local inst = Mark.chargeInst and Mark.chargeInst()
+			local inst = Mark.chargeInst()
 			if inst and inst.SetVolleyArrivalTime then
 				inst.SetVolleyArrivalTime(inst, 0)
 			end
@@ -23083,7 +23110,7 @@ Mark.sprintWatch = function()
 	Mark.sprint = Mark.sprint or require(Client.Gameplay.Player.Sprint)
 	local slideLive = ClientSlide.IsSlideTackling()
 	local dribLive = ClientDodge.IsDribbling()
-	local chargeLive = ChargedKick.IsCharging and ChargedKick.IsCharging()
+	local chargeLive = ChargedKick.IsCharging()
 	if slideLive or dribLive then
 		Mark.sprintBusyAt = now
 	end
@@ -23159,7 +23186,7 @@ Mark.stateLine = function()
 	local ch = LocalPlayer.Character
 	local hum = ch and ch:FindFirstChildOfClass("Humanoid")
 	try(function()
-		local ch1 = ChargedKick.IsCharging and ChargedKick.IsCharging()
+		local ch1 = ChargedKick.IsCharging()
 		add("charge", ch1 and string.format("%.1f", os.clock() - (Mark.chargeSeenAt or os.clock())) or 0)
 		add("forced", (ChargedKick.IsForcedClearCharging and ChargedKick.IsForcedClearCharging()) or false)
 		add("gk", MatchSettings.IsGoalkeeperCharacter(ch))
@@ -23176,7 +23203,7 @@ Mark.stateLine = function()
 		end
 	end)
 	try(function()
-		local t = Mark.jumpBlocks and Mark.jumpBlocks()
+		local t = Mark.jumpBlocks()
 		if t then
 			local keys = {}
 			for k, v in t do
@@ -23206,7 +23233,7 @@ Mark.stateLine = function()
 	try(function()
 		Mark.sprint = Mark.sprint or require(Client.Gameplay.Player.Sprint)
 		Mark.sprintMod = Mark.sprintMod or require(Modules.Actions.Sprint)
-		local keys = Mark.sprintBlockKeys and Mark.sprintBlockKeys() or {}
+		local keys = Mark.sprintBlockKeys() or {}
 		add("sprintBlk", #keys > 0 and table.concat(keys, "+") or "-")
 		add("sprinting", Mark.sprintMod.GetCharacterIsSprinting(LocalPlayer))
 		add("unlimited", Mark.sprintMod.HasUnlimitedStamina(LocalPlayer))
@@ -23341,7 +23368,7 @@ Mark.stateWatch = function(character)
 	end):gsub("down=%S+", function(s)
 		return s:match("false") and s or "down=T"
 	end)
-	local blk = Mark.jumpBlocks and Mark.jumpBlocks()
+	local blk = Mark.jumpBlocks()
 	local held = blk and blk.HeldJump
 	if held then
 		Mark.heldSince = Mark.heldSince or now
@@ -24479,7 +24506,7 @@ Mark.projTick = function(character, root)
 				local a = k * math.pi / 4
 				local dir = Vector3.new(axis.X * math.cos(a) - axis.Z * math.sin(a), 0, axis.X * math.sin(a) + axis.Z * math.cos(a))
 				local off = dir * 5
-				if not (Mark.wallHit and Mark.wallHit(O, dir, 5.5)) then
+				if not (Mark.wallHit(O, dir, 5.5)) then
 					local c = clearance(off)
 					if c > bestC then
 						bestOff, bestC = off, c
@@ -24769,9 +24796,7 @@ Mark.dodgeSteer = function(root, threat)
 	if not (root and threat) then
 		if Mark.dodgeAt and os.clock() - Mark.dodgeAt > 0.4 then
 			Mark.dodgeDone = true
-			if Mark.moveStop then
-				Mark.moveStop("dodge")
-			end
+			Mark.moveStop("dodge")
 		end
 		return
 	end
@@ -24863,9 +24888,7 @@ Mark.dodgeSteer = function(root, threat)
 	local slideOver = elapsed > C.HitboxDelaySeconds + C.HitboxSeconds + pingD + 0.08
 	if Mark.dodgeAt and slideOver then
 		Mark.dodgeDone = true
-		if Mark.moveStop then
-			Mark.moveStop("dodge")
-		end
+		Mark.moveStop("dodge")
 		return
 	end
 	if not Mark.dodgeAt and not willHit and not approach then
@@ -25014,9 +25037,7 @@ Mark.dodgeSteer = function(root, threat)
 			end
 		end
 	end
-	if Mark.moveSteer then
-		Mark.moveSteer(holdDir, "dodge")
-	end
+	Mark.moveSteer(holdDir, "dodge")
 	Mark.agentHold(true, "dodge")
 	if not Mark.dodgeBoosted then
 		Mark.dodgeBoosted = true
@@ -26095,7 +26116,12 @@ Mark.paInstall()
 dbg("boot", "drawing.new", true, "reach", CFG.TackleReach, "track", CFG.TrackStuds, "dribble", "slide-predict", "speed", CFG.TackleSpeed, "dump", "H", "corner", CFG.PreferCornerCurl, "trick", CFG.OnlyTrick)
 
 -- perf probe wrappers: installed last, after every Mark.* function exists
-Mark.perfNames = { "tickGk", "tickSkill", "tickHazard", "tickVolley", "tickBlock", "tickBall", "tickBike", "tickAerial", "tickKickDodge", "moveTick", "drawRoute", "drawOil", "drawKickBox", "kickThreat", "saDraw", "homeSlide", "ballPath", "gkOwnDive", "gkDiveSearch", "airSolve", "tickAir", "drawFlight", "drawShadow", "drawScar", "dodgeSteer", "silentArt", "trajArt", "posArt", "sightArt", "passTick", "paDraw", "shieldTick", "gunTick", "gunPushTick", "stateWatch", "chargeWatch", "sprintWatch", "slideAudit", "slideTrackTick", "teleTick", "evadeTick", "tickBox", "drawBox" }
+Mark.perfNames = { "tickGk", "tickSkill", "tickHazard", "tickVolley", "tickBlock", "tickBall", "tickBike", "tickAerial", "tickKickDodge", "moveTick", "drawRoute", "drawOil", "drawKickBox", "kickThreat", "saDraw", "homeSlide", "ballPath", "gkOwnDive", "gkDiveSearch", "airSolve", "tickAir", "drawFlight", "drawShadow", "drawScar", "dodgeSteer", "silentArt", "trajArt", "posArt", "sightArt", "passTick", "paDraw", "shieldTick", "gunTick", "gunPushTick", "stateWatch", "chargeWatch", "sprintWatch", "slideAudit", "slideTrackTick", "teleTick", "evadeTick", "tickBox", "drawBox",
+	-- v199: the parts of the big ones (the top-of-the-log tickGk / tickBlock / paintWorld / stepLogic were one number each)
+	"gkPress", "gkFutures", "gkPressSolve", "gkFlierPick", "gkHooker", "gkComboTick", "gkAimTick", "gkHomeTrack", "gkReturnTick", "gkBait", "gkVerify", "jetRead", "carrierPose",
+	"blockRoleTick", "rolePlan", "blockTarget", "blockSlide", "tickBlockJump", "passSpot", "chargeSpot", "flightTarget", "tickLob", "tickCounterJump", "akUserTick",
+	"drawGk", "drawBlk", "drawDuel", "hazDraw", "galDraw", "dribblePlan", "dodgeTend", "akTick", "feintTick", "spoofTick", "faceTick", "bfTrack", "dribWatch",
+	"tackleShield", "tackleGate", "shotWatch", "boxResult", "volleyPending", "agentSteer", "moveSteer" }
 Mark.perfSet(CFG.Perf)
 
 -- ============================================================================================================
