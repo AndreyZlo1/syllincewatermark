@@ -2787,11 +2787,9 @@ end
 -- crosses the executor bridge. All holders below receive the proxy, not the raw object.
 local drawMeta = {}
 drawMeta.stats = { created = 0, removed = 0, live = 0, peak = 0 }
--- Every Drawing ever made, proxy -> the frame section that was running when it was created. It lives in getgenv so a re-executed copy can
--- clear what a failed unload left on screen, and a failing section can hide everything it owns.
+-- Every live Drawing. It lives in getgenv so a re-executed copy can clear what the previous one left on screen.
 local drawSet = getgenv().HushDrawings
 if type(drawSet) ~= "table" then drawSet = {}; getgenv().HushDrawings = drawSet end
-drawMeta.owner = "init"
 drawMeta.remove = function(self)
     if self._dead then return end
     drawSet[self] = nil
@@ -2824,14 +2822,8 @@ local function new_draw(kind)
     stats.live += 1
     stats.peak = math.max(stats.peak, stats.live)
     local proxy = setmetatable({ _raw = raw, _cache = {}, _dead = false }, drawMeta)
-    drawSet[proxy] = drawMeta.owner
+    drawSet[proxy] = true
     return proxy
-end
--- hide (through the proxy, so its write cache stays true) everything a section created
-drawMeta.hideOwned = function(owner)
-    for proxy, o in drawSet do
-        if o == owner and not proxy._dead then proxy.Visible = false end
-    end
 end
 -- last step of unload: nothing may stay on screen whatever an earlier step did
 drawMeta.sweep = function()
@@ -7014,15 +7006,12 @@ Visual.waterWalk = function(now)
 end
 Visual.baseTick = function(now)
     local b = Visual.base
-    local try = Visual.try
-    try("crouch", Visual.crouchStep, now)
-    if CFG.AntiDrown or Visual.water.slab then try("waterWalk", Visual.waterWalk, now) end
-    if CFG.NoRagdoll then try("unRagdoll", Visual.unRagdoll) end
+    Visual.crouchStep(now)
+    if CFG.AntiDrown or Visual.water.slab then Visual.waterWalk(now) end
+    if CFG.NoRagdoll then Visual.unRagdoll() end
     if b.controls and CFG.InfStamina then
-        try("infStamina", function()
-            b.controls.stamina = b.controls.staminaMax()
-            b.controls.breathing, b.controls.windedUntil = false, 0
-        end)
+        b.controls.stamina = b.controls.staminaMax()
+        b.controls.breathing, b.controls.windedUntil = false, 0
     end
     if now < b.nextAt then return end
     b.nextAt = now + 0.25
@@ -7034,277 +7023,239 @@ Visual.baseTick = function(now)
     end
     if client and not b.controls then
         local inst = client:FindFirstChild("Controls")
-        if inst then try("controls", function() b.controls = require(inst) end) end
+        if inst then b.controls = require(inst) end
     end
     if client and not b.vault then
         local inst = client:FindFirstChild("Vault")
-        if inst then try("vault", function() b.vault = require(inst) end) end
+        if inst then b.vault = require(inst) end
     end
     if client then
-        try("antiClimb", Visual.antiClimbInstall, client)
-        try("roundsFx", Visual.attachRoundsFx, client)
+        Visual.antiClimbInstall(client)
+        Visual.attachRoundsFx(client)
     end
-    try("autoHeal", Visual.healTick, now, client)
-    try("autoArmor", Visual.armorTick, now, client)
-    return client
-end
--- hooks and one-time installs; reached only on the 0.25 s ticks baseTick lets through
-Visual.baseHooks = function(now, client)
-    local b = Visual.base
-    local try = Visual.try
-    try("hook:client_and_not_b.drown", function()
-        if client and not b.drown then
-            local inst = client:FindFirstChild("Drown")
-            if inst then
-                b.drown = require(inst)
-                b.drownSetRaid = b.drown.setRaid
-                b.drownHook = function(inRaid)
-                    b.drownRaid = inRaid
-                    b.drownApplied = running and CFG.AntiDrown or false
-                    return b.drownSetRaid(inRaid and not b.drownApplied)
-                end
-                b.drown.setRaid = b.drownHook
-                b.drownHook(LP:GetAttribute("RaidState") == "Raid")
+    Visual.healTick(now, client)
+    Visual.armorTick(now, client)
+    if client and not b.drown then
+        local inst = client:FindFirstChild("Drown")
+        if inst then
+            b.drown = require(inst)
+            b.drownSetRaid = b.drown.setRaid
+            b.drownHook = function(inRaid)
+                b.drownRaid = inRaid
+                b.drownApplied = running and CFG.AntiDrown or false
+                return b.drownSetRaid(inRaid and not b.drownApplied)
             end
+            b.drown.setRaid = b.drownHook
+            b.drownHook(LP:GetAttribute("RaidState") == "Raid")
         end
-    end)
-    try("hook:b.drown_and_b.drownApplied_CFG.AntiDrown", function()
-        if b.drown and b.drownApplied ~= CFG.AntiDrown then
-            b.drownHook(b.drownRaid)
-        end
-    end)
-    try("hook:client_and_not_b.draw", function()
-        if client and not b.draw then
-            local inst = client:FindFirstChild("BodyAnimDefs")
-            if inst then
-                local defs = require(inst)
-                b.draw, b.drawSpeed = defs.Draw, defs.Draw.speed
-                b.drawHook = function(plr)
-                    if CFG.InstantEquip and plr == LP then return 0.001 end
-                    return b.drawSpeed(plr)
-                end
-                b.draw.speed = b.drawHook
+    end
+    if b.drown and b.drownApplied ~= CFG.AntiDrown then
+        b.drownHook(b.drownRaid)
+    end
+    if client and not b.draw then
+        local inst = client:FindFirstChild("BodyAnimDefs")
+        if inst then
+            local defs = require(inst)
+            b.draw, b.drawSpeed = defs.Draw, defs.Draw.speed
+            b.drawHook = function(plr)
+                if CFG.InstantEquip and plr == LP then return 0.001 end
+                return b.drawSpeed(plr)
             end
+            b.draw.speed = b.drawHook
         end
-    end)
-    try("hook:client_and_not_b.breath", function()
-        if client and not b.breath then
-            local inst = client:FindFirstChild("Breath")
-            if inst then
-                -- ClientMain calls Breath.run(checks, onCheck, onDone) through the module table; onCheck is
-                -- Remotes.Breath:FireServer(bool). The zone is random on the client, the server only sees the bool.
-                local mod = require(inst)
-                b.breath, b.breathRun, b.breathStop, b.breathToken = mod, mod.run, mod.stop, 0
-                log("[hush] auto breath hooked (Breath.run)")
-                mod.stop = function(...)
-                    b.breathToken += 1
-                    return b.breathStop(...)
-                end
-                mod.run = function(checks, onCheck, onDone)
-                    if not (running and CFG.AutoBreath) then return b.breathRun(checks, onCheck, onDone) end
-                    if CFG.ShotLog then log("[hush] auto breath: start, " .. tostring(checks) .. " checks") end
-                    mod.stop()
-                    local token = b.breathToken
-                    task.spawn(function()
-                        task.wait(0.4)
-                        for i = 1, checks do
-                            -- BreathLeadIn 0.45 + the needle reaching a mid zone (~0.6 of BreathSpinSeconds 1.15)
-                            task.wait(0.45 + 1.15 * (0.4 + math.random() * 0.3))
-                            if b.breathToken ~= token then return end
-                            onCheck(true)
-                            if i < checks then task.wait(0.9 + math.random() * 1.3) end
-                        end
-                        task.wait(0.9)
+    end
+    if client and not b.breath then
+        local inst = client:FindFirstChild("Breath")
+        if inst then
+            -- ClientMain calls Breath.run(checks, onCheck, onDone) through the module table; onCheck is
+            -- Remotes.Breath:FireServer(bool). The zone is random on the client, the server only sees the bool.
+            local mod = require(inst)
+            b.breath, b.breathRun, b.breathStop, b.breathToken = mod, mod.run, mod.stop, 0
+            log("[hush] auto breath hooked (Breath.run)")
+            mod.stop = function(...)
+                b.breathToken += 1
+                return b.breathStop(...)
+            end
+            mod.run = function(checks, onCheck, onDone)
+                if not (running and CFG.AutoBreath) then return b.breathRun(checks, onCheck, onDone) end
+                if CFG.ShotLog then log("[hush] auto breath: start, " .. tostring(checks) .. " checks") end
+                mod.stop()
+                local token = b.breathToken
+                task.spawn(function()
+                    task.wait(0.4)
+                    for i = 1, checks do
+                        -- BreathLeadIn 0.45 + the needle reaching a mid zone (~0.6 of BreathSpinSeconds 1.15)
+                        task.wait(0.45 + 1.15 * (0.4 + math.random() * 0.3))
                         if b.breathToken ~= token then return end
-                        if onDone then onDone(true) end
-                        if CFG.ShotLog then log("[hush] auto breath: " .. checks .. " checks sent as quiet") end
-                    end)
-                end
-            end
-        end
-    end)
-    local g = guns()
-    try("hook:g_and_not_b.boltTimes_and_type_g.boltTim", function()
-        if g and not b.boltTimes and type(g.boltTimes) == "function" then
-            b.boltTimes = g.boltTimes
-            b.boltHook = function(loads)
-                local t = b.boltTimes(loads)
-                if CFG.FastBolt and type(t) == "table" then
-                    local k = CFG.FastBoltScale or 0.25
-                    for key, v in t do if type(v) == "number" then t[key] = v * k end end
-                end
-                return t
-            end
-            g.boltTimes = b.boltHook
-        end
-    end)
-    try("hook:not_b.config", function()
-        if not b.config then
-            local shared = ReplicatedStorage:FindFirstChild("Shared")
-            local inst = shared and shared:FindFirstChild("Config")
-            if inst then b.config = require(inst) end
-        end
-    end)
-    local gc = b.config and b.config.Guns
-    try("hook:gc", function()
-        if gc then
-            if b.heat == nil then b.heat = gc.HeatPerShot end
-            gc.HeatPerShot = CFG.NoHeat and 0 or b.heat
-            if not b.airSway then b.airSway = { JumpSway = gc.JumpSway, JumpKick = gc.JumpKick } end
-            for key, value in b.airSway do gc[key] = CFG.NoRecoil and 0 or value end
-        end
-    end)
-    try("hook:CFG.AutoHotwire_and_not_b.wireFn_and_now", function()
-        if CFG.AutoHotwire and not b.wireFn and now >= (b.wireNextAt or 0) and type(filtergc) == "function" then
-            b.wireNextAt = now + 5
-            -- closeHotwire is inlined and getupvalues skips nil slots: capture the dial table in runChecks(state, run) instead.
-            local fn = filtergc("function", { Name = "runChecks", Constants = { "HushWire" } }, true)
-            if fn then
-                b.wireFn = fn
-                b.wireOld = hookfunction(fn, function(st, run, ...)
-                    b.wire = st
-                    if CFG.ShotLog and type(st) == "table" then
-                        log("[hush] auto hotwire: " .. tostring(st.kind) .. ", " .. tostring(st.of) .. " checks")
+                        onCheck(true)
+                        if i < checks then task.wait(0.9 + math.random() * 1.3) end
                     end
-                    return b.wireOld(st, run, ...)
+                    task.wait(0.9)
+                    if b.breathToken ~= token then return end
+                    if onDone then onDone(true) end
+                    if CFG.ShotLog then log("[hush] auto breath: " .. checks .. " checks sent as quiet") end
                 end)
-                log("[hush] auto hotwire hooked (Vehicles.runChecks)")
             end
         end
-    end)
-    try("hook:client_and_not_b.fallSlots_and_CFG.NoFal", function()
-        if client and not b.fallSlots and CFG.NoFall then
-            -- Fall.lua lands through the local judge() (PostSimulation post -> judge); judge computes the damage and sends Move "fall".
-            -- Replace the judge upvalue in both closures with a gate (post() re-arms its state next frame).
-            b.fallSlots = {}
-            local ok, posts = pcall(filtergc, "function", { Name = "post", Constants = { "FloorMaterial", "RootPart" }, IgnoreExecutor = true })
-            local ok2, lands = pcall(filtergc, "function", { Name = "landed", Constants = { "IsA", "Model" }, IgnoreExecutor = true })
-            for _, group in { ok and posts or {}, ok2 and lands or {} } do
-                for _, f in group do
-                    for idx, up in debug.getupvalues(f) do
-                        if type(up) == "function" and debug.info(up, "n") == "judge" then
-                            local sends = false
-                            for _, c in debug.getconstants(up) do if c == "fall" then sends = true end end
-                            if sends then
-                                b.fallJudge = b.fallJudge or up
-                                if up == b.fallJudge then b.fallSlots[#b.fallSlots + 1] = { fn = f, idx = idx } end
-                            end
+    end
+    local g = guns()
+    if g and not b.boltTimes and type(g.boltTimes) == "function" then
+        b.boltTimes = g.boltTimes
+        b.boltHook = function(loads)
+            local t = b.boltTimes(loads)
+            if CFG.FastBolt and type(t) == "table" then
+                local k = CFG.FastBoltScale or 0.25
+                for key, v in t do if type(v) == "number" then t[key] = v * k end end
+            end
+            return t
+        end
+        g.boltTimes = b.boltHook
+    end
+    if not b.config then
+        local shared = ReplicatedStorage:FindFirstChild("Shared")
+        local inst = shared and shared:FindFirstChild("Config")
+        if inst then b.config = require(inst) end
+    end
+    local gc = b.config and b.config.Guns
+    if gc then
+        if b.heat == nil then b.heat = gc.HeatPerShot end
+        gc.HeatPerShot = CFG.NoHeat and 0 or b.heat
+        if not b.airSway then b.airSway = { JumpSway = gc.JumpSway, JumpKick = gc.JumpKick } end
+        for key, value in b.airSway do gc[key] = CFG.NoRecoil and 0 or value end
+    end
+    if CFG.AutoHotwire and not b.wireFn and now >= (b.wireNextAt or 0) and type(filtergc) == "function" then
+        b.wireNextAt = now + 5
+        -- closeHotwire is inlined and getupvalues skips nil slots: capture the dial table in runChecks(state, run) instead.
+        local fn = filtergc("function", { Name = "runChecks", Constants = { "HushWire" } }, true)
+        if fn then
+            b.wireFn = fn
+            b.wireOld = hookfunction(fn, function(st, run, ...)
+                b.wire = st
+                if CFG.ShotLog and type(st) == "table" then
+                    log("[hush] auto hotwire: " .. tostring(st.kind) .. ", " .. tostring(st.of) .. " checks")
+                end
+                return b.wireOld(st, run, ...)
+            end)
+            log("[hush] auto hotwire hooked (Vehicles.runChecks)")
+        end
+    end
+    if client and not b.fallSlots and CFG.NoFall then
+        -- Fall.lua lands through the local judge() (PostSimulation post -> judge); judge computes the damage and sends Move "fall".
+        -- Replace the judge upvalue in both closures with a gate (post() re-arms its state next frame).
+        b.fallSlots = {}
+        local ok, posts = pcall(filtergc, "function", { Name = "post", Constants = { "FloorMaterial", "RootPart" }, IgnoreExecutor = true })
+        local ok2, lands = pcall(filtergc, "function", { Name = "landed", Constants = { "IsA", "Model" }, IgnoreExecutor = true })
+        for _, group in { ok and posts or {}, ok2 and lands or {} } do
+            for _, f in group do
+                for idx, up in debug.getupvalues(f) do
+                    if type(up) == "function" and debug.info(up, "n") == "judge" then
+                        local sends = false
+                        for _, c in debug.getconstants(up) do if c == "fall" then sends = true end end
+                        if sends then
+                            b.fallJudge = b.fallJudge or up
+                            if up == b.fallJudge then b.fallSlots[#b.fallSlots + 1] = { fn = f, idx = idx } end
                         end
                     end
                 end
             end
-            if #b.fallSlots == 0 then
-                log("[hush] NoFall: Fall.judge not found (filtergc post/landed); fall damage is NOT blocked")
-            else
-                b.fallHook = function(...)
-                    if running and CFG.NoFall then return false end
-                    return b.fallJudge(...)
-                end
-                for _, slot in b.fallSlots do debug.setupvalue(slot.fn, slot.idx, b.fallHook) end
-                if CFG.ShotLog then log(string.format("[hush] NoFall: judge gated in %d closures", #b.fallSlots)) end
-            end
         end
-    end)
-    try("hook:client_and_not_b.hitReact", function()
-        if client and not b.hitReact then
-            local inst = client:FindFirstChild("HitReact")
-            if inst then
-                -- Effect "Ragdoll" calls HitReact.fall(shot): per-Heartbeat velocity kicks on every limb
-                local mod = require(inst)
-                b.hitReact, b.hitFall = mod, mod.fall
-                mod.fall = function(...)
-                    if running and CFG.NoRagdoll then
-                        if CFG.ShotLog then log("[hush] NoRagdoll: blocked HitReact.fall (limb kicks)") end
-                        return
-                    end
-                    return b.hitFall(...)
-                end
+        if #b.fallSlots == 0 then
+            log("[hush] NoFall: Fall.judge not found (filtergc post/landed); fall damage is NOT blocked")
+        else
+            b.fallHook = function(...)
+                if running and CFG.NoFall then return false end
+                return b.fallJudge(...)
             end
+            for _, slot in b.fallSlots do debug.setupvalue(slot.fn, slot.idx, b.fallHook) end
+            if CFG.ShotLog then log(string.format("[hush] NoFall: judge gated in %d closures", #b.fallSlots)) end
         end
-    end)
-    try("hook:b.controls_and_not_b.bounce_and_type_b.c", function()
-        if b.controls and not b.bounce and type(b.controls.bounce) == "function" then
-            -- Effect "Ragdoll" -> Controls.setStunned(true) + Controls.bounce(knock velocity)
-            b.bounce = b.controls.bounce
-            b.controls.bounce = function(v, ...)
+    end
+    if client and not b.hitReact then
+        local inst = client:FindFirstChild("HitReact")
+        if inst then
+            -- Effect "Ragdoll" calls HitReact.fall(shot): per-Heartbeat velocity kicks on every limb
+            local mod = require(inst)
+            b.hitReact, b.hitFall = mod, mod.fall
+            mod.fall = function(...)
                 if running and CFG.NoRagdoll then
-                    if CFG.ShotLog then log(string.format("[hush] NoRagdoll: blocked bounce, knock velocity %.0f st/s", typeof(v) == "Vector3" and v.Magnitude or -1)) end
+                    if CFG.ShotLog then log("[hush] NoRagdoll: blocked HitReact.fall (limb kicks)") end
                     return
                 end
-                return b.bounce(v, ...)
-            end
-            b.stun = b.controls.setStunned
-            b.controls.setStunned = function(on, ...)
-                -- only the ragdoll stun; monster grabs/hits (no Ragdoll attribute) keep the game's stun
-                local char = LP.Character
-                if on and running and CFG.NoRagdoll and char and char:GetAttribute("Ragdoll") then on = false end
-                return b.stun(on, ...)
+                return b.hitFall(...)
             end
         end
-    end)
-    try("hook:CFG.FullBright_and_not_b.fbBound", function()
-        if CFG.FullBright and not b.fbBound then
-            b.fbBound = true
-            b.lighting = cloneref(game:GetService("Lighting"))
-            -- WorldFX rewrites Lighting every RenderStepped; write after it, every frame.
-            RunService:BindToRenderStep("HushFullBright", Enum.RenderPriority.Last.Value + 1, Visual.safe("fullbright", Visual.fullBright))
-            b.fbCheckAt = now + 2
-        end
-    end)
-    try("hook:b.fbBound_and_not_CFG.FullBright", function()
-        if b.fbBound and not CFG.FullBright then
-            b.fbBound, b.fbCheckAt = nil, nil
-            RunService:UnbindFromRenderStep("HushFullBright") -- the game's own Lighting writes return on the next frame
-        end
-    end)
-    try("hook:b.fbCheckAt_and_now_b.fbCheckAt", function()
-        if b.fbCheckAt and now >= b.fbCheckAt then
-            b.fbCheckAt = nil
-            if CFG.FullBright then
-                local L, bad = b.lighting, {}
-                if L.Ambient ~= Visual.FB_AMBIENT then bad[#bad + 1] = "Ambient" end
-                if L.Brightness ~= 2 then bad[#bad + 1] = "Brightness" end
-                if L.ClockTime ~= 14 then bad[#bad + 1] = "ClockTime" end
-                if #bad > 0 then log("[hush] Fullbright: overwritten after our write: " .. table.concat(bad, ", ")) end
+    end
+    if b.controls and not b.bounce and type(b.controls.bounce) == "function" then
+        -- Effect "Ragdoll" -> Controls.setStunned(true) + Controls.bounce(knock velocity)
+        b.bounce = b.controls.bounce
+        b.controls.bounce = function(v, ...)
+            if running and CFG.NoRagdoll then
+                if CFG.ShotLog then log(string.format("[hush] NoRagdoll: blocked bounce, knock velocity %.0f st/s", typeof(v) == "Vector3" and v.Magnitude or -1)) end
+                return
             end
+            return b.bounce(v, ...)
         end
-    end)
-    try("hook:b.fullAuto_CFG.FullAuto", function()
-        if b.fullAuto ~= CFG.FullAuto then
-            local gg = guns()
-            if gg then
-                for _, def in gg.Defs do
-                    if type(def) == "table" and def.ammo ~= nil and not def.melee then
-                        if CFG.FullAuto then
-                            if def.auto == false then
-                                local ok = pcall(function() def.auto = true end)
-                                if ok then b.autoOrig[def] = true; b.autoN = (b.autoN or 0) + 1 else b.autoFail = (b.autoFail or 0) + 1 end
-                            end
-                        elseif b.autoOrig[def] then
-                            def.auto = false
-                            b.autoOrig[def] = nil
+        b.stun = b.controls.setStunned
+        b.controls.setStunned = function(on, ...)
+            -- only the ragdoll stun; monster grabs/hits (no Ragdoll attribute) keep the game's stun
+            local char = LP.Character
+            if on and running and CFG.NoRagdoll and char and char:GetAttribute("Ragdoll") then on = false end
+            return b.stun(on, ...)
+        end
+    end
+    if CFG.FullBright and not b.fbBound then
+        b.fbBound = true
+        b.lighting = cloneref(game:GetService("Lighting"))
+        -- WorldFX rewrites Lighting every RenderStepped; write after it, every frame.
+        RunService:BindToRenderStep("HushFullBright", Enum.RenderPriority.Last.Value + 1, Visual.fullBright)
+        b.fbCheckAt = now + 2
+    end
+    if b.fbBound and not CFG.FullBright then
+        b.fbBound, b.fbCheckAt = nil, nil
+        RunService:UnbindFromRenderStep("HushFullBright") -- the game's own Lighting writes return on the next frame
+    end
+    if b.fbCheckAt and now >= b.fbCheckAt then
+        b.fbCheckAt = nil
+        if CFG.FullBright then
+            local L, bad = b.lighting, {}
+            if L.Ambient ~= Visual.FB_AMBIENT then bad[#bad + 1] = "Ambient" end
+            if L.Brightness ~= 2 then bad[#bad + 1] = "Brightness" end
+            if L.ClockTime ~= 14 then bad[#bad + 1] = "ClockTime" end
+            if #bad > 0 then log("[hush] Fullbright: overwritten after our write: " .. table.concat(bad, ", ")) end
+        end
+    end
+    if b.fullAuto ~= CFG.FullAuto then
+        local gg = guns()
+        if gg then
+            for _, def in gg.Defs do
+                if type(def) == "table" and def.ammo ~= nil and not def.melee then
+                    if CFG.FullAuto then
+                        if def.auto == false then
+                            local ok = pcall(function() def.auto = true end)
+                            if ok then b.autoOrig[def] = true; b.autoN = (b.autoN or 0) + 1 else b.autoFail = (b.autoFail or 0) + 1 end
                         end
+                    elseif b.autoOrig[def] then
+                        def.auto = false
+                        b.autoOrig[def] = nil
                     end
                 end
-                b.fullAuto = CFG.FullAuto
-                if CFG.FullAuto then log(string.format("[hush] FullAuto: %d weapons switched to auto, %d writes refused", b.autoN or 0, b.autoFail or 0)) end
+            end
+            b.fullAuto = CFG.FullAuto
+            if CFG.FullAuto then log(string.format("[hush] FullAuto: %d weapons switched to auto, %d writes refused", b.autoN or 0, b.autoFail or 0)) end
+        end
+    end
+    if b.recoil ~= CFG.NoRecoil then
+        if not g then return end
+        for _, def in g.Defs do
+            if type(def) == "table" then
+                local saved = b.originals[def]
+                if not saved then saved = { recoil = def.recoil, side = def.side }; b.originals[def] = saved end
+                if saved.recoil ~= nil then def.recoil = CFG.NoRecoil and 0 or saved.recoil end
+                if saved.side ~= nil then def.side = CFG.NoRecoil and 0 or saved.side end
             end
         end
-    end)
-    try("hook:b.recoil_CFG.NoRecoil", function()
-        if b.recoil ~= CFG.NoRecoil then
-            if not g then return end
-            for _, def in g.Defs do
-                if type(def) == "table" then
-                    local saved = b.originals[def]
-                    if not saved then saved = { recoil = def.recoil, side = def.side }; b.originals[def] = saved end
-                    if saved.recoil ~= nil then def.recoil = CFG.NoRecoil and 0 or saved.recoil end
-                    if saved.side ~= nil then def.side = CFG.NoRecoil and 0 or saved.side end
-                end
-            end
-            b.recoil = CFG.NoRecoil
-        end
-    end)
+        b.recoil = CFG.NoRecoil
+    end
 end
 Visual.baseStop = function()
     local b = Visual.base
@@ -8125,59 +8076,12 @@ Visual.staffStop = function()
     table.clear(S.warned)
 end
 
--- Frame sections run isolated: a failing one hides what it owns and is counted in Life.errs (HushSilent.diag()); the rest of the frame still runs,
--- so one bad model or one new game field can no longer freeze every drawing at its last frame.
-Life.errs = {}
-Visual.noteErr = function(name, err)
-    local e = Life.errs[name]
-    if not e then e = { n = 0 }; Life.errs[name] = e end
-    e.n += 1
-    e.msg, e.at = tostring(err), os.clock()
-    if e.n == 1 then warn("[hush] '" .. name .. "' failed: " .. e.msg) end
-end
--- one stage of a tick: a throw is counted and printed once, never allowed to starve the stages after it
-Visual.try = function(name, fn, a, b)
-    local ok, res = pcall(fn, a, b)
-    if not ok then Visual.noteErr(name, res); return false end
-    return true, res
-end
-Visual.guard = function(name, hide, fn, a, b, c)
-    drawMeta.owner = name
-    local ok, err = pcall(fn, a, b, c)
-    drawMeta.owner = "init"
-    if ok then return true end
-    Visual.noteErr(name, err)
-    drawMeta.hideOwned(name)
-    if hide then pcall(hide) end
-    return false
-end
-Visual.safe = function(name, fn)
-    return function(...)
-        local ok, err = pcall(fn, ...)
-        if not ok then Visual.noteErr(name, err) end
-    end
-end
--- one actor that throws (an unexpected rig) is skipped for 5 s; everyone else keeps their box
-local espBad = setmetatable({}, { __mode = "k" })
 local function esp_one(model, plr, origin, color, role)
-    local now = os.clock()
-    if (espBad[model] or 0) > now then return end
-    local ok, err = pcall(update_esp_one, model, plr, origin, color, role)
-    if ok then return end
-    espBad[model] = now + 5
-    local o = espByModel[model]
-    if o then pcall(hide_esp, o) end
-    Visual.noteErr("espActor", tostring(model.Name) .. ": " .. tostring(err))
+    update_esp_one(model, plr, origin, color, role)
 end
 local function hide_all_esp()
     for _, o in espByModel do hide_esp(o) end
 end
--- a section that threw may have drawn without reaching its own flag: force "shown", then hide
-local function hide_ret_hard() retHidden = false; hide_ret() end
-local function hide_ka_hard() Visual.kaHidden = false; hide_ka() end
-local function hide_loot_hard() Loot.hidden = false; hide_loot() end
-local function hide_mock_hard() Loot.mockHidden = false; hide_mock() end
-local function hide_fov_hard() fovOn = true; hide_fov() end
 Visual.sec = {}
 Visual.sec.target = function(now, origin)
     if held.firearm then
@@ -8195,11 +8099,6 @@ Visual.sec.target = function(now, origin)
     elseif not CFG.Silent or not held.firearm then
         saTgt = nil
     end
-end
--- a failed target section must not leave a stale target for the shot hook
-local function drop_target()
-    saTgt = nil
-    hide_fov_hard()
 end
 Visual.sec.aimArt = function(now)
     if saTgt and saTgt.pos and held.firearm then
@@ -8266,7 +8165,6 @@ Visual.sec.esp = function(now, origin)
         end
     end
 end
-local function clear_particles_soft() Visual.clearParticles(false) end
 
 local function step(dt)
     if not running then
@@ -8281,43 +8179,37 @@ local function step(dt)
     end
     local now = os.clock()
     local origin = Cam.CFrame.Position
-    local G, S = Visual.guard, Visual.sec
+    local S = Visual.sec
     Visual.mt = os.clock()
     local stepStart = Visual.mt
     Visual.memStart()
-    G("target", drop_target, S.target, now, origin)
-    G("aimArt", hide_ret_hard, S.aimArt, now)
-    -- unarmed: nothing of the aim art may exist, whatever the flags believe (re-checked 4x a second)
-    if not held.firearm and now >= (Visual.idleSweepAt or 0) then
-        Visual.idleSweepAt = now + 0.25
-        hide_ret_hard()
-        hide_fov_hard()
-    end
+    S.target(now, origin)
+    S.aimArt(now)
     Visual.mt = Visual.measure("aim", Visual.mt)
-    G("killaura", hide_ka_hard, draw_killaura)
+    draw_killaura()
     Visual.mt = Visual.measure("kaArt", Visual.mt)
-    G("esp", hide_all_esp, S.esp, now, origin)
+    S.esp(now, origin)
     Visual.mt = Visual.measure("espNpc", Visual.mt)
-    G("espSweep", nil, espPool.sweep, seen, now)
+    espPool.sweep(seen, now)
     Visual.mt = Visual.measure("sweep", Visual.mt)
-    G("world", nil, Visual.worldDraw, origin)
+    Visual.worldDraw(origin)
     Visual.mt = Visual.measure("world", Visual.mt)
-    G("pvp", nil, Visual.pvpTick, now)
-    G("loot", hide_loot_hard, draw_loot, dt, origin)
+    Visual.pvpTick(now)
+    draw_loot(dt, origin)
     Visual.mt = Visual.measure("loot", Visual.mt)
-    G("mock", hide_mock_hard, draw_mock, dt)
+    draw_mock(dt)
     Visual.mt = Visual.measure("mock", Visual.mt)
-    G("liveFx", nil, Visual.stepLiveFx, now)
+    Visual.stepLiveFx(now)
     Visual.mt = Visual.measure("liveFx", Visual.mt)
-    G("death", nil, Visual.deathStep, now, origin)
-    G("exit", nil, Visual.exitStep, now, origin)
-    G("find", nil, Visual.findStep, now, origin)
-    G("boss", nil, Visual.bossStep, now, origin)
+    Visual.deathStep(now, origin)
+    Visual.exitStep(now, origin)
+    Visual.findStep(now, origin)
+    Visual.bossStep(now, origin)
     Visual.mt = Visual.measure("marks", Visual.mt)
-    G("aimSpoof", nil, Visual.aimSpoofTick, now)
-    G("particles", clear_particles_soft, Visual.pfxStep, Cam, now)
+    Visual.aimSpoofTick(now)
+    Visual.pfxStep(Cam, now)
     Visual.mt = Visual.measure("particles", Visual.mt)
-    G("icons", nil, Visual.icon.flush)
+    Visual.icon.flush()
     Visual.measure("iconFlush", Visual.mt)
     Visual.measureT("STEP", stepStart)
 end
@@ -8325,242 +8217,99 @@ end
 local function unload()
     if not running then return end
     running = false
-    local function try(step)
-        local ok, err = pcall(step)
-        if not ok then
-            Life.errs.unload = { n = ((Life.errs.unload or {}).n or 0) + 1, msg = tostring(err), at = os.clock() }
-            log("[hush] unload step failed: " .. tostring(err))
-        end
-    end
     Life.uiState = nil
-    try(function()
-        Visual.aimSpoofTick(math.huge) -- take a spoofed ADS back
-    end)
-    try(function()
-        Visual.dbgFlush(0, true)
-    end)
-    try(function()
-        Life.clear(connections)
-    end)
-    try(function()
-        Visual.worldStop()
-    end)
-    try(function()
-        Visual.baseStop()
-    end)
-    try(function()
-        Visual.weaponScaleStop()
-    end)
-    try(function()
-        Visual.skinStop()
-    end)
-    try(function()
-        Visual.swapStop()
-    end)
-    try(function()
-        Visual.stopLiveFx()
-    end)
-    try(function()
-        Visual.deathStop()
-    end)
-    try(function()
-        game:GetService("ContextActionService"):UnbindAction("HushMoveKeys")
-    end)
-    try(function()
-        Visual.markersStop()
-    end)
-    try(function()
-        Visual.dnClear()
-    end)
-    try(function()
-        Visual.staffStop()
-    end)
-    try(function()
-        Visual.moveStop()
-    end)
-    try(function()
-        Visual.sitStop()
-    end)
-    try(function()
-        Life.clear(Life.char)
-    end)
-    try(function()
-        Life.clear(Life.monsters)
-    end)
-    try(function()
-        Life.character = nil
-    end)
-    try(function()
-        RunService:UnbindFromRenderStep("HushKA_Facing")
-    end)
-    try(function()
-        RunService:UnbindFromRenderStep("HushSwap")
-    end)
-    try(function()
-        Visual.kaFaceStop()
-    end)
-    try(function()
-        if Visual.hitGroup then Visual.hitGroup:Destroy(); Visual.hitGroup = nil end
-    end)
-    try(function()
-        if Visual.sledgeBind then
-            Visual.sledgeBind.aim = Visual.sledgeOriginalAim
-            Visual.sledgeBind.swing = Visual.sledgeOriginalSwing
-            Visual.sledgeBind.__hushAim = nil
-        end
-    end)
-    try(function()
-        Loot.stopAuto()
-    end)
-    try(function()
-        for prompt in searchPrompts do Loot.remove(prompt) end
-    end)
-    try(function()
-        for _, cache in Loot.scan do table.clear(cache.rows); table.clear(cache.keys) end
-    end)
-    try(function()
-        for part, conn in Loot.waiting do conn:Disconnect(); Loot.waiting[part] = nil end
-    end)
-    try(function()
-        table.clear(lootKnown)
-    end)
-    try(function()
-        table.clear(Loot.moving)
-    end)
-    try(function()
-        table.clear(Loot.byPart)
-    end)
-    try(function()
-        table.clear(Loot.grid)
-    end)
-    try(function()
-        Loot.module, Loot.gui = nil, nil
-    end)
-    try(function()
-        for _, buffer in Loot.bufs do table.clear(buffer.rows); table.clear(buffer.d2); buffer.n = 0 end
-    end)
-    try(function()
-        if restorefunction then
-            if Life.shootTarget then restorefunction(Life.shootTarget); Life.shootTarget = nil end
-            if Visual.everywhere.target then restorefunction(Visual.everywhere.target); Visual.everywhere.target = nil end
-        end
-    end)
-    try(function()
-        hooked = false
-    end)
-    try(function()
-        espPool.destroy()
-    end)
-    try(function()
-        Visual.clearParticles(true)
-    end)
-    try(function()
-        for _, pen in Visual.pens do
-            for _, tri in pen.tris do tri:Remove() end
-            for _, quad in pen.quads do quad:Remove() end
-        end
-    end)
-    try(function()
-        table.clear(Visual.pens)
-    end)
-    try(function()
-        table.clear(visCache)
-    end)
-    try(function()
-        table.clear(shotAt)
-    end)
-    try(function()
-        table.clear(reloadAt)
-    end)
-    try(function()
-        table.clear(aimPartCache)
-    end)
-    try(function()
-        table.clear(humCache)
-    end)
-    try(function()
-        table.clear(humRecheck)
-    end)
-    try(function()
-        table.clear(Resolver.track)
-    end)
-    try(function()
-        table.clear(Visual.mp)
-    end)
-    try(function()
-        table.clear(monsterList)
-    end)
-    try(function()
-        table.clear(roster)
-    end)
-    try(function()
-        saTgt, kaAim, lastAim, ka.tgt = nil, nil, nil, nil
-    end)
-    try(function()
-        Visual.lock.model = nil
-    end)
-    try(function()
-        table.clear(Rel.cache)
-    end)
-    try(function()
-        hide_fov()
-    end)
-    try(function()
-        for i = 1, FOV_N do
-            fovLines[i]:Remove()
-        end
-    end)
-    try(function()
-        hide_aim_lines()
-    end)
-    try(function()
-        for i = 1, RET_N do
-            retLines[i]:Remove()
-        end
-    end)
-    try(function()
-        hide_ka()
-    end)
-    try(function()
-        for i = 1, KA_N do
-            kaLines[i]:Remove()
-        end
-    end)
-    try(function()
-        hide_mock()
-    end)
-    try(function()
-        for i = 1, #mockLines do
-            mockLines[i]:Remove()
-        end
-    end)
-    try(function()
-        for i = 1, #mockText do
-            mockText[i]:Remove()
-        end
-    end)
-    try(function()
-        Visual.fxFree()
-    end)
-    try(function()
-        table.clear(Visual.mockActors)
-    end)
-    try(function()
-        table.clear(stations)
-    end)
-    try(function()
-        hide_loot()
-    end)
-    try(function()
-        for i = 1, #lootLines do
-            lootLines[i]:Remove()
-        end
-    end)
-    try(function()
-        for i = 1, #lootText do
-            lootText[i]:Remove()
-        end
-    end)
+    Visual.aimSpoofTick(math.huge) -- take a spoofed ADS back
+    Visual.dbgFlush(0, true)
+    Life.clear(connections)
+    Visual.worldStop()
+    Visual.baseStop()
+    Visual.weaponScaleStop()
+    Visual.skinStop()
+    Visual.swapStop()
+    Visual.stopLiveFx()
+    Visual.deathStop()
+    game:GetService("ContextActionService"):UnbindAction("HushMoveKeys")
+    Visual.markersStop()
+    Visual.dnClear()
+    Visual.staffStop()
+    Visual.moveStop()
+    Visual.sitStop()
+    Life.clear(Life.char)
+    Life.clear(Life.monsters)
+    Life.character = nil
+    RunService:UnbindFromRenderStep("HushKA_Facing")
+    RunService:UnbindFromRenderStep("HushSwap")
+    Visual.kaFaceStop()
+    if Visual.hitGroup then Visual.hitGroup:Destroy(); Visual.hitGroup = nil end
+    if Visual.sledgeBind then
+        Visual.sledgeBind.aim = Visual.sledgeOriginalAim
+        Visual.sledgeBind.swing = Visual.sledgeOriginalSwing
+        Visual.sledgeBind.__hushAim = nil
+    end
+    Loot.stopAuto()
+    for prompt in searchPrompts do Loot.remove(prompt) end
+    for _, cache in Loot.scan do table.clear(cache.rows); table.clear(cache.keys) end
+    for part, conn in Loot.waiting do conn:Disconnect(); Loot.waiting[part] = nil end
+    table.clear(lootKnown)
+    table.clear(Loot.moving)
+    table.clear(Loot.byPart)
+    table.clear(Loot.grid)
+    Loot.module, Loot.gui = nil, nil
+    for _, buffer in Loot.bufs do table.clear(buffer.rows); table.clear(buffer.d2); buffer.n = 0 end
+    if restorefunction then
+        if Life.shootTarget then restorefunction(Life.shootTarget); Life.shootTarget = nil end
+        if Visual.everywhere.target then restorefunction(Visual.everywhere.target); Visual.everywhere.target = nil end
+    end
+    hooked = false
+    espPool.destroy()
+    Visual.clearParticles(true)
+    for _, pen in Visual.pens do
+        for _, tri in pen.tris do tri:Remove() end
+        for _, quad in pen.quads do quad:Remove() end
+    end
+    table.clear(Visual.pens)
+    table.clear(visCache)
+    table.clear(shotAt)
+    table.clear(reloadAt)
+    table.clear(aimPartCache)
+    table.clear(humCache)
+    table.clear(humRecheck)
+    table.clear(Resolver.track)
+    table.clear(Visual.mp)
+    table.clear(monsterList)
+    table.clear(roster)
+    saTgt, kaAim, lastAim, ka.tgt = nil, nil, nil, nil
+    Visual.lock.model = nil
+    table.clear(Rel.cache)
+    hide_fov()
+    for i = 1, FOV_N do
+        fovLines[i]:Remove()
+    end
+    hide_aim_lines()
+    for i = 1, RET_N do
+        retLines[i]:Remove()
+    end
+    hide_ka()
+    for i = 1, KA_N do
+        kaLines[i]:Remove()
+    end
+    hide_mock()
+    for i = 1, #mockLines do
+        mockLines[i]:Remove()
+    end
+    for i = 1, #mockText do
+        mockText[i]:Remove()
+    end
+    Visual.fxFree()
+    table.clear(Visual.mockActors)
+    table.clear(stations)
+    hide_loot()
+    for i = 1, #lootLines do
+        lootLines[i]:Remove()
+    end
+    for i = 1, #lootText do
+        lootText[i]:Remove()
+    end
     -- the registry removes whatever the steps above missed or failed to reach
     try(drawMeta.sweep)
     getgenv().HushSilent = nil
@@ -8624,31 +8373,28 @@ end))
 game:GetService("ContextActionService"):BindActionAtPriority("HushMoveKeys", function() return Enum.ContextActionResult.Sink end,
     false, 3000, CFG.Keys.Speed, CFG.Keys.HighJump)
 
-bind(RunService.RenderStepped:Connect(Visual.safe("frame", step)))
-bind(RunService.PreSimulation:Connect(Visual.safe("moveStep", Visual.moveStep)))
-bind(RunService.PostSimulation:Connect(Visual.safe("hopPost", Visual.hopHorizontalPost)))
+bind(RunService.RenderStepped:Connect(step))
+bind(RunService.PreSimulation:Connect(Visual.moveStep))
+bind(RunService.PostSimulation:Connect(Visual.hopHorizontalPost))
 Visual.worldStart()
 bind(game:GetService("ProximityPromptService").PromptShown:Connect(Visual.onPromptShown))
 -- Runs after the game's Camera/Character yaw writers; Heartbeat yaw alone is overwritten.
-RunService:BindToRenderStep("HushKA_Facing", Enum.RenderPriority.Character.Value + 1, Visual.safe("kaFace", Visual.kaFaceStep))
+RunService:BindToRenderStep("HushKA_Facing", Enum.RenderPriority.Character.Value + 1, Visual.kaFaceStep)
 -- after the game's cameraStep (Camera+1) rewrote u108: keeps the HUD crosshair and the next shot on the camera centre
-RunService:BindToRenderStep("HushSwap", Enum.RenderPriority.Camera.Value + 3, Visual.safe("swap", Visual.swapStep))
+RunService:BindToRenderStep("HushSwap", Enum.RenderPriority.Camera.Value + 3, Visual.swapStep)
 Visual.perfAt = os.clock() + 15
-bind(RunService.Heartbeat:Connect(Visual.safe("heartbeat", function()
+bind(RunService.Heartbeat:Connect(function()
     if not running then
         return
     end
     local hbStart = os.clock()
     Visual.memStart()
-    -- every stage is isolated: one that throws is printed once and the rest (heal, loot, kill aura) still run
-    local try = Visual.try
-    try("held", refresh_held)
+    refresh_held()
     local now = hbStart
-    local ok, client = try("baseTick", Visual.baseTick, now)
-    if ok and client then try("baseHooks", Visual.baseHooks, now, client) end
-    try("skin", Visual.skinTick, now)
-    try("weaponScale", Visual.weaponScaleTick, now)
-    try("autoWire", Visual.autoWire)
+    Visual.baseTick(now)
+    Visual.skinTick(now)
+    Visual.weaponScaleTick(now)
+    Visual.autoWire()
     Visual.measure("hbBase", hbStart)
     if not hooked and held.firearm and now >= Install.nextAt and Install.tries < 8 then
         Install.tries += 1
@@ -8658,24 +8404,24 @@ bind(RunService.Heartbeat:Connect(Visual.safe("heartbeat", function()
             Install.why = tostring(err)
         end
         if not hooked and Install.tries == 8 then
-            warn("[hush] silent off: " .. tostring(Install.why) .. ". Unequip and equip a firearm to retry.")
+            log("[hush] silent off: " .. tostring(Install.why) .. ". Unequip and equip a firearm to retry.")
         end
     end
-    try("ledger", Visual.ledSweep, now)
-    try("dbgTick", Visual.dbgTick, now)
-    try("staff", Visual.staffTick, now)
+    Visual.ledSweep(now)
+    Visual.dbgTick(now)
+    Visual.staffTick(now)
     local t0 = os.clock()
-    try("killAura", step_killaura, now)
+    step_killaura(now)
     t0 = Visual.measure("hbKillAura", t0)
-    try("autoLoot", Loot.auto, now)
-    try("lootExpire", Loot.expireKnown, now)
+    Loot.auto(now)
+    Loot.expireKnown(now)
     Visual.measure("hbAutoOpen", t0)
     Visual.measureT("HB", hbStart)
     if CFG.PerfLog and now >= Visual.perfAt then
         Visual.perfAt = now + 15
         Visual.report()
     end
-end)))
+end))
 
 local function watch_char(char)
     if not running or not char or Life.character == char then return end
@@ -8875,16 +8621,6 @@ getgenv().HushSilent = {
     unload = unload,
     soundTest = play_hit,
     resources = Life.snapshot,
-    diag = function()
-        local parts = { "HUSH diagnostics", "drawings live " .. drawMeta.stats.live .. " peak " .. drawMeta.stats.peak .. " created " .. drawMeta.stats.created .. " removed " .. drawMeta.stats.removed }
-        local any = false
-        for name, e in Life.errs do
-            any = true
-            parts[#parts + 1] = string.format("%s x%d (%.0f s ago): %s", name, e.n, os.clock() - (e.at or 0), tostring(e.msg))
-        end
-        if not any then parts[#parts + 1] = "no section errors" end
-        return table.concat(parts, "\n")
-    end,
     perf = function()
         local result = {}
         for name, row in Loot.perf do
