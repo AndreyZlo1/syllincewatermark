@@ -153,6 +153,7 @@ local CFG = {
 	AutoBall = true,
 	TackleGoalZone = 40,
 	CompetitorGoalZone = 45, -- we or the ball this close to EITHER goal -> every Competitor Check is off (0 = never off by zone)
+	DrawBox = true, -- AutoBox: rings on the boxes, the plan colour, the race labels
 	AutoBox = false, -- AutoBox: run for an item box when nothing else needs the body (stun a rival who beats us to it)
 	BoxMaxDist = 45, -- AutoBox: no box farther than this
 	BoxMargin = 0.3, -- AutoBox: a rival closing on the box within this of our arrival is a race (s)
@@ -7062,6 +7063,12 @@ oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
 			if packet.Phase == "Release" and cmd.PassType == "Shot" and Shoot.launch then
 				-- ground truth of every shot: the ball 0.2 s after the release against the solved flight (curve included)
 				local pv, hadDecoy, hadBody, p0 = Shoot.preview, Mark.sp ~= nil, Mark.fs ~= nil, Renderer.GetPosition()
+				-- what the ball can have followed: the packet aim, the last decoy, the aim the game froze at its lock, the first-frame real
+				local sp0 = Mark.sp
+				local decoyLast = sp0 and sp0.lastDir
+				local realFirst = sp0 and sp0.D0
+				local lockRay = ChargedKick.GetChargeAimRay and ChargedKick.GetChargeAimRay()
+				local lockDir = type(lockRay) == "table" and lockRay.Direction or nil
 				-- how stale the solved shot is at the release: the ball against the origin it was solved from, the age of the
 				-- solve / of the last re-aim (the carried ball swings with the body pose)
 				local drift = p0 and Shoot.aimBallAt and (p0 - Shoot.aimBallAt).Magnitude or -1
@@ -7092,6 +7099,17 @@ oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
 						return
 					end
 					local ang = math.deg(math.acos(math.clamp(ea.Unit:Dot(aa.Unit), -1, 1)))
+					if hadDecoy then
+						local function yawGap(u, v)
+							if not (u and v) then
+								return "-"
+							end
+							local d = math.deg(math.atan2(u.X, u.Z) - math.atan2(v.X, v.Z))
+							return string.format("%.0f", math.abs((d + 180) % 360 - 180))
+						end
+						local sent = typeof(aimSent) == "Vector3" and aimSent or nil
+						logFile("spoof leak", "ball vs sent", yawGap(aa, sent), "vs last decoy", yawGap(aa, decoyLast), "vs game lock", yawGap(aa, lockDir), "sent vs first real", yawGap(sent, realFirst), "sent vs decoy", yawGap(sent, decoyLast))
+					end
 					logFile("shoot", "flight", "angle to solved", string.format("%.1f", ang), "moved", string.format("%.1f", aa.Magnitude), "solved", string.format("%.1f", ea.Magnitude), "decoy", hadDecoy and "yes" or "no", "body", hadBody and "yes" or "no", "drift", string.format("%.1f", drift), "solve age", string.format("%.2f", ageS), "rebase age", string.format("%.2f", ageR), "aim sent", aimSent and fmtV(aimSent) or "-")
 				end)
 			end
@@ -8471,6 +8489,32 @@ end
 --   DEPTH: the knock-back goes along our line to him. A push whose path (GunPushTravel studs) runs over the point
 --   where the ball crosses while he stays in front of the line throws him INTO the shot - skipped;
 --   not down / not shielded (ItemInvulnerableUntil).
+-- The keeper's dive is a committed motion (GoalkeeperDive: Distance 20, DurationSeconds 0.875, he is back in control after
+-- MovementRestoreStartsAtSeconds 1.125 + MovementRestoreSeconds 0.5): while it runs or he recovers a push changes nothing
+-- he could still decide (user: "it shoots the keeper after his dive"). t = seconds since his dive started.
+Mark.diveBusy = function(t)
+	return t ~= nil and t >= 0 and t < 1.125 + 0.5
+end
+
+-- seconds since this enemy keeper started a dive, or nil. Players: the GoalkeeperDiveStarted stamp; an NPC keeper moves by
+-- the server, so his body speed (kpTrack, > 35 st/s = the dive burst) and the wall-trap dive record stand for it.
+Mark.keeperDiveAge = function(k)
+	local now = os.clock()
+	if not k.npc then
+		local at = Mark.foeDive and Mark.foeDive[k.key]
+		return at and now - at or nil
+	end
+	local td = Mark.trapDive
+	if td and td.uid == k.key then
+		return now - td.at + (td.el0 or 0)
+	end
+	local tr = Mark.kpTrack
+	if tr and tr.key == k.key and tr.vK and tr.vK.Magnitude > 35 then
+		return 0.2
+	end
+	return nil
+end
+
 Mark.gunPushTry = function(root, tag, key, pts)
 	if not CFG.GunPush or not pts or #pts < 2 then
 		return false
@@ -8535,6 +8579,15 @@ Mark.gunPushTry = function(root, tag, key, pts)
 	end
 	if k.actor and Mark.mateDown(k.actor, k.model) then
 		return skip("keeper already down")
+	end
+	local diveAge = Mark.keeperDiveAge(k)
+	if Mark.diveBusy(diveAge) then
+		return skip(string.format("keeper is in his dive (%.2f s)", diveAge))
+	end
+	-- he is not in a dive yet: if the shot crosses the line farther than a dive reaches (GoalkeeperDive.Distance 20 + body)
+	-- the keeper does not save it and there is nothing to push
+	if math.abs(flat(C - K):Dot(side)) > 23 and segK > 6 then
+		return skip(string.format("shot is out of his reach (%.1f)", math.abs(flat(C - K):Dot(side))))
 	end
 	local inv = k.model and k.model:GetAttribute("ItemInvulnerableUntil")
 	if type(inv) == "number" and inv > Workspace:GetServerTimeNow() then
@@ -8632,6 +8685,13 @@ Mark.gunPushRoll = function(root)
 	if not iC then
 		return
 	end
+	-- the ball is heading into the goal: from here every silent return says why (once per reason per second)
+	local function why(w)
+		if w ~= Mark.rollWhy or os.clock() - (Mark.rollWhyAt or 0) > 1 then
+			Mark.rollWhy, Mark.rollWhyAt = w, os.clock()
+			logFile("gunpush roll skip", w)
+		end
+	end
 	local ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
 	local tLand = ping * 0.5 + 0.1
 	local reach = CFG.GunPushRollReach or 6
@@ -8666,6 +8726,11 @@ Mark.gunPushRoll = function(root)
 		end
 	end
 	if not best then
+		why("nobody on the path (reach " .. tostring(reach) .. ")")
+		return
+	end
+	if Mark.diveBusy(Mark.keeperDiveAge({ npc = best.actor == nil, key = best.key })) then
+		why("the blocker is a keeper in his dive")
 		return
 	end
 	local now = os.clock()
@@ -8676,6 +8741,7 @@ Mark.gunPushRoll = function(root)
 	end
 	local inv = best.model:GetAttribute("ItemInvulnerableUntil")
 	if type(inv) == "number" and inv > Workspace:GetServerTimeNow() then
+		why("the blocker is shielded")
 		return
 	end
 	local K = best.r.Position
@@ -8689,6 +8755,7 @@ Mark.gunPushRoll = function(root)
 		gun = "flintlock"
 	end
 	if not gun then
+		why(string.format("no gun for d %.1f", d))
 		return
 	end
 	local pushDir = unitOrNil(flat(K - root.Position))
@@ -10972,8 +11039,28 @@ end
 -- seconds: the forcefield (when owned, AutoShield) or a barricade on the line of fire, 5 studs in front of us, BEFORE the shot -
 -- a hitscan gets no reaction time after it. One try per aim episode; a new one needs the aim lost for 0.6 s.
 Mark.gunSeen = {}
+-- Out of the line of fire (no shield, no wall): with the ball a pass / dump, without it a 5 st step across the line - the side
+-- away from his muzzle line is the one the line of sight leaves (his aim is on our body: either side leaves the 3.5 st cone).
+Mark.gunSidestep = function(root, from, d)
+	local line = unitOrNil(flat(root.Position - from))
+	if not line then
+		return "no line"
+	end
+	local side = Vector3.new(-line.Z, 0, line.X)
+	if liveOwnerId() == LocalPlayer.UserId then
+		local ev = { born = os.clock(), p = flat(from), r = 20, item = "gun" }
+		return Mark.hazPass(root, ev, 0.4, 0, line, "gun") and "pass" or "own ball, no pass"
+	end
+	if side:Dot(unitOrNil(flat(root.AssemblyLinearVelocity)) or side) < 0 then
+		side = -side -- the side we already run to
+	end
+	Mark.hazardStep(root, side * 5, "gun")
+	return "step"
+end
 Mark.gunTick = function(root)
-	if not (CFG.AutoWall and CFG.GunWall ~= false) or Mark.meKeeper() then
+	-- the wall / shield answer belongs to AutoWall; AutoDodge steps out of the line of fire when that answer is not there
+	local wallOn = CFG.AutoWall and CFG.GunWall ~= false
+	if not (wallOn or CFG.AutoDodge) or Mark.meKeeper() then
 		return
 	end
 	local now = os.clock()
@@ -11001,9 +11088,9 @@ Mark.gunTick = function(root)
 					if not s.tried and now - s.since >= hold then
 						s.tried = true
 						local how = "-"
-						if CFG.AutoShield and Mark.shieldNow(string.format("%s aimed by %s d %.0f miss %.1f", gun, actorName(actor), d, miss)) then
+						if wallOn and CFG.AutoShield and Mark.shieldNow(string.format("%s aimed by %s d %.0f miss %.1f", gun, actorName(actor), d, miss)) then
 							how = "shield"
-						else
+						elseif wallOn then
 							-- the line of fire as a path the wall solver can cross: hitscan = fast (400 st/s) from his muzzle at us
 							local from = r.Position
 							local u = unitOrNil(flat(root.Position - from))
@@ -11015,6 +11102,9 @@ Mark.gunTick = function(root)
 								s.tried = false -- barricades coming out: place on the next tick
 								continue
 							end
+						end
+						if how ~= "shield" and how ~= "wall" and CFG.AutoDodge then
+							how = how .. " -> " .. Mark.gunSidestep(root, r.Position, d)
 						end
 						logFile("gun aimed", gun, actorName(actor), "d", string.format("%.0f", d), "miss", string.format("%.1f", miss), "held", string.format("%.2f", now - s.since), "->", how)
 					end
@@ -12153,7 +12243,7 @@ end
 --              the stream velocity carries the extra speed (CharacterMotion.SetStreamVelocity, nil = real velocity again),
 --              so the MovementUpdate packets agree with the position. Pulse = the same step in bursts.
 --  Jump Boost  Movement.SetMultiplier JumpHeight: getJumpLaunchSpeed and the guard's registered launch read that table.
---  Stamina     Sprint.SetUnlimitedStamina (source "MoveHack"; the agent has no stamina source of its own).
+--  Stamina     Sprint.SetUnlimitedStamina (the same source API AgentJump / MoveAgent use).
 --  Knockback   KnockbackMotion.Run (the client half of a server push) is skipped for our character (Mark.knockHook).
 --  Ragdoll     Ragdoll.ClearActor, the game's own end-of-ragdoll, as soon as the server state reaches us.
 --  Stun        Stun.IsCharacterStunned / IsActorStunnedForPress answer false for us: sprint and the client button locks.
@@ -12834,6 +12924,7 @@ local function onFx(kind, userId, a, b, c, aimDir, ...)
 		end
 		if userId == LocalPlayer.UserId then
 			Mark.gkKnockDive(c)
+			Mark.hitNote(b, typeof(c) == "Vector3" and c.Magnitude or 0)
 		end
 	elseif kind == "ForcefieldBlocked" then
 		logFile("shield blocked", "actor", tostring(userId), "a", tostring(a), "by", tostring(b))
@@ -12979,7 +13070,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- Illegal Soccer dump " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v185")
+	add("-- Illegal Soccer dump " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v187")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -13158,9 +13249,17 @@ Mark.doJump = function(why)
 	if Mark.walk.ReleaseJump then
 		Mark.walk.ReleaseJump()
 	end
-	-- Movement.Jump runs Sprint.spendJumpStamina: a jump on an empty bar is refused (ok = false) - the agent has no free jumps
+	-- Movement.Jump calls the jump-started handler = Sprint.spendJumpStamina, which returns false (no jump, no error) when stamina
+	-- is short and no unlimited-stamina source is set (the "AutoBlock sometimes does not jump"); not while a flag guard runs
 	Mark.sprint = Mark.sprint or require(Client.Gameplay.Player.Sprint)
+	local calm = os.clock() < (Mark.sprintFlagUntil or 0)
+	if not calm then
+		Mark.sprint.SetUnlimitedStamina("AgentJump", true)
+	end
 	local ok = Mark.walk.Jump()
+	task.delay(0.4, function()
+		Mark.sprint.SetUnlimitedStamina("AgentJump", false)
+	end)
 	if not ok and Mark.walk.SetJumpStateBlocked then
 		local blocks = Mark.jumpBlocks and Mark.jumpBlocks()
 		if type(blocks) == "table" and blocks.HeldJump and not blocks.Server and not blocks.Ragdoll then
@@ -16118,6 +16217,41 @@ Mark.spoofWin = function(body)
 	return math.min(want, lock - ping * 0.5 - 0.03)
 end
 
+-- weighted pattern pick. Pro Patterns: only what a human does with the camera. A curled shot: yaw-locked patterns only.
+-- Patterns used in the last two shots weigh x0.3. Pure: `roll` is math.random().
+Mark.spoofPro = { triple = true, reverse = true, mirror = true, late = true, drop = true, across = true, stair = true, lift = true }
+Mark.spoofPick = function(pats, hist, proOnly, curved, roll)
+	local total, list = 0, {}
+	for name, p in pats do
+		local w = ((proOnly and not Mark.spoofPro[name]) or (curved and not p.yawLock)) and 0 or p.w
+		for i = 1, #hist do
+			if hist[i] == name then
+				w *= 0.3
+			end
+		end
+		if w > 0 then
+			total += w
+			list[#list + 1] = { name, w }
+		end
+	end
+	table.sort(list, function(x, y)
+		return x[1] < y[1]
+	end)
+	local r, pick = roll * total, list[#list][1]
+	for i = 1, #list do
+		r -= list[i][2]
+		if r <= 0 then
+			pick = list[i][1]
+			break
+		end
+	end
+	hist[#hist + 1] = pick
+	if #hist > 2 then
+		table.remove(hist, 1)
+	end
+	return pick
+end
+
 Mark.spoofPlan = function()
 	Mark.sp = nil
 	if not CFG.DirSpoof or Mark.flickStrike or Mark.forceBike or Mark.aerial or Shoot.lob then
@@ -16157,109 +16291,138 @@ Mark.spoofPlan = function()
 	local sr = math.clamp((P - lb):Dot(along) / W * 2 - 1, -1, 1)
 	local hr = math.clamp((P.Y - lb.Y) / H, 0, 1)
 	local rs = sr >= 0 and 1 or -1
-	local opp = -rs
 	local sk = nil
 	if Mark.gkRoot and Mark.gkRoot.Parent then
 		sk = math.clamp((Mark.gkRoot.Position - lb):Dot(along) / W * 2 - 1, -1.5, 1.5)
 	end
-	local hi = hr > 0.5
+	-- steps = { side, seconds, side at the end (a sweep) }. A side is in HALF-GOALS RELATIVE TO THE REAL SHOT: +a = the real
+	-- side, -a = the other one, "R" = the real point itself. The real shot is re-solved while we charge (the carried ball
+	-- moves, the keeper moves: log `vs real 52 deg` mid-charge), so the decoy is rebuilt from the live real aim in
+	-- Mark.spoofDir, not from the aim of the first frame.
 	local pats = {
 		-- the mirror corner the whole time: he leans the wrong way
-		mirror = { w = 1 + ((sk and math.abs(sk - sr) < 0.5) and 1.5 or 0), steps = { { opp * 0.8, hi and 0.15 or 0.85, win } } },
-		-- opposite low, our side high, opposite high: a bot keeper follows every update
-		swing = { w = 1.6, steps = { { opp * 0.8, 0.2, win / 3 }, { rs * 0.6, 0.8, win / 3 }, { opp * 0.8, 0.85, win / 3 } } },
+		mirror = { w = 1 + ((sk and math.abs(sk - sr) < 0.5) and 1.5 or 0), steps = { { -0.8, win } } },
+		-- the other side low, our side high, the other side high: a bot keeper follows every update
+		swing = { w = 1.6, steps = { { -0.8, win / 3 }, { 0.6, win / 3 }, { -0.8, win / 3 } } },
 		-- the middle: he stays where he is (best when he is already far from the real side)
-		freeze = { w = (sk and math.abs(sk - sr) > 0.9) and 2 or 0.4, steps = { { 0, 0.3, win } } },
+		freeze = { w = (sk and math.abs(sk - sr) > 0.9) and 2 or 0.4, steps = { { 0, win } } },
 		-- four quick hops: with a 30 Hz update stream every hop is one packet, he cannot settle on one side
-		zigzag = { w = 1.6, steps = { { opp * 0.85, 0.5, win / 4 }, { rs * 0.5, 0.5, win / 4 }, { opp * 0.5, 0.5, win / 4 }, { rs * 0.85, 0.5, win / 4 } } },
+		zigzag = { w = 1.6, steps = { { -0.85, win / 4 }, { 0.5, win / 4 }, { -0.5, win / 4 }, { 0.85, win / 4 } } },
 		-- a sweep from our side to the far post: he chases it away from the real shot
-		sweep = { w = 0.8, steps = { { rs * 0.9, 0.4, win, opp * 0.9 } } },
-		-- PRO TRIPLE (user: aim the real corner, flick to the other, come back): real side first, the other corner up to
+		sweep = { w = 0.8, steps = { { 0.9, win, -0.9 } } },
+		-- PRO TRIPLE (user: aim the real corner, flick to the other, come back): the real point first, the other corner up to
 		-- the window end, then real again for the lock - the last flick is as late as the server allows (spoofWin)
-		triple = { w = 3, steps = { { sr, hr, win * 0.35 }, { opp * 0.85, hr, win * 0.65 } } },
+		triple = { w = 3, steps = { { "R", win * 0.35 }, { -0.85, win * 0.65 } } },
 		-- PRO REVERSE: the fake corner first, then across through the middle, then the real one at the lock
-		reverse = { w = 2.5, steps = { { opp * 0.85, hr, win * 0.55 }, { 0, hr, win * 0.45 } } },
+		reverse = { w = 2.5, steps = { { -0.85, win * 0.55 }, { 0, win * 0.45 } } },
 		-- left, right, then the real one (made for a middle shot, high or low)
-		late = { w = math.abs(sr) < 0.35 and 2.5 or 0, steps = { { -opp * 0.8, hi and 0.2 or 0.8, win / 2 }, { opp * 0.8, hi and 0.2 or 0.8, win / 2 } } },
+		late = { w = math.abs(sr) < 0.35 and 2.5 or 0, steps = { { 0.8, win / 2 }, { -0.8, win / 2 } } },
+		-- VERTICAL (user: real top corner right, look at the bottom corner right or left): a step is { side, seconds, side
+		-- at the end, height, height at the end }; height nil = the real one, "O" = the other half of the goal (low <-> high)
+		-- DROP: the real point, then the same side in the other half
+		drop = { w = 2.5, steps = { { "R", win * 0.3 }, { 0.85, win * 0.7, nil, "O" } } },
+		-- ACROSS: the real point, then the other half AND the other side
+		across = { w = 2.5, steps = { { "R", win * 0.3 }, { -0.85, win * 0.7, nil, "O" } } },
+		-- STAIR: the other half on the other side, then the other half on the real side
+		stair = { w = 1.8, steps = { { -0.85, win * 0.5, nil, "O" }, { 0.85, win * 0.5, nil, "O" } } },
+		-- LIFT: the yaw never leaves the real shot (a curled shot is bent around its yaw), only the pitch lies
+		lift = { w = 2, yawLock = true, steps = { { "R", win * 0.4, nil, "O" }, { "R", win * 0.6, nil, "R" } } },
 	}
-	local hist = Mark.spoofHist
-	local total, list = 0, {}
-	-- Pro Patterns: only what a human does with the camera (triple flick, the mirror corner, left-right for a middle shot)
-	local proOnly = CFG.DirSpoofPro ~= false
-	for name, p in pats do
-		local w = (proOnly and not (name == "triple" or name == "reverse" or name == "mirror" or name == "late")) and 0 or p.w
-		for i = 1, #hist do
-			if hist[i] == name then
-				w *= 0.3
-			end
-		end
-		if w > 0 then
-			total += w
-			list[#list + 1] = { name, w }
-		end
-	end
-	table.sort(list, function(x, y)
-		return x[1] < y[1]
-	end)
-	local roll, pick = math.random() * total, list[#list][1]
-	for i = 1, #list do
-		roll -= list[i][2]
-		if roll <= 0 then
-			pick = list[i][1]
-			break
-		end
-	end
-	hist[#hist + 1] = pick
-	if #hist > 2 then
-		table.remove(hist, 1)
-	end
+	-- a CURLED shot (|curve| >= SpoofCurveGuard) is bent around its yaw: only the yaw-locked pattern may lie (user: from the
+	-- side, curling to the other side, the ball flew nowhere near the goal with the yaw patterns)
+	local curved = math.abs(Shoot.curve or 0) >= (CFG.SpoofCurveGuard or 0.4)
+	local pick = Mark.spoofPick(pats, Mark.spoofHist, CFG.DirSpoofPro ~= false, curved, math.random())
 	local now = os.clock()
 	Mark.sp = {
-		t0 = now, endAt = now + win, steps = pats[pick].steps, O = O, D = D, lb = lb, along = along, W = W, H = H,
-		fov = a.CameraFieldOfView, air = a.IsAirborne, name = pick, hr = hr, cs = sr, lt = now,
+		t0 = now, endAt = now + win, steps = pats[pick].steps, O = O, lb = lb, along = along, n = n, W = W, H = H,
+		fov = a.CameraFieldOfView, air = a.IsAirborne, name = pick, hr = hr, sr = sr, rs = rs, cs = sr, ch = hr, lt = now, sr0 = sr, D0 = D,
 	}
-	logFile("spoof", "plan", pick, "real s", string.format("%.2f", sr), "h", string.format("%.2f", hr), "keeper s", sk and string.format("%.2f", sk) or "-", "window", string.format("%.2f", win))
+	logFile("spoof", "plan", pick, "curve", string.format("%.2f", Shoot.curve or 0), "real s", string.format("%.2f", sr), "h", string.format("%.2f", hr), "keeper s", sk and string.format("%.2f", sk) or "-", "window", string.format("%.2f", win))
 end
 
--- the decoy direction now (nil = real: after the window, or no plan)
+-- the REAL shot on the goal plane now (half-goals side, height 0..1) from the live Shoot.aim: the origin moves with us and
+-- the solve changes mid-charge, the decoy is built around this and not around the first frame
+Mark.spoofReal = function(sp)
+	local a = Shoot.aim
+	if not (a and typeof(a.Origin) == "Vector3" and typeof(a.Direction) == "Vector3") then
+		return
+	end
+	local den = a.Direction:Dot(sp.n)
+	if den > -0.05 then
+		return
+	end
+	local t = (sp.lb - a.Origin):Dot(sp.n) / den
+	if t <= 0 then
+		return
+	end
+	local P = a.Origin + a.Direction * t
+	sp.sr = math.clamp((P - sp.lb):Dot(sp.along) / sp.W * 2 - 1, -1, 1)
+	sp.hr = math.clamp((P.Y - sp.lb.Y) / sp.H, 0, 1)
+	sp.O = a.Origin
+end
+
+-- the decoy direction now (nil = real: after the window, or no plan). The aim travels to each step's side and ARRIVES
+-- inside the step: speed = max(Fake Speed, distance / half of what is left of the step). With the fixed speed alone the
+-- short presets never got there (Normal: 0.078 s for 1.85 half-goals at 14/s = it moved 1.1 and the window was over), the
+-- keeper saw a slow drift off the real point and no fake corner at all - only Long (0.13 s) arrived.
 Mark.spoofDir = function()
 	local sp = Mark.sp
 	if not sp then
 		return nil
 	end
-	local el = os.clock() - sp.t0
-	if os.clock() >= sp.endAt then
+	local now = os.clock()
+	if now >= sp.endAt then
 		return nil
 	end
-	local s, h = 0, 0.5
-	local acc = 0
+	Mark.spoofReal(sp)
+	local rl = math.abs(sp.sr) >= 0.15 and (sp.sr > 0 and 1 or -1) or sp.rs
+	local el = now - sp.t0
+	local s, h, rem, acc = 0, sp.hr, 0.02, 0
+	-- height tokens: nil / "R" = the real height, "O" = the other half of the goal, a number = that fraction
+	local function hOf(tok)
+		if tok == nil or tok == "R" then
+			return sp.hr
+		elseif tok == "O" then
+			return sp.hr > 0.5 and 0.12 or 0.88
+		end
+		return tok
+	end
 	for i = 1, #sp.steps do
 		local st = sp.steps[i]
-		if el < acc + st[3] or i == #sp.steps then
-			s, h = st[1], st[2]
-			if st[4] then
-				s = st[1] + (st[4] - st[1]) * math.clamp((el - acc) / st[3], 0, 1)
+		if el < acc + st[2] or i == #sp.steps then
+			local f = st[3] and math.clamp((el - acc) / st[2], 0, 1) or 0
+			s = st[1] == "R" and sp.sr or st[1] * rl
+			if st[3] then
+				s += (st[3] * rl - s) * f
 			end
+			h = hOf(st[4])
+			if st[5] then
+				h += (hOf(st[5]) - h) * f
+			end
+			rem = acc + st[2] - el
 			break
 		end
-		acc += st[3]
+		acc += st[2]
 	end
-	-- sideways only: the decoy keeps the real height. A decoy pitch that leaks into the shot sends it over the bar.
-	h = sp.hr or h
-	-- the decoy slides to each step at Fake Speed (half-goals / s), not a jump: a human flick the keeper can follow
-	local nowC = os.clock()
 	local spd = CFG.DirSpoofSpeed or 14
 	if sp.cs == nil or spd >= 40 then
-		sp.cs = s
-	elseif nowC > (sp.lt or nowC) then
-		local mv = spd * (nowC - sp.lt)
-		sp.cs = sp.cs + math.clamp(s - sp.cs, -mv, mv)
+		sp.cs, sp.ch = s, h
+	elseif now > sp.lt then
+		-- one straight move in the goal plane (metres), same arrival rule for side and height
+		local dm = math.sqrt(((s - sp.cs) * sp.W * 0.5) ^ 2 + ((h - sp.ch) * sp.H) ^ 2)
+		if dm > 1e-6 then
+			local v = math.max(spd, dm / (sp.W * 0.5) / math.max(rem * 0.5, 0.02))
+			local k = math.min(1, v * (sp.W * 0.5) * (now - sp.lt) / dm)
+			sp.cs += (s - sp.cs) * k
+			sp.ch += (h - sp.ch) * k
+		end
 	end
-	sp.lt = nowC
-	s = sp.cs
-	local Q = sp.lb + sp.along * (sp.W * (s + 1) * 0.5) + Vector3.new(0, sp.H * h, 0)
+	sp.lt = now
+	-- the decoy ray goes through (cs, ch) on the goal plane
+	local Q = sp.lb + sp.along * (sp.W * (sp.cs + 1) * 0.5) + Vector3.new(0, sp.H * sp.ch, 0)
 	sp.q = Q
-	return unitOrNil(Q - sp.O)
+	sp.lastDir = unitOrNil(Q - sp.O)
+	return sp.lastDir
 end
 
 Mark.spoofRay = function()
@@ -20168,146 +20331,265 @@ Mark.boxFree = function()
 	return false
 end
 
-Mark.tickBox = function(character, root)
-	local m = Mark.move
-	local function quit(why)
-		if m.mode == "box" then
-			Mark.moveStop("box")
+-- a condition must hold `onT` s to turn true and fail `offT` s to turn false: a one-frame flicker (the ball owner flips
+-- between "nobody" and "him" at a touch) used to stop the run and zero the stick every other frame - the log showed
+-- `box go` 120 times a second with the distance frozen
+Mark.boxDeb = {}
+Mark.boxHold = function(key, cond, onT, offT)
+	local now = os.clock()
+	local s = Mark.boxDeb[key]
+	if not s then
+		s = { v = false }
+		Mark.boxDeb[key] = s
+	end
+	if cond == s.v then
+		s.pend = nil
+	else
+		s.pend = s.pend or now
+		if now - s.pend >= (cond and onT or offT) then
+			s.v, s.pend = cond, nil
 		end
-		if why ~= Mark.boxWhy then
-			Mark.boxWhy = why
-			if why ~= "off" and why ~= "busy" and why ~= "no box" then
-				logFile("box skip", why)
-			end
-		end
 	end
-	if not CFG.AutoBox then
-		quit("off")
-		return
+	return s.v
+end
+
+-- the plan for the nearest live box, at 10 Hz: who gets there first and what we do about it
+Mark.boxScan = function(character, root, hum)
+	local now = os.clock()
+	local N = Mark.boxNow
+	if N and now - N.at < 0.1 then
+		return N
 	end
-	local hum = character:FindFirstChildOfClass("Humanoid")
-	if not hum or Mark.meKeeper() or Mark.slideBody() or Mark.aerial or Mark.duel or not CharacterControllers.IsLanded(character, hum) then
-		quit("busy")
-		return
-	end
-	if Mark.moveLive(m) and m.mode ~= "box" then
-		quit("mode " .. tostring(m.mode)) -- another module owns the body
-		return
-	end
-	local oid = liveOwnerId()
-	if type(oid) == "number" and oid ~= 0 and not (playerOf(oid) and sameTeam(playerOf(oid)) and oid ~= LocalPlayer.UserId) then
-		quit("ball owned") -- we or an enemy carry: the ball is the job
-		return
-	end
-	if not Mark.boxFree() then
-		quit("slots full")
-		return
-	end
+	N = { at = now, others = {}, rivals = {} }
+	Mark.boxNow = N
 	local O = root.Position
 	local lim = CFG.BoxMaxDist or 45
-	local best, bd = nil, math.huge
+	local bd = math.huge
 	for _, b in CollectionService:GetTagged("GameplayItemBox") do
 		local hb = b:FindFirstChild("Hitbox")
 		if hb and hb.CanTouch then
 			local d = flat(hb.Position - O).Magnitude
 			if d < bd and d <= lim then
-				best, bd = hb, d
+				if N.part then
+					N.others[#N.others + 1] = N.part.Position
+				end
+				N.part, bd = hb, d
+			elseif d <= lim * 1.5 then
+				N.others[#N.others + 1] = hb.Position
 			end
 		end
 	end
-	if not best then
-		quit("no box")
-		return
+	if not N.part then
+		return N
 	end
-	-- the ball first: a ball close to our goal is not left for a box
-	local ballP = Renderer.GetPosition()
-	local lb, _, rb = goalMouthCorners(ourGoalPart())
-	if lb and rb and typeof(ballP) == "Vector3" then
-		local mid = (lb + rb) * 0.5
-		if flat(ballP - mid).Magnitude < (CFG.BoxBallSafe or 45) then
-			quit("ball near our goal")
-		return
-		end
-	end
-	local P = best.Position
+	N.P, N.bd = N.part.Position, bd
 	local speed = math.max(hum.WalkSpeed, 16)
-	local myEta = bd / speed
+	N.myEta = bd / speed
 	local ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
-	local rivals, mates = {}, {}
+	local mates = {}
 	for _, pl in Players:GetPlayers() do
 		if pl ~= LocalPlayer and not isGoalkeeper(pl) then
 			local hr = ActorTargeting.GetActorRoot(pl)
 			local ch = Actors.GetCharacter(pl)
 			local hh = ch and ch:FindFirstChildOfClass("Humanoid")
 			if hr and hh and hh.Health > 0 then
-				local to = flat(P - hr.Position)
+				local to = flat(N.P - hr.Position)
 				local d = to.Magnitude
-				local v = flat(hr.AssemblyLinearVelocity)
-				local sp = math.max(hh.WalkSpeed, 16)
-				local eta = d / sp
+				local v = flat(CharacterMotion.GetVelocity(ch) or hr.AssemblyLinearVelocity)
+				local eta = d / math.max(hh.WalkSpeed, 16)
 				if sameTeam(pl) then
 					mates[#mates + 1] = eta
 				else
 					local closing = d < 10 or (v.Magnitude > 4 and to.Unit:Dot(v.Unit) > 0.5)
-					local rec = { eta = eta, closing = closing, pl = pl, root = hr, ch = ch }
-					local dm = flat(hr.Position - O).Magnitude
-					rec.reach = closing and dm <= math.min(CFG.TackleReach or 18, 14)
-					rivals[#rivals + 1] = rec
+					local rec = { eta = eta, closing = closing, pl = pl, root = hr, pos = hr.Position, v = v }
+					rec.reach = closing and flat(hr.Position - O).Magnitude <= math.min(CFG.TackleReach or 18, 14)
+					N.rivals[#N.rivals + 1] = rec
 				end
 			end
 		end
 	end
-	local plan, who = Mark.boxPlan(myEta, rivals, CFG.BoxMargin or 0.3, mates)
-	if plan == "skip" then
-		quit("skip " .. tostring(who))
+	N.plan, N.who = Mark.boxPlan(N.myEta, N.rivals, CFG.BoxMargin or 0.3, mates)
+	N.ping = ping
+	return N
+end
+
+Mark.boxEnd = function(why)
+	local m = Mark.move
+	if m.mode == "box" then
+		Mark.moveStop("box")
+	end
+	local r = Mark.boxRun
+	if r then
+		Mark.boxRun = nil
+		logFile("box end", why, "ran", string.format("%.1f", os.clock() - r.at), "dist", string.format("%.1f", r.last or -1), "from", string.format("%.1f", r.d0))
+	end
+	Mark.boxWhy = why
+end
+
+Mark.boxStep = function(character, root)
+	local m = Mark.move
+	if not CFG.AutoBox then
+		Mark.boxEnd("off")
 		return
 	end
-	if plan == "stun" then
-		local r = who
-		local v = flat(r.root.AssemblyLinearVelocity)
-		local aimP = r.root.Position + v * (0.25 + ping * 0.5)
+	local hum = character:FindFirstChildOfClass("Humanoid")
+	if not hum or Mark.meKeeper() or Mark.slideBody() or Mark.aerial or Mark.duel or not CharacterControllers.IsLanded(character, hum) then
+		Mark.boxEnd("busy")
+		return
+	end
+	if Mark.moveLive(m) and m.mode ~= "box" then
+		Mark.boxEnd("mode " .. tostring(m.mode)) -- another module owns the body
+		return
+	end
+	local oid = liveOwnerId()
+	local carried = type(oid) == "number" and oid ~= 0 and not (playerOf(oid) and sameTeam(playerOf(oid)) and oid ~= LocalPlayer.UserId)
+	if Mark.boxHold("carried", carried, 0.25, 0.25) then
+		Mark.boxEnd("ball carried") -- we or an enemy carry: the ball is the job
+		return
+	end
+	if not Mark.boxFree() then
+		Mark.boxEnd("slots full")
+		return
+	end
+	local N = Mark.boxScan(character, root, hum)
+	if not N.part then
+		Mark.boxEnd("no box")
+		return
+	end
+	local lb, _, rb = goalMouthCorners(ourGoalPart())
+	local ballP = Renderer.GetPosition()
+	if lb and rb and typeof(ballP) == "Vector3" and flat(ballP - (lb + rb) * 0.5).Magnitude < (CFG.BoxBallSafe or 45) then
+		Mark.boxEnd("ball near our goal")
+		return
+	end
+	if N.plan == "skip" then
+		Mark.boxEnd("skip " .. tostring(N.who))
+		return
+	end
+	local O = root.Position
+	if N.plan == "stun" then
+		local r = N.who
+		local aimP = r.root.Position + r.v * (0.25 + N.ping * 0.5)
 		local dir = unitOrNil(flat(aimP - O))
 		if dir then
 			local ok, why = tryTackle(character, root, dir, nil, nil, false, nil)
-			Mark.teleAdd("box.stun", ok == true)
-			logFile("box stun", ok and "ok" or "refused", tostring(why), "rival eta", string.format("%.2f", r.eta), "my eta", string.format("%.2f", myEta), "dist", string.format("%.1f", flat(r.root.Position - O).Magnitude))
+			-- a refusal for the cooldown is not an attempt; every other answer is logged when it changes
+			if ok or (why ~= "cd" and why ~= "reject-wait") then
+				Mark.teleAdd("box.stun", ok == true)
+			end
+			local key = ok and "ok" or tostring(why)
+			if key ~= Mark.boxStunKey or os.clock() - (Mark.boxStunAt or 0) > 1 then
+				Mark.boxStunKey, Mark.boxStunAt = key, os.clock()
+				logFile("box stun", ok and "ok" or "refused", tostring(why), "rival eta", string.format("%.2f", r.eta), "my eta", string.format("%.2f", N.myEta), "dist", string.format("%.1f", flat(r.root.Position - O).Magnitude))
+			end
 			if ok then
 				return
 			end
 		end
-		quit("stun refused")
+		Mark.boxEnd("stun refused")
 		return
 	end
-	-- go: steer at the box; the touch is the grant
+	local bd = flat(N.P - O).Magnitude
 	if bd < 1.0 then
-		quit("at box")
+		Mark.boxEnd("at box")
 		return
 	end
-	local dir = unitOrNil(flat(P - O))
-	if not dir then
-		quit("no dir")
-		return
+	local dir = unitOrNil(flat(N.P - O))
+	if not Mark.boxRun then
+		Mark.boxRun = { at = os.clock(), part = N.part, d0 = bd }
+		Mark.boxTrack = { at = os.clock(), part = N.part, n0 = Mark.boxCount() }
+		Mark.boxWhy = "go"
+		logFile("box go", "dist", string.format("%.1f", bd), "eta", string.format("%.2f", N.myEta), "rivals", #N.rivals)
 	end
-	if m.mode ~= "box" then
-		logFile("box go", "dist", string.format("%.1f", bd), "eta", string.format("%.2f", myEta), "rivals", #rivals)
-		Mark.boxTrack = { at = os.clock(), part = best, n0 = Mark.boxCount() }
-	end
+	Mark.boxRun.last = bd
 	Mark.moveSteer(dir, "box")
 end
 
--- result of a box run: the box is gone 2 s after we started -> did a slot fill?
+-- what AutoBox is doing, in the world: a ring on every live box, the target in the colour of the plan, our line to it, the
+-- lines of the rivals that race us, and one label with the two arrival times
+Mark.drawBox = function(root)
+	Mark.boxLines = Mark.boxLines or makeLines(120, 1.4, 40)
+	Mark.boxPool = Mark.boxPool or Mark.segPool(Mark.boxLines)
+	Mark.boxText = Mark.boxText or newDraw("Text", 41)
+	local pool, tx = Mark.boxPool, Mark.boxText
+	tx.Visible = false
+	local N = Mark.boxNow
+	if CFG.Draw and CFG.AutoBox and CFG.DrawBox ~= false and N and N.part and os.clock() - N.at < 0.5 and Workspace.CurrentCamera then
+		local function ring(c, R, col, th)
+			local prev = nil
+			for k = 0, 16 do
+				local a = k / 16 * math.pi * 2
+				local p = Vector3.new(c.X + math.cos(a) * R, c.Y, c.Z + math.sin(a) * R)
+				if prev then
+					pool.seg(prev, p, col, 0.9, th, 40)
+				end
+				prev = p
+			end
+		end
+		for _, p in N.others do
+			ring(p, 2, Color3.fromRGB(150, 160, 175), 1)
+		end
+		local col, word = Color3.fromRGB(90, 255, 150), "GO"
+		if N.plan == "stun" then
+			col, word = Color3.fromRGB(255, 80, 80), "STUN"
+		elseif N.plan == "skip" then
+			col, word = Color3.fromRGB(255, 170, 60), "SKIP " .. tostring(N.who == "mate" and "mate nearer" or "rival wins")
+		elseif not Mark.boxRun then
+			col, word = Color3.fromRGB(150, 190, 255), "IDLE " .. tostring(Mark.boxWhy or "")
+		end
+		ring(N.P, 4, col, 2)
+		ring(N.P, 1.5, col, 1.4)
+		if Mark.boxRun or N.plan == "stun" then
+			pool.seg(root.Position, N.P, col, 0.9, 1.6, 40)
+		end
+		local best = nil
+		for _, r in N.rivals do
+			if r.closing then
+				pool.seg(r.pos, N.P, Color3.fromRGB(255, 90, 90), 0.7, 1.2, 40)
+				best = (not best or r.eta < best.eta) and r or best
+			end
+		end
+		local sp = Workspace.CurrentCamera:WorldToViewportPoint(N.P + Vector3.new(0, 5, 0))
+		if sp.Z > 0 then
+			tx.Center, tx.Outline, tx.OutlineColor, tx.Size, tx.Font = true, true, COL.Ink, 14, FONT
+			tx.Color = col
+			tx.Position = Vector2.new(sp.X, sp.Y)
+			tx.Text = string.format("BOX %s  you %.1fs  him %s", word, N.myEta, best and string.format("%.1fs", best.eta) or "-")
+			tx.Visible = true
+		end
+	end
+	pool.finish()
+end
+
+Mark.tickBox = function(character, root)
+	Mark.boxStep(character, root)
+	Mark.drawBox(root)
+end
+
+-- result of a box run: the box gone -> did a slot fill (we got it) or not (a rival did)? Checked while we run for it and
+-- for 3 s after; a box still there 3 s after the run ended is dropped
 Mark.boxResult = function()
 	local t = Mark.boxTrack
-	if not t or os.clock() - t.at < 1.0 then
+	if not t then
 		return
 	end
+	local now = os.clock()
 	local gone = not (t.part.Parent and t.part.CanTouch)
-	if gone or os.clock() - t.at > 8 then
+	if not gone and not Mark.boxRun and now - (t.endAt or now) > 3 then
+		t.endAt = nil
+		Mark.boxTrack = nil
+		return
+	end
+	if not Mark.boxRun and not t.endAt then
+		t.endAt = now
+	end
+	if gone then
 		Mark.boxTrack = nil
 		Mark.slotsCache = nil
 		local n = Mark.boxCount()
-		Mark.teleAdd("box.take", gone and n > (t.n0 or 0))
-		logFile("box result", gone and "claimed" or "timeout", "slots", n)
+		local got = n > (t.n0 or 0)
+		Mark.teleAdd("box.take", got)
+		logFile("box result", got and "taken" or "lost to a rival", "slots", n, "after", string.format("%.1f", now - t.at))
 	end
 end
 
@@ -21185,10 +21467,13 @@ Mark.agentHold = function(on, why)
 			Mark.sprintAttrPrev = ch:GetAttribute(Mark.sprintMod.Constants.IsSprintingAttribute)
 		end
 		Mark.agentSprinting = true
-		-- no unlimited-stamina source: the agent runs, dribbles, slides and jumps on the real bar (the sprint animation is
-		-- shown only while there is stamina left)
-		Mark.sprintMod.SetCharacterIsSprinting(LocalPlayer, (Mark.sprint.GetStamina() or 0) > 0.02)
-		if why ~= "block" and why ~= "dribble" and why ~= "dodge" and ch and Mark.sprintMod.SetDodgeBoost then
+		-- the agent sprints without limit (stamina source "MoveAgent") EXCEPT for Mark.flagGuard seconds after the server put
+		-- us back (the anti-cheat sees a sprint on an empty server bar): then it jogs on the real bar
+		local calm = os.clock() < (Mark.sprintFlagUntil or 0)
+		Mark.sprint.SetUnlimitedStamina("MoveAgent", not calm)
+		Mark.sprintMod.SetUnlimitedStamina(LocalPlayer, "MoveAgent", not calm)
+		Mark.sprintMod.SetCharacterIsSprinting(LocalPlayer, not calm)
+		if not calm and why ~= "block" and why ~= "dribble" and why ~= "dodge" and ch and Mark.sprintMod.SetDodgeBoost then
 			local now = Workspace:GetServerTimeNow()
 			local want = now + 0.4
 			local boostUntil = Mark.sprintMod.GetDodgeBoostUntil and Mark.sprintMod.GetDodgeBoostUntil(ch)
@@ -21197,6 +21482,8 @@ Mark.agentHold = function(on, why)
 			end
 		end
 	else
+		Mark.sprint.SetUnlimitedStamina("MoveAgent", false)
+		Mark.sprintMod.SetUnlimitedStamina(LocalPlayer, "MoveAgent", false)
 		if Mark.agentSprinting then
 			Mark.agentSprinting = false
 			-- restore what the attribute was before the agent, or the live client sprint state
@@ -21206,6 +21493,110 @@ Mark.agentHold = function(on, why)
 			end
 			Mark.sprintMod.SetCharacterIsSprinting(LocalPlayer, want == true or (Mark.sprint.IsSprinting and Mark.sprint.IsSprinting()))
 		end
+		if Mark.sprint.RestoreStamina and os.clock() >= (Mark.sprintFlagUntil or 0) then
+			Mark.sprint.RestoreStamina(1)
+		end
+	end
+end
+
+-- SERVER FLAG. The game has an anti-cheat that puts us back where we were when we run on an empty (server) stamina bar,
+-- and the agent sprints for ever. A flag shows as the root jumping AGAINST our own motion in one frame, farther than a body
+-- can legally cover (dash bursts included). Pure: prev position / velocity, dt, the new position.
+Mark.flagJump = function(prevPos, prevVel, dt, pos)
+	if dt <= 0 or dt > 0.25 then
+		return false
+	end
+	local dp = flat(pos - prevPos)
+	local len = dp.Magnitude
+	if len <= 70 * dt * 2 + 5 then
+		return false
+	end
+	local pv = flat(prevVel)
+	return pv.Magnitude > 8 and dp:Dot(pv.Unit) < -0.5 * len
+end
+
+-- HIT TRAIN. Items we do not model (a gun that fires every 1.5 s, a repeating slam) hit us again and again and the log showed 8
+-- knock-backs in 12 s from one man while the script did nothing. Every STRONG knock-back (>= 40: slides are 24-26) is noted per
+-- attacker; the second one inside 8 s starts an evade: 3 s of running away from him (a lateral weave, alternating each 0.6 s) and,
+-- with the ball, a pass / dump (Mark.hazPass). Pure counter: times = the attacker's earlier hits.
+Mark.hitCount = function(times, now, window)
+	local n = 0
+	for i = #times, 1, -1 do
+		if now - times[i] > window then
+			table.remove(times, i)
+		else
+			n += 1
+		end
+	end
+	return n
+end
+Mark.hitLog = {}
+Mark.hitNote = function(attacker, vel)
+	if not CFG.AutoDodge or type(attacker) ~= "number" or attacker == LocalPlayer.UserId or vel < 40 then
+		return
+	end
+	local now = os.clock()
+	local h = Mark.hitLog[attacker]
+	if not h then
+		h = {}
+		Mark.hitLog[attacker] = h
+	end
+	h[#h + 1] = now
+	local n = Mark.hitCount(h, now, CFG.EvadeWindow or 8)
+	if n >= (CFG.EvadeHits or 2) then
+		Mark.evade = { uid = attacker, untilT = now + (CFG.EvadeTime or 3), since = now, ev = { born = now, r = 45, item = "hits" } }
+		logFile("evade", "hit train", n, "by", tostring(attacker), "vel", string.format("%.0f", vel), "for", CFG.EvadeTime or 3, "s")
+	end
+end
+Mark.evadeTick = function(character, root)
+	local e = Mark.evade
+	if not e then
+		return
+	end
+	local now = os.clock()
+	if now >= e.untilT then
+		Mark.evade = nil
+		return
+	end
+	local a = playerOf(e.uid)
+	local ar = a and ActorTargeting.GetActorRoot(a)
+	if not ar then
+		Mark.evade = nil
+		return
+	end
+	local P, O = flat(ar.Position), flat(root.Position)
+	if (O - P).Magnitude > 80 then
+		Mark.evade = nil
+		return
+	end
+	local away = unitOrNil(O - P) or Vector3.new(0, 0, 1)
+	local side = Vector3.new(-away.Z, 0, away.X) * (math.floor((now - e.since) / 0.6) % 2 == 0 and 1 or -1)
+	e.ev.p = P
+	if liveOwnerId() == LocalPlayer.UserId then
+		Mark.hazPass(root, e.ev, 0.8, 0, away, "evade")
+	end
+	if Mark.move.mode ~= "dodge" and Mark.move.mode ~= "dribble" and not Mark.slideBody() then
+		local dir = unitOrNil(away + side * 0.7) or away
+		Mark.fleeUntil = now + 0.3
+		Mark.move.look = away
+		Mark.moveSteer(dir, "flee")
+		Mark.agentHold(true, "flee")
+	end
+end
+
+-- the guard time after a flag (user: 4 s) with no sprint
+Mark.flagGuard = 4
+Mark.flagWatch = function(root)
+	local now = os.clock()
+	local last = Mark.flagLast
+	Mark.flagLast = { pos = root.Position, vel = root.AssemblyLinearVelocity, t = now }
+	if not last or Ragdoll.IsActorRagdolled(LocalPlayer) then
+		return
+	end
+	if Mark.flagJump(last.pos, last.vel, now - last.t, root.Position) then
+		Mark.sprintFlagUntil = now + Mark.flagGuard
+		logFile("sprint flag", "put back", string.format("%.1f", flat(root.Position - last.pos).Magnitude), "st", "no sprint for", Mark.flagGuard, "s", "mode", tostring(Mark.move.mode))
+		Mark.agentHold(false)
 	end
 end
 
@@ -21601,6 +21992,31 @@ end
 -- Kick charge dodge (no ball, or ball with the dribble unavailable). Exit the HitboxSettings.Kick box through the
 -- nearest face whose direction does not go back against the user's own movement (or facing when idle). Exit within
 -- 5 studs -> instant step; otherwise leave it.
+-- The way out of the enemy kick box. opts = { { d = studs to the face, v = direction }, ... }; u = our own heading. A STEP (<= 5.2 st,
+-- Dodge's teleport) through the nearest face not against our heading; else a RUN (<= 14 st) through the nearest face that is not
+-- straight back. Returns "step" | "run", { d, v } or nil.
+Mark.kickExit = function(opts, u)
+	local step, run = nil, nil
+	for _, o in opts do
+		local v = unitOrNil(flat(o.v))
+		if v and o.d > 0.2 then
+			if o.d <= 5.2 and (not u or v:Dot(u) >= -0.4) and (not step or o.d < step.d) then
+				step = { d = o.d, v = v }
+			end
+			if o.d <= 14 and (not u or v:Dot(u) >= -0.8) and (not run or o.d < run.d) then
+				run = { d = o.d, v = v }
+			end
+		end
+	end
+	if step then
+		return "step", step
+	end
+	if run then
+		return "run", run
+	end
+	return nil, nil
+end
+
 Mark.tickKickDodge = function(root, own)
 	if not CFG.AutoDodge or os.clock() - (Mark.kickDodgeAt or 0) < 0.9 then
 		return
@@ -21640,21 +22056,32 @@ Mark.tickKickDodge = function(root, own)
 		{ d = hz - lp.Z + 0.8, v = -cf.LookVector }, -- back face (+Z, toward him)
 		{ d = hz + lp.Z + 0.8, v = cf.LookVector }, -- front face (-Z, along the kick)
 	}
-	local best = nil
-	for _, o in opts do
-		local v = unitOrNil(flat(o.v))
-		if v and o.d > 0.2 and o.d <= 5.2 and (not u or v:Dot(u) >= -0.4) then
-			if not best or o.d < best.d then
-				best = { d = o.d, v = v }
-			end
-		end
-	end
-	if best then
+	local kind, best = Mark.kickExit(opts, u)
+	if kind == "step" then
 		Mark.kickDodgeAt = os.clock()
 		Mark.hazardStep(root, best.v * best.d, "kick " .. actorName(kt.actor))
-	elseif not Mark.kickDodgeLog or os.clock() - Mark.kickDodgeLog > 0.5 then
+		return
+	end
+	-- no exit a step away (it used to be a log line and nothing else - the user stood in the box and got hit): the ball goes
+	-- to a mate, and the body RUNS out through the nearest face
+	local away = best and best.v or unitOrNil(flat(root.Position - kt.aimed.CFrame.Position))
+	if own and away then
+		local ev = Mark.kickPassEv
+		if not ev or os.clock() - ev.born > 1.5 then
+			ev = { born = os.clock(), p = kt.aimed.CFrame.Position, r = 14, item = "kick" }
+			Mark.kickPassEv = ev
+		end
+		Mark.hazPass(root, ev, math.max(math.max(kt.minRel - kt.elapsed, 0), 0.25), 0, away, "kick")
+	end
+	if best and Mark.move.mode ~= "dodge" and Mark.move.mode ~= "dribble" then
+		Mark.fleeUntil = os.clock() + 0.3
+		Mark.move.look = best.v
+		Mark.moveSteer(best.v, "flee")
+		Mark.agentHold(true, "flee")
+	end
+	if not Mark.kickDodgeLog or os.clock() - Mark.kickDodgeLog > 0.5 then
 		Mark.kickDodgeLog = os.clock()
-		logFile("hazard kick", "no-forward-exit", string.format("%.1f,%.1f", lp.X, lp.Z))
+		logFile("hazard kick", best and "run out" or "no exit", string.format("%.1f,%.1f", lp.X, lp.Z), best and string.format("%.1f st", best.d) or "", own and "ball" or "")
 	end
 end
 
@@ -22319,6 +22746,45 @@ end
 -- Run out of a blast; with the ball and no clean way out, give it to a teammate first (a stun takes it otherwise).
 -- The pass is charged as long as the time allows, not to the full solve: the release packet must reach the server before
 -- the blast (ta - ping/2 - HazPassMargin). A lob needs PassMinCharge; under that the ball is dumped away from the zone.
+-- The ball leaves us before a zone that is about to hurt: a Pass Assist lob to the mate whose landing is farthest from the zone
+-- (ev = { p, r, item }), or, with no time even for the shortest lob, a dump away from it. One try per 0.1 s, once per event.
+Mark.hazPass = function(root, ev, ta, slack, away, tag)
+	if ev.passed or (Mark.pa and Mark.pa.live) or os.clock() < (ev.passTry or 0) then
+		return false
+	end
+	ev.passTry = os.clock() + 0.1
+	local ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
+	local budget = ta - ping * 0.5 - (CFG.HazPassMargin or 0.1)
+	local minC = CFG.PassMinCharge or 0.1
+	local pick, pickSol, pickFar = nil, nil, -1
+	if budget >= minC and CFG.PassAssistSync ~= false and Mark.paList then
+		for _, sel in Mark.paAuto(root) do
+			local sol = Mark.paSolve(sel)
+			if sol and not sol.contested then
+				local far = flat(sol.land - ev.p).Magnitude
+				if far > ev.r and far > pickFar then
+					pick, pickSol, pickFar = sel, sol, far
+				end
+			end
+		end
+	end
+	if pick then
+		local c = math.min(pickSol.charge or 0.3, budget)
+		if Mark.paPress(pick, pickSol, tag, c) then
+			ev.passed = true
+			logFile(tag .. " pass", ev.item, "to", pick.name, "ta", string.format("%.2f", ta), "charge", string.format("%.2f", c), "of", string.format("%.2f", pickSol.charge or 0.3), "slack", string.format("%.1f", slack))
+			return true
+		end
+	elseif budget < minC and ta > ping * 0.5 then
+		-- no time even for the shortest lob: the ball leaves us away from the zone instead of dying with us
+		ev.passed = true
+		Mark.dumpBall(root, away)
+		logFile(tag .. " dump", ev.item, "ta", string.format("%.2f", ta), "slack", string.format("%.1f", slack))
+		return true
+	end
+	return false
+end
+
 Mark.hazFlee = function(character, root)
 	local list = Mark.hazEv
 	local nowS = Workspace:GetServerTimeNow()
@@ -22341,7 +22807,7 @@ Mark.hazFlee = function(character, root)
 		end
 	end
 	if not worst then
-		if Mark.move.mode == "flee" then
+		if Mark.move.mode == "flee" and os.clock() >= (Mark.fleeUntil or 0) then
 			Mark.moveStop("flee")
 		end
 		return
@@ -22375,34 +22841,8 @@ Mark.hazFlee = function(character, root)
 		end
 	end
 	-- with the ball: out by a thin margin or not at all -> the ball goes to a mate now
-	if own and slack < (CFG.HazPassSlack or 2) and not ev.passed and not (Mark.pa and Mark.pa.live) and os.clock() >= (ev.passTry or 0) then
-		ev.passTry = os.clock() + 0.1
-		local budget = ta - ping * 0.5 - (CFG.HazPassMargin or 0.1)
-		local minC = CFG.PassMinCharge or 0.1
-		local pick, pickSol, pickFar = nil, nil, -1
-		if budget >= minC and CFG.PassAssistSync ~= false and Mark.paList then
-			for _, sel in Mark.paAuto(root) do
-				local sol = Mark.paSolve(sel)
-				if sol and not sol.contested then
-					local far = flat(sol.land - ev.p).Magnitude
-					if far > ev.r and far > pickFar then
-						pick, pickSol, pickFar = sel, sol, far
-					end
-				end
-			end
-		end
-		if pick then
-			local c = math.min(pickSol.charge or 0.3, budget)
-			if Mark.paPress(pick, pickSol, "blast", c) then
-				ev.passed = true
-				logFile("blast pass", ev.item, "to", pick.name, "ta", string.format("%.2f", ta), "charge", string.format("%.2f", c), "of", string.format("%.2f", pickSol.charge or 0.3), "slack", string.format("%.1f", slack))
-			end
-		elseif budget < minC and ta > ping * 0.5 then
-			-- no time even for the shortest lob: the ball leaves us away from the zone instead of dying with us
-			ev.passed = true
-			Mark.dumpBall(root, away)
-			logFile("blast dump", ev.item, "ta", string.format("%.2f", ta), "slack", string.format("%.1f", slack))
-		end
+	if own and slack < (CFG.HazPassSlack or 2) then
+		Mark.hazPass(root, ev, ta, slack, away, "blast")
 	end
 	if Mark.move.mode == "dodge" or Mark.move.mode == "dribble" then
 		return
@@ -23141,6 +23581,7 @@ Mark.tickHazard = function(character, root)
 	Mark.stateWatch(character)
 	Mark.chargeWatch()
 	Mark.sprintWatch()
+	Mark.flagWatch(root)
 	local own = liveOwnerId() == LocalPlayer.UserId
 	Mark.slideAudit(root)
 	Mark.tickKickDodge(root, own)
@@ -23151,6 +23592,7 @@ Mark.tickHazard = function(character, root)
 	end
 	Mark.oilSlideTick(character, root)
 	Mark.projTick(character, root)
+	Mark.evadeTick(character, root)
 	local now = Workspace:GetServerTimeNow()
 	local R = CFG.HammerRadius
 	for uid, h in Mark.hammers do
@@ -24737,12 +25179,21 @@ return function(_Lib, _Core)
 			fresh[sec] = true
 			return sec
 		end
+		-- the first header of a card names its function; every later header is a PART of it and says so ("AutoBall · Rival
+		-- Slide"): a function with its own switch gets its own card, so a row is never read as the setting of the wrong one
+		local owner = {}
 		local function head(sec, name)
 			if not fresh[sec] then
 				keep(sec:Divider())
 			end
 			fresh[sec] = false
-			return keep(sec:Header({ Name = name }))
+			local label = name
+			if owner[sec] then
+				label = owner[sec] .. " · " .. name
+			else
+				owner[sec] = name
+			end
+			return keep(sec:Header({ Name = label }))
 		end
 		local function note(sec, text)
 			return keep(sec:SubLabel({ Text = text }))
@@ -25009,7 +25460,7 @@ return function(_Lib, _Core)
 			drop(s, "Shot Curve", "ShotCurve", { "Full", "Light", "Off" }, "How much a shot may bend. Off = straight shots only.")
 
 			local pr = card(tab, "Left")
-			head(pr, "Priority")
+			head(pr, "AutoShoot · Priority")
 			pick(pr, "Try First", "TryFirst", { { "FAKE", "FAKE" }, { "Normal Shot", "NORMAL" }, { "Bounce FAKE", "BOUNCE" } }, "The rest follow it, the normal shot comes last.", function(v)
 				CFG.PriorityFAKE = v == "FAKE"
 				CFG.PriorityBounceFAKE = v == "BOUNCE"
@@ -25077,20 +25528,24 @@ return function(_Lib, _Core)
 			head(ds, "Direction Spoof")
 			tog(ds, "Enabled", "DirSpoof", "Fake aim shown to the keeper while charging, then the real shot.")
 			sld(ds, "Chance", "DirSpoofChance", 0, 100, { scale = 100, suffix = "%" })
-			sld(ds, "Fake Speed", "DirSpoofSpeed", 2, 40, { suffix = " /s", text = "How fast the fake aim moves. Max = instant." })
+			sld(ds, "Fake Speed", "DirSpoofSpeed", 2, 40, { suffix = " /s", text = "Slowest fake move; it speeds up to arrive." })
 			tog(ds, "Show Fake Marker", "DrawSpoof", "Marks the fake aim point on the goal.")
-			drop(ds, "Preset", "DirSpoofPreset", { "Safe", "Normal", "Long", "Custom" }, "How long the fake shows and the body lies. Longer fools more but can pull the shot off target.")
+			drop(ds, "Preset", "DirSpoofPreset", { "Safe", "Normal", "Long", "Custom" }, "How long the fake aim and the body lie.")
 			tog(ds, "Smart Select", "DirSpoofSmart", "No spoof once the keeper has dived.")
 			tog(ds, "Pro Patterns", "DirSpoofPro", "Human-like fake patterns only.")
-			head(ds, "Body Spoof")
-			tog(ds, "Enabled", "FaceSpoof", "Your body faces the wrong way to fool the keeper.")
-			drop(ds, "Mode", "FaceSpoofMode", { "smart", "spin", "side", "lookoff", "away", "decoy" })
-			sld(ds, "Turn Speed", "FaceSpoofSpeed", 90, 1440, { suffix = " °/s", text = "How fast the body turns. Max = instant." })
-			drop(ds, "When", "FaceSpoofWhen", { "charge", "ball", "always" }, "Charge: while you charge a shot. Ball: while you have it.")
-			sld(ds, "Spin Speed", "FaceSpinSpeed", 1, 6, { prec = 1, suffix = " /s" })
 			advanced(ds, "Spoof", function()
 				sld(ds, "Custom Fake Time", "DirSpoofTime", 0.04, 0.24, { prec = 2, suffix = " s", text = "Preset Custom: how long the fake aim shows." })
-				sld(ds, "Custom Body Time", "FaceSpoofTime", 0.04, 0.24, { prec = 2, suffix = " s", text = "Preset Custom: how long the body lies." })
+			end)
+
+			local bs = card(tab, "Right")
+			head(bs, "Body Spoof")
+			tog(bs, "Enabled", "FaceSpoof", "Your body faces the wrong way to fool the keeper.")
+			drop(bs, "Mode", "FaceSpoofMode", { "smart", "spin", "side", "lookoff", "away", "decoy" })
+			sld(bs, "Turn Speed", "FaceSpoofSpeed", 90, 1440, { suffix = " °/s", text = "How fast the body turns. Max = instant." })
+			drop(bs, "When", "FaceSpoofWhen", { "charge", "ball", "always" }, "Charge: while you charge a shot. Ball: while you have it.")
+			sld(bs, "Spin Speed", "FaceSpinSpeed", 1, 6, { prec = 1, suffix = " /s" })
+			advanced(bs, "BodySpoof", function()
+				sld(bs, "Custom Body Time", "FaceSpoofTime", 0.04, 0.24, { prec = 2, suffix = " s", text = "Preset Custom: how long the body lies." })
 			end)
 
 			local b = card(tab, "Left")
@@ -25107,7 +25562,7 @@ return function(_Lib, _Core)
 			end)
 
 			local v = card(tab, "Left")
-			head(v, "Shot Preview")
+			head(v, "AutoShoot · Shot Preview")
 			tog(v, "Show Preview", "DrawShot")
 			drop(v, "Style", "ShotStyle", { "aurora", "classic" }, "Classic uses the colors from Visuals.")
 			if Mark.artPal then
@@ -25121,7 +25576,7 @@ return function(_Lib, _Core)
 
 			-- right column -----------------------------------------------------------------------------------
 			local ty = card(tab, "Right")
-			head(ty, "Shot Types")
+			head(ty, "AutoShoot · Shot Types")
 			typeList(ty, "Allowed Types", "ShotBan", "ShotTypes", SHOT_TYPES, "Unchecked types are never used.")
 			tog(ty, "Prefer Corner Curl", "PreferCornerCurl")
 			tog(ty, "Only Trick / Dip", "OnlyTrick")
@@ -25198,11 +25653,6 @@ return function(_Lib, _Core)
 			tog(s, "Competitor Check", "TackleCompetitor", "Skips a carrier a teammate is already on.")
 			tog(s, "Perfect Mode", "TacklePerfect", "Slide only when his dribble can't save him.")
 			sld(s, "Competitor Radius", "TackleCompetitorRadius", 3, 25, { suffix = " st" })
-			head(s, "Manual Tackle")
-			tog(s, "Manual Tackle", "ManualTackle", "Your own tackle press is aimed at the carrier.")
-			bind(s, "Manual Tackle Key", "KB_ManualTackle", function()
-				Mark.manualFire()
-			end)
 			head(s, "Visual")
 			tog(s, "Show Prediction", "DrawTackle")
 			drop(s, "Sight Style", "SightStyle", { "reticle", "classic" })
@@ -25211,8 +25661,15 @@ return function(_Lib, _Core)
 				sld(s, "Max Block Wait", "TackleHoldMax", 0.2, 2, { prec = 1, suffix = " s", text = "Block First: longest the tackle waits for the block." })
 				sld(s, "Track Radius", "TrackStuds", 30, 160, { suffix = " st" })
 				sld(s, "Min Slide Power", "TackleMinSpeed", 0.3, 1.2, { prec = 2, suffix = "x" })
-				sld(s, "Manual Radius", "ManualRadius", 8, 50, { suffix = " st" })
 			end)
+
+			local mt = card(tab, "Left")
+			head(mt, "Manual Tackle")
+			tog(mt, "Enabled", "ManualTackle", "Your own tackle press is aimed at the carrier.")
+			bind(mt, "Manual Tackle Key", "KB_ManualTackle", function()
+				Mark.manualFire()
+			end)
+			sld(mt, "Radius", "ManualRadius", 8, 50, { suffix = " st" })
 
 			-- AutoBlock ------------------------------------------------------------------------------------
 			local b = card(tab, "Left")
@@ -25318,6 +25775,8 @@ return function(_Lib, _Core)
 			note(g, "Reactions only: intercept, dive, press, return.")
 			tog(g, "Jump + Dive", "GkJumpDive", "For shots no ground dive reaches.")
 			tog(g, "Auto Clear", "GkAutoClear")
+			tog(g, "Mirror Runner", "GkMirror", "Follows a carrier near the goal sideways.")
+			tog(g, "Keeper Kick", "GkKick", "No dive line and he is close: charges a full kick at him.")
 			advanced(g, "Gk", function()
 				sld(g, "Reaction", "GkReactSeconds", 0.05, 0.4, { prec = 2, suffix = " s" })
 				sld(g, "Walk Slack", "GkWalkSlack", 0, 0.3, { prec = 2, suffix = " s" })
@@ -25329,21 +25788,14 @@ return function(_Lib, _Core)
 			end)
 
 			local p = card(tab, "Right")
-			head(p, "Press")
-			tog(p, "Press", "GkPress", "Dives into a carrier running at your goal.")
+			head(p, "AutoGK · Press")
+			tog(p, "Enabled", "GkPress", "Dives into a carrier running at your goal.")
 			tog(p, "Come Out", "GkPressMove", "Steps out to cut his angle.")
 			tog(p, "Last Man Only", "GkPressLastMan", "No press while another attacker can take the pass.")
 			tog(p, "Read Passes", "GkPassRead", "Moves to the player a pass is going to.")
-			tog(p, "Return Home", "GkHome", "Runs back to the goal when far out and an attack comes.")
 			tog(p, "Show Press", "DrawGk", "His possible paths and your dive.")
 			sld(p, "Confidence", "GkPressConf", 0.3, 0.95, { prec = 2, text = "How sure the dive must be." })
-			tog(p, "Rush", "GkRush", "Dives at a runner before his dribble is known.")
-			sld(p, "Rush Zone", "GkRushZone", 10, 80, { prec = 0, suffix = " st" })
-			sld(p, "Rush Confidence", "GkRushConf", 0.1, 0.9, { prec = 2 })
-			sld(p, "Too Close", "GkPressMinT", 0, 0.15, { prec = 2, suffix = " s", text = "A contact earlier than this into the dash passes through him." })
 			tog(p, "Press Hook Fliers", "GkHookPress", "Dives at a grapple flier coming at the goal.")
-		tog(p, "Mirror Runner", "GkMirror", "Follows a carrier near the goal sideways.")
-		tog(p, "Keeper Kick", "GkKick", "No dive line and he is close: charges a full kick at him.")
 			advanced(p, "GkPress", function()
 				sld(p, "Press Zone", "GkPressZone", 20, 140, { suffix = " st" })
 				sld(p, "Hit Margin", "GkPressRadiusFrac", 0.4, 1, { prec = 2 })
@@ -25357,8 +25809,16 @@ return function(_Lib, _Core)
 				sld(p, "Gap To Him", "GkPressGap", 4, 24, { suffix = " st" })
 			end)
 
+			local ru = card(tab, "Right")
+			head(ru, "AutoGK · Rush")
+			tog(ru, "Enabled", "GkRush", "Dives at a runner before his dribble is known.")
+			sld(ru, "Rush Zone", "GkRushZone", 10, 80, { prec = 0, suffix = " st" })
+			sld(ru, "Rush Confidence", "GkRushConf", 0.1, 0.9, { prec = 2 })
+			sld(ru, "Too Close", "GkPressMinT", 0, 0.15, { prec = 2, suffix = " s", text = "A contact earlier than this into the dash passes through him." })
+
 			local r = card(tab, "Right")
-			head(r, "Return")
+			head(r, "AutoGK · Return")
+			tog(r, "Return Home", "GkHome", "Runs back to the goal when far out and an attack comes.")
 			tog(r, "Return After Push", "GkReturn", "Back to the spot after a shotgun or dash push.")
 			advanced(r, "GkReturn", function()
 				sld(r, "Dive Back From", "GkReturnDive", 5, 30, { suffix = " st" })
@@ -25413,19 +25873,21 @@ return function(_Lib, _Core)
 			tog(w, "Block Projectiles", "BarricadeAddon", "Puts a wall on a projectile's path.")
 			tog(w, "Wall On Shot Path", "WallShot", "Walls a shot charged at our goal.")
 			tog(w, "Block Guns", "GunWall", "Shield or wall when an enemy aims a gun at you.")
-			head(w, "Keeper Trap")
-			tog(w, "Enabled", "WallTrap", "Puts a wall between you and the enemy keeper's dive.")
-			tog(w, "Bait", "WallTrapBait", "Puts the wall up just before the keeper dives at you.")
-			tog(w, "Learn Dive Range", "WallTrapAuto", "Measures where the keeper starts his dive.")
-			sld(w, "Keeper Dive Range", "WallTrapTrigger", 4, 22, { prec = 1, suffix = " st" })
-			tog(w, "Only Dives At You", "WallTrapForwardOnly", "Ignores keeper dives that do not go at you.")
-			sld(w, "Dive Cone", "WallTrapCone", 20, 90, { suffix = " deg" })
 			advanced(w, "Wall", function()
 				sld(w, "Body Reach", "WallReach", 8, 40, { suffix = " st", text = "Walls a chaser or the carrier within this distance." })
 				sld(w, "Body Window", "WallWindow", 0.15, 1, { prec = 2, suffix = " s", text = "He must hit the wall this soon after it appears." })
 				sld(w, "Put Away After", "WallEquipHold", 1, 10, { prec = 1, suffix = " s" })
 				sld(w, "Cooldown", "WallCooldown", 0.2, 3, { prec = 1, suffix = " s" })
 			end)
+
+			local kt = card(tab, "Right")
+			head(kt, "Keeper Trap")
+			tog(kt, "Enabled", "WallTrap", "Puts a wall between you and the enemy keeper's dive.")
+			tog(kt, "Bait", "WallTrapBait", "Puts the wall up just before the keeper dives at you.")
+			tog(kt, "Learn Dive Range", "WallTrapAuto", "Measures where the keeper starts his dive.")
+			sld(kt, "Keeper Dive Range", "WallTrapTrigger", 4, 22, { prec = 1, suffix = " st" })
+			tog(kt, "Only Dives At You", "WallTrapForwardOnly", "Ignores keeper dives that do not go at you.")
+			sld(kt, "Dive Cone", "WallTrapCone", 20, 90, { suffix = " deg" })
 		end)
 
 		-- ==================================================================================================
@@ -25439,30 +25901,40 @@ return function(_Lib, _Core)
 			feature(ba, "AutoBall", "AutoBall")
 			tog(ba, "Competitor Check", "BallCompetitor", "Stops when a teammate is clearly closer to the ball.")
 			sld(ba, "Max Distance", "BallMaxDist", 20, 200, { suffix = " st", text = "No chase beyond this." })
-			head(ba, "Item Boxes")
-			feature(ba, "AutoBox", "AutoBox")
-			sld(ba, "Box Distance", "BoxMaxDist", 10, 100, { suffix = " st", text = "No box farther than this." })
 			tog(ba, "Catch Flicks", "BallFlick", "Wins the ball from enemy flicks.")
 			sld(ba, "Body Range", "LobBodyRange", 0, 20, { suffix = " st", text = "Closer than this, take the lob with the body." })
 			sld(ba, "Competitor Gap", "BallYieldGap", 2, 20, { suffix = " st", text = "How much closer he must be." })
-			head(ba, "Rival Slide")
-			tog(ba, "Enabled", "CandidateKiller", "Slides an enemy who runs for the same ball.")
-			head(ba, "Goal Guard")
-			tog(ba, "Enabled", "KillerGuard", "Ball near our goal: slide the closest enemy first.")
 			advanced(ba, "Ball", function()
 				sld(ba, "Jump Gain", "BallJumpGain", 0, 0.6, { prec = 2, suffix = " s", text = "Jump only if it is this much faster." })
 				sld(ba, "Slide Gain", "RouteSlideGain", 0, 1.5, { prec = 2, suffix = " s", text = "A slide replaces the run if it gets there this much sooner." })
-				head(ba, "Rival Slide")
-				sld(ba, "Ball Radius", "KillerRadius", 8, 40, { suffix = " st" })
-				sld(ba, "Our Reach", "KillerReach", 10, 50, { suffix = " st" })
-				sld(ba, "Threat Margin", "KillerMargin", 0, 1.5, { prec = 2, suffix = " s" })
-				sld(ba, "Max Turn", "KillerAngle", 10, 90, { suffix = "°" })
-				sld(ba, "Intent Radius", "IntentTackleRadius", 20, 120, { suffix = " st" })
-				head(ba, "Goal Guard")
-				sld(ba, "Goal Distance", "KillerGuardGoal", 20, 100, { suffix = " st" })
-				sld(ba, "Ball Distance", "KillerGuardNear", 8, 40, { suffix = " st" })
-				sld(ba, "Enemy Distance", "KillerGuardFoe", 10, 80, { suffix = " st" })
 			end)
+
+			local rs = card(tab, "Left")
+			head(rs, "AutoBall · Rival Slide")
+			tog(rs, "Enabled", "CandidateKiller", "Slides an enemy who runs for the same ball.")
+			advanced(rs, "RivalSlide", function()
+				sld(rs, "Ball Radius", "KillerRadius", 8, 40, { suffix = " st" })
+				sld(rs, "Our Reach", "KillerReach", 10, 50, { suffix = " st" })
+				sld(rs, "Threat Margin", "KillerMargin", 0, 1.5, { prec = 2, suffix = " s" })
+				sld(rs, "Max Turn", "KillerAngle", 10, 90, { suffix = "°" })
+				sld(rs, "Intent Radius", "IntentTackleRadius", 20, 120, { suffix = " st" })
+			end)
+
+			local gg = card(tab, "Left")
+			head(gg, "AutoBall · Goal Guard")
+			tog(gg, "Enabled", "KillerGuard", "Ball near our goal: slide the closest enemy first.")
+			advanced(gg, "GoalGuard", function()
+				sld(gg, "Goal Distance", "KillerGuardGoal", 20, 100, { suffix = " st" })
+				sld(gg, "Ball Distance", "KillerGuardNear", 8, 40, { suffix = " st" })
+				sld(gg, "Enemy Distance", "KillerGuardFoe", 10, 80, { suffix = " st" })
+			end)
+
+			local bx = card(tab, "Left")
+			head(bx, "AutoBox")
+			feature(bx, "AutoBox", "AutoBox")
+			note(bx, "Runs for item boxes, stuns a rival who wins the race.")
+			tog(bx, "Show Plan", "DrawBox", "Rings on boxes, green go / red stun / orange skip.")
+			sld(bx, "Box Distance", "BoxMaxDist", 10, 100, { suffix = " st", text = "No box farther than this." })
 
 			local j = card(tab, "Right")
 			head(j, "Free Jump")
@@ -25505,20 +25977,26 @@ return function(_Lib, _Core)
 			head(jb, "Jump Boost")
 			feature(jb, "Jump Boost", "JumpBoost")
 			sld(jb, "Jump Height", "JumpMult", 1, 3, { prec = 1, suffix = "x", text = "How high you jump." })
-			head(jb, "Infinite Stamina")
-			feature(jb, "Infinite Stamina", "InfStamina")
-			note(jb, "Sprint and jumps never drain stamina.")
+
+			local ist = card(tab, "Right")
+			head(ist, "Infinite Stamina")
+			feature(ist, "Infinite Stamina", "InfStamina")
+			note(ist, "Sprint and jumps never drain stamina.")
 
 			local rc = card(tab, "Left")
 			head(rc, "No Ragdoll")
 			feature(rc, "No Ragdoll", "NoRagdoll")
 			note(rc, "You don't fall down when hit.")
-			head(rc, "No Knockback")
-			feature(rc, "No Knockback", "NoKnockback")
-			note(rc, "Shotguns and hits don't push you.")
-			head(rc, "No Stun")
-			feature(rc, "No Stun", "NoStun")
-			note(rc, "You can still sprint while stunned.")
+
+			local nk = card(tab, "Left")
+			head(nk, "No Knockback")
+			feature(nk, "No Knockback", "NoKnockback")
+			note(nk, "Shotguns and hits don't push you.")
+
+			local ns = card(tab, "Left")
+			head(ns, "No Stun")
+			feature(ns, "No Stun", "NoStun")
+			note(ns, "You can still sprint while stunned.")
 		end)
 
 		-- ==================================================================================================
@@ -25615,7 +26093,7 @@ return function(_Lib, _Core)
 			local tab = T.Debug
 
 			local s = card(tab, "Left")
-			head(s, "AutoShoot")
+			head(s, "AutoShoot Debug")
 			tog(s, "Debug Text", "ShotDebug", "Shot name, side, distance and curve under the crosshair.")
 			tog(s, "Status Text", "DrawHud", "Tackle, dribble and ball state, bottom left.")
 			sld(s, "Solver Budget", "ShootSliceMs", 0.3, 3, { prec = 1, suffix = " ms", text = "CPU per frame. Higher solves faster, hitches more." })
