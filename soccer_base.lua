@@ -329,6 +329,7 @@ local CFG = {
 	BallContestLate = 0.15, -- AutoBall: losing the ball race by more than this (s) -> run at the enemy's touch point instead
 	BallSlideNeed = 0.35, -- AutoBall slides only when the run beats the first enemy by less than this (s), or nothing else reaches -- AutoBall route: a slide replaces the run when it touches the ball this much earlier (or the run loses the race)
 	BallRamp = 0.2, -- AutoBall: seconds to go from the current speed to full sprint (unmeasured: see "ball track" v= in the log)
+	ArriveStop = 0.12, -- every agent route: seconds the body needs to stop from full speed (unmeasured, shorter than BallRamp: the stick is released, not eased). The brake starts spd * ArriveStop / 2 studs out and not before
 	CounterTackle = true, -- air duel x AutoTackle: the slide (flick wind-up on the ground, from the air at an airborne carrier)
 	GkAutoClear = false,
 	PassAssist = true, -- Pass / Lob press while looking at a teammate -> our own lob (yaw + charge solved), see Mark.paSolve
@@ -7487,7 +7488,9 @@ local function onProjectile(kind, proj)
 		Mark.projLive = Mark.projLive or {}
 		Mark.projLive[proj.Id] = {
 			id = proj.Id, item = id, src = proj.SourceUserId, pos = pos, vel = typeof(vel) == "Vector3" and vel or Vector3.zero,
-			at = nowS, born = type(proj.StartedAt) == "number" and proj.StartedAt or nowS, grav = g, rad = rad,
+			at = nowS, born = type(proj.StartedAt) == "number" and proj.StartedAt or nowS, rad = rad,
+			-- the ice shot's gravity is the server's (grav 45 in every log), not the 0.3 g of the prediction config (58.9): the landing point is what the zone is made of
+			grav = (id == "freezeGun" and type(proj.Gravity) == "number" and proj.Gravity > 1) and proj.Gravity or g,
 			homing = id == "rocketPunch", throw = type(proj.BoomerangThrow) == "table" and proj.BoomerangThrow or nil,
 			ballId = proj.BallId,
 		}
@@ -7529,7 +7532,7 @@ Mark.projBatch = function(rows, batchAt)
 				end
 				-- explosives: the zone follows every correction (a grenade bounces off bodies and the server re-sends it); a
 				-- zone that could not be built at the start is built from the first row that can
-				if (st.item == "grenade" or st.item == "bazooka") and not (st.det and st.det < nowS - 0.3) then
+				if (st.item == "grenade" or st.item == "bazooka" or st.item == "freezeGun") and not (st.det and st.det < nowS - 0.3) then
 					st.fp, st.fv, st.ft = p, st.vel, rowAt
 					if os.clock() - (st.hazAt or 0) > 0.12 or st.det ~= st.hazDet then
 						Mark.hazAdd(st)
@@ -12344,7 +12347,7 @@ Mark.tickGk = function(character, root)
 	local toStand = stand and flat(stand - root.Position) or Vector3.zero
 	local gapStand = toStand.Magnitude
 	if stand and gapStand > stopAt then
-		local scale = urgent and 1 or math.clamp(gapStand / 3, 0.3, 1)
+		local scale = urgent and 1 or math.max(Mark.arriveScale(gapStand, 16), 0.3)
 		Mark.move.look = fwd
 		Mark.moveSteer(toStand.Unit * scale, "gk")
 	elseif Mark.move.mode == "gk" then
@@ -13418,7 +13421,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- Illegal Soccer dump " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v196")
+	add("-- Illegal Soccer dump " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v197")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -14831,6 +14834,22 @@ Mark.blockCurve = function(from, to, vUs, vHim)
 	return out
 end
 
+-- ARRIVAL. The routes braked in proportion to the distance left: speed = 3.5 * gap (the polar orbit), d / 3 of the stick (the
+-- straight run), another d / 3 on top for the block roles: the last 5-8 studs were an exponential crawl, 0.6 s of it for the last
+-- stud (user: "the closer to the final point, the slower"). The speed worth keeping with `gap` studs to go is the one the body
+-- can still stop from: v = sqrt(2 * a * gap), a = vmax / stopT; full speed until then, the last studs braked like a body does.
+Mark.arriveSpeed = function(gap, vmax, stopT)
+	local g = math.abs(gap)
+	if g < 0.05 then
+		return 0
+	end
+	local v = math.min(vmax, math.sqrt(2 * (vmax / math.max(stopT or CFG.ArriveStop or 0.12, 0.03)) * g))
+	return gap < 0 and -v or v
+end
+Mark.arriveScale = function(gap, spd)
+	return math.abs(Mark.arriveSpeed(gap, spd)) / math.max(spd, 1)
+end
+
 -- AGENT STEER (AutoBlock shadow / mark / cut-off, the air duel). The agent's way to a spot near a moving man is not a ruler:
 --   far from him (> 20 st): a Hermite curve that leaves along our momentum and arrives along his run (Mark.blockCurve);
 --     the command follows the curve a few studs ahead;
@@ -14854,7 +14873,7 @@ Mark.agentSteer = function(o)
 			else
 				local route = Mark.blockCurve(us, target, vUs, o.vC or Vector3.zero)
 				local aim = route[3] and d > 5 and flat(route[3] - us) or off
-				straight = (unitOrNil(aim) or Vector3.zero) * spd * math.clamp(d / 3, 0.3, 1)
+				straight = (unitOrNil(aim) or Vector3.zero) * Mark.arriveSpeed(d, spd)
 			end
 		end
 		if not center then
@@ -14871,8 +14890,8 @@ Mark.agentSteer = function(o)
 		local et = Vector3.new(-er.Z, 0, er.X)
 		local uT = relT / rT
 		local dA = math.atan2(er.X * uT.Z - er.Z * uT.X, er:Dot(uT))
-		local vt = math.clamp(dA * r * 3.5, -spd, spd)
-		local vr = math.clamp((rT - r) * 3.5, -spd, spd)
+		local vt = Mark.arriveSpeed(dA * r, spd)
+		local vr = Mark.arriveSpeed(rT - r, spd)
 		local minR = o.minR or 4
 		if r < minR and math.abs(dA) > 0.5 then
 			vr = math.max(vr, (minR - r) * 4)
@@ -15657,9 +15676,6 @@ Mark.blockRoleTick = function(character, root, carrier, cr, chE, P, V, g, flight
 		Mark.standing = true
 	else
 		Mark.standing = false
-		if role ~= "press" and off.Magnitude < 3 then
-			cmd = cmd * math.clamp(off.Magnitude / 3, 0.35, 1)
-		end
 	end
 	Mark.sprintStand(Mark.standing)
 	if role ~= "press" then
@@ -19489,6 +19505,7 @@ Mark.guardClear = function(character, root, ev)
 	end
 	Mark.volleyInput = input
 	Mark.volleyAt = os.clock()
+	Mark.volleyShot = false
 	logFile("block clear", "press", "from", actorName(kicker), "approach", string.format("%.2f", ev.ApproachSeconds or -1), "miss", string.format("%.1f", ev.MissAngleDegrees or -1), "grounded", tostring(ev.BallGrounded), "goal t", string.format("%.2f", threat.t), "lat", string.format("%.1f", threat.lat), "speed", string.format("%.0f", typeof(vel) == "Vector3" and vel.Magnitude or 0), "aim", fmtV(dir))
 	return true
 end
@@ -19506,13 +19523,22 @@ Mark.tickVolley = function(character, root)
 	local charging = ChargedKick.IsCharging and ChargedKick.IsCharging()
 	-- Our volley charge turned into a normal reception (we own the ball): the delayed release would now shoot our
 	-- own ball away. Cancel it.
+	-- Only a charge that was a KEEP (no shot, nobody near): with enemies near or a shot solved the delayed release is the point
+	-- (the shot at the goal / the clear) and cancelling it handed the ball to the man next to us (user, twice: "the cancel is
+	-- only for when nobody is near").
 	if Mark.volleyAt and os.clock() - Mark.volleyAt < 1.2 and charging and liveOwnerId() == LocalPlayer.UserId then
-		ChargedKick.CancelCharge()
-		Mark.volleyInput = nil
-		Mark.volleyAt = nil
-		Mark.volleyAim = nil
-		logFile("volley", "cancel", "own")
-		return
+		local foeNear = Mark.foeWithin(root.Position, (CFG.VolleyKeepRadius or 22) * 0.55)
+		if not Mark.volleyShot and not foeNear then
+			ChargedKick.CancelCharge()
+			Mark.volleyInput = nil
+			Mark.volleyAt = nil
+			Mark.volleyAim = nil
+			logFile("volley", "cancel", "own")
+			return
+		elseif not Mark.volleyOwnLog or os.clock() - Mark.volleyOwnLog > 1 then
+			Mark.volleyOwnLog = os.clock()
+			logFile("volley", "kept charge", "own ball", Mark.volleyShot and "a shot is solved" or ("enemy near " .. actorName(foeNear)))
+		end
 	end
 	if Mark.volleyInput then
 		return -- still waiting for the 0.05 s press (Mark.volleyPending releases it)
@@ -19644,6 +19670,7 @@ Mark.tickVolley = function(character, root)
 	else
 		Mark.volleyInput = input
 		Mark.volleyAt = os.clock()
+		Mark.volleyShot = shotFrom ~= nil
 		Mark.volleyKeep = nil
 		if CFG.VolleyKeep ~= false and not shotFrom and not Mark.foeWithin(meet, CFG.VolleyKeepRadius or 22) then
 			Mark.volleyKeep = { radius = (CFG.VolleyKeepRadius or 22) * 0.55, arriveAt = os.clock() + (ev.ApproachSeconds or 0.3) + 0.12 }
@@ -21815,7 +21842,7 @@ Mark.tickBall = function(character, root)
 		if bq and bd > (CFG.BlockGoalCenter or 0.8) then
 			dir = unitOrNil(bq - O) or dir
 			gap = receiveHalf + bd
-			moveScale = math.clamp(bd / 2, 0.35, 1)
+			moveScale = math.max(Mark.arriveScale(bd, spd or 27.6), 0.35)
 			if not Mark.centreLog or os.clock() - Mark.centreLog > 0.5 then
 				Mark.centreLog = os.clock()
 				logFile("block goal", "centre", "off", string.format("%.1f", bd), "t", string.format("%.2f", threat.t))
@@ -23369,8 +23396,10 @@ Mark.hazAdd = function(st)
 			path[i + 1] = si.Position
 		end
 		ev.path = path
-	elseif item == "bazooka" then
-		local g = st.grav or 196.2
+	elseif item == "bazooka" or item == "freezeGun" then
+		-- The freeze gun is a bazooka with the ice shot's gravity (user): it is dangerous where it LANDS (ground, a wall, the first body),
+		-- not along its flight - the flight was a corridor "contact path" and the dodge ran from a shot that came down 20 studs behind us.
+		local g = st.grav or (item == "freezeGun" and 58.9 or 196.2)
 		local dt0 = math.max(nowS - st.ft, 0)
 		local p = st.fp + st.fv * dt0 + Vector3.new(0, -0.5 * g * dt0 * dt0, 0)
 		local v = st.fv + Vector3.new(0, -g * dt0, 0)
@@ -23419,22 +23448,10 @@ Mark.hazAdd = function(st)
 			end
 			t += 0.03
 		end
-	else
-		-- freeze gun: contact path
-		local g = st.grav or 58.9
-		local dt0 = math.max(nowS - st.at, 0)
-		local samples = {}
-		local t = 0
-		while t < 2.5 do
-			local tt = dt0 + t
-			samples[#samples + 1] = { t = nowS + t, p = st.pos + st.vel * tt + Vector3.new(0, -0.5 * g * tt * tt, 0) }
-			t += 0.05
-		end
-		ev = { kind = "path", samples = samples, r = HitboxSettings.Receive.Size.X * 0.5 * 1.15 + 1.2 }
 	end
 	if ev then
 		ev.id, ev.item, ev.srcName = st.id, item, who and actorName(who) or "?"
-		ev.r = ev.r or Mark.blastR()
+		ev.r = ev.r or (item == "freezeGun" and (CFG.FreezeRadius or 8) or Mark.blastR())
 		ev.seen = ev.seen or nowS
 		Mark.hazEv[st.id] = ev
 		if ev.kind == "blast" and not old then
@@ -24162,8 +24179,12 @@ Mark.projTick = function(character, root)
 	for id, st in live do
 		-- explosives live until ProjectileFinish (a grenade flies up to MaximumFlightSeconds 5 with rows only at the
 		-- bounces): dropped after 1.2 s without a row, its later corrections had no state to land in
-		local explosive = st.item == "grenade" or st.item == "bazooka"
+		local explosive = st.item == "grenade" or st.item == "bazooka" or st.item == "freezeGun"
 		if (not explosive and nowS - st.at > 1.2) or nowS - st.born > 8 then
+			-- a punch that left no trace: neither "wait" nor "eval" (the 3rd punch of the last session: no line at all)
+			if st.homing and not st.waitLogged and not st.evalLogged then
+				logFile("proj punch", "dropped unseen", nowS - st.at > 1.2 and "no row for 1.2 s" or "older than 8 s", "age", string.format("%.2f", nowS - st.born), "done", tostring(st.done))
+			end
 			live[id] = nil
 			continue
 		end
@@ -24190,7 +24211,10 @@ Mark.projTick = function(character, root)
 			if not own then
 				if not st.waitLogged then
 					st.waitLogged = true
-					logFile("proj punch", "wait: ball not ours", "owner", tostring(liveOwnerId()))
+					local oid = liveOwnerId()
+					local ow = type(oid) == "number" and oid ~= 0 and playerOf(oid) or nil
+					local bl = Renderer.GetPosition()
+					logFile("proj punch", "wait: ball not ours", "owner", tostring(oid), ow and (sameTeam(ow) and "mate " or "foe ") .. actorName(ow) or "free", "us-ball", typeof(bl) == "Vector3" and string.format("%.1f", flat(bl - O).Magnitude) or "-", "punch-ball", typeof(bl) == "Vector3" and string.format("%.1f", (st.pos - bl).Magnitude) or "-")
 				end
 				continue
 			end
