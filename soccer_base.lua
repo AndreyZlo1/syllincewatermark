@@ -255,7 +255,6 @@ local CFG = {
 	BlockGoalRange = 70,
 	RolePressGap = 6, -- AutoBlock presser: distance in front of the carrier on his line to our mouth (tight = kick reach)
 	RoleTakenR = 10, -- a teammate goal-side within this of the carrier is already pressing him
-	RoleBehindPen = 0.8, -- press cost (s) for a defender behind the carrier (he runs at our goal as fast as we do)
 	RoleDeepZone = 90, -- enemies within this of our mouth are the deep defender's threats
 	RoleCoverMax = 12, -- deepest median stand (studs in front of the carrier on the bisector of his lines to the posts)
 	RolePassLean = 0.5, -- the presser leans toward the open receiver by this share of the angle goal-line / pass-lane
@@ -8489,6 +8488,34 @@ end
 --   DEPTH: the knock-back goes along our line to him. A push whose path (GunPushTravel studs) runs over the point
 --   where the ball crosses while he stays in front of the line throws him INTO the shot - skipped;
 --   not down / not shielded (ItemInvulnerableUntil).
+-- GUN KNOCK WINDOW. A gun hit throws the target by KnockbackMotion: the speed decays and the motion lasts ln(1 + v / 26) s
+-- (v = the speed of the hit; the log's "we hit victim ... vel" gives flintlock 25 (0.67 s, ~7.6 st) and shotgun 37 (0.88 s)). The
+-- flintlock fires ShotCount 3 shots ShotIntervalSeconds 0.25 apart (SingleShotGun dump) and every one hit in the log (0.21 /
+-- 0.48 / 0.73 s after the press): the keeper is held from the first hit to the last hit + the knock-back. A push fired while
+-- the ball is farther away than that holds him for nothing - log: a roll shot at a keeper the ball reached 1.60 s later, the
+-- hold ended at ~1.4 s ("the last shot for no reason"). Speeds are observed, not from the dump.
+Mark.gunKnock = { flintlock = { v = 25, shots = 3, gap = 0.25 }, shotgun = { v = 37, shots = 1, gap = 0 } }
+Mark.pushSpan = function(gun)
+	local g = Mark.gunKnock[gun]
+	return (g.shots - 1) * g.gap + math.log(1 + g.v / 26)
+end
+-- tb: seconds until the ball reaches him; tLand: seconds until the first hit lands. "late" = the ball is there before the
+-- push; "early" = he is free again before the ball (0.15 s margin); else "ok".
+Mark.pushWindow = function(gun, tb, tLand)
+	if tb < tLand + 0.1 then
+		return "late"
+	end
+	if tb > tLand + Mark.pushSpan(gun) - 0.15 then
+		return "early"
+	end
+	return "ok"
+end
+-- when to press so the hold is on the ball: the first hit lands at tb - 0.3 of the span (never sooner than `delay`, never
+-- later than 2.5 s)
+Mark.pushFireIn = function(gun, tb, ping, delay)
+	return math.clamp(tb - 0.3 * Mark.pushSpan(gun) - ping * 0.5, delay, 2.5)
+end
+
 -- The keeper's dive is a committed motion (GoalkeeperDive: Distance 20, DurationSeconds 0.875, he is back in control after
 -- MovementRestoreStartsAtSeconds 1.125 + MovementRestoreSeconds 0.5): while it runs or he recovers a push changes nothing
 -- he could still decide (user: "it shoots the keeper after his dive"). t = seconds since his dive started.
@@ -8515,7 +8542,7 @@ Mark.keeperDiveAge = function(k)
 	return nil
 end
 
-Mark.gunPushTry = function(root, tag, key, pts)
+Mark.gunPushTry = function(root, tag, key, pts, ts)
 	if not CFG.GunPush or not pts or #pts < 2 then
 		return false
 	end
@@ -8538,14 +8565,14 @@ Mark.gunPushTry = function(root, tag, key, pts)
 	if flat(pts[1] - mouth):Dot(out) < 0 then
 		out = -out
 	end
-	local C = nil
+	local C, ci = nil, nil
 	for i = 2, #pts do
 		local a1 = flat(pts[i] - mouth):Dot(out)
 		if a1 <= 0.3 then
 			local a0 = flat(pts[i - 1] - mouth):Dot(out)
 			local q = pts[i - 1]:Lerp(pts[i], math.clamp((a0 - 0.3) / math.max(a0 - a1, 1e-4), 0, 1))
 			if math.abs(flat(q - mouth):Dot(side)) <= half + 1 and q.Y <= math.max(lt.Y, lb.Y) + 1 then
-				C = q
+				C, ci = q, i
 			end
 			break
 		end
@@ -8622,8 +8649,13 @@ Mark.gunPushTry = function(root, tag, key, pts)
 	Mark.gunPushKeys[key] = true
 	local r = k.r
 	local ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
-	-- GunPushDelay (user: 0.1 s) before the equip + shot: the press / equip goes out a beat after the decision
-	task.delay(CFG.GunPushDelay or 0.1, function()
+	-- GunPushDelay (user: 0.1 s) before the equip + shot: the press / equip goes out a beat after the decision. A shot the ball
+	-- reaches later than the hold lasts is timed so the hold is on the ball (Mark.pushFireIn)
+	local fireIn = CFG.GunPushDelay or 0.1
+	if ts and ts[ci] and Mark.pushWindow(gun, ts[ci], ping * 0.5 + fireIn) == "early" then
+		fireIn = Mark.pushFireIn(gun, ts[ci], ping, fireIn)
+	end
+	task.delay(fireIn, function()
 		local ok, how = Mark.itemNow(gun, "gunpush " .. tag, function()
 			local v = r.AssemblyLinearVelocity
 			return r.Position + (typeof(v) == "Vector3" and flat(v) or Vector3.zero) * (ping * 0.5) + Vector3.new(0, 0.4, 0)
@@ -8637,7 +8669,7 @@ Mark.gunPushTry = function(root, tag, key, pts)
 				end
 			end)
 		end
-		logFile("gunpush", tag, gun, ok and "fired" or "no", tostring(how or ""), "keeper", k.npc and "npc" or actorName(k.actor), "d", string.format("%.1f", d), "seg", string.format("%.1f", segK), "cross lat", string.format("%.1f", flat(C - mouth):Dot(side)))
+		logFile("gunpush", tag, gun, ok and "fired" or "no", tostring(how or ""), "keeper", k.npc and "npc" or actorName(k.actor), "d", string.format("%.1f", d), "seg", string.format("%.1f", segK), "cross lat", string.format("%.1f", flat(C - mouth):Dot(side)), "ball t", ts and ts[ci] and string.format("%.2f", ts[ci]) or "-", "fire in", string.format("%.2f", fireIn))
 	end)
 	return true
 end
@@ -8687,13 +8719,16 @@ Mark.gunPushRoll = function(root)
 	end
 	-- the ball is heading into the goal: from here every silent return says why (once per reason per second)
 	local function why(w)
-		if w ~= Mark.rollWhy or os.clock() - (Mark.rollWhyAt or 0) > 1 then
-			Mark.rollWhy, Mark.rollWhyAt = w, os.clock()
+		-- one line per reason per second (the numbers in it change every tick: key without them)
+		local k = string.gsub(w, "[%d%.]+", "#")
+		Mark.rollWhy = Mark.rollWhy or {}
+		if os.clock() - (Mark.rollWhy[k] or 0) > 1 then
+			Mark.rollWhy[k] = os.clock()
 			logFile("gunpush roll skip", w)
 		end
 	end
 	local ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
-	local tLand = ping * 0.5 + 0.1
+	local tLand = ping * 0.5 + (CFG.GunPushDelay or 0.1)
 	local reach = CFG.GunPushRollReach or 6
 	local best, bestI = nil, math.huge
 	local function consider(model, actor, key)
@@ -8758,6 +8793,12 @@ Mark.gunPushRoll = function(root)
 		why(string.format("no gun for d %.1f", d))
 		return
 	end
+	-- the hold must be on the ball: too early = he is back on his feet when it arrives (waits, the next tick asks again)
+	local win = Mark.pushWindow(gun, ts[bestI], tLand)
+	if win == "early" then
+		why(string.format("too early: the ball reaches him in %.2f s, the %s holds him %.2f s", ts[bestI], gun, tLand + Mark.pushSpan(gun)))
+		return
+	end
 	local pushDir = unitOrNil(flat(K - root.Position))
 	local K2 = pushDir and K + pushDir * (CFG.GunPushTravel or 18) or K
 	for i = bestI, iC do
@@ -8800,7 +8841,7 @@ Mark.gunPushTick = function(root)
 			if a and sameTeam(a) then
 				local cs = Mark.chargeShot(uid)
 				if cs and cs.passType == "Shot" then
-					Mark.gunPushTry(root, "mate " .. actorName(a), "m" .. uid .. "@" .. tostring(rec.at), cs.pts)
+					Mark.gunPushTry(root, "mate " .. actorName(a), "m" .. uid .. "@" .. tostring(rec.at), cs.pts, cs.ts)
 				end
 			end
 		end
@@ -8817,10 +8858,10 @@ Mark.gunPushOwn = function(cmd)
 	if not root then
 		return
 	end
-	local pts = nil
+	local pts, ts = nil, nil
 	local pv = Shoot.preview
 	if pv and pv.pts and #pv.pts >= 2 and Shoot.aim then
-		pts = pv.pts
+		pts, ts = pv.pts, pv.times
 	else
 		local aim = type(cmd) == "table" and typeof(cmd.AimDirection) == "table" and cmd.AimDirection.Direction
 		aim = typeof(aim) == "Vector3" and aim or (type(cmd) == "table" and typeof(cmd.KickDirection) == "Vector3" and cmd.KickDirection) or nil
@@ -8832,7 +8873,7 @@ Mark.gunPushOwn = function(cmd)
 			end
 		end
 	end
-	Mark.gunPushTry(root, "own", "o@" .. tostring(os.clock()), pts)
+	Mark.gunPushTry(root, "own", "o@" .. tostring(os.clock()), pts, ts)
 end
 
 Mark.equipWall = function(tag)
@@ -13081,7 +13122,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- Illegal Soccer dump " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v188")
+	add("-- Illegal Soccer dump " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v189")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -14905,8 +14946,8 @@ end
 -- predicted diagonal (he goes left -> we go left) and stood aside the moment a mate came within CompetitorRadius.
 -- Roles are decided every tick for every field defender we see (us + mates, keeper and downed mates excluded), with
 -- our teammates' REAL positions: they are humans, we take the role they leave open.
---   PRESS : the defender who gets goal-side of the carrier soonest (run time to the press spot; behind him = +RoleBehindPen
---           s, he runs at our goal as fast as we do; anyone already on him goal-side -0.5 s; our own role -0.25 s of
+--   PRESS : the defender who reaches the press spot soonest (Mark.pressTime: the spot moves with the carrier, so a man in
+--           front of him meets him and a man behind only chases; anyone already on him -0.9 s; our own role -0.25 s of
 --           hysteresis). Press spot = on the line from his CURRENT server pose to the MIDDLE of our mouth (not his
 --           predicted run), RolePressGap in front of him (tight = kick reach when nobody can take a pass or he has an
 --           open shot). His sideways run is mirrored (feed-forward), so we stay on that line and he cannot go round us.
@@ -14918,6 +14959,22 @@ end
 --         by danger, standing ON that line goal-side of him; all covered = between the two most dangerous (DEEP).
 -- NOBODY to pass to (no other enemy ahead / near): everyone PRESSES the carrier. Shot block first / pass read (above) and
 -- AutoBall / Air Intercept (a free ball) override every role.
+-- Seconds until a defender at `pos` (speed spd) stands on the press spot - and the spot MOVES: the carrier C runs with `vel`
+-- and the spot is always C + off (the line to our mouth, in front of him). First t on a 0.1 s grid (6 s horizon) at which the
+-- defender can be there. A man in front of the carrier meets him (closing speed = ours + his), a man behind chases (ours -
+-- his: never catches a carrier that is as fast): the old cost divided the distance to the spot AS IT WAS NOW by our speed and
+-- added a flat penalty for "behind" - it sent a mate 40 studs behind the runner to press while the man standing in front of
+-- him marked a receiver (user: "he just runs to the goal and the script covers his teammate").
+Mark.pressTime = function(pos, spd, C, vel, off)
+	for k = 1, 60 do
+		local t = k * 0.1
+		if flat(C + vel * t + off - pos).Magnitude <= spd * t then
+			return t
+		end
+	end
+	return 6 + flat(C + off - pos).Magnitude / spd
+end
+
 Mark.rolePlan = function(o)
 	local M, n, side, half = o.M, o.n, o.side, o.half
 	local C = o.C
@@ -14943,12 +15000,10 @@ Mark.rolePlan = function(o)
 	end
 	local presser, costs = nil, {}
 	for _, d in defs do
-		local rel = flat(d.pos - C)
-		local goalSide = rel:Dot(ug) > -2
-		local engaged = rel.Magnitude <= takenR + 2
+		local engaged = flat(d.pos - C).Magnitude <= takenR + 2
 		-- a man within reach of the carrier is ON him, whichever side (a mate slightly behind him is chasing, not
 		-- absent: log - we ran at the carrier while his unmarked receivers stood nearer our goal)
-		local cost = flat(pressSpot - d.pos).Magnitude / spd + ((goalSide or engaged) and 0 or (CFG.RoleBehindPen or 0.8))
+		local cost = Mark.pressTime(d.pos, spd, C, o.vel or Vector3.zero, pressSpot - C)
 		if engaged then
 			cost -= 0.9
 		end
@@ -15179,7 +15234,7 @@ Mark.blockRoleTick = function(character, root, carrier, cr, chE, P, V, g, flight
 		bis = bis, cover = cover,
 		M = M, n = n, side = side, half = flat(rb - lb).Magnitude * 0.5, C = C, me = root.Position, spd = mySpd, now = now,
 		prev = Mark.roleLast, mates = mates, foes = foes, gap = gap, tight = iso or openShot, ping = ping,
-		face = unitOrNil(flat(Vc)) or (cr and unitOrNil(flat(cr.CFrame.LookVector))),
+		face = unitOrNil(flat(Vc)) or (cr and unitOrNil(flat(cr.CFrame.LookVector))), vel = flat(Vc),
 	})
 	local role = plan.role
 	local S = role == "press" and plan.pressSpot or plan.deepSpot
