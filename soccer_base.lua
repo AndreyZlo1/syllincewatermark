@@ -157,6 +157,8 @@ local CFG = {
 	AutoBox = false, -- AutoBox: run for an item box when nothing else needs the body (stun a rival who beats us to it)
 	BoxMaxDist = 45, -- AutoBox: no box farther than this
 	BoxMargin = 0.3, -- AutoBox: a rival closing on the box within this of our arrival is a race (s)
+	BoxCommitEta = 1.6, -- AutoBox: a winning run this close keeps the body from AutoBall's far-ball chase (s; guessed)
+	BoxYieldBall = 1.0, -- ...unless the ball is ours within this (s; guessed)
 	BoxBallSafe = 45, -- AutoBox: no box run while the ball is this close to our goal
 	BallMaxDist = 60, -- AutoBall does not chase a ball (or its contact point) farther than this
 	BallYieldKeeper = false, -- AutoBall stops when the enemy keeper gets to the ball first (off: keep pressing him)
@@ -385,6 +387,7 @@ local CFG = {
 	ManualTackle = true, -- redirect the player's own Tackle press onto the solved hit (works with AutoTackle off)
 	HammerRadius = 9, -- estimate: slam radius is server-side; 'skill hammer slam ... dist' logs calibrate it
 	OilRadius = 4, -- fallback when the Puddle template gives no part size (server zone not in the client dump)
+	ShootCalib = true, -- AutoShoot: aim lower by what the last shots of the same kind flew over the prediction (Mark.calBias)
 	ShootQuick = true, -- AutoShoot: solve candidates one by one in weighted order and stop at the first open shot (weak devices); false = the old full enumeration
 	ShootSliceMs = 0.9,
 	SilentAim = true,
@@ -402,12 +405,17 @@ local CFG = {
 	GkPressMinT = 0.06, -- a contact earlier than this into the dash is a pass-through (too close), not a catch (estimate)
 	GkKnockDive = true, -- AutoGK: knocked back by a gun (Keeper Push on us): dive at once (the only press the stun lets through)
 	GkMirror = true, -- AutoGK: a carrier near the goal drags the keeper across with him (more the closer he is)
-	GkMirrorRange = 60, -- ... from this far out (guessed)
+	GkMirrorRange = 26, -- ... only while he is this close to the mouth segment (studs; guessed: the dive reach 20 + a step). Was 60 and measured along the field axis only: a carrier 60 out on the far wing pulled the keeper in to 6 studs
+	GkMirrorNear = 9, -- ... a LOOSE ball counts as his when an enemy is this close to it
+	GkFlier = true, -- AutoGK: dive at ANY enemy body flying at our mouth with the ball near its path (lob + hook / jet / launch), not only at the carrier
+	GkFlierZone = 90, -- ... only bodies this close to the mouth are read
+	GkFlierLink = 12, -- ... the ball must be this close to his path at the time he gets to the goal (guessed: a body that never meets the ball scores nothing)
+	GkFlierSpeed = 32, -- ... a grounded body this fast (a boost, a kart) is a flier too (sprint is below it)
 	GkHookPress = true, -- AutoGK: a hook flier heading for the ball in our zone is dived at on his exact grapple path
 	GkKick = true, -- AutoGK: no dive line and he is close -> the keeper charges a full Kick at him
 	GkKickRange = 8, -- ... within kick reach + this
 	GkHomeDist = 20, -- ... "far out" = this far in front of the line (studs)
-	GkHomeDanger = 110, -- ... "attack" = enemy carrier / free ball this close to our mouth
+	GkHomeDanger = 70, -- ... "attack" = enemy carrier / free ball this close to our mouth
 	GkChaseDepth = 12, -- a free ball going away is not chased past this depth
 	GkPressFlierShot = true, -- no press dive at a flier with the ball unless it lands before he can kick -- a pass flying to an enemy near our goal: shift to his cone before he touches it
 	GkPassReadZone = 45, -- ... receiver within this of our mouth segment (studs)
@@ -4842,7 +4850,9 @@ solveShotRaw = function(root, forced)
 			local hb = pack.band
 			if hb == "high" or hb == "trick" or hb == "airHigh" or hb == "mid" then
 				local top = fineTop(pack)
+				-- + what the last shots of this class proved: they flew HIGH by this much over what the solver predicted (Mark.calBias)
 				local margin = (Mark.forceBike and 1.5 or 1.05) - (hb == "trick" and 0.3 or 0)
+					+ Mark.calBias(Mark.shotClass(pack.curve, Mark.flickAim or Mark.aerial or Mark.flickStrike or Mark.forceBike))
 				if top and mouthH - top < radius + margin then
 					Mark.barWhy = string.format("fine %s %s top %.2f", hb, pack.curve and "spin" or "straight", mouthH - top)
 					fail.bar = (fail.bar or 0) + 1
@@ -5099,7 +5109,7 @@ solveShotRaw = function(root, forced)
 		-- target INSIDE the acceptance window: the old target (gap 1.35) sat under the reject line (radius + 0.85,
 		-- bicycle radius + 1.35) so the correction converged onto rejects (G log: high0/3, bar:high top 1.6)
 		local topH = mouthH - radius - (Mark.forceBike and 2.2 or 1.6)
-		local curveH = topH
+		local curveH = topH - Mark.calBias("curve")
 		local dipH = -4 -- aim point below the goal line: the curl hits the floor first (see take trickLow)
 		local dipS = post * 0.45
 		local function straightSide(sideSign)
@@ -5138,8 +5148,9 @@ solveShotRaw = function(root, forced)
 		if air then
 			-- from the airborne contact point: straight shots into the four corners first (downward launches allowed)
 			Shoot.simCap = 24
-			aimAndPack(topH, sign * post * 0.85, nil, "airHigh", true)
-			aimAndPack(topH, -sign * post * 0.85, nil, "airHigh", true)
+			local airTop = topH - Mark.calBias("flick")
+			aimAndPack(airTop, sign * post * 0.85, nil, "airHigh", true)
+			aimAndPack(airTop, -sign * post * 0.85, nil, "airHigh", true)
 			aimAndPack(1.6, sign * post * 0.85, nil, "airLow", true)
 			aimAndPack(1.6, -sign * post * 0.85, nil, "airLow", true)
 			if #pool == 0 then
@@ -5169,7 +5180,7 @@ solveShotRaw = function(root, forced)
 			end
 		else
 			local band = Shoot.wantBand or "high"
-			local h = mouthH - radius - 0.3
+			local h = mouthH - radius - 0.3 - Mark.calBias(amounts and "curve" or "straight")
 			local curve = amounts and (0.85 * curveFor(sign * post)) or nil
 			local sideAmt = post * 0.92
 			if band == "trickLow" and amounts then
@@ -6492,6 +6503,7 @@ else
 		end
 		Mark.tickBox(character, root)
 		Mark.boxResult()
+		Mark.shotWatch()
 		if Mark.jumpHoldUntil and os.clock() > Mark.jumpHoldUntil then
 			Mark.jumpHoldUntil = nil
 			CharacterControllers.SetJumpCommand(character, false)
@@ -7089,6 +7101,7 @@ oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
 				local nowR = os.clock()
 				local ageS, ageR = nowR - (Shoot.goodT or nowR), nowR - (Shoot.rebased or nowR)
 				local aimSent = typeof(cmd.AimDirection) == "table" and cmd.AimDirection.Direction
+				Mark.shotAuditStart(pv, p0)
 				task.delay(0.2, function()
 					local pB = Renderer.GetPosition()
 					if not (pv and pv.pts and pv.times and p0 and pB) then
@@ -7124,7 +7137,14 @@ oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
 						local sent = typeof(aimSent) == "Vector3" and aimSent or nil
 						logFile("spoof leak", "ball vs sent", yawGap(aa, sent), "vs last decoy", yawGap(aa, decoyLast), "vs game lock", yawGap(aa, lockDir), "sent vs first real", yawGap(sent, realFirst), "sent vs decoy", yawGap(sent, decoyLast))
 					end
-					logFile("shoot", "flight", "angle to solved", string.format("%.1f", ang), "moved", string.format("%.1f", aa.Magnitude), "solved", string.format("%.1f", ea.Magnitude), "decoy", hadDecoy and "yes" or "no", "body", hadBody and "yes" or "no", "drift", string.format("%.1f", drift), "solve age", string.format("%.2f", ageS), "rebase age", string.format("%.2f", ageR), "aim sent", aimSent and fmtV(aimSent) or "-")
+					-- the same error split: up/down (a flight over the bar) and left/right (a flight wide)
+					local function elev(v)
+						return math.deg(math.atan2(v.Y, flat(v).Magnitude))
+					end
+					local pitchErr = elev(aa) - elev(ea)
+					local yawErr = math.deg(math.atan2(aa.X, aa.Z) - math.atan2(ea.X, ea.Z))
+					yawErr = (yawErr + 180) % 360 - 180
+					logFile("shoot", "flight", "pitch err", string.format("%.1f", pitchErr), "yaw err", string.format("%.1f", yawErr), "angle to solved", string.format("%.1f", ang), "moved", string.format("%.1f", aa.Magnitude), "solved", string.format("%.1f", ea.Magnitude), "decoy", hadDecoy and "yes" or "no", "body", hadBody and "yes" or "no", "drift", string.format("%.1f", drift), "solve age", string.format("%.2f", ageS), "rebase age", string.format("%.2f", ageR), "aim sent", aimSent and fmtV(aimSent) or "-")
 				end)
 			end
 			if packet.Phase == "Release" and (Mark.flickStrike or Mark.forceBike) then
@@ -10558,6 +10578,32 @@ Mark.gkPressSolve = function(o)
 	return bestNow, bestLater, cen
 end
 
+-- The jetpack phase of an enemy (a packet told us he fired it): { te, dir, base } or false. One reading for the press on the
+-- carrier and for the flier scan.
+Mark.jetRead = function(uid, er, P, V, rootY, now, ping, lead, airborne, vyT, g, fwdDefault)
+	local jr = Mark.jets and Mark.jets[uid]
+	if not (jr and now - jr.at < 4) then
+		return false
+	end
+	-- phase of the DISPLAYED pose: packet time + ping/2 - his display delay; while he is in the lift his height says
+	-- it better (invert the Cubic-InOut), the packet time is only the fallback
+	local te = now - jr.at + ping * 0.5 - (lead - ping * 0.5)
+	local hgt = P.Y - rootY
+	if te > 0.4 and te < 1.6 and hgt > 0.8 and hgt < 24.5 and vyT > 1 then
+		local f = hgt / 25
+		local u = f < 0.5 and (f / 4) ^ (1 / 3) or (1 - ((2 - 2 * f) ^ (1 / 3)) / 2)
+		te = 0.5 + u
+	end
+	if te > 1.6 and not airborne then
+		Mark.jets[uid] = nil -- landed
+		return false
+	elseif te < 2.6 then
+		local dirJ = unitOrNil(flat(er.CFrame.LookVector)) or unitOrNil(flat(V)) or fwdDefault
+		return { te = te, dir = dirJ, base = P.Y - Mark.jetCurveY(te, g) }
+	end
+	return false
+end
+
 -- Vertical state of another player's body (shared by AutoGK press and the air duel). See the note inside.
 Mark.vertState = function(model, P, baseY, airborne, now, g)
 	-- VERTICAL STATE. CharacterMotion.GetVelocity has Y = 0 for another player: vy and ay come from the history of his
@@ -10636,6 +10682,130 @@ Mark.vertState = function(model, P, baseY, airborne, now, g)
 	return { vy = vyT, ay = ayT, kind = vKind, airborne = airborne, dy = dyNow, airAt = yh.airAt }
 end
 
+-- FLIER (user: a lob, a rocket punch on the ball, then a hook to it - he flew into the goal and the keeper stood). Two holes: the
+-- press only knew the CARRIER (a lob leaves his hands: nobody is "owner") and a hook it SAW by packet, and both were switched off
+-- while the ball was a "shot" (the lob flying at the goal IS one). Now it reads every enemy BODY by what it does, not by the item in
+-- his hand: his measured flight (Mark.gkFutures: the same futures the dive is solved against, the jetpack's own timeline when a
+-- packet told us) enters our mouth within the horizon AND the ball is near that path at that time (a body that never meets the
+-- ball scores nothing). The dive stays the game's: a forward dash into him, solved by gkPressSolve.
+-- the ball's position t seconds ahead from the live path (Mark.ballPath samples / times), else where it lies now
+Mark.pathAt = function(bs, bt, now)
+	local nb = bs and #bs or 0
+	if nb < 2 or not bt then
+		if typeof(now) ~= "Vector3" then
+			return nil
+		end
+		return function()
+			return now
+		end
+	end
+	return function(t)
+		if t >= bt[nb] then
+			return bs[nb]
+		end
+		for i = 2, nb do
+			if bt[i] >= t then
+				local a, b = bt[i - 1], bt[i]
+				return bs[i - 1]:Lerp(bs[i], b > a and math.clamp((t - a) / (b - a), 0, 1) or 0)
+			end
+		end
+		return bs[nb]
+	end
+end
+
+-- when (s from now) and where his path is in our mouth with the ball near it. o: pts (0.025 s steps, index 1 = now), DT, mouth, fwd,
+-- side, half, inside (studs in front of the line that count as "in"), pad (studs beside the posts), ballAt(t), link (studs)
+Mark.gkFlierEta = function(o)
+	local pts = o.pts
+	for k = 1, #pts do
+		local rel = flat(pts[k] - o.mouth)
+		if rel:Dot(o.fwd) <= o.inside and math.abs(rel:Dot(o.side)) <= o.half + o.pad then
+			local t = (k - 1) * o.DT
+			local b = o.ballAt(t)
+			if b and flat(b - pts[k]).Magnitude <= o.link then
+				return t, pts[k]
+			end
+		end
+	end
+	return nil
+end
+
+-- may the press dive go while the ball plan / the shot say something else? The carrier: no shot, no ball plan. A hook flier or a
+-- flier body: through a shot (the lob IS the shot he flies after); a flier only if the keeper's own ball plan is not earlier
+Mark.gkPressGate = function(shot, plan, hookId, flierId, flierT)
+	if hookId then
+		return true
+	end
+	if flierId then
+		return plan == nil or plan.kind == "dive" or (flierT or math.huge) <= plan.t + 0.05
+	end
+	return not shot and plan == nil
+end
+
+-- the enemy body that gets to our mouth soonest with the ball near its path (uid, t, kind), not the carrier (his press is the old
+-- one) and not a hooker (his path is exact: Mark.gkHooker). Cached 0.05 s.
+Mark.gkFlierPick = function(root, mouth, side, fwd, half, now, ownerId)
+	local fc = Mark.gkFlierCache
+	if fc and now - fc.at < 0.05 then
+		return fc.uid, fc.t, fc.kind
+	end
+	local uid, tBest, kBest = nil, math.huge, nil
+	local _, _, bs, bt = Mark.ballPath(root)
+	local ballAt = Mark.pathAt(bs, bt, Renderer.GetPosition())
+	if ballAt then
+		local g = workspace.Gravity
+		local ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
+		local zone = CFG.GkFlierZone or 90
+		for _, model in Mark.models() do
+			local actor = Actors.GetFromCharacter(model)
+			local id = actor and actor.UserId
+			if actor and actor ~= LocalPlayer and id ~= ownerId and not sameTeam(actor) and not isGoalkeeper(actor) and not (Mark.grapples and Mark.grapples[id]) then
+				local er = ActorTargeting.GetActorRoot(actor)
+				local hum = model:FindFirstChildOfClass("Humanoid")
+				if er and hum and flat(er.Position - mouth).Magnitude <= zone then
+					local lr = Mark.launchRec and Mark.launchRec[id]
+					local jr = Mark.jets and Mark.jets[id]
+					local airborne = not CharacterControllers.IsLanded(model, hum)
+					local wv = CharacterMotion.GetVelocity(model)
+					local fast = typeof(wv) == "Vector3" and flat(wv).Magnitude >= (CFG.GkFlierSpeed or 32)
+					local down = Mark.mateDown(actor, model)
+					if down then
+						local hrp = model:FindFirstChild("HumanoidRootPart")
+						local vD = hrp and hrp.AssemblyLinearVelocity
+						-- a ragdoll thrown at the goal flies; a ragdoll lying there does not
+						down = not (typeof(vD) == "Vector3" and (flat(vD).Magnitude > 8 or math.abs(vD.Y) > 8))
+					end
+					if not down and (airborne or fast or (lr and now - lr.at < 0.6) or (jr and now - jr.at < 4)) then
+						local P, V, W = Mark.carrierPose(er, model)
+						local vf = flat(W)
+						if vf.Magnitude > V.Magnitude then
+							V = vf
+						end
+						local lead = math.clamp(CharacterMotion.GetDisplayDelaySeconds(model) or 0, 0, 0.25) + ping * 0.5
+						local vs = Mark.vertState(model, P, root.Position.Y, airborne, now, g)
+						local vy = vs.airborne and ((math.abs(W.Y) > 0.5) and W.Y or vs.vy) or 0
+						local jet = Mark.jetRead(id, er, P, V, root.Position.Y, now, ping, lead, vs.airborne, vs.vy, g, fwd)
+						local futs = Mark.gkFutures(P, V, vy, vs.airborne, jet, root.Position.Y, lead, mouth, g, false)
+						local t = Mark.gkFlierEta({
+							pts = futs[1].pts, DT = 0.025, mouth = mouth, fwd = fwd, side = side, half = half,
+							inside = 3, pad = 3, ballAt = ballAt, link = CFG.GkFlierLink or 12,
+						})
+						if t and t < tBest then
+							uid, tBest, kBest = id, t, jet and "jet" or vs.kind
+							if not Mark.gkFlierLog or now - Mark.gkFlierLog > 0.5 then
+								Mark.gkFlierLog = now
+								logFile("gk flier", actorName(actor), "in", string.format("%.2f", t), "kind", tostring(kBest), "dSeg", string.format("%.1f", flat(P - mouth).Magnitude), "dy", string.format("%.1f", P.Y - root.Position.Y))
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+	Mark.gkFlierCache = { at = now, uid = uid, t = uid and tBest or nil, kind = kBest }
+	return uid, uid and tBest or nil, kBest
+end
+
 -- HOOK FLIER (user: the enemy shot at the bar on purpose, grappled to the rebound and flew in - the keeper did nothing).
 -- GrappleMotion is exact (Mark.grapplePath: the hook flies to the BALL, then a 75 st/s pull homing on it), so the dive can be
 -- solved against his real path instead of being refused as "powered flight". Pure: his arrival point A is a threat when it is
@@ -10682,6 +10852,8 @@ Mark.gkPress = function(character, root, c)
 	if not (model and hum) then
 		return false
 	end
+	-- a flier body (Mark.gkFlierPick), not the carrier: no ball at his feet, so no dribble, flick, charge, pass and "he shoots first"
+	local bare = c.flier == true
 	local function note(why)
 		if not Mark.gkPressLog or c.now - Mark.gkPressLog > 0.5 then
 			Mark.gkPressLog = c.now
@@ -10719,25 +10891,7 @@ Mark.gkPress = function(character, root, c)
 	local lr = Mark.launchRec and Mark.launchRec[pl.UserId]
 	local launchPending = lr and not airborne and c.now - lr.at < 0.45 and lr.kind or nil
 	Mark.jetM = Mark.jetM or require(Modules.Actions.JetpackMotion)
-	local jet = false
-	local jr = Mark.jets and Mark.jets[pl.UserId]
-	if jr and c.now - jr.at < 4 then
-		-- phase of the DISPLAYED pose: packet time + ping/2 - his display delay; while he is in the lift his height says
-		-- it better (invert the Cubic-InOut), the packet time is only the fallback
-		local te = c.now - jr.at + ping * 0.5 - (lead - ping * 0.5)
-		local hgt = P.Y - root.Position.Y
-		if te > 0.4 and te < 1.6 and hgt > 0.8 and hgt < 24.5 and vyT > 1 then
-			local f = hgt / 25
-			local u = f < 0.5 and (f / 4) ^ (1 / 3) or (1 - ((2 - 2 * f) ^ (1 / 3)) / 2)
-			te = 0.5 + u
-		end
-		if te > 1.6 and not airborne then
-			Mark.jets[pl.UserId] = nil -- landed
-		elseif te < 2.6 then
-			local dirJ = unitOrNil(flat(er.CFrame.LookVector)) or unitOrNil(flat(V)) or c.fwd
-			jet = { te = te, dir = dirJ, base = P.Y - Mark.jetCurveY(te, g) }
-		end
-	end
+	local jet = Mark.jetRead(pl.UserId, er, P, V, root.Position.Y, c.now, ping, lead, airborne, vyT, g, c.fwd)
 	local fwd, side, mouth, half = c.fwd, c.side, c.mouth, c.half
 	-- he is on a hook: his path to the ball is exact (arrival point hookA at hookT); it replaces the speed read everywhere below
 	local hookPts, hookT, hookA = nil, nil, nil
@@ -10773,6 +10927,8 @@ Mark.gkPress = function(character, root, c)
 	local threat = committed or dSeg <= 16 or (dSeg <= zone and going) or (tReach <= 2.2 and appr > 6)
 	if hookPts then
 		threat, tReach = true, hookT
+	elseif bare then
+		threat, tReach = true, c.flierT or tReach
 	end
 	-- appr hovers around the 2 st/s edge while he dribbles: the stand flipped press/free every frame (log). Hold 0.6 s.
 	if threat then
@@ -10787,7 +10943,7 @@ Mark.gkPress = function(character, root, c)
 	-- he flicked: the ball leaves his feet (detach in ~0.4 s) and goes over us. The save logic owns the ball; a dive at the
 	-- man who no longer has it is the open goal.
 	local fr = Mark.flickRec and Mark.flickRec[pl.UserId]
-	if fr and c.now - fr.at < 1.2 then
+	if fr and not bare and c.now - fr.at < 1.2 then
 		-- before the detach the ball is still at his feet (RainbowFlick BallDetachSeconds 0.4): a dive at him takes it.
 		-- Only after it does the lob leave him (v171 session: 9 refusals here, some mid wind-up)
 		local carried = fr.detachSrv ~= nil and Workspace:GetServerTimeNow() + ping * 0.5 < fr.detachSrv - 0.05
@@ -10799,7 +10955,7 @@ Mark.gkPress = function(character, root, c)
 	-- the last man only: an open attacker nearer the goal or level with him (BlockLevelSlack) is the pass he plays the
 	-- moment we leave the line. Then we do not come out and do not dive; he can still score himself only if he is at the
 	-- mouth within GkPressLate s or flying in.
-	if CFG.GkPressLastMan ~= false and not committed and not imminentT then
+	if CFG.GkPressLastMan ~= false and not bare and not committed and not imminentT then
 		local sup, sd = Mark.gkSupport(pl, P, mouth, side, half, dSeg)
 		if sup then
 			return note(string.format("pass option %s dSeg %.1f vs %.1f", actorName(sup), sd, dSeg))
@@ -10812,7 +10968,7 @@ Mark.gkPress = function(character, root, c)
 	-- RUSH (user: a man running at our goal is caught, not watched). A grounded carrier who GOES at the mouth inside
 	-- GkRushZone is dived at without his dribble side-bursts in the fan and with GkRushConf: a dribble against the dive
 	-- is the risk taken. "Only when sure" gave 0-2 press dives per session in every log since v134.
-	local rush = CFG.GkRush ~= false and not airborne and not jet and not hookPts and going and dSeg <= (CFG.GkRushZone or 35)
+	local rush = CFG.GkRush ~= false and not bare and not airborne and not jet and not hookPts and going and dSeg <= (CFG.GkRushZone or 35)
 	local futs = hookPts and { { w = 1, pts = hookPts, air = true } } or Mark.gkFutures(P, V, vy, airborne, jet, root.Position.Y, lead, nearP + fwd * 0.5, g, dribReady and not airborne and not jet and not rush)
 
 	-- come out on his line to the mouth: close the angle so the dive reaches him before he reaches the line. Only when it
@@ -10908,7 +11064,7 @@ Mark.gkPress = function(character, root, c)
 	local function fmt(x)
 		return string.format("%.2f", x)
 	end
-	local info0 = hookPts and string.format("HOOK %.2f ", hookT) or ""
+	local info0 = hookPts and string.format("HOOK %.2f ", hookT) or (bare and string.format("FLIER %.2f ", c.flierT or -1) or "")
 	local info = info0 .. string.format("dSeg %.1f appr %.1f tReach %s air %s vy %.1f dy %.1f drib %s jet %s vk %s%s%s", dSeg, appr, tReach == math.huge and "-" or fmt(tReach), tostring(airborne), vy, P.Y - root.Position.Y, dribReady and "ready" or "spent", jet and fmt(jet.te) or "-", vKind, downFly and " downFly" or "", Mark.gkPressStandP and string.format(" stand %.1f", flat(Mark.gkPressStandP - root.Position).Magnitude) or "")
 	if not best then
 		-- too close / no dive line: the keeper's own charged Kick (full charge, released by the kick box) pushes him off
@@ -10945,7 +11101,7 @@ Mark.gkPress = function(character, root, c)
 	-- press dive at a jetpacker dy 21.9, contact t 0.23; he released a 124 st/s shot 0.07 s after our dash - stunned
 	-- after the ball had gone, keeper on the floor, goal). A dive is only worth it when it lands before he can complete a
 	-- fresh kick: contact within the game's minimum release time minus what we see of him late (display delay).
-	if (airborne or jet) and not committed and not hookPts and CFG.GkPressFlierShot ~= false then
+	if (airborne or jet) and not committed and not hookPts and not bare and CFG.GkPressFlierShot ~= false then
 		local minRel = (KickCore.GetMinimumReleaseSeconds and KickCore.GetMinimumReleaseSeconds()) or 0.2
 		local seen = math.clamp(CharacterMotion.GetDisplayDelaySeconds(model) or 0, 0, 0.25)
 		if best.t + ping * 0.5 > minRel - seen then
@@ -11439,12 +11595,36 @@ Mark.knockHook = function()
 end
 Mark.knockHook()
 
+-- the enemy field player nearest to a loose ball within r (not a keeper, not down): who a free ball is "his" for
+Mark.gkContender = function(ballPos, r)
+	local best, bd = nil, r
+	for _, model in Mark.models() do
+		local actor = Actors.GetFromCharacter(model)
+		if actor and actor ~= LocalPlayer and not sameTeam(actor) and not isGoalkeeper(actor) and not Mark.mateDown(actor, model) then
+			local rr = ActorTargeting.GetActorRoot(actor)
+			if rr then
+				local d = flat(rr.Position - ballPos).Magnitude
+				if d < bd then
+					best, bd = rr, d
+				end
+			end
+		end
+	end
+	return best, bd
+end
+
 -- the spot the keeper stands on: remembered while he stands still near his goal
 -- MIRROR (user): a carrier running at the goal drags the keeper across with him, the closer the more. weight 0.15 at `range`
 -- (a pass can still go the other way) -> 0.9 from 10 studs in; depth in front of the line 35 % of his depth, 2..6, never within
 -- 3 studs of him (goal-side: a kick / dive at him then sends the ball away from the mouth, not into it). Pure.
-Mark.gkMirror = function(along, side, half, range)
-	local k = math.clamp((along - 10) / math.max(range - 10, 1), 0, 1)
+Mark.gkMirror = function(along, side, half, range, seg)
+	-- `seg` = his distance to the mouth SEGMENT (a carrier on the far wing is far from the goal whatever his depth is): nothing
+	-- beyond `range`. The user: "mirror him when he is NEAR", the keeper stood on the line at every attack 60 studs away.
+	local d = seg or along
+	if d > range then
+		return nil
+	end
+	local k = math.clamp((d - 10) / math.max(range - 10, 1), 0, 1)
 	local w = 0.9 - 0.75 * k
 	local lat = math.clamp(side * w, -(half - 1), half - 1)
 	local depth = math.min(math.clamp(along * 0.35, 2, 6), math.max(along - 3, 1.5))
@@ -11724,11 +11904,13 @@ Mark.tickGk = function(character, root)
 		end
 	end
 	local along, ballSide, into = 0, 0, 0
+	local segB = math.huge -- the ball's distance to the mouth SEGMENT (along is only its depth)
 	if ballPos then
 		local relB = flat(ballPos - defend)
 		along = relB:Dot(fwd)
 		ballSide = relB:Dot(side)
 		into = -flat(ballVel):Dot(fwd)
+		segB = (relB - side * math.clamp(ballSide, -half, half)).Magnitude
 	end
 	local now = os.clock()
 	local hum = character:FindFirstChildOfClass("Humanoid")
@@ -12056,7 +12238,7 @@ Mark.tickGk = function(character, root)
 	end
 	-- a hook flier (the ball is free: he is flying at it) is pressed like a carrier, on his exact grapple path
 	local hookId = nil
-	if landed and role and role.Dive and not shot then
+	if landed and role and role.Dive then
 		hookId = Mark.gkHooker(root, mouthP, side, fwd, half)
 		if hookId and (not pid or pid == hookId) then
 			pid = hookId
@@ -12064,14 +12246,35 @@ Mark.tickGk = function(character, root)
 			hookId = nil
 		end
 	end
-	if pid and landed and role and role.Dive and not shot and (not plan or hookId) then
-		if Mark.gkPress(character, root, { now = now, ownerId = pid, fwd = fwd, side = side, half = half, mouth = mouthP, diveMod = diveMod, role = role }) then
+	-- a flier body: he beats the carrier's press only when he is about to arrive (the carrier we press keeps the dive until then)
+	local flierId, flierT = nil, nil
+	if landed and role and role.Dive and not hookId and CFG.GkFlier ~= false then
+		flierId, flierT = Mark.gkFlierPick(root, mouthP, side, fwd, half, now, ownerId)
+		if flierId and pid and pid ~= flierId and flierT > (CFG.GkPressLate or 0.9) then
+			flierId = nil
+		end
+		if flierId then
+			pid = flierId
+		end
+	end
+	if pid and landed and role and role.Dive and Mark.gkPressGate(shot, plan, hookId, flierId, flierT) then
+		if Mark.gkPress(character, root, { now = now, ownerId = pid, fwd = fwd, side = side, half = half, mouth = mouthP, diveMod = diveMod, role = role, flier = flierId ~= nil, flierT = flierT }) then
 			return true
 		end
 		local sl = Mark.gkStandLast
 		if not Mark.gkPressStandP and sl and sl.id == pid and now - sl.at < 0.35 then
 			Mark.gkPressStandP = sl.p
 		end
+	end
+	-- MIRROR / HOME read "who is attacking": the carrier, or the enemy standing at a loose ball. Only when he is NEAR the mouth
+	local mRoot = ownerRoot
+	local mirrorRange = CFG.GkMirrorRange or 26
+	if not mRoot and free and ballPos and not shot and segB <= math.max(mirrorRange, CFG.GkHomeDanger or 70) and flat(ballVel).Magnitude < 25 then
+		mRoot = Mark.gkContender(ballPos, CFG.GkMirrorNear or 9)
+	end
+	local mDepth, mLat = nil, nil
+	if mRoot and CFG.GkMirror ~= false and along > -2 then
+		mDepth, mLat = Mark.gkMirror(along, ballSide, half, mirrorRange, segB)
 	end
 	local stand, why, eta = nil, "free", nil
 	local stopAt, urgent = 0.8, false
@@ -12087,9 +12290,8 @@ Mark.tickGk = function(character, root)
 		stand = recvStand
 		why = "recv"
 		stopAt, urgent = 0.5, true
-	elseif not plan and not shot and ownerRoot and CFG.GkMirror ~= false and not Mark.userInputDir() and along < (CFG.GkMirrorRange or 60) and along > -2 then
-		local dm, lm = Mark.gkMirror(along, ballSide, half, CFG.GkMirrorRange or 60)
-		stand = mouthP + fwd * dm + side * lm
+	elseif not plan and not shot and mDepth and not Mark.userInputDir() then
+		stand = mouthP + fwd * mDepth + side * mLat
 		why = "mirror"
 		stopAt, urgent = 0.6, true
 	end
@@ -12128,7 +12330,9 @@ Mark.tickGk = function(character, root)
 		local outU = relU:Dot(fwd)
 		local latU = math.abs(relU:Dot(side))
 		if outU > (CFG.GkHomeDist or 20) or latU > half + 15 then
-			local danger = ballPos and along < (CFG.GkHomeDanger or 110) and (free or ownerRoot ~= nil)
+			-- an attack: an enemy carrier, a shot / ball coming at us, or an enemy at a loose ball, NEAR the mouth segment (was: any
+			-- ball in the half field - 51 "home" runs a session, most for a ball nobody played at us)
+			local danger = ballPos and segB <= (CFG.GkHomeDanger or 70) and (ownerRoot ~= nil or (free and (into > 4 or mRoot ~= nil)))
 			if danger then
 				stand = mouthP + fwd * 3 + side * math.clamp(ballSide * 0.15, -(half - 2), half - 2)
 				why, stopAt, urgent = "home", 1.5, true
@@ -13214,7 +13418,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- Illegal Soccer dump " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v194")
+	add("-- Illegal Soccer dump " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v196")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -18237,6 +18441,48 @@ Mark.airY = function(o, t, td)
 	return o.floor + math.max(vJ * x - 0.5 * g * x * x, 0)
 end
 
+-- The order the meets are shown to the game. The earliest reachable meet is the one we reach with NOTHING to spare: one frame of
+-- ping, a ramp slower than the model, and the press misses (log: "short xz 0.3"). So: the earliest meet with `minSlack` seconds in
+-- hand, if there is one within `window` of the earliest, else the old order. Inside those the plan we are on keeps its kind
+-- (ground / a jump): the log flipped between td ground and td 1.00 every 0.05 s for one ball. prevGround = nil: no plan yet.
+Mark.airOrder = function(list, minSlack, window, prevGround)
+	local lead = list[1]
+	if not lead then
+		return list
+	end
+	local comfy, rest = {}, {}
+	for _, c in list do
+		if c.slack >= minSlack and c.T <= lead.T + window then
+			comfy[#comfy + 1] = c
+		else
+			rest[#rest + 1] = c
+		end
+	end
+	if #comfy == 0 then
+		return list
+	end
+	if prevGround ~= nil then
+		for i, c in comfy do
+			if (c.td == "ground") == prevGround then
+				if i > 1 then
+					table.insert(comfy, 1, table.remove(comfy, i))
+				end
+				break
+			end
+		end
+	end
+	for _, c in rest do
+		comfy[#comfy + 1] = c
+	end
+	return comfy
+end
+
+-- What the game's own no is worth: a dive, a spent jump or a competitor who takes the ball first do not pass with time; "no approach"
+-- (the flight is too young, the ball not at the box yet) and a rising kicker do.
+Mark.airHard = function(info)
+	return info ~= nil and (info.BlockedByDive == true or info.BlockedBySpentJump == true or info.BlockedByCompetitor == true)
+end
+
 -- Candidates: per path sample, a root spot where our FrontAssist box (facing the incoming ball) sits on the ball, that
 -- we reach in time - running at o.spd on the ground and at o.spdAir after a take-off (the game drops the sprint in the
 -- air: state lines show ws 16 in Freefall) - and a height option (ground, a jump at td with the latest td first =
@@ -18286,13 +18532,15 @@ Mark.airSolve = function(o)
 		local toQ = flat(Q - o.O)
 		local u = unitOrNil(toQ)
 		local need = math.max(toQ.Magnitude - (hx + tol), 0)
-		local bestY, bestTd, gapXZ = math.huge, nil, math.huge
+		local bestY, bestTd, gapXZ, slack = math.huge, nil, math.huge, 0
 		for _, td in tds do
 			if td == "ground" or td == false or td + 0.03 <= T then
 				local gx = math.max(need - reach(u, T, td), 0)
 				local dy = math.max(math.abs(B.Y - Mark.airY(o, T, td) - cy) - (hy + tol), 0)
 				if gx <= 0 and dy <= 0 then
 					bestY, bestTd, gapXZ = 0, td, 0
+					-- seconds to spare: the studs we reach beyond what the meet needs, at the speed we run
+					slack = (reach(u, T, td) - need) / math.max(o.spd, 1)
 					break
 				end
 				if gx + dy < gapXZ + bestY then
@@ -18301,10 +18549,11 @@ Mark.airSolve = function(o)
 			end
 		end
 		if bestTd ~= nil then
-			list[#list + 1] = { td = bestTd, T = T, B = B, Q = Vector3.new(Q.X, o.O.Y, Q.Z), inc = inc, tol = tol, k = k }
+			list[#list + 1] = { td = bestTd, T = T, B = B, Q = Vector3.new(Q.X, o.O.Y, Q.Z), inc = inc, tol = tol, k = k, slack = slack }
 		else
 			local gap = gapXZ + bestY
-			if not near or gap < near.gap then
+			-- (only an AIR sample is a near miss: the log's "short xz 0.0" was a ball rolling on the grass under the height gate)
+			if (not near or gap < near.gap) and B.Y - o.floor >= (o.minH or -math.huge) then
 				near = { gap = gap, gapXZ = gapXZ, gapY = bestY, T = T, h = B.Y - o.floor, d = flat(B - o.O).Magnitude }
 			end
 		end
@@ -18455,7 +18704,9 @@ Mark.tickAir = function(character, root)
 		local spd = math.max(Mark.akSpeeds(character), hum.WalkSpeed)
 		local spdAir = landed and Mark.mover.GetBaseWalkSpeed(character) or hum.WalkSpeed
 		local foeFlight = kicker ~= nil and kicker ~= LocalPlayer and not sameTeam(kicker)
+		local gshot = Mark.airGoalShot(root, kicker) -- (a shot into our mouth is met at any height)
 		local o = {
+			minH = (not gshot) and (CFG.AirMinHeight or 1.5) or nil,
 			O = root.Position, v0 = flat(root.AssemblyLinearVelocity), spd = spd, spdAir = (type(spdAir) == "number" and spdAir > 4) and spdAir or 16,
 			landed = landed, vy = root.AssemblyLinearVelocity.Y, floor = floor, g = g, vJ = math.sqrt(2 * g * (Mark.jumpH or 7.2)),
 			pts = pts, DT = 0.025, tolDeg = foeFlight and 6 or 10, ballR = Physics.BallRadius or 1,
@@ -18463,12 +18714,14 @@ Mark.tickAir = function(character, root)
 		local _, near, all = Mark.airSolve(o)
 		-- only meets IN THE AIR (a ball that is on the grass at the sample is nobody's air ball)
 		local list = {}
-		local gshot = Mark.airGoalShot(root, kicker) -- (a shot into our mouth is met at any height)
 		for _, c in all do
 			if gshot or c.B.Y - floor >= (CFG.AirMinHeight or 1.5) then
 				list[#list + 1] = c
 			end
 		end
+		-- the meet we reach with time to spare before the one we reach by a hair; the kind of plan we are on (ground / jump) first
+		local prev = Mark.airPlan
+		list = Mark.airOrder(list, CFG.AirComfort or 0.12, CFG.AirComfyWindow or 0.35, prev and prev.td ~= nil and (prev.td == "ground") or nil)
 		local first = list[1]
 		-- the rules on the earliest reachable meet (user: near a goal every ball)
 		local want = false
@@ -18508,6 +18761,16 @@ Mark.tickAir = function(character, root)
 				plan.verified = inFlight
 				plan.why, plan.src, plan.kicker = why, src, kicker
 				plan.aim = Mark.volleyClearAim(plan.B)
+			elseif firstInfo and not Mark.airHard(firstInfo.info) and firstInfo.c.T <= 1.2 then
+				-- the game says no NOW (the flight is too young for a claim, the kicker still rises): the answer changes with
+				-- the ball's age, and standing still until it does is how the spot is never reached. Run to the earliest meet; the
+				-- press stays the game's (an offer). A dive / a spent jump / a competitor is a no that does not pass: no run.
+				plan = firstInfo.c
+				plan.hope = true
+				plan.verified = false
+				plan.why, plan.src, plan.kicker = why, src, kicker
+				plan.aim = Mark.volleyClearAim(plan.B)
+				why = "game says no, running to the meet: " .. Mark.airInfo(firstInfo.info)
 			else
 				local fi = firstInfo
 				why = "game says no: " .. Mark.airInfo(fi and fi.info) .. (fi and string.format(" (T %.2f td %s h %.1f d %.1f, %d poses)", fi.c.T, tostring(fi.c.td), fi.c.B.Y - floor, flat(fi.c.B - root.Position).Magnitude, tried) or "")
@@ -18538,7 +18801,7 @@ Mark.tickAir = function(character, root)
 	plan.jumped = Mark.airPlan and not fresh and Mark.airPlan.jumped or nil
 	Mark.airPlan = plan
 	if fresh then
-		logFile("air plan", plan.why, plan.verified and "GAME OK" or "wind-up (not checkable yet)", "flick age", Mark.flickAge(), "src", plan.src, "kicker", plan.kicker and actorName(plan.kicker) or "-", "T", string.format("%.2f", plan.T), "lead", tostring(plan.lead or "-"),
+		logFile("air plan", plan.why, plan.verified and "GAME OK" or (plan.hope and "HOPE (the game says no now)" or "wind-up (not checkable yet)"), "flick age", Mark.flickAge(), "src", plan.src, "kicker", plan.kicker and actorName(plan.kicker) or "-", "T", string.format("%.2f", plan.T), "lead", tostring(plan.lead or "-"),
 			"td", tostring(type(plan.td) == "number" and string.format("%.2f", plan.td) or plan.td), "meet d", string.format("%.1f", flat(plan.B - root.Position).Magnitude), "h", string.format("%.1f", plan.B.Y - floor), "landed", tostring(landed))
 	end
 	-- move to the spot; face the incoming ball once we are close (the box is in FRONT of the root; facing it from afar
@@ -20498,6 +20761,126 @@ Mark.ballIdle = function(root, why)
 	end
 end
 
+-- SHOT AUDIT. The log had the first 0.2 s of every shot and nothing about where it ended: "flick / straight shots fly over" could
+-- not be checked. Now every released shot is followed to the goal plane and compared with the flight the solver PREDICTED (the
+-- preview at the release): height and side where it crosses, and when. The height error is kept per class (straight / flick /
+-- curve) and the solver aims lower by the median of the recent ones that flew HIGH (Mark.calBias): the bar margin grows by what
+-- the last shots proved, not by a guess. A save, a block or a deflection (the ball is late / off line) is not a sample.
+Mark.shotClass = function(curve, air)
+	if air then
+		return "flick"
+	end
+	return (curve ~= nil and curve ~= 0) and "curve" or "straight"
+end
+
+-- the first crossing of the plane through `mouth` with the horizontal normal `out` (pointing from the goal to the shooter) by a
+-- polyline: the point and its time (ts optional)
+Mark.planeCross = function(pts, mouth, out, ts)
+	for i = 2, #pts do
+		local a0 = flat(pts[i - 1] - mouth):Dot(out)
+		local a1 = flat(pts[i] - mouth):Dot(out)
+		if a0 > 0 and a1 <= 0 then
+			local f = a0 / math.max(a0 - a1, 1e-6)
+			return pts[i - 1]:Lerp(pts[i], f), ts and (ts[i - 1] + (ts[i] - ts[i - 1]) * f) or nil
+		end
+	end
+	return nil
+end
+
+Mark.shotCal = { straight = {}, flick = {}, curve = {} }
+Mark.calAdd = function(cls, dh)
+	local l = Mark.shotCal[cls]
+	l[#l + 1] = dh
+	while #l > 6 do
+		table.remove(l, 1)
+	end
+end
+-- how many studs HIGH the class flew over its prediction (median of the last 6, needs 2); 0 when it flew low or is unknown. The
+-- solver adds it to the bar margin and takes it off the aim height.
+Mark.calBias = function(cls)
+	if CFG.ShootCalib == false then
+		return 0
+	end
+	local l = Mark.shotCal[cls]
+	if not l or #l < 2 then
+		return 0
+	end
+	local s = table.clone(l)
+	table.sort(s)
+	local med = s[math.floor((#s + 1) / 2)]
+	return math.clamp(med, 0, 2.5)
+end
+
+-- follow the released shot (Mark.shotAudit, set at the release) to the goal plane
+Mark.shotWatch = function()
+	local A = Mark.shotAudit
+	if not A then
+		return
+	end
+	local now = os.clock()
+	local p = Renderer.GetPosition()
+	if typeof(p) ~= "Vector3" then
+		return
+	end
+	local function done(...)
+		Mark.shotAudit = nil
+		logFile("shoot result", A.cls, A.name, ...)
+	end
+	if now - A.at > 3.2 then
+		done("no crossing", "pred h", string.format("%.1f", A.predH or -1))
+		return
+	end
+	local prev = A.prev
+	A.prev = p
+	if not prev then
+		return
+	end
+	local q = Mark.planeCross({ prev, p }, A.mouth, A.out)
+	if not q then
+		return
+	end
+	local lat = flat(q - A.mouth):Dot(A.side)
+	local h = (q - A.bottom):Dot(A.up)
+	local t = now - A.at
+	local dh, dlat = h - (A.predH or h), lat - (A.predLat or lat)
+	-- a sample only when the flight went as predicted to the plane (a deflected / saved ball is off in time or side)
+	local clean = A.predH ~= nil and math.abs(t - (A.predT or t)) <= 0.45 and math.abs(dlat) <= 4
+	if clean then
+		Mark.calAdd(A.cls, dh)
+	end
+	local inside = math.abs(lat) <= A.half and h >= 0 and h <= A.mouthH
+	done(inside and "IN" or (h > A.mouthH and "OVER" or (math.abs(lat) > A.half and "WIDE" or "UNDER")), "h", string.format("%.1f", h), "pred", string.format("%.1f", A.predH or -1),
+		"dh", string.format("%.1f", dh), "side", string.format("%.1f", lat), "pred", string.format("%.1f", A.predLat or 0), "dside", string.format("%.1f", dlat), "t", string.format("%.2f", t),
+		"pred t", string.format("%.2f", A.predT or -1), clean and "sample" or "not a sample", "bias", string.format("%.1f", Mark.calBias(A.cls)), "dist", string.format("%.0f", A.dist))
+end
+
+-- the audit of a shot that has just been released: the predicted flight is the preview of the release
+Mark.shotAuditStart = function(pv, p0)
+	local goal = enemyGoalPart()
+	local lb, lt, rb, rt = goalMouthCorners(goal)
+	if not (pv and pv.pts and lb and lt and rb and rt and typeof(p0) == "Vector3") then
+		return
+	end
+	local bottom = (lb + rb) * 0.5
+	local rise = (lt + rt) * 0.5 - bottom
+	local side = unitOrNil(flat(rb - lb))
+	if not side then
+		return
+	end
+	local out = Vector3.new(-side.Z, 0, side.X)
+	if flat(p0 - bottom):Dot(out) < 0 then
+		out = -out
+	end
+	local A = { at = os.clock(), mouth = bottom, bottom = bottom, up = rise.Magnitude > 0.4 and rise.Unit or Vector3.yAxis, side = side, out = out,
+		half = flat(rb - lb).Magnitude * 0.5, mouthH = math.max(rise.Magnitude, 1), dist = flat(p0 - bottom).Magnitude,
+		cls = Mark.shotClass(Shoot.curve, (Mark.flickStrike ~= nil and os.clock() < Mark.flickStrike) or Mark.aerial ~= nil or Mark.forceBike == true), name = Shoot.shotName or "?" }
+	local q, t = Mark.planeCross(pv.pts, bottom, out, pv.times)
+	if q then
+		A.predH, A.predLat, A.predT = (q - bottom):Dot(A.up), flat(q - bottom):Dot(side), t
+	end
+	Mark.shotAudit = A
+end
+
 -- ITEM BOXES. Dump: a box is a Model tagged "GameplayItemBox" (ItemBoxes.TagName) with a Hitbox part; Hitbox.CanTouch false =
 -- claimed / not there (ItemBoxVisuals.shouldShowItemBox). The server grants on touch and tells the clients only
 -- {Kind "ItemBoxClaimed", BoxName}: the content is NOT replicated - the box shows a "?" and the roll is server side
@@ -20573,7 +20956,44 @@ Mark.boxHold = function(key, cond, onT, offT)
 	return s.v
 end
 
--- the plan for the nearest live box, at 10 Hz: who gets there first and what we do about it
+-- Seconds to cover d studs: the body accelerates from the speed it already has TOWARD the target (v0, 0..speed) to `speed` over
+-- `ramp` s (CFG.BallRamp), then runs. The old race was d / WalkSpeed: a standing rival and a runner at full speed were the same.
+Mark.boxEta = function(d, speed, v0, ramp)
+	if d <= 0 then
+		return 0
+	end
+	speed = math.max(speed, 1)
+	v0 = math.clamp(v0, 0, speed)
+	ramp = math.max(ramp, 0.05)
+	local acc = (speed - v0) / ramp
+	local dRamp = (speed + v0) * 0.5 * ramp
+	if d <= dRamp then
+		if acc < 1e-6 then
+			return d / math.max(v0, 1e-6)
+		end
+		return (math.sqrt(v0 * v0 + 2 * acc * d) - v0) / acc
+	end
+	return ramp + (d - dRamp) / speed
+end
+
+-- Which box to run for. cands = { { part, bd, eta, plan } }: a box we win ("go") beats one we can only take by stunning a rival
+-- ("stun"), that beats a lost race ("skip", kept only so the overlay has something to show: the nearest). Inside a rank the soonest
+-- arrival; the box we already run for counts 20 % sooner (a pick that flips between two boxes every 0.1 s is two half runs).
+Mark.boxPick = function(cands, runPart)
+	local rank = { go = 0, stun = 1, skip = 2 }
+	local best, bestKey = nil, math.huge
+	for _, c in cands do
+		local r = rank[c.plan]
+		local key = r * 1000 + (r < 2 and c.eta * (c.part == runPart and 0.8 or 1) or c.bd)
+		if key < bestKey then
+			best, bestKey = c, key
+		end
+	end
+	return best
+end
+
+-- the plan for the best live box, at 10 Hz: who gets there first and what we do about it. EVERY box in range is raced, not only the
+-- nearest: the nearest one is the one rivals stand at, another a few studs farther is often free.
 Mark.boxScan = function(character, root, hum)
 	local now = os.clock()
 	local N = Mark.boxNow
@@ -20584,54 +21004,90 @@ Mark.boxScan = function(character, root, hum)
 	Mark.boxNow = N
 	local O = root.Position
 	local lim = CFG.BoxMaxDist or 45
-	local bd = math.huge
+	local ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
+	local ramp = CFG.BallRamp or 0.2
+	local speed = math.max(hum.WalkSpeed, 16)
+	local v0 = flat(root.AssemblyLinearVelocity)
+	local boxes = {}
 	for _, b in CollectionService:GetTagged("GameplayItemBox") do
 		local hb = b:FindFirstChild("Hitbox")
 		if hb and hb.CanTouch then
 			local d = flat(hb.Position - O).Magnitude
-			if d < bd and d <= lim then
-				if N.part then
-					N.others[#N.others + 1] = N.part.Position
-				end
-				N.part, bd = hb, d
+			if d <= lim then
+				boxes[#boxes + 1] = { part = hb, bd = d }
 			elseif d <= lim * 1.5 then
 				N.others[#N.others + 1] = hb.Position
 			end
 		end
 	end
-	if not N.part then
+	if #boxes == 0 then
 		return N
 	end
-	N.P, N.bd = N.part.Position, bd
-	N.R = math.max(N.part.Size.X, N.part.Size.Z) * 0.5 -- the Hitbox the server touches against
-	local speed = math.max(hum.WalkSpeed, 16)
-	N.myV, N.myEta = speed, bd / speed
-	local ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
-	local mates = {}
+	-- the racers once (the same men for every box). An enemy is seen DISPLAY DELAY behind where he runs: his pose is advanced by it.
+	local mates, foes = {}, {}
 	for _, pl in Players:GetPlayers() do
 		if pl ~= LocalPlayer and not isGoalkeeper(pl) then
 			local hr = ActorTargeting.GetActorRoot(pl)
 			local ch = Actors.GetCharacter(pl)
 			local hh = ch and ch:FindFirstChildOfClass("Humanoid")
 			if hr and hh and hh.Health > 0 then
-				local to = flat(N.P - hr.Position)
-				local d = to.Magnitude
-				local v = flat(CharacterMotion.GetVelocity(ch) or hr.AssemblyLinearVelocity)
-				local eta = d / math.max(hh.WalkSpeed, 16)
+				local pos, vel = Mark.carrierPose(hr, ch)
+				if not sameTeam(pl) then
+					pos = pos + flat(vel) * math.clamp(CharacterMotion.GetDisplayDelaySeconds(ch) or 0, 0, 0.25)
+				end
+				local rec = { pl = pl, root = hr, pos = pos, v = flat(vel), speed = math.max(hh.WalkSpeed, 16) }
 				if sameTeam(pl) then
-					mates[#mates + 1] = eta
+					mates[#mates + 1] = rec
 				else
-					local closing = d < 10 or (v.Magnitude > 4 and to.Unit:Dot(v.Unit) > 0.5)
-					local rec = { eta = eta, closing = closing, pl = pl, root = hr, pos = hr.Position, v = v, speed = math.max(hh.WalkSpeed, 16) }
-					rec.reach = closing and flat(hr.Position - O).Magnitude <= math.min(CFG.TackleReach or 18, 14)
-					N.rivals[#N.rivals + 1] = rec
+					foes[#foes + 1] = rec
 				end
 			end
 		end
 	end
-	N.plan, N.who = Mark.boxPlan(N.myEta, N.rivals, CFG.BoxMargin or 0.3, mates)
-	N.ping = ping
+	local runPart = Mark.boxRun and Mark.boxRun.part
+	for _, c in boxes do
+		local P = c.part.Position
+		local R = math.max(c.part.Size.X, c.part.Size.Z) * 0.5 -- the Hitbox the server touches against
+		local u = unitOrNil(flat(P - O))
+		c.P, c.R = P, R
+		c.eta = Mark.boxEta(math.max(c.bd - R * 0.9, 0), speed, u and v0:Dot(u) or 0, ramp) + ping * 0.5 -- the server sees us ping/2 late
+		c.rivals, c.mateEta = {}, {}
+		for _, f in foes do
+			local to = flat(P - f.pos)
+			local d = to.Magnitude
+			local fu = unitOrNil(to)
+			local eta = Mark.boxEta(math.max(d - R * 0.9, 0), f.speed, fu and f.v:Dot(fu) or 0, ramp)
+			-- coming at it, or on top of it, or a man much nearer than us who will simply start (a standing enemy next to a box
+			-- was "not closing" and a race we were about to lose looked free)
+			local closing = d < 10 or (f.v.Magnitude > 4 and fu ~= nil and fu:Dot(f.v.Unit) > 0.5) or (eta < c.eta - 0.15 and eta < 1.2)
+			local rec = { eta = eta, closing = closing, pl = f.pl, root = f.root, pos = f.pos, v = f.v, speed = f.speed }
+			rec.reach = closing and flat(f.root.Position - O).Magnitude <= math.min(CFG.TackleReach or 18, 14)
+			c.rivals[#c.rivals + 1] = rec
+		end
+		for _, m in mates do
+			local to = flat(P - m.pos)
+			local mu = unitOrNil(to)
+			c.mateEta[#c.mateEta + 1] = Mark.boxEta(math.max(to.Magnitude - R * 0.9, 0), m.speed, mu and m.v:Dot(mu) or 0, ramp)
+		end
+		-- a run already on this box is kept unless a rival wins it outright (0.05 s margin instead of 0.3)
+		c.plan, c.who = Mark.boxPlan(c.eta, c.rivals, c.part == runPart and 0.05 or (CFG.BoxMargin or 0.3), c.mateEta)
+	end
+	local pick = Mark.boxPick(boxes, runPart)
+	for _, c in boxes do
+		if c ~= pick then
+			N.others[#N.others + 1] = c.P
+		end
+	end
+	N.part, N.P, N.bd, N.R, N.rivals, N.plan, N.who = pick.part, pick.P, pick.bd, pick.R, pick.rivals, pick.plan, pick.who
+	N.myV, N.myEta, N.ping, N.boxes = speed, pick.eta, ping, #boxes
 	return N
+end
+
+-- A run that is on and winning: AutoBall may not take the body for a ball we cannot get to soon anyway (the log: `box go` and 0.1-0.4 s
+-- later `box end mode ball` for a free ball 50-75 studs away, our ETA 1.9-2.6 s, the box 1.3 s). ONLY for the near box (CFG.BoxCommitEta).
+Mark.boxCommit = function()
+	local r, N = Mark.boxRun, Mark.boxNow
+	return r ~= nil and N ~= nil and N.part == r.part and N.plan == "go" and N.myEta <= (CFG.BoxCommitEta or 1.6) and os.clock() - N.at < 0.3
 end
 
 Mark.boxEnd = function(why)
@@ -20731,11 +21187,14 @@ Mark.boxStep = function(character, root)
 		return
 	end
 	local dir = unitOrNil(flat(N.P - O))
+	if Mark.boxRun and Mark.boxRun.part ~= N.part then
+		Mark.boxEnd("another box") -- a rival took it / a better one appeared: the new run is logged as its own
+	end
 	if not Mark.boxRun then
 		Mark.boxRun = { at = os.clock(), part = N.part, d0 = bd }
 		Mark.boxTrack = { at = os.clock(), part = N.part, n0 = Mark.boxCount() }
 		Mark.boxWhy = "go"
-		logFile("box go", "dist", string.format("%.1f", bd), "eta", string.format("%.2f", N.myEta), "rivals", #N.rivals)
+		logFile("box go", "dist", string.format("%.1f", bd), "eta", string.format("%.2f", N.myEta), "rivals", #N.rivals, "boxes", N.boxes or 1, "R", string.format("%.1f", N.R))
 	end
 	Mark.boxRun.last = bd
 	Mark.moveSteer(dir, "box")
@@ -20909,10 +21368,16 @@ Mark.boxResult = function()
 		t.endAt = now
 	end
 	if gone then
-		Mark.boxTrack = nil
+		t.goneAt = t.goneAt or now
 		Mark.slotsCache = nil
 		local n = Mark.boxCount()
 		local got = n > (t.n0 or 0)
+		-- the box leaves the world one trip before the item state arrives: "lost to a rival" was written at that moment
+		-- for boxes we took (box.take 2/5 in telemetry). Wait for the slot, 0.8 s at most.
+		if not got and now - t.goneAt < 0.8 then
+			return
+		end
+		Mark.boxTrack = nil
 		Mark.teleAdd("box.take", got)
 		logFile("box result", got and "taken" or "lost to a rival", "slots", n, "after", string.format("%.1f", now - t.at))
 	end
@@ -21309,6 +21774,12 @@ Mark.tickBall = function(character, root)
 			Mark.ballWhy = "keeper"
 			logFile("ball", "keeper")
 		end
+		return
+	end
+	-- a box run that is winning keeps the body for a ball that is not ours within CFG.BoxYieldBall seconds (Mark.boxCommit)
+	if not threat and Mark.boxCommit() and (plan and (plan.tUs or plan.tp or plan.t) or steerT or 0) > (CFG.BoxYieldBall or 1.0) then
+		Mark.ballIdle(root, "box run (ball later than " .. tostring(CFG.BoxYieldBall or 1.0) .. " s)")
+		Mark.ballStop("box")
 		return
 	end
 	if beaten then
@@ -25882,6 +26353,7 @@ return function(_Lib, _Core)
 			head(s, "AutoShoot")
 			feature(s, "AutoShoot", "AutoShoot")
 			tog(s, "Quick Solve", "ShootQuick", "Faster shot search for weak PCs.")
+			tog(s, "Learn From Misses", "ShootCalib", "Aims lower after shots that flew over.")
 			sld(s, "Max Distance", "ShootMaxDist", 20, 160, { suffix = " st" })
 			sld(s, "Keeper Margin", "ShotReachMargin", -0.2, 0.5, { prec = 2, suffix = " s", text = "How late the keeper must be for a shot to count." })
 			drop(s, "Shot Curve", "ShotCurve", { "Full", "Light", "Off" }, "How much a shot may bend. Off = straight shots only.")
@@ -26205,6 +26677,7 @@ return function(_Lib, _Core)
 			tog(g, "Mirror Runner", "GkMirror", "Follows a carrier near the goal sideways.")
 			tog(g, "Keeper Kick", "GkKick", "No dive line and he is close: charges a full kick at him.")
 			advanced(g, "Gk", function()
+				sld(g, "Mirror Range", "GkMirrorRange", 10, 80, { suffix = " st", text = "He must be this close to the goal to drag the keeper." })
 				sld(g, "Reaction", "GkReactSeconds", 0.05, 0.4, { prec = 2, suffix = " s" })
 				sld(g, "Walk Slack", "GkWalkSlack", 0, 0.3, { prec = 2, suffix = " s" })
 				sld(g, "Dive Late", "GkDiveLate", 0, 0.2, { prec = 2, suffix = " s", text = "Dives as late as possible. 0 = at once." })
@@ -26223,6 +26696,7 @@ return function(_Lib, _Core)
 			tog(p, "Show Press", "DrawGk", "His possible paths and your dive.")
 			sld(p, "Confidence", "GkPressConf", 0.3, 0.95, { prec = 2, text = "How sure the dive must be." })
 			tog(p, "Press Hook Fliers", "GkHookPress", "Dives at a grapple flier coming at the goal.")
+			tog(p, "Press Any Flier", "GkFlier", "Dives at any body flying into the goal after the ball.")
 			advanced(p, "GkPress", function()
 				sld(p, "Press Zone", "GkPressZone", 20, 140, { suffix = " st" })
 				sld(p, "Hit Margin", "GkPressRadiusFrac", 0.4, 1, { prec = 2 })
