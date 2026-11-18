@@ -6884,7 +6884,10 @@ Reticle.GetCameraRay = function(...)
 		local cam = Workspace.CurrentCamera
 		local okP, P = Mark.try(pa.fn)
 		if cam and okP and typeof(P) == "Vector3" then
-			local o = cam.CFrame.Position
+			-- the gun aims at the FIRST thing the ray meets (Reticle: TargetPosition = the aim hit): from the camera - 15-30 studs
+			-- behind and above us - the line to a keeper 75 st away crosses our own team and the goal frame; from the body it does not
+			local me = ActorTargeting.GetActorRoot(LocalPlayer)
+			local o = me and (me.Position + Vector3.new(0, 1.5, 0)) or cam.CFrame.Position
 			local dir = unitOrNil(P - o)
 			if dir then
 				return Ray.new(o, dir)
@@ -8494,6 +8497,21 @@ end
 -- 0.48 / 0.73 s after the press): the keeper is held from the first hit to the last hit + the knock-back. A push fired while
 -- the ball is farther away than that holds him for nothing - log: a roll shot at a keeper the ball reached 1.60 s later, the
 -- hold ended at ~1.4 s ("the last shot for no reason"). Speeds are observed, not from the dump.
+-- Which gun at distance d. The shotgun is 1 pellet exactly on the aim + 11 in a tan(8 deg) disk (SingleShotGun.GetConeDirections):
+-- the cone is 0.14 d wide, so past ~20 st only the centre pellet is on him and the rest hit whoever stands around. Hits in the
+-- log: knock 37 at 38 and 47 st, 28 at 76 st. It is chosen only inside min(GunPushShotgunRange, ShotgunMax = 50, guessed from
+-- those three shots); farther - the flintlock (one accurate pellet x3). Log: the shotgun was picked at 75.7 st over a
+-- flintlock in the other slot because the user's range was 120, and the knock landed on the wrong man.
+Mark.ShotgunMax = 50
+Mark.pushGun = function(d, haveShotgun, haveFlint)
+	if haveShotgun and d <= math.min(CFG.GunPushShotgunRange or 22, Mark.ShotgunMax) then
+		return "shotgun"
+	end
+	if haveFlint and d <= (CFG.GunPushFlintRange or 70) then
+		return "flintlock"
+	end
+	return nil
+end
 Mark.gunKnock = { flintlock = { v = 25, shots = 3, gap = 0.25 }, shotgun = { v = 37, shots = 1, gap = 0 } }
 Mark.pushSpan = function(gun)
 	local g = Mark.gunKnock[gun]
@@ -8627,11 +8645,7 @@ Mark.gunPushTry = function(root, tag, key, pts, ts)
 	local function have(id)
 		return held == id or Mark.slotOfItem(id) ~= nil
 	end
-	if have("shotgun") and d <= (CFG.GunPushShotgunRange or 22) then
-		gun = "shotgun"
-	elseif have("flintlock") and d <= (CFG.GunPushFlintRange or 70) then
-		gun = "flintlock"
-	end
+	gun = Mark.pushGun(d, have("shotgun"), have("flintlock"))
 	if not gun then
 		return skip(string.format("no gun for d %.1f (shotgun %s flintlock %s)", d, tostring(have("shotgun")), tostring(have("flintlock"))))
 	end
@@ -8661,7 +8675,7 @@ Mark.gunPushTry = function(root, tag, key, pts, ts)
 			return r.Position + (typeof(v) == "Vector3" and flat(v) or Vector3.zero) * (ping * 0.5) + Vector3.new(0, 0.4, 0)
 		end)
 		if ok then
-			local rec = { at = os.clock(), gun = gun, tag = tag, d = d }
+			local rec = { at = os.clock(), gun = gun, tag = tag, d = d, vid = k.actor and k.actor.UserId or nil }
 			Mark.gunPushRec = rec
 			task.delay(1.2, function()
 				if Mark.gunPushRec == rec and not rec.hit then
@@ -8784,11 +8798,7 @@ Mark.gunPushRoll = function(root)
 	local use = Mark.itemUse
 	local held = use and use.IsEquipped and use.IsEquipped() and Mark.equippedId() or nil
 	local gun = nil
-	if (held == "shotgun" or Mark.slotOfItem("shotgun")) and d <= (CFG.GunPushShotgunRange or 22) then
-		gun = "shotgun"
-	elseif (held == "flintlock" or Mark.slotOfItem("flintlock")) and d <= (CFG.GunPushFlintRange or 70) then
-		gun = "flintlock"
-	end
+	gun = Mark.pushGun(d, held == "shotgun" or Mark.slotOfItem("shotgun") ~= nil, held == "flintlock" or Mark.slotOfItem("flintlock") ~= nil)
 	if not gun then
 		why(string.format("no gun for d %.1f", d))
 		return
@@ -8816,7 +8826,7 @@ Mark.gunPushRoll = function(root)
 			return r.Position + (typeof(v) == "Vector3" and flat(v) or Vector3.zero) * (ping * 0.5) + Vector3.new(0, 0.4, 0)
 		end)
 		if ok then
-			local rec = { at = now, gun = gun, tag = "roll", d = d }
+			local rec = { at = now, gun = gun, tag = "roll", d = d, vid = best.actor and best.actor.UserId or nil }
 			Mark.gunPushRec = rec
 			task.delay(1.2, function()
 				if Mark.gunPushRec == rec and not rec.hit then
@@ -12970,7 +12980,7 @@ local function onFx(kind, userId, a, b, c, aimDir, ...)
 		local gp = Mark.gunPushRec
 		gp = gp and os.clock() - gp.at < 1.5 and b == LocalPlayer.UserId and gp or nil
 		-- tackles / slides / other guns knock too: only a knock-back of ours right after a push is its result
-		logFile(gp and "gunpush result" or "knock", b == LocalPlayer.UserId and "we hit" or "we were hit", "victim", tostring(userId), "by", tostring(b), "vel", typeof(c) == "Vector3" and string.format("%.0f", c.Magnitude) or "-", gp and string.format("%.2f s after the shot", os.clock() - gp.at) or "")
+		logFile(gp and "gunpush result" or "knock", b == LocalPlayer.UserId and "we hit" or "we were hit", "victim", tostring(userId), "by", tostring(b), "vel", typeof(c) == "Vector3" and string.format("%.0f", c.Magnitude) or "-", gp and string.format("%.2f s after the shot", os.clock() - gp.at) or "", gp and gp.vid and (gp.vid == userId and "= THE KEEPER" or "= NOT the keeper") or "")
 		if gp and b == LocalPlayer.UserId then
 			gp.hit = true
 		end
@@ -13122,7 +13132,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- Illegal Soccer dump " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v189")
+	add("-- Illegal Soccer dump " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v190")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -20384,17 +20394,27 @@ Mark.boxPlan = function(myEta, rivals, margin, mates)
 	return "skip", "rival"
 end
 
-Mark.boxFree = function()
+-- Item slots: ItemCommands.Constants.SlotCount = 2 (dump; the 4 it was written with was a guess - the box was chased with
+-- both slots full: user "AutoBox goes for the box with 2 skills, the maximum is 2"). Mark.boxCount was lost in the v188
+-- rewrite of tickBox: `attempt to call a nil value` in boxStep every frame.
+Mark.slotCount = function()
+	Mark.itemCmds = Mark.itemCmds or require(Modules.Items.ItemCommands)
+	return Mark.itemCmds.Constants.SlotCount
+end
+Mark.boxCount = function()
 	local s = Mark.itemSlots()
-	if not s then
-		return true
-	end
-	for i = 1, 4 do
-		if type(s[i]) ~= "table" then
-			return true
+	local n = 0
+	if s then
+		for i = 1, Mark.slotCount() do
+			if type(s[i]) == "table" then
+				n += 1
+			end
 		end
 	end
-	return false
+	return n
+end
+Mark.boxFree = function()
+	return Mark.boxCount() < Mark.slotCount()
 end
 
 -- a condition must hold `onT` s to turn true and fail `offT` s to turn false: a one-frame flicker (the ball owner flips
@@ -26019,7 +26039,7 @@ return function(_Lib, _Core)
 			tog(kp, "Teammate Shots", "GunPushMates", "Fires as soon as a teammate charges a shot on target.")
 			tog(kp, "Rolling Ball", "GunPushRoll", "Shoots the enemy who would stop a rolling ball.")
 			sld(kp, "Flintlock Range", "GunPushFlintRange", 10, 400, { suffix = " st" })
-			sld(kp, "Shotgun Range", "GunPushShotgunRange", 5, 120, { suffix = " st" })
+			sld(kp, "Shotgun Range", "GunPushShotgunRange", 5, 50, { suffix = " st" })
 			sld(kp, "Delay", "GunPushDelay", 0, 0.5, { prec = 2, suffix = " s", text = "Wait before the equip and shot." })
 			advanced(kp, "Keeper Push", function()
 				sld(kp, "Keeper Zone", "GunPushKeeperZone", 4, 40, { suffix = " st", text = "Only a keeper this close to his goal." })
