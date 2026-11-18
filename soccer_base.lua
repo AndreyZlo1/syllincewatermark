@@ -6894,7 +6894,11 @@ Reticle.GetCameraRay = function(...)
 		local cam = Workspace.CurrentCamera
 		local okP, P = Mark.try(pa.fn)
 		if cam and okP and typeof(P) == "Vector3" then
-			local o = cam.CFrame.Position
+			-- the gun hits the FIRST character the ray meets (Reticle: TargetPosition = the aim hit). From the camera - 15-30 studs behind
+			-- and above us - the line to a keeper 77 st away crosses other players: log, flintlock (ONE accurate pellet) at the keeper
+			-- from the camera: "we hit victim ... = NOT the keeper" twice; from the body (v190/191): "= THE KEEPER" twice.
+			local me = ActorTargeting.GetActorRoot(LocalPlayer)
+			local o = me and (me.Position + Vector3.new(0, 1.5, 0)) or cam.CFrame.Position
 			local dir = unitOrNil(P - o)
 			if dir then
 				return Ray.new(o, dir)
@@ -8631,11 +8635,6 @@ Mark.gunPushTry = function(root, tag, key, pts, ts)
 	local diveAge = Mark.keeperDiveAge(k)
 	if Mark.diveBusy(diveAge) then
 		return skip(string.format("keeper is in his dive (%.2f s)", diveAge))
-	end
-	-- he is not in a dive yet: if the shot crosses the line farther than a dive reaches (GoalkeeperDive.Distance 20 + body)
-	-- the keeper does not save it and there is nothing to push
-	if math.abs(flat(C - K):Dot(side)) > 23 and segK > 6 then
-		return skip(string.format("shot is out of his reach (%.1f)", math.abs(flat(C - K):Dot(side))))
 	end
 	local inv = k.model and k.model:GetAttribute("ItemInvulnerableUntil")
 	if type(inv) == "number" and inv > Workspace:GetServerTimeNow() then
@@ -13148,7 +13147,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- Illegal Soccer dump " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v192")
+	add("-- Illegal Soccer dump " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v193")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -20574,9 +20573,13 @@ Mark.boxEnd = function(why)
 		Mark.moveStop("box")
 	end
 	-- AutoBox on and doing nothing must say why (v190: two empty slots read as full and the feature was silent for a whole session)
-	if CFG.AutoBox and why ~= "off" and not Mark.boxRun and (why ~= Mark.boxIdleWhy or os.clock() - (Mark.boxIdleAt or 0) > 5) then
-		Mark.boxIdleWhy, Mark.boxIdleAt = why, os.clock()
-		logFile("box idle", why)
+	-- (one line per reason per 5 s: two reasons alternating frame to frame - "no box" / "mode block" - wrote 300 lines in 100 s)
+	if CFG.AutoBox and why ~= "off" and not Mark.boxRun then
+		Mark.boxIdle = Mark.boxIdle or {}
+		if os.clock() - (Mark.boxIdle[why] or 0) > 5 then
+			Mark.boxIdle[why] = os.clock()
+			logFile("box idle", why)
+		end
 	end
 	local r = Mark.boxRun
 	if r then
