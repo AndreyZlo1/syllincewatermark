@@ -5,6 +5,7 @@
 local Players = cloneref(game:GetService("Players"))
 local RunService = cloneref(game:GetService("RunService"))
 local Workspace = cloneref(game:GetService("Workspace"))
+local CollectionService = cloneref(game:GetService("CollectionService"))
 local ReplicatedStorage = cloneref(game:GetService("ReplicatedStorage"))
 local UserInputService = cloneref(game:GetService("UserInputService"))
 
@@ -101,7 +102,7 @@ local CFG = {
 	BallCompetitor = true, -- AutoBall yields to a teammate clearly closer to the ball
 	BallYieldGap = 6, -- ... closer by more than this many studs
 	TackleCompetitor = false, -- AutoTackle yields to a teammate already on the carrier
-	TackleOnDribble = true, -- AutoTackle slides a carrier only after his dribble is spent (iframe over on arrival, cooldown running)
+	TacklePerfect = true, -- AutoTackle Perfect Mode: slides only when his dribble cannot save him (spent / no ball / down / his own slide / locked)
 	TackleCompetitorRadius = 8,
 	CounterCompetitorRadius = 12,
 	CounterCompetitor = false, -- CounterJump stands down when a teammate is already on the enemy (CompetitorRadius); off = jump regardless
@@ -139,7 +140,7 @@ local CFG = {
 	OnlyTrick = false,
 	ShotBan = {}, -- [band] = true: this shot type is never picked (AutoShoot tab > Shot Types)
 	ShotWeight = {}, -- [band] = factor on the built-in family weight (1 = default)
-	TackleConfidence = 0.15, -- AutoTackle: share of the 0.3 s hitbox window that must connect while his dribble is READY (Tackle On Dribble off)
+	TackleConfidence = 0.15, -- AutoTackle: share of the 0.3 s hitbox window that must connect while his dribble is READY (Perfect Mode off)
 	TackleNakedConf = 0.35, -- ...and while his dribble is SPENT (he can only run); guessed
 	FakeFoeRadius = 7, -- an enemy this close to the mate would take the ball: the mate is dropped
 	FakeLatMul = 1.5, -- prefilter: the straight line through the mate may miss the goal by post * this + FakeSlop (curves bend it back)
@@ -151,8 +152,11 @@ local CFG = {
 	AutoBlock = true,
 	AutoBall = true,
 	TackleGoalZone = 40,
-	CompetitorRadius = 12,
 	CompetitorGoalZone = 45, -- we or the ball this close to EITHER goal -> every Competitor Check is off (0 = never off by zone)
+	AutoBox = false, -- AutoBox: run for an item box when nothing else needs the body (stun a rival who beats us to it)
+	BoxMaxDist = 45, -- AutoBox: no box farther than this
+	BoxMargin = 0.3, -- AutoBox: a rival closing on the box within this of our arrival is a race (s)
+	BoxBallSafe = 45, -- AutoBox: no box run while the ball is this close to our goal
 	BallMaxDist = 60, -- AutoBall does not chase a ball (or its contact point) farther than this
 	BallYieldKeeper = false, -- AutoBall stops when the enemy keeper gets to the ball first (off: keep pressing him)
 	CompetitorEnemyNear = 15, -- ... and off when an enemy is this close to the ball / target
@@ -396,6 +400,7 @@ local CFG = {
 	GkKnockDive = true, -- AutoGK: knocked back by a gun (Keeper Push on us): dive at once (the only press the stun lets through)
 	GkMirror = true, -- AutoGK: a carrier near the goal drags the keeper across with him (more the closer he is)
 	GkMirrorRange = 60, -- ... from this far out (guessed)
+	GkHookPress = true, -- AutoGK: a hook flier heading for the ball in our zone is dived at on his exact grapple path
 	GkKick = true, -- AutoGK: no dive line and he is close -> the keeper charges a full Kick at him
 	GkKickRange = 8, -- ... within kick reach + this
 	GkHomeDist = 20, -- ... "far out" = this far in front of the line (studs)
@@ -2006,6 +2011,21 @@ Mark.foeCharging = function(uid)
 	return rec ~= nil and rec.live and os.clock() - (rec.seen or 0) < 0.6
 end
 
+-- A state where a dribble is impossible or hard at hitAt (os.clock) though he is not "spent" (Perfect Mode):
+--   "slide"  his own slide tackle is on (SlideTackle.GetSlidingUntil beyond the hit; Dodge is locked by the SlideTackle lock),
+--   "locked" an action lock / stun on him that blocks Dodge right now (ActionLocks.HasDodgeBlock: jetpack, go-kart, item ball
+--            controls, tackle-kick). Not air: a body in the air is outside the slide box height anyway.
+Mark.dribBlocked = function(actor, model, hitAt)
+	local untilT = SlideTackle.GetSlidingUntil(model)
+	if untilT and untilT > Workspace:GetServerTimeNow() + (hitAt - os.clock()) + 0.02 then
+		return "slide"
+	end
+	if ActionLocks.HasDodgeBlock(actor) then
+		return "locked"
+	end
+	return nil
+end
+
 Mark.dribState = function(actor, model, hitAt, hasBall)
 	-- stunned / ragdolled / frozen: no dribble and no movement - the most predictable state there is
 	if model and Mark.mateDown(actor, model) then
@@ -2020,6 +2040,10 @@ Mark.dribState = function(actor, model, hitAt, hasBall)
 	end
 	if not hasBall then
 		return "noball", rec
+	end
+	local blocked = model and Mark.dribBlocked(actor, model, hitAt)
+	if blocked then
+		return blocked, rec
 	end
 	return "ready", rec
 end
@@ -6455,6 +6479,8 @@ else
 		if Mark.tickBall then
 			Mark.tickBall(character, root)
 		end
+		Mark.tickBox(character, root)
+		Mark.boxResult()
 		if Mark.jumpHoldUntil and os.clock() > Mark.jumpHoldUntil then
 			Mark.jumpHoldUntil = nil
 			CharacterControllers.SetJumpCommand(character, false)
@@ -10416,6 +10442,38 @@ Mark.vertState = function(model, P, baseY, airborne, now, g)
 	return { vy = vyT, ay = ayT, kind = vKind, airborne = airborne, dy = dyNow, airAt = yh.airAt }
 end
 
+-- HOOK FLIER (user: the enemy shot at the bar on purpose, grappled to the rebound and flew in - the keeper did nothing).
+-- GrappleMotion is exact (Mark.grapplePath: the hook flies to the BALL, then a 75 st/s pull homing on it), so the dive can be
+-- solved against his real path instead of being refused as "powered flight". Pure: his arrival point A is a threat when it is
+-- on our side of the goal line (-1 stud) and within `zone` of the mouth segment.
+Mark.hookThreat = function(A, mouth, side, fwd, half, zone)
+	local rel = flat(A - mouth)
+	if rel:Dot(fwd) < -1 then
+		return false
+	end
+	return (rel - side * math.clamp(rel:Dot(side), -half, half)).Magnitude <= zone
+end
+
+-- the enemy field player whose hook lands in our zone soonest (uid, arrival t), or nil
+Mark.gkHooker = function(root, mouth, side, fwd, half)
+	if CFG.GkHookPress == false or not Mark.grapples or next(Mark.grapples) == nil then
+		return nil
+	end
+	local best, bt = nil, math.huge
+	for uid in Mark.grapples do
+		local pl = playerOf(uid)
+		local model = pl and pl ~= LocalPlayer and not sameTeam(pl) and not isGoalkeeper(pl) and Actors.GetCharacter(pl)
+		local hr = model and ActorTargeting.GetActorRoot(pl)
+		if hr then
+			local gp, tA = Mark.grapplePath(uid, model, (Mark.carrierPose(hr, model)), root)
+			if gp and tA and tA < bt and Mark.hookThreat(gp[math.min(math.floor(tA / 0.025 + 0.5) + 1, #gp)], mouth, side, fwd, half, CFG.GkPressZone or 90) then
+				best, bt = uid, tA
+			end
+		end
+	end
+	return best, bt
+end
+
 Mark.gkPress = function(character, root, c)
 	Mark.gkPressStandP = nil
 	if CFG.GkPress == false then
@@ -10487,6 +10545,17 @@ Mark.gkPress = function(character, root, c)
 		end
 	end
 	local fwd, side, mouth, half = c.fwd, c.side, c.mouth, c.half
+	-- he is on a hook: his path to the ball is exact (arrival point hookA at hookT); it replaces the speed read everywhere below
+	local hookPts, hookT, hookA = nil, nil, nil
+	if CFG.GkHookPress ~= false and Mark.grapples and Mark.grapples[pl.UserId] then
+		local gp, tA = Mark.grapplePath(pl.UserId, model, P, root)
+		if gp and tA then
+			local A = gp[math.min(math.floor(tA / 0.025 + 0.5) + 1, #gp)]
+			if Mark.hookThreat(A, mouth, side, fwd, half, CFG.GkPressZone or 90) then
+				hookPts, hookT, hookA = gp, tA, A
+			end
+		end
+	end
 
 	-- threat: distance to the mouth segment and the speed he closes on it
 	local E0 = P + flat(V) * lead
@@ -10508,6 +10577,9 @@ Mark.gkPress = function(character, root, c)
 	local spd = flat(V).Magnitude
 	local going = appr >= math.max(6, spd * 0.5)
 	local threat = committed or dSeg <= 16 or (dSeg <= zone and going) or (tReach <= 2.2 and appr > 6)
+	if hookPts then
+		threat, tReach = true, hookT
+	end
 	-- appr hovers around the 2 st/s edge while he dribbles: the stand flipped press/free every frame (log). Hold 0.6 s.
 	if threat then
 		Mark.gkThreatUntil = c.now + 0.6
@@ -10546,8 +10618,8 @@ Mark.gkPress = function(character, root, c)
 	-- RUSH (user: a man running at our goal is caught, not watched). A grounded carrier who GOES at the mouth inside
 	-- GkRushZone is dived at without his dribble side-bursts in the fan and with GkRushConf: a dribble against the dive
 	-- is the risk taken. "Only when sure" gave 0-2 press dives per session in every log since v134.
-	local rush = CFG.GkRush ~= false and not airborne and not jet and going and dSeg <= (CFG.GkRushZone or 35)
-	local futs = Mark.gkFutures(P, V, vy, airborne, jet, root.Position.Y, lead, nearP + fwd * 0.5, g, dribReady and not airborne and not jet and not rush)
+	local rush = CFG.GkRush ~= false and not airborne and not jet and not hookPts and going and dSeg <= (CFG.GkRushZone or 35)
+	local futs = hookPts and { { w = 1, pts = hookPts, air = true } } or Mark.gkFutures(P, V, vy, airborne, jet, root.Position.Y, lead, nearP + fwd * 0.5, g, dribReady and not airborne and not jet and not rush)
 
 	-- come out on his line to the mouth: close the angle so the dive reaches him before he reaches the line. Only when it
 	-- matters: he is inside GkPressMoveZone and reaches the mouth within 3.5 s, and the player is not steering himself
@@ -10565,12 +10637,12 @@ Mark.gkPress = function(character, root, c)
 	-- a jetpack flier: no coming out (he lands where the dash ends, or shoots from above: the save logic blocks the ball)
 	-- a committed flier (in the air, inside dive range, over the mouth) cannot turn: standing where he comes down is
 	-- exactly right, so a landing point is taken even then (it was "not committed" -> the keeper stood still)
-	local moveOk = CFG.GkPressMove ~= false and not jet and ((not committed and dSeg <= (CFG.GkPressMoveZone or 50) and tReach <= 3.5) or landP ~= nil)
+	local moveOk = CFG.GkPressMove ~= false and not jet and ((not committed and dSeg <= (CFG.GkPressMoveZone or 50) and tReach <= 3.5) or landP ~= nil or hookA ~= nil)
 	if moveOk and Mark.userInputDir() then
 		moveOk = false
 	end
 	if moveOk then
-		local Pl = landP or futs[1].pts[13] or E0
+		local Pl = landP or hookA or futs[1].pts[13] or E0
 		-- he comes down behind the line: meet him where his arc crosses the mouth plane instead
 		if landP and flat(landP - mouth):Dot(fwd) < 1.5 then
 			local pts = futs[1].pts
@@ -10599,7 +10671,7 @@ Mark.gkPress = function(character, root, c)
 
 	local diveReady = c.now - (Mark.gkDive or 0) > D.Constants.RepeatDelaySeconds + 0.05
 	local iframe = Dodge.IsDribbling(model)
-	local viz = { at = c.now, futs = futs, from = root.Position, conf = 0, need = 1, stand = Mark.gkPressStandP, R = (CFG.PressReach or 2.6) * ((airborne or jet) and 1 or (CFG.GkPressRadiusFrac or 0.75)) }
+	local viz = { at = c.now, futs = futs, from = root.Position, conf = 0, need = 1, stand = Mark.gkPressStandP, R = (CFG.PressReach or 2.6) * ((airborne or jet or hookPts ~= nil) and 1 or (CFG.GkPressRadiusFrac or 0.75)) }
 	Mark.gkViz = viz
 	if not diveReady then
 		return note("wait dive cooldown")
@@ -10618,11 +10690,11 @@ Mark.gkPress = function(character, root, c)
 		Mark.actionMotion = Mark.actionMotion or require(Modules.Actions.ActionMotion)
 		best, later, cen = Mark.gkPressSolve({
 			root = root.Position, vel = flat(root.AssemblyLinearVelocity), futs = futs, D = D, dist = dist,
-			maxD = math.min(CFG.PressDist or (dist - 0.5), dist - 0.5), R = (CFG.PressReach or 2.6) * ((airborne or jet) and 1 or (CFG.GkPressRadiusFrac or 0.75)), H = CFG.PressVert or 4,
+			maxD = math.min(CFG.PressDist or (dist - 0.5), dist - 0.5), R = (CFG.PressReach or 2.6) * ((airborne or jet or hookPts ~= nil) and 1 or (CFG.GkPressRadiusFrac or 0.75)), H = CFG.PressVert or 4,
 			RF = CFG.GkPressReachFrac or 0.85,
-			mouth = mouth, fwd = fwd, g = g, jumpH = Mark.jumpH or 7.2, air = airborne or jet,
+			mouth = mouth, fwd = fwd, g = g, jumpH = Mark.jumpH or 7.2, air = airborne or jet or hookPts ~= nil,
 			exact = CFG.GkPressExact ~= false, camCF = cam and cam.CFrame or root.CFrame,
-			slip = (airborne or jet) and (ping * 0.5 + (CFG.GkPressSlip or 0.03)) or nil,
+			slip = (airborne or jet or hookPts ~= nil) and (ping * 0.5 + (CFG.GkPressSlip or 0.03)) or nil,
 			facing = unitOrNil(flat(root.CFrame.LookVector)) or fwd,
 			minT = CFG.GkPressMinT or 0.06,
 		})
@@ -10642,7 +10714,8 @@ Mark.gkPress = function(character, root, c)
 	local function fmt(x)
 		return string.format("%.2f", x)
 	end
-	local info = string.format("dSeg %.1f appr %.1f tReach %s air %s vy %.1f dy %.1f drib %s jet %s vk %s%s%s", dSeg, appr, tReach == math.huge and "-" or fmt(tReach), tostring(airborne), vy, P.Y - root.Position.Y, dribReady and "ready" or "spent", jet and fmt(jet.te) or "-", vKind, downFly and " downFly" or "", Mark.gkPressStandP and string.format(" stand %.1f", flat(Mark.gkPressStandP - root.Position).Magnitude) or "")
+	local info0 = hookPts and string.format("HOOK %.2f ", hookT) or ""
+	local info = info0 .. string.format("dSeg %.1f appr %.1f tReach %s air %s vy %.1f dy %.1f drib %s jet %s vk %s%s%s", dSeg, appr, tReach == math.huge and "-" or fmt(tReach), tostring(airborne), vy, P.Y - root.Position.Y, dribReady and "ready" or "spent", jet and fmt(jet.te) or "-", vKind, downFly and " downFly" or "", Mark.gkPressStandP and string.format(" stand %.1f", flat(Mark.gkPressStandP - root.Position).Magnitude) or "")
 	if not best then
 		-- too close / no dive line: the keeper's own charged Kick (full charge, released by the kick box) pushes him off
 		-- the ball. AutoKick's planner with the keeper flag (no run-up: the keeper keeps his stand).
@@ -10678,7 +10751,7 @@ Mark.gkPress = function(character, root, c)
 	-- press dive at a jetpacker dy 21.9, contact t 0.23; he released a 124 st/s shot 0.07 s after our dash - stunned
 	-- after the ball had gone, keeper on the floor, goal). A dive is only worth it when it lands before he can complete a
 	-- fresh kick: contact within the game's minimum release time minus what we see of him late (display delay).
-	if (airborne or jet) and not committed and CFG.GkPressFlierShot ~= false then
+	if (airborne or jet) and not committed and not hookPts and CFG.GkPressFlierShot ~= false then
 		local minRel = (KickCore.GetMinimumReleaseSeconds and KickCore.GetMinimumReleaseSeconds()) or 0.2
 		local seen = math.clamp(CharacterMotion.GetDisplayDelaySeconds(model) or 0, 0, 0.25)
 		if best.t + ping * 0.5 > minRel - seen then
@@ -10688,13 +10761,13 @@ Mark.gkPress = function(character, root, c)
 	-- never a dive at a man whose height we cannot predict: about to launch, just launched (slope not measured yet), or
 	-- flying on something that is not a ballistic arc (lift rigs, grapple). Exception for powered: he is at our height
 	-- right now and the contact is immediate. The jetpack has its own timeline (jet ~= false) and skips this.
-	if launchPending then
+	if launchPending and not hookPts then
 		return note("launch pending " .. launchPending .. " " .. info)
 	end
-	if not jet and vKind == "fresh" then
+	if not jet and not hookPts and vKind == "fresh" then
 		return note("wait arc " .. info)
 	end
-	if not jet and vKind == "powered" and not (best.t <= 0.15 and math.abs(dyNow) <= (CFG.PressVert or 4) * 0.75) then
+	if not jet and not hookPts and vKind == "powered" and not (best.t <= 0.15 and math.abs(dyNow) <= (CFG.PressVert or 4) * 0.75) then
 		return note(string.format("powered flight ay %s %s", ayT and string.format("%.0f", ayT) or "-", info))
 	end
 	if best.conf < need then
@@ -10704,7 +10777,7 @@ Mark.gkPress = function(character, root, c)
 	-- him off the ground the moment he fires; he sees our dash after the latency (~our ping) and fires after a reaction
 	-- (GkLauncherReact). A contact later than that is a dive into the air he is about to leave (log: bazooka boost
 	-- right after our dash, the dive passed under him, 1.9 s open goal). Stand and read the launch instead.
-	if not airborne and not jet then
+	if not airborne and not jet and not hookPts then
 		local held = Mark.heldLauncher(pl.UserId)
 		if held then
 			local escT = (CFG.GkLauncherReact or 0.2) + ping
@@ -11758,7 +11831,17 @@ Mark.tickGk = function(character, root)
 			pid = Mark.gkFreeAt.id
 		end
 	end
-	if pid and landed and role and role.Dive and not shot and not plan then
+	-- a hook flier (the ball is free: he is flying at it) is pressed like a carrier, on his exact grapple path
+	local hookId = nil
+	if landed and role and role.Dive and not shot then
+		hookId = Mark.gkHooker(root, mouthP, side, fwd, half)
+		if hookId and (not pid or pid == hookId) then
+			pid = hookId
+		else
+			hookId = nil
+		end
+	end
+	if pid and landed and role and role.Dive and not shot and (not plan or hookId) then
 		if Mark.gkPress(character, root, { now = now, ownerId = pid, fwd = fwd, side = side, half = half, mouth = mouthP, diveMod = diveMod, role = role }) then
 			return true
 		end
@@ -12070,7 +12153,7 @@ end
 --              the stream velocity carries the extra speed (CharacterMotion.SetStreamVelocity, nil = real velocity again),
 --              so the MovementUpdate packets agree with the position. Pulse = the same step in bursts.
 --  Jump Boost  Movement.SetMultiplier JumpHeight: getJumpLaunchSpeed and the guard's registered launch read that table.
---  Stamina     Sprint.SetUnlimitedStamina (the same source API AgentJump / MoveAgent use).
+--  Stamina     Sprint.SetUnlimitedStamina (source "MoveHack"; the agent has no stamina source of its own).
 --  Knockback   KnockbackMotion.Run (the client half of a server push) is skipped for our character (Mark.knockHook).
 --  Ragdoll     Ragdoll.ClearActor, the game's own end-of-ragdoll, as soon as the server state reaches us.
 --  Stun        Stun.IsCharacterStunned / IsActorStunnedForPress answer false for us: sprint and the client button locks.
@@ -12896,7 +12979,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- Illegal Soccer dump " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v183")
+	add("-- Illegal Soccer dump " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v185")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -13075,14 +13158,9 @@ Mark.doJump = function(why)
 	if Mark.walk.ReleaseJump then
 		Mark.walk.ReleaseJump()
 	end
-	-- Movement.Jump calls the jump-started handler = Sprint.spendJumpStamina, which returns false (no jump, no error)
-	-- when stamina is short and no unlimited-stamina source is set. That was the "AutoBlock sometimes does not jump".
+	-- Movement.Jump runs Sprint.spendJumpStamina: a jump on an empty bar is refused (ok = false) - the agent has no free jumps
 	Mark.sprint = Mark.sprint or require(Client.Gameplay.Player.Sprint)
-	Mark.sprint.SetUnlimitedStamina("AgentJump", true)
 	local ok = Mark.walk.Jump()
-	task.delay(0.4, function()
-		Mark.sprint.SetUnlimitedStamina("AgentJump", false)
-	end)
 	if not ok and Mark.walk.SetJumpStateBlocked then
 		local blocks = Mark.jumpBlocks and Mark.jumpBlocks()
 		if type(blocks) == "table" and blocks.HeldJump and not blocks.Server and not blocks.Ragdoll then
@@ -17257,9 +17335,9 @@ end
 
 -- DRIBBLE SHIELD (user: "it slides when he has his dribble and does nothing when he has none"). A carrier answers a
 -- slide with his dribble (iframe + SuccessfulDodgeSpeedBoost), so:
---   his dribble covers our box (iframe) or is ready with TackleOnDribble -> no slide;
---   spent (cooldown runs past our box) -> slide on TackleNakedConf (he can only run, the window share is the only risk);
---   ready with TackleOnDribble off -> TackleConfidence (the strict number for a man who can still dribble).
+--   his dribble covers our box (iframe) or is ready with Perfect Mode on -> no slide;
+--   spent (cooldown runs past our box) / no ball / his own slide / locked -> slide on TackleNakedConf (he can only run);
+--   ready with Perfect Mode off -> TackleConfidence (the strict number for a man who can still dribble).
 -- Sets Mark.tackleNeed / Mark.tackleDrib for the confidence test that follows. Returns true = hold the slide.
 Mark.tackleShield = function(player, ch, solved)
 	local now = os.clock()
@@ -17269,13 +17347,13 @@ Mark.tackleShield = function(player, ch, solved)
 	Mark.tackleDrib = ds
 	-- the confidence the state asks for: he cannot dribble (spent / no ball) -> the naked number; he cannot even move
 	-- (down) -> any window; a dribble that is still possible -> the strict one
-	Mark.tackleNeed = ds == "down" and 0.15 or ((ds == "spent" or ds == "noball") and (CFG.TackleNakedConf or 0.35) or (CFG.TackleConfidence or 0))
+	Mark.tackleNeed = ds == "down" and 0.15 or ((ds == "spent" or ds == "noball" or ds == "slide" or ds == "locked") and (CFG.TackleNakedConf or 0.35) or (CFG.TackleConfidence or 0))
 	-- no slide into a man who is charging an attack either (it only fed his dribble / shot; AutoBlock blocks the shot)
 	if Mark.foeCharging(player.UserId) then
 		Mark.tackleDrib = "charge"
 		return true
 	end
-	local hold = ds == "iframe" or (ds == "ready" and CFG.TackleOnDribble ~= false)
+	local hold = ds == "iframe" or (ds == "ready" and CFG.TacklePerfect ~= false)
 	if hold and now - (Mark.todLog or 0) > 0.8 then
 		Mark.todLog = now
 		logFile("tackle shield", actorName(player), ds, rec and string.format("iframe %.2f cd %.2f hit %.2f", rec.untilT - now, rec.cdUntil - now, hitAt - now) or "never dribbled", "conf", string.format("%.2f", solved.conf or 0))
@@ -17290,8 +17368,11 @@ Mark.tackleGate = function(character, root, player, ch, solved)
 	local now = os.clock()
 	local eta = solved.eta or C.HitboxDelaySeconds
 	local key = (typeof(player) == "Instance" and player:IsA("Player") and player.UserId) or nil
-	if Mark.dribState(player, ch, now + eta, true) == "spent" then
-		return true, "naked"
+	do
+		local dsG = Mark.dribState(player, ch, now + eta, true)
+		if dsG == "spent" or dsG == "slide" or dsG == "locked" then
+			return true, "naked"
+		end
 	end
 	-- our kick is on him (charging, or the run-up): the slide waits. Kick first - his Dodge against it opens "naked"
 	-- above; a slide into a ready Dodge was 84 of 115 misses.
@@ -19843,7 +19924,7 @@ Mark.killerSlide = function(root, routeDir, foes, ballNow, ourT, mLo, mHi, guard
 				why[#why + 1] = name .. " charging"
 				continue
 			end
-			if ds == "iframe" or (ds == "ready" and CFG.TackleOnDribble ~= false) then
+			if ds == "iframe" or (ds == "ready" and CFG.TacklePerfect ~= false) then
 				why[#why + 1] = name .. " dribble " .. ds
 				continue
 			end
@@ -19853,9 +19934,19 @@ Mark.killerSlide = function(root, routeDir, foes, ballNow, ourT, mLo, mHi, guard
 			why[#why + 1] = name .. " down"
 			continue
 		end
+		-- Perfect Mode: a man in his OWN slide cannot dribble and his path is a locked heading dash (lockEnemySlide) - he is a
+		-- target; with it off the old rule stands (no slide at a slider)
+		local slideLock, slideEl = nil, nil
 		if f.sliding then
-			why[#why + 1] = name .. " sliding"
-			continue
+			if CFG.TacklePerfect == false then
+				why[#why + 1] = name .. " sliding"
+				continue
+			end
+			slideLock, slideEl = lockEnemySlide(f.model, f.root)
+			if not slideLock then
+				why[#why + 1] = name .. " sliding (no lock)"
+				continue
+			end
 		end
 		local delay = math.clamp(CharacterMotion.GetDisplayDelaySeconds(f.model) or 0, 0, 0.25)
 		if vel.Magnitude > 32 then
@@ -19863,7 +19954,11 @@ Mark.killerSlide = function(root, routeDir, foes, ballNow, ourT, mLo, mHi, guard
 		end
 		local E = {}
 		for k = 1, #fine do
-			E[k] = pos + vel * (delay + ping * 0.5 + fine[k])
+			if slideLock then
+				E[k] = slideLock.origin + slideLock.heading * Mark.dumpTravel(math.min(slideEl + ping * 0.5 + fine[k], C.TotalMotionSeconds))
+			else
+				E[k] = pos + vel * (delay + ping * 0.5 + fine[k])
+			end
 		end
 		local racer = dBall <= (CFG.KillerRadius or 22) or (f.first or math.huge) <= (ourT or math.huge) + (CFG.KillerMargin or 0.5)
 		cands[#cands + 1] = { f = f, name = name, pos = pos, dUs = dUs, dBall = dBall, E = E, racer = racer or guard }
@@ -19998,6 +20093,224 @@ Mark.goalThreat = function(samples, ts)
 	return nil
 end
 
+-- WHY AUTOBALL DID NOTHING for a loose ball that passes close (user: "it sometimes ignores balls that fly right by me"). Every
+-- silent return of tickBall calls this with its reason: if the ball path comes within 20 studs of us in the next 1.5 s (and
+-- the ball is not owned) one `ball idle` line says which gate fired, with the closest approach and our state.
+Mark.ballIdle = function(root, why)
+	local now = os.clock()
+	if now - (Mark.ballIdleAt or 0) < 0.5 then
+		return
+	end
+	local pos, vel, S, T = Mark.ballPath(root)
+	if not (pos and S and vel.Magnitude > 6) then
+		return
+	end
+	local oid = liveOwnerId()
+	if type(oid) == "number" and oid ~= 0 then
+		return
+	end
+	local O = root.Position
+	local bd, bt, bh = math.huge, 0, 0
+	for i = 1, #S do
+		if T[i] > 1.5 then
+			break
+		end
+		local d = flat(S[i] - O).Magnitude
+		if d < bd and S[i].Y - O.Y < 12 then
+			bd, bt, bh = d, T[i], S[i].Y - O.Y
+		end
+	end
+	if bd <= 20 then
+		Mark.ballIdleAt = now
+		local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+		logFile("ball idle", why, "closest", string.format("%.1f", bd), "at", string.format("%.2f", bt), "h", string.format("%.1f", bh), "ball v", string.format("%.0f", vel.Magnitude), "ws", hum and string.format("%.1f", hum.WalkSpeed) or "-", "mode", tostring(Mark.move.mode), "AutoBall", tostring(CFG.AutoBall))
+	end
+end
+
+-- ITEM BOXES. Dump: a box is a Model tagged "GameplayItemBox" (ItemBoxes.TagName) with a Hitbox part; Hitbox.CanTouch false =
+-- claimed / not there (ItemBoxVisuals.shouldShowItemBox). The server grants on touch and tells the clients only
+-- {Kind "ItemBoxClaimed", BoxName}: the content is NOT replicated - the box shows a "?" and the roll is server side
+-- (ItemTiers.RollWeightedItemId over the claimer's own item pool, recent grants down-weighted). Nothing to read before the
+-- touch. Race decision (pure): myEta against rivals {eta, closing}; "go" when nobody closing beats us by `margin`,
+-- "stun" when a closing rival wins but is inside slide reach (a slide stuns him and we are nearer the box afterwards),
+-- else "skip".
+Mark.boxPlan = function(myEta, rivals, margin, mates)
+	for _, e in mates do
+		if e < myEta - margin then
+			return "skip", "mate"
+		end
+	end
+	local worst, wd = nil, math.huge
+	for _, r in rivals do
+		if r.closing and r.eta < myEta + margin and r.eta < wd then
+			worst, wd = r, r.eta
+		end
+	end
+	if not worst then
+		return "go"
+	end
+	if worst.reach then
+		return "stun", worst
+	end
+	return "skip", "rival"
+end
+
+Mark.boxFree = function()
+	local s = Mark.itemSlots()
+	if not s then
+		return true
+	end
+	for i = 1, 4 do
+		if type(s[i]) ~= "table" then
+			return true
+		end
+	end
+	return false
+end
+
+Mark.tickBox = function(character, root)
+	local m = Mark.move
+	local function quit(why)
+		if m.mode == "box" then
+			Mark.moveStop("box")
+		end
+		if why ~= Mark.boxWhy then
+			Mark.boxWhy = why
+			if why ~= "off" and why ~= "busy" and why ~= "no box" then
+				logFile("box skip", why)
+			end
+		end
+	end
+	if not CFG.AutoBox then
+		quit("off")
+		return
+	end
+	local hum = character:FindFirstChildOfClass("Humanoid")
+	if not hum or Mark.meKeeper() or Mark.slideBody() or Mark.aerial or Mark.duel or not CharacterControllers.IsLanded(character, hum) then
+		quit("busy")
+		return
+	end
+	if Mark.moveLive(m) and m.mode ~= "box" then
+		quit("mode " .. tostring(m.mode)) -- another module owns the body
+		return
+	end
+	local oid = liveOwnerId()
+	if type(oid) == "number" and oid ~= 0 and not (playerOf(oid) and sameTeam(playerOf(oid)) and oid ~= LocalPlayer.UserId) then
+		quit("ball owned") -- we or an enemy carry: the ball is the job
+		return
+	end
+	if not Mark.boxFree() then
+		quit("slots full")
+		return
+	end
+	local O = root.Position
+	local lim = CFG.BoxMaxDist or 45
+	local best, bd = nil, math.huge
+	for _, b in CollectionService:GetTagged("GameplayItemBox") do
+		local hb = b:FindFirstChild("Hitbox")
+		if hb and hb.CanTouch then
+			local d = flat(hb.Position - O).Magnitude
+			if d < bd and d <= lim then
+				best, bd = hb, d
+			end
+		end
+	end
+	if not best then
+		quit("no box")
+		return
+	end
+	-- the ball first: a ball close to our goal is not left for a box
+	local ballP = Renderer.GetPosition()
+	local lb, _, rb = goalMouthCorners(ourGoalPart())
+	if lb and rb and typeof(ballP) == "Vector3" then
+		local mid = (lb + rb) * 0.5
+		if flat(ballP - mid).Magnitude < (CFG.BoxBallSafe or 45) then
+			quit("ball near our goal")
+		return
+		end
+	end
+	local P = best.Position
+	local speed = math.max(hum.WalkSpeed, 16)
+	local myEta = bd / speed
+	local ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
+	local rivals, mates = {}, {}
+	for _, pl in Players:GetPlayers() do
+		if pl ~= LocalPlayer and not isGoalkeeper(pl) then
+			local hr = ActorTargeting.GetActorRoot(pl)
+			local ch = Actors.GetCharacter(pl)
+			local hh = ch and ch:FindFirstChildOfClass("Humanoid")
+			if hr and hh and hh.Health > 0 then
+				local to = flat(P - hr.Position)
+				local d = to.Magnitude
+				local v = flat(hr.AssemblyLinearVelocity)
+				local sp = math.max(hh.WalkSpeed, 16)
+				local eta = d / sp
+				if sameTeam(pl) then
+					mates[#mates + 1] = eta
+				else
+					local closing = d < 10 or (v.Magnitude > 4 and to.Unit:Dot(v.Unit) > 0.5)
+					local rec = { eta = eta, closing = closing, pl = pl, root = hr, ch = ch }
+					local dm = flat(hr.Position - O).Magnitude
+					rec.reach = closing and dm <= math.min(CFG.TackleReach or 18, 14)
+					rivals[#rivals + 1] = rec
+				end
+			end
+		end
+	end
+	local plan, who = Mark.boxPlan(myEta, rivals, CFG.BoxMargin or 0.3, mates)
+	if plan == "skip" then
+		quit("skip " .. tostring(who))
+		return
+	end
+	if plan == "stun" then
+		local r = who
+		local v = flat(r.root.AssemblyLinearVelocity)
+		local aimP = r.root.Position + v * (0.25 + ping * 0.5)
+		local dir = unitOrNil(flat(aimP - O))
+		if dir then
+			local ok, why = tryTackle(character, root, dir, nil, nil, false, nil)
+			Mark.teleAdd("box.stun", ok == true)
+			logFile("box stun", ok and "ok" or "refused", tostring(why), "rival eta", string.format("%.2f", r.eta), "my eta", string.format("%.2f", myEta), "dist", string.format("%.1f", flat(r.root.Position - O).Magnitude))
+			if ok then
+				return
+			end
+		end
+		quit("stun refused")
+		return
+	end
+	-- go: steer at the box; the touch is the grant
+	if bd < 1.0 then
+		quit("at box")
+		return
+	end
+	local dir = unitOrNil(flat(P - O))
+	if not dir then
+		quit("no dir")
+		return
+	end
+	if m.mode ~= "box" then
+		logFile("box go", "dist", string.format("%.1f", bd), "eta", string.format("%.2f", myEta), "rivals", #rivals)
+		Mark.boxTrack = { at = os.clock(), part = best, n0 = Mark.boxCount() }
+	end
+	Mark.moveSteer(dir, "box")
+end
+
+-- result of a box run: the box is gone 2 s after we started -> did a slot fill?
+Mark.boxResult = function()
+	local t = Mark.boxTrack
+	if not t or os.clock() - t.at < 1.0 then
+		return
+	end
+	local gone = not (t.part.Parent and t.part.CanTouch)
+	if gone or os.clock() - t.at > 8 then
+		Mark.boxTrack = nil
+		Mark.slotsCache = nil
+		local n = Mark.boxCount()
+		Mark.teleAdd("box.take", gone and n > (t.n0 or 0))
+		logFile("box result", gone and "claimed" or "timeout", "slots", n)
+	end
+end
+
 Mark.tickBall = function(character, root)
 	local guardOn = CFG.AutoBlock and CFG.BlockGoal ~= false
 	if not CFG.AutoBall and not guardOn then
@@ -20012,9 +20325,11 @@ Mark.tickBall = function(character, root)
 		return
 	end
 	if Mark.move.mode == "dodge" or Mark.move.mode == "dribble" or Mark.move.mode == "flee" or Mark.aerial then
+		Mark.ballIdle(root, "busy " .. (Mark.aerial and "aerial" or tostring(Mark.move.mode)))
 		return
 	end
 	if Mark.duel or Mark.lobBusy() or Mark.airBusy() then
+		Mark.ballIdle(root, Mark.duel and "duel" or (Mark.lobBusy() and "lob" or "air intercept"))
 		return -- the air duel / the flick lob catch / Air Intercept owns the body
 	end
 	if Mark.move.mode == "block" then
@@ -20026,6 +20341,7 @@ Mark.tickBall = function(character, root)
 		end
 	end
 	if slideAim or Mark.slideBody() then
+		Mark.ballIdle(root, "sliding")
 		return
 	end
 	if ClientDodge.IsDribbling() or Mark.weOwn() then
@@ -20039,6 +20355,7 @@ Mark.tickBall = function(character, root)
 		local humF = character:FindFirstChildOfClass("Humanoid")
 		if humF and humF.WalkSpeed < 2 then
 			Mark.ballStop("frozen")
+			Mark.ballIdle(root, "frozen")
 			return
 		end
 	end
@@ -20290,6 +20607,7 @@ Mark.tickBall = function(character, root)
 	end
 	if not aimP then
 		Mark.ballStop("no aim")
+		Mark.ballIdle(root, "no aim (no contact the run / slide / jump can reach)")
 		return
 	end
 	-- TOO FAR: no chase for a ball (and a contact point) farther than BallMaxDist - anywhere on the map, enemy goal included
@@ -20299,6 +20617,7 @@ Mark.tickBall = function(character, root)
 		local lim = (CFG.BallMaxDist or 60) + (Mark.move.mode == "ball" and 10 or 0)
 		if dist > lim and flat(aimP - root.Position).Magnitude > lim then
 			Mark.ballStop("far")
+			Mark.ballIdle(root, "far")
 			return
 		end
 	end
@@ -20377,6 +20696,7 @@ Mark.tickBall = function(character, root)
 		end
 	end
 	if keeperFirst then
+		Mark.ballIdle(root, "enemy keeper first")
 		Mark.ballStop("keeper")
 		if Mark.ballWhy ~= "keeper" then
 			Mark.ballWhy = "keeper"
@@ -20385,6 +20705,7 @@ Mark.tickBall = function(character, root)
 		return
 	end
 	if beaten then
+		Mark.ballIdle(root, "teammate closer")
 		Mark.ballStop("teammate")
 		if Mark.ballWhy ~= "teammate" then
 			Mark.ballWhy = "teammate"
@@ -20864,9 +21185,9 @@ Mark.agentHold = function(on, why)
 			Mark.sprintAttrPrev = ch:GetAttribute(Mark.sprintMod.Constants.IsSprintingAttribute)
 		end
 		Mark.agentSprinting = true
-		Mark.sprint.SetUnlimitedStamina("MoveAgent", true)
-		Mark.sprintMod.SetUnlimitedStamina(LocalPlayer, "MoveAgent", true)
-		Mark.sprintMod.SetCharacterIsSprinting(LocalPlayer, true)
+		-- no unlimited-stamina source: the agent runs, dribbles, slides and jumps on the real bar (the sprint animation is
+		-- shown only while there is stamina left)
+		Mark.sprintMod.SetCharacterIsSprinting(LocalPlayer, (Mark.sprint.GetStamina() or 0) > 0.02)
 		if why ~= "block" and why ~= "dribble" and why ~= "dodge" and ch and Mark.sprintMod.SetDodgeBoost then
 			local now = Workspace:GetServerTimeNow()
 			local want = now + 0.4
@@ -20876,8 +21197,6 @@ Mark.agentHold = function(on, why)
 			end
 		end
 	else
-		Mark.sprint.SetUnlimitedStamina("MoveAgent", false)
-		Mark.sprintMod.SetUnlimitedStamina(LocalPlayer, "MoveAgent", false)
 		if Mark.agentSprinting then
 			Mark.agentSprinting = false
 			-- restore what the attribute was before the agent, or the live client sprint state
@@ -20886,9 +21205,6 @@ Mark.agentHold = function(on, why)
 				want = Mark.sprint.IsSprinting and Mark.sprint.IsSprinting() or false
 			end
 			Mark.sprintMod.SetCharacterIsSprinting(LocalPlayer, want == true or (Mark.sprint.IsSprinting and Mark.sprint.IsSprinting()))
-		end
-		if Mark.sprint.RestoreStamina then
-			Mark.sprint.RestoreStamina(1)
 		end
 	end
 end
@@ -22907,7 +23223,7 @@ Mark.moveSteer = function(dir, mode, replay)
 		end
 		local rot = (m.mode == "dodge" or m.mode == "block" or m.mode == "air")
 		origSetMove(ch, dir, face, rot)
-		if m.mode == "ball" or m.mode == "walk" or m.mode == "dodge" or m.mode == "dribble" or m.mode == "take" or m.mode == "block" or m.mode == "gk" or m.mode == "kick" or m.mode == "flee" or m.mode == "duel" or m.mode == "lob" or m.mode == "air" then
+		if m.mode == "ball" or m.mode == "box" or m.mode == "walk" or m.mode == "dodge" or m.mode == "dribble" or m.mode == "take" or m.mode == "block" or m.mode == "gk" or m.mode == "kick" or m.mode == "flee" or m.mode == "duel" or m.mode == "lob" or m.mode == "air" then
 			Mark.agentHold(true, m.mode)
 		end
 		if m.mode == "dodge" then
@@ -22950,7 +23266,7 @@ Mark.moveStop = function(only)
 	elseif ch then
 		origSetMove(ch, Vector3.zero, Vector3.zero, false)
 	end
-	if was == "walk" or was == "take" or was == "dodge" or was == "block" or was == "ball" or was == "gk" or was == "kick" or was == "flee" or was == "air" then
+	if was == "walk" or was == "take" or was == "box" or was == "dodge" or was == "block" or was == "ball" or was == "gk" or was == "kick" or was == "flee" or was == "air" then
 		Mark.agentHold(false)
 	end
 	if was == "block" then
@@ -24880,7 +25196,7 @@ return function(_Lib, _Core)
 			})
 			pick(s, "Priority", "TackleVsBlock", { { "Block First", "block" }, { "Smart", "smart" }, { "Tackle First", "tackle" } }, "Block First: waits for AutoBlock while it is on him.")
 			tog(s, "Competitor Check", "TackleCompetitor", "Skips a carrier a teammate is already on.")
-			tog(s, "Tackle On Dribble", "TackleOnDribble", "No slide into a ready dribble.")
+			tog(s, "Perfect Mode", "TacklePerfect", "Slide only when his dribble can't save him.")
 			sld(s, "Competitor Radius", "TackleCompetitorRadius", 3, 25, { suffix = " st" })
 			head(s, "Manual Tackle")
 			tog(s, "Manual Tackle", "ManualTackle", "Your own tackle press is aimed at the carrier.")
@@ -25025,7 +25341,8 @@ return function(_Lib, _Core)
 			sld(p, "Rush Zone", "GkRushZone", 10, 80, { prec = 0, suffix = " st" })
 			sld(p, "Rush Confidence", "GkRushConf", 0.1, 0.9, { prec = 2 })
 			sld(p, "Too Close", "GkPressMinT", 0, 0.15, { prec = 2, suffix = " s", text = "A contact earlier than this into the dash passes through him." })
-			tog(p, "Mirror Runner", "GkMirror", "Follows a carrier near the goal sideways.")
+			tog(p, "Press Hook Fliers", "GkHookPress", "Dives at a grapple flier coming at the goal.")
+		tog(p, "Mirror Runner", "GkMirror", "Follows a carrier near the goal sideways.")
 		tog(p, "Keeper Kick", "GkKick", "No dive line and he is close: charges a full kick at him.")
 			advanced(p, "GkPress", function()
 				sld(p, "Press Zone", "GkPressZone", 20, 140, { suffix = " st" })
@@ -25122,6 +25439,9 @@ return function(_Lib, _Core)
 			feature(ba, "AutoBall", "AutoBall")
 			tog(ba, "Competitor Check", "BallCompetitor", "Stops when a teammate is clearly closer to the ball.")
 			sld(ba, "Max Distance", "BallMaxDist", 20, 200, { suffix = " st", text = "No chase beyond this." })
+			head(ba, "Item Boxes")
+			feature(ba, "AutoBox", "AutoBox")
+			sld(ba, "Box Distance", "BoxMaxDist", 10, 100, { suffix = " st", text = "No box farther than this." })
 			tog(ba, "Catch Flicks", "BallFlick", "Wins the ball from enemy flicks.")
 			sld(ba, "Body Range", "LobBodyRange", 0, 20, { suffix = " st", text = "Closer than this, take the lob with the body." })
 			sld(ba, "Competitor Gap", "BallYieldGap", 2, 20, { suffix = " st", text = "How much closer he must be." })
