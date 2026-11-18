@@ -257,6 +257,7 @@ local CFG = {
 	RoleTakenR = 10, -- a teammate goal-side within this of the carrier is already pressing him
 	RoleDeepZone = 90, -- enemies within this of our mouth are the deep defender's threats
 	RoleCoverMax = 12, -- deepest median stand (studs in front of the carrier on the bisector of his lines to the posts)
+	ProjServerExtra = 0.04, -- guessed: extra server-side lead on projectile hits (user: "the server is more aggressive on projectiles")
 	RoleHold = 0.7, -- AutoBlock keeps a role this long before changing it (s)
 	RolePassLean = 0.5, -- the presser leans toward the open receiver by this share of the angle goal-line / pass-lane
 	RolePassMax = 55, -- ...at most this many degrees off the line to our goal
@@ -3268,8 +3269,12 @@ CharacterControllers.GetMoveCommand = function(ch)
 	-- the player's own stick (no agent mode live): AutoDodge keeps it out of a blast about to go off and off mines
 	if ch == LocalPlayer.Character and CFG.AutoDodge and not Mark.moveLive(Mark.move) then
 		local haz, mines = next(Mark.hazEv) ~= nil, Mark.mines ~= nil and #Mark.mines() > 0
-		if haz or mines then
+		local proj = Mark.projDanger ~= nil and next(Mark.projDanger) ~= nil
+		if haz or mines or proj then
 			local cc = origGetMove(ch)
+			if proj and typeof(cc) == "Vector3" and cc.Magnitude > 0.2 then
+				cc = Mark.projDir(cc)
+			end
 			if haz then
 				cc = Mark.blastClamp(ch, cc)
 			end
@@ -3311,7 +3316,11 @@ Mark.moveLive = function(m)
 		return false
 	end
 	if m.mode == "dodge" then
-		return true
+		-- the dodge has its own end (dodgeSteer: slide over / threat gone), and when that end is never reached - a stale threat
+		-- table, a Mark.dodgeDone left over from the last dodge so dodgeSteer returns at once, a mode set by a step-walk - the
+		-- old "always live" held the stick for 30 s (log: move=dodge from 11386 to 11416, through a kick and two jumps). 1.4 s from
+		-- the start of the dodge is the hard cap the keeper half always had (dodgeTend); the watchdog in moveTick ends it.
+		return os.clock() - (Mark.dodgeAt or m.at or 0) < 1.4
 	end
 	-- (m.pts is a drawn route for ball / block / dribble too, not proof that anybody is still driving the mode;
 	-- walk / take paths are driven by moveTick, which steers every frame and refreshes m.at)
@@ -6885,10 +6894,7 @@ Reticle.GetCameraRay = function(...)
 		local cam = Workspace.CurrentCamera
 		local okP, P = Mark.try(pa.fn)
 		if cam and okP and typeof(P) == "Vector3" then
-			-- the gun aims at the FIRST thing the ray meets (Reticle: TargetPosition = the aim hit): from the camera - 15-30 studs
-			-- behind and above us - the line to a keeper 75 st away crosses our own team and the goal frame; from the body it does not
-			local me = ActorTargeting.GetActorRoot(LocalPlayer)
-			local o = me and (me.Position + Vector3.new(0, 1.5, 0)) or cam.CFrame.Position
+			local o = cam.CFrame.Position
 			local dir = unitOrNil(P - o)
 			if dir then
 				return Ray.new(o, dir)
@@ -8498,14 +8504,10 @@ end
 -- 0.48 / 0.73 s after the press): the keeper is held from the first hit to the last hit + the knock-back. A push fired while
 -- the ball is farther away than that holds him for nothing - log: a roll shot at a keeper the ball reached 1.60 s later, the
 -- hold ended at ~1.4 s ("the last shot for no reason"). Speeds are observed, not from the dump.
--- Which gun at distance d. The shotgun is 1 pellet exactly on the aim + 11 in a tan(8 deg) disk (SingleShotGun.GetConeDirections):
--- the cone is 0.14 d wide, so past ~20 st only the centre pellet is on him and the rest hit whoever stands around. Hits in the
--- log: knock 37 at 38 and 47 st, 28 at 76 st. It is chosen only inside min(GunPushShotgunRange, ShotgunMax = 50, guessed from
--- those three shots); farther - the flintlock (one accurate pellet x3). Log: the shotgun was picked at 75.7 st over a
--- flintlock in the other slot because the user's range was 120, and the knock landed on the wrong man.
-Mark.ShotgunMax = 50
+-- Which gun at distance d: the shotgun inside GunPushShotgunRange (the user's setting, no hidden cap: the v190 cap of 50 st was
+-- invented from three shots - his SilentAim shotgun hits from far away), else the flintlock inside GunPushFlintRange.
 Mark.pushGun = function(d, haveShotgun, haveFlint)
-	if haveShotgun and d <= math.min(CFG.GunPushShotgunRange or 22, Mark.ShotgunMax) then
+	if haveShotgun and d <= (CFG.GunPushShotgunRange or 22) then
 		return "shotgun"
 	end
 	if haveFlint and d <= (CFG.GunPushFlintRange or 70) then
@@ -9018,6 +9020,7 @@ Mark.wallVsPath = function(root, pathFn, tEnd, tag, o)
 	-- the press reaches the server after ping/2, the wall exists WallLatency later (seen 0.11-0.14 s after the press at
 	-- ping 0.08 = round trip + ~0.04); equipping first costs WallEquipDelay more
 	local ready = ping * 0.5 + (CFG.WallLatency or 0.06) + (CFG.WallMargin or 0.05) + (equipped and 0 or (CFG.WallEquipDelay or 0.3))
+		+ (o.proj and (CFG.ProjServerExtra or 0.04) or 0) -- the server is quicker on projectiles than on bodies (user): the wall must be up earlier
 	local dtS = 0.04
 	local pts = Mark.wallPts or {}
 	Mark.wallPts = pts
@@ -13145,7 +13148,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- Illegal Soccer dump " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v191")
+	add("-- Illegal Soccer dump " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v192")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -20469,7 +20472,9 @@ Mark.boxCount = function()
 	local n = 0
 	if s then
 		for i = 1, Mark.slotCount() do
-			if type(s[i]) == "table" then
+			-- an EMPTY slot is a table too ({ ItemId = nil }: the log prints "item slots 1=nil 2=nil"); only an ItemId fills it.
+			-- v190 counted every table and read two empty slots as full: "AutoBox stopped working"
+			if type(s[i]) == "table" and s[i].ItemId ~= nil then
 				n += 1
 			end
 		end
@@ -20567,6 +20572,11 @@ Mark.boxEnd = function(why)
 	local m = Mark.move
 	if m.mode == "box" then
 		Mark.moveStop("box")
+	end
+	-- AutoBox on and doing nothing must say why (v190: two empty slots read as full and the feature was silent for a whole session)
+	if CFG.AutoBox and why ~= "off" and not Mark.boxRun and (why ~= Mark.boxIdleWhy or os.clock() - (Mark.boxIdleAt or 0) > 5) then
+		Mark.boxIdleWhy, Mark.boxIdleAt = why, os.clock()
+		logFile("box idle", why)
 	end
 	local r = Mark.boxRun
 	if r then
@@ -23490,6 +23500,113 @@ Mark.projPathFn = function(st, nowS)
 	end
 end
 
+-- OUR POSE AS THE SERVER TESTS IT. The server tests a projectile against the pose we SENT: at server time t it holds what we did
+-- lag seconds earlier (our packet's one-way trip ping/2 + the send interval CharacterSendIntervalSeconds 1/60 + ProjServerExtra).
+-- The old dodge assumed our pose at t was where we would be at t: a 5 st step taken now reaches the server ping/2+ later, against a
+-- boomerang flying 103 st/s that is 4-8 studs of "I already left" that the server never saw (user: the dodge is always late).
+-- vel = our velocity, off = the step (teleport) taken NOW.
+Mark.projPose = function(O, vel, off, t, lag)
+	local s = t - lag
+	if s < 0 then
+		return O + vel * s
+	end
+	return O + off + vel * s
+end
+
+-- Smallest flat distance between a projectile path and our server pose over [0, tMax] (0.03 s grid) while the heights overlap.
+Mark.projClear = function(pathAt, O, vel, off, lag, rad, tMax)
+	local best, bestT = math.huge, 0
+	local t = 0
+	while t <= tMax do
+		local p = pathAt(t)
+		local us = Mark.projPose(O, vel, off, t, lag)
+		local dz = math.abs(p.Y - (us.Y - 0.5))
+		local d = flat(p - us).Magnitude
+		if dz < 4.5 + rad * 0.5 and d < best then
+			best, bestT = d, t
+		end
+		t += 0.03
+	end
+	return best, bestT
+end
+
+-- The user's own stick, kept out from under a projectile (user: a dodge is not only the step - do not let me walk INTO the
+-- boomerang). wish = his unit direction, speed = his run speed. Returns the direction to use and whether it was changed: his own
+-- when it clears the path (server pose), else the nearest turn (30 st .. 180 deg, either side) that does, else the widest.
+Mark.projDirPick = function(paths, O, wish, speed, lag, margin)
+	local function clear(dir)
+		local worst = math.huge
+		for _, P in paths do
+			local c = Mark.projClear(P.pathAt, O, dir * speed, Vector3.zero, lag, P.rad, P.tEnd)
+			worst = math.min(worst, c - P.rad)
+		end
+		return worst
+	end
+	local base = clear(wish)
+	if base >= margin then
+		return wish, false
+	end
+	local best, bestC = wish, base
+	for _, a in { 30, -30, 60, -60, 90, -90, 135, -135, 180 } do
+		local r = math.rad(a)
+		local cand = Vector3.new(wish.X * math.cos(r) - wish.Z * math.sin(r), 0, wish.X * math.sin(r) + wish.Z * math.cos(r))
+		local c = clear(cand)
+		if c >= margin then
+			return cand, true
+		end
+		if c > bestC then
+			best, bestC = cand, c
+		end
+	end
+	return best, best ~= wish
+end
+
+-- the projectile as the wall must stop it: the server's projectile hitbox is ProjectileHitboxScale 1.15 x the item's own
+-- (ItemHitSettings); boomerang HitboxSize 4 x 1.8 x 4 (dump) = 2.3 st half-width. The old fixed 1.5 let a boomerang edge past
+-- the barricade's side.
+Mark.projWallRad = function(item)
+	if item == "boomerang" then
+		return 4 * 0.5 * 1.15
+	end
+	return 1.5 * 1.15
+end
+
+-- GetMoveCommand hook: the user's stick, turned away from a live projectile's path when his own direction runs into it. One answer
+-- per 30 ms (the hook is asked several times a frame).
+Mark.projDir = function(cc)
+	local now = os.clock()
+	local memo = Mark.projDirMemo
+	if memo and now - memo.at < 0.03 and (memo.cc - cc).Magnitude < 0.05 then
+		return memo.out
+	end
+	local paths = {}
+	for id, P in Mark.projDanger do
+		if now - P.at > 0.15 then
+			Mark.projDanger[id] = nil
+		else
+			paths[#paths + 1] = P
+		end
+	end
+	local out = cc
+	local root = ActorTargeting.GetActorRoot(LocalPlayer)
+	local wish = unitOrNil(flat(cc))
+	if #paths > 0 and root and wish then
+		local ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
+		local lag = ping * 0.5 + 1 / 60 + (CFG.ProjServerExtra or 0.04)
+		local speed = math.max(flat(root.AssemblyLinearVelocity).Magnitude, 16)
+		local dir, changed = Mark.projDirPick(paths, root.Position, wish, speed, lag, CFG.ProjSafeMargin or 1.0)
+		if changed then
+			out = dir * cc.Magnitude
+			if now - (Mark.projDirLog or 0) > 0.5 then
+				Mark.projDirLog = now
+				logFile("proj stick", "turned away", string.format("%.0f deg", math.deg(math.acos(math.clamp(wish:Dot(dir), -1, 1)))), "paths", #paths)
+			end
+		end
+	end
+	Mark.projDirMemo = { at = now, cc = cc, out = out }
+	return out
+end
+
 Mark.projTick = function(character, root)
 	Mark.hazFlee(character, root)
 	local live = Mark.projLive
@@ -23698,20 +23815,16 @@ Mark.projTick = function(character, root)
 				continue
 			end
 			local rad = st.rad or 4
+			local lag = ping * 0.5 + 1 / 60 + (CFG.ProjServerExtra or 0.04)
+			-- every live threat is also a corridor for the user's own stick (Mark.projDir, GetMoveCommand)
+			local tEnd = 1.4
+			if st.throw then
+				tEnd = math.clamp(Mark.boomMod.GetEndTime(st.throw) - nowS, 0.1, 2.2)
+			end
+			Mark.projDanger = Mark.projDanger or {}
+			Mark.projDanger[id] = { pathAt = pathAt, rad = rad, tEnd = tEnd, at = os.clock() }
 			local function clearance(off)
-				local best, bestT = math.huge, 0
-				local t = 0
-				while t <= 1.4 do
-					local p = pathAt(t)
-					local us = O + off + ourV * t
-					local dz = math.abs(p.Y - (us.Y - 0.5))
-					local d = flat(p - us).Magnitude
-					if dz < 4.5 + rad * 0.5 and d < best then
-						best, bestT = d, t
-					end
-					t += 0.03
-				end
-				return best, bestT
+				return Mark.projClear(pathAt, O, ourV, off, lag, rad, 1.4)
 			end
 			local stay, tImp = clearance(Vector3.zero)
 			local margin = CFG.ProjSafeMargin or 1.0
@@ -23729,7 +23842,7 @@ Mark.projTick = function(character, root)
 			end
 			-- BarricadeAddon: a wall on its path instead of a dodge / pass (explosives excluded: the blast would still reach us)
 			if st.item ~= "bazooka" and st.item ~= "grenade" and not st.wallTried then
-				local okW, wWhy = Mark.wallVsPath(root, pathAt, tImp, st.item, { proj = true, rad = 1.5 })
+				local okW, wWhy = Mark.wallVsPath(root, pathAt, tImp, st.item, { proj = true, rad = Mark.projWallRad(st.item) })
 				if okW == "equip" then
 					st.wallUntil = os.clock() + 0.12 -- barricades coming out: hold the dodge a moment, place on the next tick
 					continue
@@ -26102,7 +26215,7 @@ return function(_Lib, _Core)
 			tog(kp, "Teammate Shots", "GunPushMates", "Fires as soon as a teammate charges a shot on target.")
 			tog(kp, "Rolling Ball", "GunPushRoll", "Shoots the enemy who would stop a rolling ball.")
 			sld(kp, "Flintlock Range", "GunPushFlintRange", 10, 400, { suffix = " st" })
-			sld(kp, "Shotgun Range", "GunPushShotgunRange", 5, 50, { suffix = " st" })
+			sld(kp, "Shotgun Range", "GunPushShotgunRange", 5, 300, { suffix = " st" })
 			sld(kp, "Delay", "GunPushDelay", 0, 0.5, { prec = 2, suffix = " s", text = "Wait before the equip and shot." })
 			advanced(kp, "Keeper Push", function()
 				sld(kp, "Keeper Zone", "GunPushKeeperZone", 4, 40, { suffix = " st", text = "Only a keeper this close to his goal." })
