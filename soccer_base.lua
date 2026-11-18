@@ -408,6 +408,8 @@ local CFG = {
 	GkMirror = true, -- AutoGK: a carrier near the goal drags the keeper across with him (more the closer he is)
 	GkMirrorRange = 26, -- ... only while he is this close to the mouth segment (studs; guessed: the dive reach 20 + a step). Was 60 and measured along the field axis only: a carrier 60 out on the far wing pulled the keeper in to 6 studs
 	GkMirrorNear = 9, -- ... a LOOSE ball counts as his when an enemy is this close to it
+	GkLastChance = true, -- AutoGK press: he is in the net within GkLastChanceT s and the careful solve found nothing: dive at the best contact the relaxed solve finds (standing is the goal for sure)
+	GkLastChanceT = 0.7,
 	GkFlier = true, -- AutoGK: dive at ANY enemy body flying at our mouth with the ball near its path (lob + hook / jet / launch), not only at the carrier
 	GkFlierZone = 90, -- ... only bodies this close to the mouth are read
 	GkFlierLink = 12, -- ... the ball must be this close to his path at the time he gets to the goal (guessed: a body that never meets the ball scores nothing)
@@ -10724,6 +10726,9 @@ Mark.gkFlierEta = function(o)
 		local rel = flat(pts[k] - o.mouth)
 		if rel:Dot(o.fwd) <= o.inside and math.abs(rel:Dot(o.side)) <= o.half + o.pad then
 			local t = (k - 1) * o.DT
+			if not o.ballAt then
+				return t, pts[k] -- the carrier: the ball is with him
+			end
 			local b = o.ballAt(t)
 			if b and flat(b - pts[k]).Magnitude <= o.link then
 				return t, pts[k]
@@ -10731,6 +10736,22 @@ Mark.gkFlierEta = function(o)
 		end
 	end
 	return nil
+end
+
+-- LAST CHANCE (user: "the enemy used a jetpack, the keeper took a position and did NOT dive forward"). The press solver is cautious on
+-- purpose: it demands the contact to hold with him a ping/2 + 0.03 s further along his path (`slip`) and discards a contact in the
+-- first `minT` 0.06 s of the dash ("passes through him"). A jetpack dash starts at 63 st/s: 0.065 s of slip is 4 studs, more than the
+-- 2.6 stud reach, so EVERY dive at a fresh jetpacker was "no contact" (reproduced: keeper 13 out, he 21 out, all 5 paths, conf 0; with
+-- slip / minT off: conf 0.7-1.0, contact in 0.03-0.10 s). When he is in the net within `GkLastChanceT` s and the careful solve has
+-- nothing (or too little), standing is the goal for sure: the relaxed solve decides, the dive goes at the best contact there is.
+Mark.gkPickDive = function(best, relaxed, need, last)
+	if best and best.conf >= need then
+		return best, "plan"
+	end
+	if last and relaxed and (not best or relaxed.conf > best.conf) then
+		return relaxed, "last chance"
+	end
+	return best, best and "weak" or nil
 end
 
 -- may the press dive go while the ball plan / the shot say something else? The carrier: no shot, no ball plan. A hook flier or a
@@ -11022,6 +11043,9 @@ Mark.gkPress = function(character, root, c)
 		end
 	end
 
+	-- when his main future is in our net (the ball is with him, or he is the flier we read): the last chance rule below
+	local goalT = Mark.gkFlierEta({ pts = futs[1].pts, DT = 0.025, mouth = mouth, fwd = fwd, side = side, half = half, inside = 3, pad = 3 })
+	local lastChance = CFG.GkLastChance ~= false and goalT ~= nil and goalT <= (CFG.GkLastChanceT or 0.7) and (airborne or jet ~= false or hookPts ~= nil or bare or committed)
 	local diveReady = c.now - (Mark.gkDive or 0) > D.Constants.RepeatDelaySeconds + 0.05
 	local iframe = Dodge.IsDribbling(model)
 	local viz = { at = c.now, futs = futs, from = root.Position, conf = 0, need = 1, stand = Mark.gkPressStandP, R = (CFG.PressReach or 2.6) * ((airborne or jet or hookPts ~= nil) and 1 or (CFG.GkPressRadiusFrac or 0.75)) }
@@ -11035,28 +11059,48 @@ Mark.gkPress = function(character, root, c)
 	-- solve at ~30 Hz: one solve is a few thousand box tests
 	local sv = Mark.gkSolveCache
 	local best, later, cen
-	if sv and sv.model == model and c.now - sv.at < 0.033 then
-		best, later, cen = sv.best, sv.later, sv.cen
-	else
+	local function solveArgs(slip, minT)
 		local dist = D.GetDistance(LocalPlayer)
 		local cam = Workspace.CurrentCamera
 		Mark.actionMotion = Mark.actionMotion or require(Modules.Actions.ActionMotion)
-		best, later, cen = Mark.gkPressSolve({
+		return {
 			root = root.Position, vel = flat(root.AssemblyLinearVelocity), futs = futs, D = D, dist = dist,
 			maxD = math.min(CFG.PressDist or (dist - 0.5), dist - 0.5), R = (CFG.PressReach or 2.6) * ((airborne or jet or hookPts ~= nil) and 1 or (CFG.GkPressRadiusFrac or 0.75)), H = CFG.PressVert or 4,
 			RF = CFG.GkPressReachFrac or 0.85,
 			mouth = mouth, fwd = fwd, g = g, jumpH = Mark.jumpH or 7.2, air = airborne or jet or hookPts ~= nil,
 			exact = CFG.GkPressExact ~= false, camCF = cam and cam.CFrame or root.CFrame,
-			slip = (airborne or jet or hookPts ~= nil) and (ping * 0.5 + (CFG.GkPressSlip or 0.03)) or nil,
+			slip = slip,
 			facing = unitOrNil(flat(root.CFrame.LookVector)) or fwd,
-			minT = CFG.GkPressMinT or 0.06,
-		})
+			minT = minT,
+		}
+	end
+	if sv and sv.model == model and c.now - sv.at < 0.033 then
+		best, later, cen = sv.best, sv.later, sv.cen
+	else
+		best, later, cen = Mark.gkPressSolve(solveArgs((airborne or jet or hookPts ~= nil) and (ping * 0.5 + (CFG.GkPressSlip or 0.03)) or nil, CFG.GkPressMinT or 0.06))
 		Mark.gkSolveCache = { model = model, at = c.now, best = best, later = later, cen = cen }
 	end
-	local imminent = committed or imminentT
+	local imminent = committed or imminentT or lastChance
 	local need = imminent and (CFG.GkPressConfLate or 0.35) or (CFG.GkPressConf or 0.6)
 	if rush then
 		need = math.min(need, CFG.GkRushConf or 0.35)
+	end
+	-- LAST CHANCE: the careful solve has nothing / too little and he is in the net within GkLastChanceT: the relaxed solve decides
+	local lastUsed = false
+	if lastChance and (not best or best.conf < need) then
+		local rc = Mark.gkRelaxCache
+		local rb, _rlater, rcen
+		if rc and rc.model == model and c.now - rc.at < 0.033 then
+			rb, rcen = rc.best, rc.cen
+		else
+			rb, _rlater, rcen = Mark.gkPressSolve(solveArgs(nil, 0))
+			Mark.gkRelaxCache = { model = model, at = c.now, best = rb, cen = rcen }
+		end
+		local pickB, how = Mark.gkPickDive(best, rb, need, true)
+		if how == "last chance" then
+			best, cen, lastUsed = pickB, rcen, true
+			need = math.min(need, best.conf)
+		end
 	end
 	viz.need = need
 	if best then
@@ -11069,6 +11113,9 @@ Mark.gkPress = function(character, root, c)
 	end
 	local info0 = hookPts and string.format("HOOK %.2f ", hookT) or (bare and string.format("FLIER %.2f ", c.flierT or -1) or "")
 	local info = info0 .. string.format("dSeg %.1f appr %.1f tReach %s air %s vy %.1f dy %.1f drib %s jet %s vk %s%s%s", dSeg, appr, tReach == math.huge and "-" or fmt(tReach), tostring(airborne), vy, P.Y - root.Position.Y, dribReady and "ready" or "spent", jet and fmt(jet.te) or "-", vKind, downFly and " downFly" or "", Mark.gkPressStandP and string.format(" stand %.1f", flat(Mark.gkPressStandP - root.Position).Magnitude) or "")
+	if lastUsed then
+		info = "LAST CHANCE " .. string.format("goal in %.2f ", goalT) .. info
+	end
 	if not best then
 		-- too close / no dive line: the keeper's own charged Kick (full charge, released by the kick box) pushes him off
 		-- the ball. AutoKick's planner with the keeper flag (no run-up: the keeper keeps his stand).
@@ -11104,7 +11151,7 @@ Mark.gkPress = function(character, root, c)
 	-- press dive at a jetpacker dy 21.9, contact t 0.23; he released a 124 st/s shot 0.07 s after our dash - stunned
 	-- after the ball had gone, keeper on the floor, goal). A dive is only worth it when it lands before he can complete a
 	-- fresh kick: contact within the game's minimum release time minus what we see of him late (display delay).
-	if (airborne or jet) and not committed and not hookPts and not bare and CFG.GkPressFlierShot ~= false then
+	if (airborne or jet) and not committed and not lastChance and not hookPts and not bare and CFG.GkPressFlierShot ~= false then
 		local minRel = (KickCore.GetMinimumReleaseSeconds and KickCore.GetMinimumReleaseSeconds()) or 0.2
 		local seen = math.clamp(CharacterMotion.GetDisplayDelaySeconds(model) or 0, 0, 0.25)
 		if best.t + ping * 0.5 > minRel - seen then
@@ -11114,13 +11161,13 @@ Mark.gkPress = function(character, root, c)
 	-- never a dive at a man whose height we cannot predict: about to launch, just launched (slope not measured yet), or
 	-- flying on something that is not a ballistic arc (lift rigs, grapple). Exception for powered: he is at our height
 	-- right now and the contact is immediate. The jetpack has its own timeline (jet ~= false) and skips this.
-	if launchPending and not hookPts then
+	if launchPending and not hookPts and not lastChance then
 		return note("launch pending " .. launchPending .. " " .. info)
 	end
-	if not jet and not hookPts and vKind == "fresh" then
+	if not jet and not hookPts and not lastChance and vKind == "fresh" then
 		return note("wait arc " .. info)
 	end
-	if not jet and not hookPts and vKind == "powered" and not (best.t <= 0.15 and math.abs(dyNow) <= (CFG.PressVert or 4) * 0.75) then
+	if not jet and not hookPts and not lastChance and vKind == "powered" and not (best.t <= 0.15 and math.abs(dyNow) <= (CFG.PressVert or 4) * 0.75) then
 		return note(string.format("powered flight ay %s %s", ayT and string.format("%.0f", ayT) or "-", info))
 	end
 	if best.conf < need then
@@ -13421,7 +13468,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- Illegal Soccer dump " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v197")
+	add("-- Illegal Soccer dump " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v198")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -14798,7 +14845,7 @@ Mark.foeIsolated = function(carrier, P, g)
 			local r = ActorTargeting.GetActorRoot(actor)
 			if r then
 				local pos = CharacterMotion.GetPosition(model) or r.Position
-				if flat(pos - mouth).Magnitude <= dC + slack and flat(pos - P).Magnitude <= (CFG.BlockPassMax or 130) and not Mark.mateNear(pos, CFG.BlockCoverRadius or 8) then
+				if flat(pos - mouth).Magnitude <= dC + slack and flat(pos - P).Magnitude <= (CFG.BlockPassMax or 130) and not Mark.mateNear(pos, CFG.BlockCoverRadius or 8, true) then
 					outlets += 1
 					names = (names and names .. "," or "") .. actorName(actor)
 				end
@@ -15259,7 +15306,7 @@ end
 -- outlet (pass lane / second ball / a lob over the presser). The old AutoBlock was "me vs the carrier": every mode
 -- (shadow, mark, cut, def cover) looked at him and at one receiver, ignored where our teammates stood, followed his
 -- predicted diagonal (he goes left -> we go left) and stood aside the moment a mate came within CompetitorRadius.
--- Roles are decided every tick for every field defender we see (us + mates, keeper and downed mates excluded), with
+-- Roles are decided every tick for every field defender we see (us + mates in ANY state, keeper excluded), with
 -- our teammates' REAL positions: they are humans, we take the role they leave open.
 --   PRESS : the defender who reaches the press spot soonest (Mark.pressTime: the spot moves with the carrier, so a man in
 --           front of him meets him and a man behind only chases; anyone already on him -0.9 s; our own role -0.25 s of
@@ -15574,12 +15621,15 @@ Mark.blockRoleTick = function(character, root, carrier, cr, chE, P, V, g, flight
 	for _, model in Mark.models() do
 		local actor = Actors.GetFromCharacter(model)
 		local r = actor and actor ~= LocalPlayer and ActorTargeting.GetActorRoot(actor)
-		if r and not isGoalkeeper(actor) and not Mark.mateDown(actor, model) then
+		-- OUR team counts whatever state it is in (user: "AutoBlock must not care whether our man is ragdolled while he covers"): with
+		-- the downed mates dropped, one defender was left, "alone" = press, and he ran at a far carrier while two of his mates stood
+		-- nearer our goal. A downed ENEMY is still no threat.
+		if r and not isGoalkeeper(actor) and (sameTeam(actor) or not Mark.mateDown(actor, model)) then
 			local pos = CharacterMotion.GetPosition(model) or r.Position
 			if sameTeam(actor) then
 				mates[#mates + 1] = { pos = pos, name = actorName(actor), actor = actor }
 			else
-				foes[#foes + 1] = { id = actor.UserId, pos = actor == carrier and C or pos, vel = flat(CharacterMotion.GetVelocity(model) or Vector3.zero), carrier = actor == carrier, marked = actor ~= carrier and Mark.mateNear(pos, CFG.BlockCoverRadius or 8) ~= nil, name = actorName(actor) }
+				foes[#foes + 1] = { id = actor.UserId, pos = actor == carrier and C or pos, vel = flat(CharacterMotion.GetVelocity(model) or Vector3.zero), carrier = actor == carrier, marked = actor ~= carrier and Mark.mateNear(pos, CFG.BlockCoverRadius or 8, true) ~= nil, name = actorName(actor) }
 			end
 		end
 	end
@@ -17911,10 +17961,12 @@ Mark.mateDown = function(actor, model)
 end
 
 -- A field teammate (not the keeper, not stunned / ragdolled / frozen) within `radius` of `pos`, or nil.
-Mark.mateNear = function(pos, radius)
+Mark.mateNear = function(pos, radius, anyState)
+	-- anyState: AutoBlock's cover reads count a team mate who is ragdolled / stunned / frozen too (he is still the man standing there;
+	-- the state flickers and the roles flipped with it). Everything else (a competitor for the ball) still needs him on his feet.
 	for _, model in Mark.models() do
 		local actor = Actors.GetFromCharacter(model)
-		if actor and actor ~= LocalPlayer and sameTeam(actor) and not isGoalkeeper(actor) and not Mark.mateDown(actor, model) then
+		if actor and actor ~= LocalPlayer and sameTeam(actor) and not isGoalkeeper(actor) and (anyState or not Mark.mateDown(actor, model)) then
 			local ar = ActorTargeting.GetActorRoot(actor)
 			if ar and flat(ar.Position - pos).Magnitude <= radius then
 				return actor
