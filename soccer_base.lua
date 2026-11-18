@@ -153,7 +153,7 @@ local CFG = {
 	AutoBall = true,
 	TackleGoalZone = 40,
 	CompetitorGoalZone = 45, -- we or the ball this close to EITHER goal -> every Competitor Check is off (0 = never off by zone)
-	DrawBox = true, -- AutoBox: rings on the boxes, the plan colour, the race labels
+	DrawBox = true, -- AutoBox: the race to the box as threads on the floor
 	AutoBox = false, -- AutoBox: run for an item box when nothing else needs the body (stun a rival who beats us to it)
 	BoxMaxDist = 45, -- AutoBox: no box farther than this
 	BoxMargin = 0.3, -- AutoBox: a rival closing on the box within this of our arrival is a race (s)
@@ -12404,16 +12404,27 @@ RunService.PreSimulation:Connect(function(dt)
 	Mark.moveHackTick(dt)
 end)
 
--- The server answers a position it does not accept with MovementCorrection (a lerp when within 15 studs, else a snap):
--- the only measurement of what it tolerates. Logged while Speed is on.
+-- The server answers a position it does not accept with MovementCorrection (CharacterReplication: a lerp over <= 0.15 s when
+-- within 15 studs, else a snap): this IS the "flag" / desync - the position the others see is the server's, ours ran ahead.
+-- Two jobs: (1) the agent sprints again only after Mark.flagGuard seconds (the game checks a sprint on an empty bar);
+-- (2) one log line per correction with what we were doing, which is the measurement of what the server refuses.
 Remotes.Get("Characters", "MovementCorrection").OnClientEvent:Connect(function(char, cf)
-	if CFG.Speed and char == LocalPlayer.Character and typeof(cf) == "CFrame" and os.clock() - (Mark.spdCorrAt or 0) > 0.25 then
-		local root = char:FindFirstChild("HumanoidRootPart")
-		if root then
-			Mark.spdCorrAt = os.clock()
-			Mark.spdCorr = (Mark.spdCorr or 0) + 1
-			logFile("speed corrected", "n", tostring(Mark.spdCorr), "off", string.format("%.1f", (root.Position - cf.Position).Magnitude), "mode", tostring(CFG.SpeedMode), "value", tostring(CFG.SpeedValue))
-		end
+	if char ~= LocalPlayer.Character or typeof(cf) ~= "CFrame" then
+		return
+	end
+	local root = char:FindFirstChild("HumanoidRootPart")
+	if not root then
+		return
+	end
+	local now = os.clock()
+	if Mark.agentSprinting and now >= (Mark.sprintFlagUntil or 0) then
+		Mark.sprintFlagUntil = now + Mark.flagGuard
+		Mark.agentHold(false)
+	end
+	if now - (Mark.spdCorrAt or 0) > 0.25 then
+		Mark.spdCorrAt = now
+		Mark.spdCorr = (Mark.spdCorr or 0) + 1
+		logFile("server correction", "n", tostring(Mark.spdCorr), "off", string.format("%.1f", (root.Position - cf.Position).Magnitude), "mode", tostring(Mark.move.mode), "agent sprint", tostring(Mark.agentSprinting), "stamina", Mark.sprint and string.format("%.2f", Mark.sprint.GetStamina() or -1) or "-", "speed hack", tostring(CFG.Speed), "no sprint for", Mark.flagGuard, "s")
 	end
 end)
 
@@ -13070,7 +13081,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- Illegal Soccer dump " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v187")
+	add("-- Illegal Soccer dump " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v188")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -20383,8 +20394,9 @@ Mark.boxScan = function(character, root, hum)
 		return N
 	end
 	N.P, N.bd = N.part.Position, bd
+	N.R = math.max(N.part.Size.X, N.part.Size.Z) * 0.5 -- the Hitbox the server touches against
 	local speed = math.max(hum.WalkSpeed, 16)
-	N.myEta = bd / speed
+	N.myV, N.myEta = speed, bd / speed
 	local ping = math.clamp(LocalPlayer:GetNetworkPing() or 0.07, 0.02, 0.25)
 	local mates = {}
 	for _, pl in Players:GetPlayers() do
@@ -20401,7 +20413,7 @@ Mark.boxScan = function(character, root, hum)
 					mates[#mates + 1] = eta
 				else
 					local closing = d < 10 or (v.Magnitude > 4 and to.Unit:Dot(v.Unit) > 0.5)
-					local rec = { eta = eta, closing = closing, pl = pl, root = hr, pos = hr.Position, v = v }
+					local rec = { eta = eta, closing = closing, pl = pl, root = hr, pos = hr.Position, v = v, speed = math.max(hh.WalkSpeed, 16) }
 					rec.reach = closing and flat(hr.Position - O).Magnitude <= math.min(CFG.TackleReach or 18, 14)
 					N.rivals[#N.rivals + 1] = rec
 				end
@@ -20456,14 +20468,20 @@ Mark.boxStep = function(character, root)
 		Mark.boxEnd("no box")
 		return
 	end
-	local lb, _, rb = goalMouthCorners(ourGoalPart())
+	-- practice maps have no goal part: nothing to keep the ball away from there
+	local goal = ourGoalPart()
+	local lb, _, rb
+	if goal then
+		lb, _, rb = goalMouthCorners(goal)
+	end
 	local ballP = Renderer.GetPosition()
 	if lb and rb and typeof(ballP) == "Vector3" and flat(ballP - (lb + rb) * 0.5).Magnitude < (CFG.BoxBallSafe or 45) then
 		Mark.boxEnd("ball near our goal")
 		return
 	end
+	Mark.boxVis = os.clock() -- the plan is live: the overlay shows it
 	if N.plan == "skip" then
-		Mark.boxEnd("skip " .. tostring(N.who))
+		Mark.boxEnd("skip " .. tostring(N.who == "mate" and "mate" or "rival"))
 		return
 	end
 	local O = root.Position
@@ -20505,58 +20523,147 @@ Mark.boxStep = function(character, root)
 	Mark.moveSteer(dir, "box")
 end
 
--- what AutoBox is doing, in the world: a ring on every live box, the target in the colour of the plan, our line to it, the
--- lines of the rivals that race us, and one label with the two arrival times
+-- AUTOBOX OVERLAY, a photo finish. No text: who wins the box is geometry. Every racer is a thread laid on the floor from his feet to
+-- the box (ink bed under a thin colour line, as the route line). The racer who gets there FIRST carries chevrons running to the
+-- box; every other racer has a bar across his thread at the spot he will have reached when the winner touches, and a dashed
+-- gap from that bar to the box - the length of the dashes is what he loses by. Colours are the roles of the other overlays:
+-- mint = ours (Mark.defPalette), red / amber = an enemy action (Mark.kickPalette). The box is the squircle footprint of its
+-- Hitbox; the plan is the footprint's state:
+--   go    mint footprint + mint ripple rings born at the box (we take it)
+--   skip  amber footprint, still (a rival wins it, we do not run) / steel footprint (a mate is nearer)
+--   stun  amber footprint + red ripple on the rival we slide into
+-- Other boxes in range are four corner ticks. v = { gy, me, myV, myEta, P, R, plan, who, rivals = { { pos, speed, eta, closing } },
+-- others, stunAt }. One renderer for the live overlay and the gallery station.
+Mark.boxArt = function(seg, v, t)
+	local gy, INK = v.gy, COL.Ink
+	local P = Vector3.new(v.P.X, gy + 0.08, v.P.Z)
+	local mint, steel = Mark.defPalette.armed[1], Mark.defPalette.safe[1]
+	local red, amber = Mark.kickPalette.live[1], Mark.kickPalette.armed[1]
+	local function floor(p)
+		return Vector3.new(p.X, gy + 0.08, p.Z)
+	end
+	local function thread(from, col, alpha, thick)
+		seg(from, P, INK, alpha * 0.5, thick + 2, 39)
+		seg(from, P, col, alpha, thick, 41)
+	end
+	-- the bar at the point this racer has reached when the winner arrives (T s), and the dashed gap to the box
+	local function lag(from, speed, T, col)
+		local to = P - from
+		local d = to.Magnitude
+		if d < 1 then
+			return
+		end
+		local dir = to / d
+		local run = math.min(speed * T, d)
+		local m = from + dir * run
+		local side = Vector3.new(-dir.Z, 0, dir.X) * 1.7
+		seg(m - side, m + side, INK, 0.8, 4.2, 39)
+		seg(m - side, m + side, col, 1, 2.2, 42)
+		local gap = d - run
+		local n = math.min(6, math.floor(gap / 1.6))
+		for k = 0, n - 1 do
+			seg(m + dir * (gap * k / n + 0.5), m + dir * (gap * (k + 0.55) / n), col, 0.6, 1.3, 41)
+		end
+	end
+	-- chevrons running to the box: three on the thread, phase accumulated (never read off the clock)
+	local function lead(from, col, key)
+		local to = P - from
+		local d = to.Magnitude
+		if d < 4 then
+			return
+		end
+		local dir = to / d
+		local side = Vector3.new(-dir.Z, 0, dir.X)
+		local ph = Mark.rippleStep(key, 0.9)
+		for k = 0, 2 do
+			local u = (ph + k / 3) % 1
+			local c = from + dir * (d * u)
+			local a = math.sin(u * math.pi) ^ 0.7
+			seg(c - dir * 1.1 + side * 1.0, c, col, a, 1.8, 42)
+			seg(c - dir * 1.1 - side * 1.0, c, col, a, 1.8, 42)
+		end
+	end
+	local function footprint(col, alpha, thick)
+		local prev = nil
+		for s = 0, 20 do
+			local a = s / 20 * math.pi * 2
+			local c, sn = math.cos(a), math.sin(a)
+			local p = P + Vector3.new((c >= 0 and 1 or -1) * math.sqrt(math.abs(c)), 0, (sn >= 0 and 1 or -1) * math.sqrt(math.abs(sn))) * v.R
+			if prev then
+				seg(prev, p, INK, alpha * 0.5, thick + 2, 39)
+				seg(prev, p, col, alpha, thick, 42)
+			end
+			prev = p
+		end
+	end
+	for _, q in v.others do
+		local c = floor(q)
+		for k = 0, 3 do
+			local a = k * math.pi / 2 + math.pi / 4
+			local u, w = Vector3.new(math.cos(a), 0, math.sin(a)), Vector3.new(-math.sin(a), 0, math.cos(a))
+			local at = c + u * 2.2
+			seg(at + w * 0.9, at, COL.Chalk, 0.4, 1, 40)
+			seg(at - w * 0.9, at, COL.Chalk, 0.4, 1, 40)
+		end
+	end
+	local me = floor(v.me)
+	local winner, T = "me", v.myEta
+	for _, r in v.rivals do
+		if r.closing and r.eta < T then
+			winner, T = r, r.eta
+		end
+	end
+	if v.plan == "go" then
+		footprint(mint, 0.95, 1.6)
+		Mark.kickRipple(seg, P, v.R * 2.2, Mark.defPalette.armed, Mark.rippleStep("box-go", Mark.rippleRates.armed), t, 4)
+	elseif v.plan == "stun" then
+		footprint(amber, 0.9, 1.6)
+	elseif v.who == "mate" then
+		footprint(steel, 0.8, 1.4)
+		return
+	else
+		footprint(amber, 0.9, 1.6)
+	end
+	thread(me, winner == "me" and mint or steel, winner == "me" and 0.55 or 0.3, 1.2)
+	if winner == "me" then
+		lead(me, mint, "box-me")
+	else
+		lag(me, v.myV, T, steel)
+	end
+	for _, r in v.rivals do
+		if r.closing then
+			local from = floor(r.pos)
+			thread(from, red, r == winner and 0.6 or 0.35, 1.2)
+			if r == winner then
+				lead(from, red, "box-foe")
+			else
+				lag(from, r.speed, T, red)
+			end
+		end
+	end
+	if v.plan == "stun" and v.stunAt then
+		Mark.kickRipple(seg, floor(v.stunAt), 2.8, Mark.kickPalette.live, Mark.rippleStep("box-stun", Mark.rippleRates.live), t, 4)
+	end
+end
+
 Mark.drawBox = function(root)
-	Mark.boxLines = Mark.boxLines or makeLines(120, 1.4, 40)
+	Mark.boxLines = Mark.boxLines or makeLines(220, 1.4, 40)
 	Mark.boxPool = Mark.boxPool or Mark.segPool(Mark.boxLines)
-	Mark.boxText = Mark.boxText or newDraw("Text", 41)
-	local pool, tx = Mark.boxPool, Mark.boxText
-	tx.Visible = false
+	local pool = Mark.boxPool
 	local N = Mark.boxNow
-	if CFG.Draw and CFG.AutoBox and CFG.DrawBox ~= false and N and N.part and os.clock() - N.at < 0.5 and Workspace.CurrentCamera then
-		local function ring(c, R, col, th)
-			local prev = nil
-			for k = 0, 16 do
-				local a = k / 16 * math.pi * 2
-				local p = Vector3.new(c.X + math.cos(a) * R, c.Y, c.Z + math.sin(a) * R)
-				if prev then
-					pool.seg(prev, p, col, 0.9, th, 40)
-				end
-				prev = p
-			end
-		end
-		for _, p in N.others do
-			ring(p, 2, Color3.fromRGB(150, 160, 175), 1)
-		end
-		local col, word = Color3.fromRGB(90, 255, 150), "GO"
+	if CFG.Draw and CFG.AutoBox and CFG.DrawBox ~= false and N and N.part and os.clock() - (Mark.boxVis or -1) < 0.3 and Workspace.CurrentCamera then
+		local stunAt = nil
 		if N.plan == "stun" then
-			col, word = Color3.fromRGB(255, 80, 80), "STUN"
-		elseif N.plan == "skip" then
-			col, word = Color3.fromRGB(255, 170, 60), "SKIP " .. tostring(N.who == "mate" and "mate nearer" or "rival wins")
-		elseif not Mark.boxRun then
-			col, word = Color3.fromRGB(150, 190, 255), "IDLE " .. tostring(Mark.boxWhy or "")
+			stunAt = N.who.root.Position + N.who.v * (0.25 + N.ping * 0.5)
 		end
-		ring(N.P, 4, col, 2)
-		ring(N.P, 1.5, col, 1.4)
-		if Mark.boxRun or N.plan == "stun" then
-			pool.seg(root.Position, N.P, col, 0.9, 1.6, 40)
+		local others = {}
+		for i = 1, math.min(#N.others, 4) do
+			others[i] = N.others[i]
 		end
-		local best = nil
-		for _, r in N.rivals do
-			if r.closing then
-				pool.seg(r.pos, N.P, Color3.fromRGB(255, 90, 90), 0.7, 1.2, 40)
-				best = (not best or r.eta < best.eta) and r or best
-			end
-		end
-		local sp = Workspace.CurrentCamera:WorldToViewportPoint(N.P + Vector3.new(0, 5, 0))
-		if sp.Z > 0 then
-			tx.Center, tx.Outline, tx.OutlineColor, tx.Size, tx.Font = true, true, COL.Ink, 14, FONT
-			tx.Color = col
-			tx.Position = Vector2.new(sp.X, sp.Y)
-			tx.Text = string.format("BOX %s  you %.1fs  him %s", word, N.myEta, best and string.format("%.1fs", best.eta) or "-")
-			tx.Visible = true
-		end
+		Mark.boxArt(pool.seg, {
+			gy = root.Position.Y - 2.9, me = root.Position, myV = N.myV, myEta = N.myEta, P = N.P, R = N.R,
+			plan = N.plan, who = N.who, rivals = N.rivals, others = others, stunAt = stunAt,
+		}, os.clock())
 	end
 	pool.finish()
 end
@@ -21499,22 +21606,6 @@ Mark.agentHold = function(on, why)
 	end
 end
 
--- SERVER FLAG. The game has an anti-cheat that puts us back where we were when we run on an empty (server) stamina bar,
--- and the agent sprints for ever. A flag shows as the root jumping AGAINST our own motion in one frame, farther than a body
--- can legally cover (dash bursts included). Pure: prev position / velocity, dt, the new position.
-Mark.flagJump = function(prevPos, prevVel, dt, pos)
-	if dt <= 0 or dt > 0.25 then
-		return false
-	end
-	local dp = flat(pos - prevPos)
-	local len = dp.Magnitude
-	if len <= 70 * dt * 2 + 5 then
-		return false
-	end
-	local pv = flat(prevVel)
-	return pv.Magnitude > 8 and dp:Dot(pv.Unit) < -0.5 * len
-end
-
 -- HIT TRAIN. Items we do not model (a gun that fires every 1.5 s, a repeating slam) hit us again and again and the log showed 8
 -- knock-backs in 12 s from one man while the script did nothing. Every STRONG knock-back (>= 40: slides are 24-26) is noted per
 -- attacker; the second one inside 8 s starts an evade: 3 s of running away from him (a lateral weave, alternating each 0.6 s) and,
@@ -21584,21 +21675,8 @@ Mark.evadeTick = function(character, root)
 	end
 end
 
--- the guard time after a flag (user: 4 s) with no sprint
+-- the pause after the server put us back (user: 4 s): see the MovementCorrection hook in the Movement section
 Mark.flagGuard = 4
-Mark.flagWatch = function(root)
-	local now = os.clock()
-	local last = Mark.flagLast
-	Mark.flagLast = { pos = root.Position, vel = root.AssemblyLinearVelocity, t = now }
-	if not last or Ragdoll.IsActorRagdolled(LocalPlayer) then
-		return
-	end
-	if Mark.flagJump(last.pos, last.vel, now - last.t, root.Position) then
-		Mark.sprintFlagUntil = now + Mark.flagGuard
-		logFile("sprint flag", "put back", string.format("%.1f", flat(root.Position - last.pos).Magnitude), "st", "no sprint for", Mark.flagGuard, "s", "mode", tostring(Mark.move.mode))
-		Mark.agentHold(false)
-	end
-end
 
 -- Oil Spill (ItemIds.OilSpill). Server streams patches as {Id, Position, TeamName, ExpiresAt} (OilSpill.PatchFields)
 -- on Items/OilPatches (gen, patches) and Items/Effect (Kind OilPatchesCheckpoint/Snapshot/Remove/Clear). HazardZoneKind
@@ -23581,7 +23659,6 @@ Mark.tickHazard = function(character, root)
 	Mark.stateWatch(character)
 	Mark.chargeWatch()
 	Mark.sprintWatch()
-	Mark.flagWatch(root)
 	local own = liveOwnerId() == LocalPlayer.UserId
 	Mark.slideAudit(root)
 	Mark.tickKickDodge(root, own)
@@ -25026,6 +25103,35 @@ Mark.galStations = {
 		local P = pts[#pts]
 		Mark.ribbonArt(seg, pts, Color3.fromRGB(90, 220, 255), os.clock(), Vector3.new(P.X, G.gy, P.Z))
 	end },
+	{ name = "AutoBox: photo finish", x = 90, art = function(seg, C, t, st, G)
+		local f, side = G.fw, G.right
+		local k = math.floor(t / 3.2) % 3
+		local u = (t % 3.2) / 3.2
+		local P = C + f * 8
+		local me = C - f * (16 - u * 8) - side * 4
+		local rv = { pos = C - f * (4 + 0) + side * 14 - f * u * 10, speed = 16, closing = true }
+		rv.eta = (P - rv.pos).Magnitude / 16
+		local v = { gy = G.gy, me = me, myV = 16, myEta = (P - me).Magnitude / 16, P = P, R = 3.5, others = { C - f * 20 + side * 18 }, rivals = { rv } }
+		if k == 0 then
+			rv.pos = C - f * (14 - u * 3) + side * 20 -- far behind: we go
+			rv.eta = (P - rv.pos).Magnitude / 16
+			v.plan = "go"
+		elseif k == 1 then
+			rv.pos = C + f * (1 - u * 3) + side * 8 -- nearer than us: skip
+			rv.eta = (P - rv.pos).Magnitude / 16
+			v.plan = "skip"
+			v.who = "rival"
+		else
+			rv.pos = C + f * 0 + side * 4 + side * 0 -- inside slide reach: stun
+			rv.eta = (P - rv.pos).Magnitude / 16
+			v.plan = "stun"
+			v.who = rv
+			v.stunAt = rv.pos + f * 2
+			v.me = C - f * 6 - side * 4
+			v.myEta = (P - v.me).Magnitude / 16
+		end
+		Mark.boxArt(seg, v, os.clock())
+	end },
 	{ name = "Projectile: fuse rail", x = 50, art = function(seg, C, t, st, G)
 		local A = C + G.fw * 40 + G.right * 8 + Vector3.new(0, 4, 0)
 		local u = (t % 1.4) / 1.1
@@ -25121,7 +25227,7 @@ Mark.paInstall()
 dbg("boot", "drawing.new", true, "reach", CFG.TackleReach, "track", CFG.TrackStuds, "dribble", "slide-predict", "speed", CFG.TackleSpeed, "dump", "H", "corner", CFG.PreferCornerCurl, "trick", CFG.OnlyTrick)
 
 -- perf probe wrappers: installed last, after every Mark.* function exists
-Mark.perfNames = { "tickGk", "tickSkill", "tickHazard", "tickVolley", "tickBlock", "tickBall", "tickBike", "tickAerial", "tickKickDodge", "moveTick", "drawRoute", "drawOil", "drawKickBox", "kickThreat", "saDraw", "homeSlide", "ballPath", "gkOwnDive", "gkDiveSearch", "airSolve", "tickAir", "drawFlight", "drawShadow", "drawScar", "dodgeSteer", "silentArt", "trajArt", "posArt", "sightArt", "passTick", "paDraw" }
+Mark.perfNames = { "tickGk", "tickSkill", "tickHazard", "tickVolley", "tickBlock", "tickBall", "tickBike", "tickAerial", "tickKickDodge", "moveTick", "drawRoute", "drawOil", "drawKickBox", "kickThreat", "saDraw", "homeSlide", "ballPath", "gkOwnDive", "gkDiveSearch", "airSolve", "tickAir", "drawFlight", "drawShadow", "drawScar", "dodgeSteer", "silentArt", "trajArt", "posArt", "sightArt", "passTick", "paDraw", "shieldTick", "gunTick", "gunPushTick", "stateWatch", "chargeWatch", "sprintWatch", "slideAudit", "slideTrackTick", "teleTick", "evadeTick", "tickBox", "drawBox" }
 Mark.perfSet(CFG.Perf)
 
 -- ============================================================================================================
@@ -25933,7 +26039,7 @@ return function(_Lib, _Core)
 			head(bx, "AutoBox")
 			feature(bx, "AutoBox", "AutoBox")
 			note(bx, "Runs for item boxes, stuns a rival who wins the race.")
-			tog(bx, "Show Plan", "DrawBox", "Rings on boxes, green go / red stun / orange skip.")
+			tog(bx, "Show Race", "DrawBox", "Threads to the box, who gets there first.")
 			sld(bx, "Box Distance", "BoxMaxDist", 10, 100, { suffix = " st", text = "No box farther than this." })
 
 			local j = card(tab, "Right")
