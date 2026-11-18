@@ -6101,7 +6101,6 @@ local function stepLogic()
 		-- items / hazards are not field-player only: a keeper can hold a shotgun (SilentAim, AutoWall) and stand in oil
 		Mark.tickSkill(character, root)
 		Mark.tickHazard(character, root)
-		Mark.drawOil(root)
 		return
 	end
 	Mark.homeSlide(root)
@@ -6465,7 +6464,6 @@ else
 	Mark.moveTick(character, root)
 	Mark.tickSkill(character, root)
 	Mark.tickHazard(character, root)
-	Mark.drawOil(root)
 	Mark.tickVolley(character, root)
 	Mark.tickBlock(character, root)
 	Mark.tickBall(character, root)
@@ -6524,6 +6522,7 @@ end
 local function paintWorld()
 	if not CFG.Draw then
 		hideWorld()
+		Mark.drawOil(nil)
 		return
 	end
 	Camera = Workspace.CurrentCamera
@@ -6531,6 +6530,7 @@ local function paintWorld()
 	local root = character and ActorTargeting.GetActorRoot(LocalPlayer)
 	if not root then
 		hideWorld()
+		Mark.drawOil(nil)
 		return
 	end
 	local gy = root.Position.Y - 3.15
@@ -6734,6 +6734,7 @@ local function paintWorld()
 	Mark.drawGk(gy)
 	Mark.drawBlk(gy)
 	Mark.drawDuel(gy)
+	Mark.drawOil(root)
 	Mark.artFinish()
 end
 
@@ -13465,7 +13466,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- Illegal Soccer dump " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v200")
+	add("-- Illegal Soccer dump " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v201")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -14839,7 +14840,7 @@ Mark.foeIsolated = function(carrier, P, g)
 	local mouth = (lb and rb) and (lb + rb) * 0.5 or g.Position
 	local dC = flat(P - mouth).Magnitude
 	local slack = CFG.BlockLevelSlack or 8
-	local outlets, names = 0, nil
+	local outlets = 0
 	for _, model in Mark.models() do
 		local actor = Actors.GetFromCharacter(model)
 		if actor and actor ~= LocalPlayer and actor ~= carrier and not sameTeam(actor) and not isGoalkeeper(actor) and not Mark.mateDown(actor, model) then
@@ -14848,38 +14849,32 @@ Mark.foeIsolated = function(carrier, P, g)
 				local pos = CharacterMotion.GetPosition(model) or r.Position
 				if flat(pos - mouth).Magnitude <= dC + slack and flat(pos - P).Magnitude <= (CFG.BlockPassMax or 130) and not Mark.mateNear(pos, CFG.BlockCoverRadius or 8, true) then
 					outlets += 1
-					names = (names and names .. "," or "") .. actorName(actor)
 				end
 			end
 		end
 	end
-	return outlets == 0, outlets, names, dC
+	return outlets == 0, outlets
 end
 
 
 
 -- Agent route as a curve: cubic Hermite from our position (leaving along our own velocity) to the spot (arriving along
 -- his run). 6 points. Short or standing: the straight pair.
-Mark.blockCurve = function(from, to, vUs, vHim)
+-- The Hermite curve from `from` (leaving along our own velocity) to `to` (arriving along his run), sampled where the command looks
+-- a few studs ahead (s = 0.4, the third of its six points). Called only farther than 5 studs out (nearer is the straight line). It
+-- used to build all six points as a table for every call of the steering law - 11 times a tick (the command + 10 route steps).
+Mark.blockAim = function(from, to, vUs, vHim)
 	local d = flat(to - from)
 	local L = d.Magnitude
-	if L < 3 then
-		return { from, to }
-	end
 	local chord = d / L
 	local u0 = vUs.Magnitude > 4 and vUs.Unit or chord
 	local u1 = vHim.Magnitude > 3 and vHim.Unit or chord
 	local m0, m1 = u0 * (L * 0.5), u1 * (L * 0.4)
-	local out = table.create(6)
-	for i = 0, 5 do
-		local s = i / 5
-		local s2, s3 = s * s, s * s * s
-		local h00, h10, h01, h11 = 2 * s3 - 3 * s2 + 1, s3 - 2 * s2 + s, -2 * s3 + 3 * s2, s3 - s2
-		local p = from * h00 + m0 * h10 + to * h01 + m1 * h11
-		out[i + 1] = Vector3.new(p.X, from.Y, p.Z)
-	end
-	out[1], out[6] = from, to
-	return out
+	local s = 2 / 5
+	local s2, s3 = s * s, s * s * s
+	local h00, h10, h01, h11 = 2 * s3 - 3 * s2 + 1, s3 - 2 * s2 + s, -2 * s3 + 3 * s2, s3 - s2
+	local p = from * h00 + m0 * h10 + to * h01 + m1 * h11
+	return Vector3.new(p.X, from.Y, p.Z)
 end
 
 -- ARRIVAL. The routes braked in proportion to the distance left: speed = 3.5 * gap (the polar orbit), d / 3 of the stick (the
@@ -14899,7 +14894,7 @@ Mark.arriveScale = function(gap, spd)
 end
 
 -- AGENT STEER (AutoBlock shadow / mark / cut-off, the air duel). The agent's way to a spot near a moving man is not a ruler:
---   far from him (> 20 st): a Hermite curve that leaves along our momentum and arrives along his run (Mark.blockCurve);
+--   far from him (> 20 st): a Hermite curve that leaves along our momentum and arrives along his run (Mark.blockAim);
 --     the command follows the curve a few studs ahead;
 --   near him: POLAR control around him - the angle round him and the distance to him are steered separately (gain
 --     3.5 /s each), so the body ORBITS him toward the spot (a spiral in, a tank-track turn) instead of cutting through
@@ -14909,47 +14904,49 @@ end
 --   the heading from snapping when his velocity jumps.
 -- Returns cmd (|cmd| <= 1, zero under the move-hook threshold) and the route: the same law integrated 1 s ahead (the
 -- agent line shows where the body will actually go).
+-- the steering law (see below): the velocity we want at `us`, heading for `target`, orbiting `center` when there is one
+Mark.steerLaw = function(o, spd, us, vUs, center, target)
+	local off = flat(target - us)
+	local straight
+	local d = off.Magnitude
+	if d < 0.05 then
+		straight = Vector3.zero
+	else
+		local aim = off
+		if d > 5 then
+			aim = flat(Mark.blockAim(us, target, vUs, o.vC or Vector3.zero) - us)
+		end
+		straight = (unitOrNil(aim) or Vector3.zero) * Mark.arriveSpeed(d, spd)
+	end
+	if not center then
+		return straight
+	end
+	local rel = flat(us - center)
+	local r = rel.Magnitude
+	local relT = flat(target - center)
+	local rT = relT.Magnitude
+	if r < 0.5 or rT < 0.5 then
+		return straight
+	end
+	local er = rel / r
+	local et = Vector3.new(-er.Z, 0, er.X)
+	local uT = relT / rT
+	local dA = math.atan2(er.X * uT.Z - er.Z * uT.X, er:Dot(uT))
+	local vt = Mark.arriveSpeed(dA * r, spd)
+	local vr = Mark.arriveSpeed(rT - r, spd)
+	local minR = o.minR or 4
+	if r < minR and math.abs(dA) > 0.5 then
+		vr = math.max(vr, (minR - r) * 4)
+	end
+	local polar = er * vr + et * vt
+	local w = math.clamp((r - 10) / 10, 0, 1)
+	return polar * (1 - w) + straight * w
+end
+
 Mark.agentSteer = function(o)
 	local spd = math.max(o.spd or 16, 8)
-	local function law(us, vUs, center, target)
-		local off = flat(target - us)
-		local straight
-		do
-			local d = off.Magnitude
-			if d < 0.05 then
-				straight = Vector3.zero
-			else
-				local route = Mark.blockCurve(us, target, vUs, o.vC or Vector3.zero)
-				local aim = route[3] and d > 5 and flat(route[3] - us) or off
-				straight = (unitOrNil(aim) or Vector3.zero) * Mark.arriveSpeed(d, spd)
-			end
-		end
-		if not center then
-			return straight
-		end
-		local rel = flat(us - center)
-		local r = rel.Magnitude
-		local relT = flat(target - center)
-		local rT = relT.Magnitude
-		if r < 0.5 or rT < 0.5 then
-			return straight
-		end
-		local er = rel / r
-		local et = Vector3.new(-er.Z, 0, er.X)
-		local uT = relT / rT
-		local dA = math.atan2(er.X * uT.Z - er.Z * uT.X, er:Dot(uT))
-		local vt = Mark.arriveSpeed(dA * r, spd)
-		local vr = Mark.arriveSpeed(rT - r, spd)
-		local minR = o.minR or 4
-		if r < minR and math.abs(dA) > 0.5 then
-			vr = math.max(vr, (minR - r) * 4)
-		end
-		local polar = er * vr + et * vt
-		local w = math.clamp((r - 10) / 10, 0, 1)
-		return polar * (1 - w) + straight * w
-	end
 	local ff = o.ff or o.vC or Vector3.zero
-	local v = law(o.us, o.vUs, o.center, o.target) + ff
+	local v = Mark.steerLaw(o, spd, o.us, o.vUs, o.center, o.target) + ff
 	local cmd = v / spd
 	if cmd.Magnitude > 1 then
 		cmd = cmd.Unit
@@ -14957,9 +14954,14 @@ Mark.agentSteer = function(o)
 	if cmd.Magnitude < 0.2 and flat(o.target - o.us).Magnitude < 0.8 then
 		cmd = Vector3.zero
 	end
-	Mark.steerPrev = Mark.steerPrev or {}
+	local steerPrev = Mark.steerPrev
+	if not steerPrev then
+		steerPrev = {}
+		Mark.steerPrev = steerPrev
+	end
 	local now = os.clock()
-	local pc = Mark.steerPrev[o.key or "x"]
+	local key = o.key or "x"
+	local pc = steerPrev[key]
 	if pc and now - pc.t < 0.25 and cmd.Magnitude > 0.2 and pc.v.Magnitude > 0.2 then
 		local k = 1 - math.exp(-(now - pc.t) / 0.06)
 		local mixed = pc.v + (cmd - pc.v) * k
@@ -14967,14 +14969,22 @@ Mark.agentSteer = function(o)
 			cmd = mixed.Magnitude > 1 and mixed.Unit or mixed
 		end
 	end
-	Mark.steerPrev[o.key or "x"] = { t = now, v = cmd }
+	if pc then
+		pc.t, pc.v = now, cmd
+	else
+		steerPrev[key] = { t = now, v = cmd }
+	end
+	-- the block's route is only the drawn agent line (moveTick replays the command in "block" mode): not integrated when nothing draws it
+	if o.key == "block" and not (CFG.Draw and CFG.DrawRoute ~= false) then
+		return cmd, nil
+	end
 	-- route: integrate the same law (him moving with vC, the target with him), 10 x 0.1 s
 	local pts = { o.us }
 	local p, vel = o.us, o.vUs or Vector3.zero
 	local c, tg = o.center, o.target
 	local vC = o.vC or Vector3.zero
 	for _ = 1, 10 do
-		local want = law(p, vel, c, tg) + ff
+		local want = Mark.steerLaw(o, spd, p, vel, c, tg) + ff
 		if want.Magnitude > spd then
 			want = want.Unit * spd
 		end
@@ -15656,8 +15666,16 @@ Mark.blockRoleTick = function(character, root, carrier, cr, chE, P, V, g, flight
 		end
 	end
 	-- tight press: nobody he can pass to, or an open shot past our keeper near goal
-	local iso = CFG.BlockPressIso ~= false and Mark.foeIsolated(carrier, P, g)
-	local so = CFG.BlockDanger ~= false and Mark.shotOpen(C, g, carrier.UserId) or nil
+	-- the two reads walk every player / 17 rays across the mouth: held 50 ms per carrier (he moves 1.4 studs in that time)
+	local br = Mark.blockRead
+	if not (br and br.id == carrier.UserId and now - br.at < 0.05) then
+		br = br or {}
+		br.id, br.at = carrier.UserId, now
+		br.iso = CFG.BlockPressIso ~= false and Mark.foeIsolated(carrier, P, g)
+		br.so = CFG.BlockDanger ~= false and Mark.shotOpen(C, g, carrier.UserId) or nil
+		Mark.blockRead = br
+	end
+	local iso, so = br.iso, br.so
 	local openShot = so ~= nil and so.dist <= (CFG.BlockGoalRange or 70) and so.open >= (CFG.BlockOpenAngle or 5) and CFG.BlockPressOpen ~= false
 	local gap = math.max(CFG.BlockGapMin or 2.2, Mark.kickReach() - 1 - (CFG.BlockCloser or 1.0))
 	local bis, cover = nil, nil
@@ -22769,24 +22787,31 @@ Mark.oilDir = function(root, dir, mode)
 end
 
 -- Debug rings: every live enemy patch within 60 studs, radius = the model radius, so the zone can be checked in game.
+-- the puddle ring: 8 chords, the unit circle built once
+Mark.oilCos, Mark.oilSin = {}, {}
+for k = 0, 8 do
+	Mark.oilCos[k], Mark.oilSin[k] = math.cos(k / 8 * math.pi * 2), math.sin(k / 8 * math.pi * 2)
+end
+Mark.oilCol = Color3.fromRGB(190, 120, 255)
+-- Painted from paintWorld (RenderStepped, PaintHz, the frame camera): it used to run in the logic step every frame, where the
+-- segment pool had no cached camera (3 property reads per chord) and the rings were redrawn at 2x the paint rate
+-- (perf log v200: 0.7 ms a call, 82 ms/s with puddles on the pitch). root = nil: nothing to draw, only hide.
 Mark.drawOil = function(root)
 	Mark.oilLines = Mark.oilLines or makeLines(160, 1.2, 22)
 	Mark.oilPool = Mark.oilPool or Mark.segPool(Mark.oilLines)
 	local pool = Mark.oilPool
-	if CFG.Draw and CFG.DrawHazards ~= false and next(Mark.oil) and Workspace.CurrentCamera then
+	if root and CFG.Draw and CFG.DrawHazards ~= false and next(Mark.oil) and Workspace.CurrentCamera then
 		local list = Mark.oilNear(root.Position, 60)
 		if list then
 			local R = Mark.oilRadius()
-			local col = Color3.fromRGB(190, 120, 255)
+			local cs, sn, col = Mark.oilCos, Mark.oilSin, Mark.oilCol
 			for n = 1, math.min(#list, 20) do
 				local c = list[n]
-				local prev = nil
-				for k = 0, 8 do
-					local a = k / 8 * math.pi * 2
-					local p = Vector3.new(c.X + math.cos(a) * R, c.Y + 0.1, c.Z + math.sin(a) * R)
-					if prev then
-						pool.seg(prev, p, col, 0.8, 1.2, 22)
-					end
+				local cx, cy, cz = c.X, c.Y + 0.1, c.Z
+				local prev = Vector3.new(cx + R, cy, cz)
+				for k = 1, 8 do
+					local p = Vector3.new(cx + cs[k] * R, cy, cz + sn[k] * R)
+					pool.seg(prev, p, col, 0.8, 1.2, 22)
 					prev = p
 				end
 			end
