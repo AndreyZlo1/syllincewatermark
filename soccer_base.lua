@@ -257,6 +257,7 @@ local CFG = {
 	RoleTakenR = 10, -- a teammate goal-side within this of the carrier is already pressing him
 	RoleDeepZone = 90, -- enemies within this of our mouth are the deep defender's threats
 	RoleCoverMax = 12, -- deepest median stand (studs in front of the carrier on the bisector of his lines to the posts)
+	RoleHold = 0.7, -- AutoBlock keeps a role this long before changing it (s)
 	RolePassLean = 0.5, -- the presser leans toward the open receiver by this share of the angle goal-line / pass-lane
 	RolePassMax = 55, -- ...at most this many degrees off the line to our goal
 	RoleMarkMin = 4, -- standing distance from the enemy we mark, on his line to the middle of our mouth
@@ -8840,6 +8841,12 @@ end
 
 -- teammates: the moment one charges a shot that goes in (or already charges when he gets the ball)
 Mark.gunPushTick = function(root)
+	-- 30 Hz: the roll window is 1 s wide and a mate's charge lasts 0.3 s+; at the frame rate it cost 7 ms of every second
+	local nowT = os.clock()
+	if nowT - (Mark.gunPushAt or 0) < 0.033 then
+		return
+	end
+	Mark.gunPushAt = nowT
 	Mark.gunPushRoll(root)
 	if not CFG.GunPush or CFG.GunPushMates == false or not Mark.charges then
 		return
@@ -11109,6 +11116,12 @@ Mark.gunSidestep = function(root, from, d)
 	return "step"
 end
 Mark.gunTick = function(root)
+	-- 30 Hz: it watches for a gun aimed at us over 0.15-0.4 s holds; a frame-rate call (110 Hz) cost 4 ms of every second
+	local nowT = os.clock()
+	if nowT - (Mark.gunTickAt or 0) < 0.033 then
+		return
+	end
+	Mark.gunTickAt = nowT
 	-- the wall / shield answer belongs to AutoWall; AutoDodge steps out of the line of fire when that answer is not there
 	local wallOn = CFG.AutoWall and CFG.GunWall ~= false
 	if not (wallOn or CFG.AutoDodge) or Mark.meKeeper() then
@@ -13132,7 +13145,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- Illegal Soccer dump " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v190")
+	add("-- Illegal Soccer dump " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v191")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -14976,13 +14989,36 @@ end
 -- added a flat penalty for "behind" - it sent a mate 40 studs behind the runner to press while the man standing in front of
 -- him marked a receiver (user: "he just runs to the goal and the script covers his teammate").
 Mark.pressTime = function(pos, spd, C, vel, off)
-	for k = 1, 60 do
-		local t = k * 0.1
-		if flat(C + vel * t + off - pos).Magnitude <= spd * t then
-			return t
+	-- |A + v t| = spd t with A = C + off - pos: a quadratic, solved - the first version scanned 60 steps per defender per frame
+	-- (tickBlock 0.13 -> 0.5 ms a tick: the FPS drop after v189)
+	local ax, az = C.X + off.X - pos.X, C.Z + off.Z - pos.Z
+	local c = ax * ax + az * az
+	if c < 1e-6 then
+		return 0
+	end
+	local vx, vz = vel.X, vel.Z
+	local a = vx * vx + vz * vz - spd * spd
+	local b = 2 * (ax * vx + az * vz)
+	local best = nil
+	if math.abs(a) < 1e-6 then
+		if b < 0 then
+			best = -c / b
+		end
+	else
+		local disc = b * b - 4 * a * c
+		if disc >= 0 then
+			local sq = math.sqrt(disc)
+			for _, t in { (-b - sq) / (2 * a), (-b + sq) / (2 * a) } do
+				if t > 0 and (not best or t < best) then
+					best = t
+				end
+			end
 		end
 	end
-	return 6 + flat(C + off - pos).Magnitude / spd
+	if best and best <= 6 then
+		return best
+	end
+	return 6 + math.sqrt(c) / spd
 end
 
 Mark.rolePlan = function(o)
@@ -15009,11 +15045,14 @@ Mark.rolePlan = function(o)
 		defs[#defs + 1] = { pos = m.pos, name = m.name, actor = m.actor }
 	end
 	local presser, costs = nil, {}
+	-- the carrier's run AT OUR GOAL only: his sideways drift and the sign noise of the replicated velocity flipped a defender
+	-- between "meets him" and "never catches him" from one tick to the next (log: my cost 3.4 / 7.7 / 3.4 on consecutive ticks)
+	local vRun = ug * math.max((o.vel or Vector3.zero):Dot(ug), 0)
 	for _, d in defs do
 		local engaged = flat(d.pos - C).Magnitude <= takenR + 2
 		-- a man within reach of the carrier is ON him, whichever side (a mate slightly behind him is chasing, not
 		-- absent: log - we ran at the carrier while his unmarked receivers stood nearer our goal)
-		local cost = Mark.pressTime(d.pos, spd, C, o.vel or Vector3.zero, pressSpot - C)
+		local cost = Mark.pressTime(d.pos, spd, C, vRun, pressSpot - C)
 		if engaged then
 			cost -= 0.9
 		end
@@ -15200,6 +15239,30 @@ Mark.sprintStand = function(on)
 	Mark.sprint.SetBlocked("AgentStand", on)
 end
 
+-- A role is kept RoleHold s: the answer must stay the same that long before the body changes its job. The log: 130 role changes,
+-- 111 of them under 3 s, press <-> deep every 0.1 s (a threat's "covered" flag or the cost margin flickers around its
+-- threshold, and the agent ran at the carrier, then back, then at the carrier). A new carrier or a stale state (> 0.6 s) takes
+-- the answer at once.
+Mark.roleSettle = function(cand, carrierId, now)
+	local h = Mark.roleHeld
+	if not h or h.carrier ~= carrierId or now - h.at > 0.6 then
+		Mark.roleHeld = { role = cand, carrier = carrierId, at = now }
+		return cand
+	end
+	h.at = now
+	if cand == h.role then
+		h.cand = nil
+		return h.role
+	end
+	if h.cand ~= cand then
+		h.cand, h.candAt = cand, now
+	end
+	if now - h.candAt >= (CFG.RoleHold or 0.7) then
+		h.role, h.cand = cand, nil
+	end
+	return h.role
+end
+
 Mark.blockRoleTick = function(character, root, carrier, cr, chE, P, V, g, flightT)
 	local lb, _, rb, _, _, nrm = goalMouthCorners(g)
 	local n = nrm and unitOrNil(flat(nrm))
@@ -15246,7 +15309,7 @@ Mark.blockRoleTick = function(character, root, carrier, cr, chE, P, V, g, flight
 		prev = Mark.roleLast, mates = mates, foes = foes, gap = gap, tight = iso or openShot, ping = ping,
 		face = unitOrNil(flat(Vc)) or (cr and unitOrNil(flat(cr.CFrame.LookVector))), vel = flat(Vc),
 	})
-	local role = plan.role
+	local role = Mark.roleSettle(plan.role, carrier.UserId, now)
 	local S = role == "press" and plan.pressSpot or plan.deepSpot
 	S = Vector3.new(S.X, root.Position.Y, S.Z)
 	-- FULL DEFENSIVE: the carrier and at least one more enemy near the mouth -> hold the goal (Mark.fullDef) instead of the roles
