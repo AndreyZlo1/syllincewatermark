@@ -257,6 +257,7 @@ local CFG = {
 	RoleTakenR = 10, -- a teammate goal-side within this of the carrier is already pressing him
 	RoleDeepZone = 90, -- enemies within this of our mouth are the deep defender's threats
 	RoleCoverMax = 12, -- deepest median stand (studs in front of the carrier on the bisector of his lines to the posts)
+	GunPushRecoil = 0.5, -- Keeper Push: spread of the flintlock's 3 shots at the target, studs (user: noise, not all 3 in one point)
 	ProjServerExtra = 0.04, -- guessed: extra server-side lead on projectile hits (user: "the server is more aggressive on projectiles")
 	RoleHold = 0.7, -- AutoBlock keeps a role this long before changing it (s)
 	RolePassLean = 0.5, -- the presser leans toward the open receiver by this share of the angle goal-line / pass-lane
@@ -6899,7 +6900,7 @@ Reticle.GetCameraRay = function(...)
 			-- from the camera: "we hit victim ... = NOT the keeper" twice; from the body (v190/191): "= THE KEEPER" twice.
 			local me = ActorTargeting.GetActorRoot(LocalPlayer)
 			local o = me and (me.Position + Vector3.new(0, 1.5, 0)) or cam.CFrame.Position
-			local dir = unitOrNil(P - o)
+			local dir = unitOrNil(Mark.recoilAim(pa, P, o, CFG.GunPushRecoil or 0.5, os.clock(), math.random) - o)
 			if dir then
 				return Ray.new(o, dir)
 			end
@@ -7626,6 +7627,11 @@ do
 			-- Keeper Push goes first: right after OUR release the shot lock (strikeRay: aerial / volley / bicycle) and the
 			-- direction spoof still answer this function - the gun went along the SHOT, at the goal, not at the keeper.
 			-- oldRay builds the payload from GetCameraRay, which returns the push ray.
+			-- a wall press (skillRay.wall, alive only inside our own ActivateEquipped) is never aimed by the push window: a wall
+			-- placed within 0.85 s after a push went along the push ray, at the keeper
+			if Mark.skillRay and Mark.skillRay.wall then
+				return Mark.skillRay
+			end
 			if Mark.pushAim and os.clock() < Mark.pushAim.untilT then
 				return oldRay(...)
 			end
@@ -8429,7 +8435,7 @@ Mark.itemNow = function(id, tag, aimFn)
 	end
 	Mark.itemNowAt[id] = now
 	if aimFn then
-		Mark.pushAim = { fn = aimFn, untilT = now + 0.85 }
+		Mark.pushAim = { fn = aimFn, untilT = now + 0.85, at = now, id = id }
 	end
 	if not inHand then
 		Mark.pressSlot(slot)
@@ -8520,6 +8526,29 @@ Mark.pushGun = function(d, haveShotgun, haveFlint)
 	return nil
 end
 Mark.gunKnock = { flintlock = { v = 25, shots = 3, gap = 0.25 }, shotgun = { v = 37, shots = 1, gap = 0 } }
+-- RECOIL NOISE (Keeper Push, the revolver = flintlock: 3 shots). Three shots into one pixel read as a script: each shot gets a small
+-- offset on the aim point - sideways at random, and a rise that grows with the shot (a gun climbs). One random draw per 0.125 s
+-- bucket since the push started (the shots are 0.25 s apart, so each lands in its own bucket; the same shot asked twice in a frame
+-- gets the same offset). r = the spread in studs at the target (CFG.GunPushRecoil, 0 = off); a single-shot gun is never touched.
+-- Worst case lateral r, rise 1.3 r: a keeper's body is ~4 studs wide, so r 0.5 keeps every shot on him (guessed, not measured).
+Mark.recoilAim = function(pa, P, o, r, now, rnd)
+	local g = pa.id and Mark.gunKnock[pa.id]
+	if r <= 0 or not g or g.shots < 2 then
+		return P
+	end
+	local fwd = unitOrNil(flat(P - o))
+	if not fwd then
+		return P
+	end
+	local b = math.floor((now - pa.at) / 0.125)
+	pa.noise = pa.noise or {}
+	local e = pa.noise[b]
+	if not e then
+		e = { lat = (rnd() * 2 - 1) * r, rise = r * 0.25 * math.min(b, 4) + rnd() * r * 0.3 }
+		pa.noise[b] = e
+	end
+	return P + Vector3.new(-fwd.Z, 0, fwd.X) * e.lat + Vector3.new(0, e.rise, 0)
+end
 Mark.pushSpan = function(gun)
 	local g = Mark.gunKnock[gun]
 	return (g.shots - 1) * g.gap + math.log(1 + g.v / 26)
@@ -8951,16 +8980,13 @@ Mark.groundUnder = function(O)
 	return y
 end
 
-Mark.wallSolve = function(O, pts, dtS, ready, rad, window, floorY)
+Mark.wallSolve = function(O, pts, dtS, ready, rad, window, floorY, placeFn)
 	local hw = CFG.WallHalf or 5.75
 	local H = CFG.WallHeight or 6.4
 	floorY = floorY or (O.Y - 3)
 	local i0 = math.ceil(ready / dtS) + 1 -- first sample at or after the wall exists
-	local best = nil
-	for k = 0, 47 do
-		local ang = k / 48 * math.pi * 2
-		local u = Vector3.new(math.cos(ang), 0, math.sin(ang))
-		local C = Vector3.new(O.X + u.X * 5, floorY, O.Z + u.Z * 5)
+	-- the first crossing of the wall plane (centre C, normal u) after `ready`, or nil when it misses the width / the height
+	local function cross(u, C)
 		local pv = Vector3.new(-u.Z, 0, u.X)
 		local sPrev, pPrev, iPrev = nil, nil, 0
 		for i = i0, #pts do
@@ -8975,14 +9001,30 @@ Mark.wallSolve = function(O, pts, dtS, ready, rad, window, floorY)
 					local margin = hw - rad - math.abs(lat)
 					local h = q.Y - floorY
 					if margin > 0.3 and h > -1 and h < H + rad and (not window or t - ready <= window) then
-						if not best or margin > best.margin + 0.25 or (margin > best.margin - 0.25 and t < best.t) then
-							best = { u = u, C = C, t = t, lat = lat, q = q, margin = margin }
-						end
+						return { u = u, C = C, t = t, lat = lat, q = q, margin = margin }
 					end
-					break
+					return nil
 				end
 				sPrev, pPrev, iPrev = s, p, i
 			end
+		end
+		return nil
+	end
+	local best = nil
+	for k = 0, 47 do
+		local ang = k / 48 * math.pi * 2
+		local u = Vector3.new(math.cos(ang), 0, math.sin(ang))
+		-- WHERE THE WALL REALLY STANDS for this aim: placeFn = the game's own placement (field clamp, pushed out of a goal) and
+		-- nil when the wall cannot go there (a teammate in it). The old solver always assumed O + 5u and rejected the best
+		-- aim afterwards ("moved by the field" / "mate"): a keeper trap at the enemy goal, where the clamp bites, got no wall.
+		local C = Vector3.new(O.X + u.X * 5, floorY, O.Z + u.Z * 5)
+		if placeFn then
+			local W = placeFn(u)
+			C = W and Vector3.new(W.X, floorY, W.Z) or nil
+		end
+		local c = C and cross(u, C)
+		if c and (not best or c.margin > best.margin + 0.25 or (c.margin > best.margin - 0.25 and c.t < best.t)) then
+			best = c
 		end
 	end
 	return best
@@ -9039,7 +9081,37 @@ Mark.wallVsPath = function(root, pathFn, tEnd, tag, o)
 		pts[i] = nil
 	end
 	local O = root.Position
-	local best = Mark.wallSolve(O, pts, dtS, ready, o.rad or 1, o.window, Mark.groundUnder(O))
+	Mark.placeMod = Mark.placeMod or require(Modules.Items.PlaceDownPlacement)
+	Mark.placeContain = Mark.placeContain or require(Client.Gameplay.ItemEffects.PlacementContain)
+	local cfgB = Mark.placeMod.Configs.barricades
+	local contain = Mark.placeContain.Get(LocalPlayer.Team and LocalPlayer.Team.Name or "Home")
+	local mates = {}
+	for _, model in Mark.models() do
+		local actor = Actors.GetFromCharacter(model)
+		if actor and actor ~= LocalPlayer and sameTeam(actor) then
+			local ar = ActorTargeting.GetActorRoot(actor)
+			if ar then
+				mates[#mates + 1] = ar.Position
+			end
+		end
+	end
+	local hw = CFG.WallHalf or 5.75
+	-- the wall for aim u as the game puts it (PlaceDownPlacement: the field clamp, pushed out of a goal); nil = a teammate stands in it
+	local function placeFn(u)
+		local W = Mark.placeMod.GetPlacementPosition(root, { AimRay = { Direction = u } }, cfgB, contain)
+		if not W then
+			return nil
+		end
+		local pv = Vector3.new(-u.Z, 0, u.X)
+		for _, m in mates do
+			local d = flat(m - W)
+			if math.abs(d:Dot(u)) < 2.5 and math.abs(d:Dot(pv)) < hw + 1 then
+				return nil
+			end
+		end
+		return W
+	end
+	local best = Mark.wallSolve(O, pts, dtS, ready, o.rad or 1, o.window, Mark.groundUnder(O), placeFn)
 	if not best then
 		return false, "no line"
 	end
@@ -9056,23 +9128,7 @@ Mark.wallVsPath = function(root, pathFn, tEnd, tag, o)
 		logFile("wall equip", "ready same frame")
 	end
 	local u = best.u
-	-- where the game really puts it (field clamp, pushed out of a goal): the plan must survive that
-	Mark.placeMod = Mark.placeMod or require(Modules.Items.PlaceDownPlacement)
-	Mark.placeContain = Mark.placeContain or require(Client.Gameplay.ItemEffects.PlacementContain)
-	local res = Mark.placeMod.Resolve(root, { AimRay = { Direction = u } }, Mark.placeMod.Configs.barricades, Mark.placeContain.Get(LocalPlayer.Team and LocalPlayer.Team.Name or "Home"))
-	local W = res and res.GroundPosition or best.C
-	if flat(W - best.C).Magnitude > 1.5 then
-		return false, "moved by the field"
-	end
-	for _, model in Mark.models() do
-		local actor = Actors.GetFromCharacter(model)
-		if actor and actor ~= LocalPlayer and sameTeam(actor) then
-			local ar = ActorTargeting.GetActorRoot(actor)
-			if ar and math.abs(flat(ar.Position - W):Dot(u)) < 2.5 and math.abs(flat(ar.Position - W):Dot(Vector3.new(-u.Z, 0, u.X))) < (CFG.WallHalf or 5.75) + 1 then
-				return false, "mate"
-			end
-		end
-	end
+	local W = best.C
 	local before = {}
 	local world = workspace:FindFirstChild("Misc")
 	world = world and world:FindFirstChild("Items")
@@ -9084,9 +9140,20 @@ Mark.wallVsPath = function(root, pathFn, tEnd, tag, o)
 		end
 	end
 	local org = O + Vector3.new(0, 1.6, 0)
-	Mark.skillRay = { Origin = org, Direction = u, CameraCFrame = CFrame.lookAt(org, org + u) }
+	Mark.skillRay = { Origin = org, Direction = u, CameraCFrame = CFrame.lookAt(org, org + u), wall = true }
+	-- the press reads the ray INSIDE this call (fireEquipped -> GetCameraAimRay): the ray lives exactly that long. ActivateEquipped
+	-- answers false when the game refused (a fired lock, the placement cooldown, carrying the ball): it used to be ignored, the
+	-- refused press still stamped skillAt / wallPend and the next attempts waited 0.5-0.7 s for a wall that never came
+	local fired = use.ActivateEquipped()
+	Mark.skillRay = nil
+	if not fired then
+		if now - (Mark.wallRefusedAt or 0) > 0.5 then
+			Mark.wallRefusedAt = now
+			logFile("wall refused", tag, "the game did not take the press (fired lock / cooldown / carrying)")
+		end
+		return false, "refused"
+	end
 	Mark.skillAt = now
-	use.ActivateEquipped()
 	-- ours: the barricades were taken out by us (equipWall stamps os.clock() after this `now`, so a time compare fails)
 	local ours = Mark.wallEquipAt ~= nil and math.abs(now - Mark.wallEquipAt) < 2
 	Mark.wallPend = { at = now, kind = tag, name = o.actor and actorName(o.actor) or tag, model = o.model, us = O, W = W, u = u, before = before, trap = o.trap, ours = ours }
@@ -13147,7 +13214,7 @@ local function dumpLog()
 	local function add(s)
 		lines[#lines + 1] = s
 	end
-	add("-- Illegal Soccer dump " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v193")
+	add("-- Illegal Soccer dump " .. os.date("%Y-%m-%d %H:%M:%S") .. " build v194")
 	add(string.format("clock=%.3f server=%.3f ping=%.3f", os.clock(), Workspace:GetServerTimeNow(), LocalPlayer:GetNetworkPing()))
 	add(string.format(
 		"cfg tackleSpeed=%.2f reach=%.1f close=%.1f slop=%.1f windup=%.3f track=%.0f",
@@ -26220,6 +26287,7 @@ return function(_Lib, _Core)
 			sld(kp, "Flintlock Range", "GunPushFlintRange", 10, 400, { suffix = " st" })
 			sld(kp, "Shotgun Range", "GunPushShotgunRange", 5, 300, { suffix = " st" })
 			sld(kp, "Delay", "GunPushDelay", 0, 0.5, { prec = 2, suffix = " s", text = "Wait before the equip and shot." })
+			sld(kp, "Recoil Noise", "GunPushRecoil", 0, 2, { prec = 1, suffix = " st", text = "Spreads the 3 flintlock shots like recoil." })
 			advanced(kp, "Keeper Push", function()
 				sld(kp, "Keeper Zone", "GunPushKeeperZone", 4, 40, { suffix = " st", text = "Only a keeper this close to his goal." })
 				sld(kp, "Shot Path Reach", "GunPushPathReach", 2, 30, { suffix = " st", text = "...or one standing this close to the shot path." })
