@@ -2,7 +2,13 @@
 -- Re-execution must not leave a second renderer, loot registry or Heartbeat loop alive.
 do
     local previous = getgenv().HushSilent
-    if previous and type(previous.unload) == "function" then previous.unload() end
+    if previous and type(previous.unload) == "function" then pcall(previous.unload) end
+    -- whatever a failed unload left on screen
+    local stale = getgenv().HushDrawings
+    if type(stale) == "table" then
+        for drawing in stale do pcall(function() drawing:Remove() end) end
+        table.clear(stale)
+    end
 end
 -- shoot() builds Unit, pellets and the tracer from upvalue u108 and the packet origin from Head.Position: both are swapped for the call and put back.
 -- Drawing.Circle does not render on this executor, nothing here uses it.
@@ -110,7 +116,7 @@ local CFG = {
     SpeedFallOnly = false,
     HopClaim = true,
     HopClaimRenew = 3.2,
-    HopLog = true, -- one console line per 0.5 s while Hop pushes: state, uplink, fall speed, extra, snap
+    HopLog = false, -- one console line per 0.5 s while Hop pushes: state, uplink, fall speed, extra, snap
     HopAuto = true, -- jump again as soon as the feet touch down (the game's own landing lockout of 0.3-1.2 s is skipped)
     -- Strafer (key .): the horizontal velocity follows the move keys at once, in the air too (the game steers its air velocity at 14 st/s^2 only), in every stance:
     -- the speed is kept and never below StrafeSpeed (sprint is 21; crouch 6, aim 7.8 and walk 12 are the game's own limits). StrafeStop: no keys in the air = stop dead.
@@ -293,8 +299,9 @@ local CFG = {
     AimSpoofHold = true,
     -- Debug file hush/shots_<time>.jsonl in the executor workspace (Potassium: %LOCALAPPDATA%/Potassium/workspace/hush): one line per shot with everything the
     -- solver, the wall trace and the target looked like at the packet, the raw server events, per-shot hit/miss and (DebugAfter) where the target was seen later.
-    DebugFile = true,
-    DebugAfter = true,
+    Debug = false, -- console output; every message goes through log()
+    DebugFile = false,
+    DebugAfter = false,
     KaAim = "Head", -- "Head" or "HRP": the part the hammer is aimed at (the other parts are the fallback when it is out of reach)
     KaLead = true,
     -- KaLookahead: where the server will have him when the hammer lands = QuickContact + 3 x ping/2 + KaInterp. Unverified model, the shot log prints it.
@@ -334,7 +341,7 @@ local CFG = {
     MPFirst = true, -- covered head: head centre -> MultiPoint -> head edge -> body (false: head edge before MultiPoint)
     LeadCap = 24, -- studs the target may be led at most
     MPRate = 0.15,
-    ShotLog = true,
+    ShotLog = false, -- verbose per-shot / per-event console lines (needs Debug)
     PerfLog = false, -- one compact console line every 15 s: avg/max ms per section
     -- AutoDecrypt opens through fireproximityprompt (Config.Loot.OpenDistance 10; the server's distance check is unread, the radius is a test).
     AutoDecrypt = false,
@@ -387,6 +394,11 @@ local CFG = {
         ModelSwapNext = Enum.KeyCode.Equals,
     },
 }
+
+-- Production: nothing reaches the console unless CFG.Debug is on (Misc > Debug). Debug toggles are never saved in a config.
+local function log(...)
+    if CFG.Debug then warn(...) end
+end
 
 -- Players: green = clear shot, red = behind cover. NPC: translucent purple. Ally sky blue, protected player gold, corpse bone. States have fixed colours (Drive orange, Aim red, Run light blue).
 local COL_INK = Color3.fromRGB(8, 8, 12)
@@ -486,7 +498,9 @@ bind(Players.PlayerRemoving:Connect(function(plr)
     for i = #roster, 1, -1 do if roster[i] == plr then table.remove(roster, i) end end
 end))
 
-local monsterList, monsterFolder, monsterCheckAt = {}, nil, 0
+-- NPC folders drawn by the monster ESP. Mimics (client-animated humanoid puppets, ActKind / Hidden / Inside attributes) arrived in the 11-18 update.
+local MONSTER_FOLDERS = { "Monsters", "Mimics" }
+local monsterList, monsterFolders, monsterCheckAt = {}, {}, 0
 local function add_monster(m)
     if m:IsA("Model") then
         monsterList[#monsterList + 1] = m
@@ -499,26 +513,28 @@ local function drop_monster(m)
         end
     end
 end
+-- Re-checked once a second, so a folder created after the script started (or replaced) is picked up.
 local function monsters()
-    if monsterFolder and monsterFolder.Parent then
-        return monsterList
-    end
     local now = os.clock()
     if now >= monsterCheckAt then
         monsterCheckAt = now + 1
-        Life.clear(Life.monsters)
-        monsterFolder = nil
-        local folder = Workspace:FindFirstChild("Monsters")
-        if folder then
-            monsterFolder = folder
+        local stale = false
+        for i, name in ipairs(MONSTER_FOLDERS) do
+            local folder = Workspace:FindFirstChild(name)
+            if folder ~= monsterFolders[i] then stale = true end
+            monsterFolders[i] = folder
+        end
+        if stale then
+            Life.clear(Life.monsters)
             table.clear(monsterList)
-            for _, m in folder:GetChildren() do
-                add_monster(m)
+            for i = 1, #MONSTER_FOLDERS do
+                local folder = monsterFolders[i]
+                if folder then
+                    for _, m in folder:GetChildren() do add_monster(m) end
+                    Life.monsters[#Life.monsters + 1] = folder.ChildAdded:Connect(add_monster)
+                    Life.monsters[#Life.monsters + 1] = folder.ChildRemoved:Connect(drop_monster)
+                end
             end
-            Life.monsters[1] = folder.ChildAdded:Connect(add_monster)
-            Life.monsters[2] = folder.ChildRemoved:Connect(drop_monster)
-        else
-            table.clear(monsterList)
         end
     end
     return monsterList
@@ -636,7 +652,8 @@ local function alive_model(model)
     end
     local cur = hp_of(model)
     if cur == nil then
-        return kind_of(model) ~= nil
+        -- NPC rigs without a Humanoid: the server's Kind attribute, or a Mimics puppet (it carries ActKind instead)
+        return kind_of(model) ~= nil or (model.Parent ~= nil and model.Parent.Name == "Mimics")
     end
     return cur > 0
 end
@@ -1691,7 +1708,7 @@ Visual.helmetStops = function(model, head, now)
             local v = d:GetAttribute("HelmetPiece")
             if v ~= nil then id = v; break end
         end
-        if id ~= c.id and id and CFG.ShotLog then warn("[hush] helmet seen on " .. model.Name .. ": " .. tostring(id)) end
+        if id ~= c.id and id and CFG.ShotLog then log("[hush] helmet seen on " .. model.Name .. ": " .. tostring(id)) end
         c.id = id
     end
     if not c.id then return false end
@@ -2063,7 +2080,7 @@ Visual.fireShot = function(plan, id, hand)
         local miss = hp and (hp - from):Cross(dir).Magnitude or -1
         local base, dev = plan.aim - plan.head.Position, 0
         if base.Magnitude > 0.1 then dev = math.deg(math.acos(math.clamp(dir:Dot(base.Unit), -1, 1))) end
-        warn(string.format("[hush] origin offset %.2f st (budget %.2f / %.2f) | %s | aim %s | own speed %.0f | lead %.2f st | ray passes %.2f st from the bone centre | dir %.0f deg off head>aim | spread sent 0 (game %.2f) deg | drop %.2f st | flight %.3f s | unc %.0f st/s | ping lead %.3f s | stale %.2f s | target %.1f st/s (%s), lead %s",
+        log(string.format("[hush] origin offset %.2f st (budget %.2f / %.2f) | %s | aim %s | own speed %.0f | lead %.2f st | ray passes %.2f st from the bone centre | dir %.0f deg off head>aim | spread sent 0 (game %.2f) deg | drop %.2f st | flight %.3f s | unc %.0f st/s | ping lead %.3f s | stale %.2f s | target %.1f st/s (%s), lead %s",
             plan.offset.Magnitude, Visual.mpBudget(), CFG.MPReach, plan.how or "?",
             plan.bodyAim or "head/point", root and root.AssemblyLinearVelocity.Magnitude or -1, plan.lead or 0, miss, dev, sp0, plan.drop or 0, plan.flightT or 0, plan.unc or 0, plan.lag or 0, plan.stale or 0, plan.speed or 0, plan.vsrc or "fit", plan.why or "on"))
     end
@@ -2082,7 +2099,7 @@ Visual.fireShot = function(plan, id, hand)
     Visual.crouchAB.tag = Visual.crouchABShot()
     if CFG.DebugFile then
         local okd, errd = pcall(Visual.dbgShot, plan, id, def, fl, from, dir, spread, sp0, seq, boss, os.clock())
-        if not okd and not Visual.dbg.errWarned then Visual.dbg.errWarned = true; warn("[hush] debug file: shot record failed: " .. tostring(errd)) end
+        if not okd and not Visual.dbg.errWarned then Visual.dbg.errWarned = true; log("[hush] debug file: shot record failed: " .. tostring(errd)) end
     end
     -- Exactly the CURRENT firearm payload: direction, scalar spread, boss distance, origin, sequence.
     u[S.gun]:FireServer("Fire", dir, spread, boss, from, seq)
@@ -2160,7 +2177,7 @@ Visual.statAdd = function(rec, hit)
         end
         local L = Visual.led
         local line = string.format("[hush] hit rate | shots %d: %d hit, %d miss, %d pending (server ShotLand) | %d Gun Hit acks | %s", L.shots, L.hits, L.miss, #L.q, L.acks, table.concat(parts, " | "))
-        warn(line)
+        log(line)
         Visual.dbgW({ ev = "summary", t = Visual.dbgR(os.clock()), text = line })
     end
 end
@@ -2170,7 +2187,7 @@ Visual.ledResolve = function(rec, hit, kind, how)
     Visual.statAdd(rec, hit)
     local dt = os.clock() - rec.t
     if CFG.ShotLog then
-        warn(string.format("[hush] shot #%d %s +%.2fs | %s | %s %.0f st | speed %.1f lead %.1f | %s%s%s", rec.seq, hit and "HIT" or ("MISS (" .. how .. ")"), dt, tostring(rec.gun),
+        log(string.format("[hush] shot #%d %s +%.2fs | %s | %s %.0f st | speed %.1f lead %.1f | %s%s%s", rec.seq, hit and "HIT" or ("MISS (" .. how .. ")"), dt, tostring(rec.gun),
             tostring(rec.name), rec.dist, rec.speed or 0, rec.lead or 0, tostring(rec.how), rec.veh and " | seated" or "", kind and (" | landed on " .. kind) or ""))
     end
     Visual.dbgW({ ev = hit and "hit" or "miss", seq = rec.seq, t = Visual.dbgR(os.clock()), dt = Visual.dbgR(dt), kind = kind, how = how, note = rec.note })
@@ -2235,11 +2252,11 @@ Visual.dbgOpen = function()
         writefile(D.path, "")
     end)
     if not ok then
-        warn("[hush] debug file: cannot create it (" .. tostring(err) .. ")")
+        log("[hush] debug file: cannot create it (" .. tostring(err) .. ")")
         return false
     end
     D.ok = true
-    warn("[hush] debug file: executor workspace/" .. D.path .. " (Potassium: %LOCALAPPDATA%/Potassium/workspace/" .. D.path .. ")")
+    log("[hush] debug file: executor workspace/" .. D.path .. " (Potassium: %LOCALAPPDATA%/Potassium/workspace/" .. D.path .. ")")
     local keys = { "Wallbang", "AimSpoof", "AimSpoofHold", "MultiPoint", "MPReach", "MPFirst", "PingPredict", "PredictInterp", "Resolver", "ResolverAccel",
         "ResolverAccelK", "LeadCap", "VisibleCheck", "AimPoints", "SilentAimDistance", "PickRate", "BodyAim", "HelmetAim", "FullAuto" }
     local cfg = {}
@@ -2268,7 +2285,7 @@ Visual.dbgFlush = function(now, force)
     local chunk = table.concat(D.buf, "\n") .. "\n"
     table.clear(D.buf)
     local ok, err = pcall(appendfile, D.path, chunk)
-    if not ok then warn("[hush] debug file: write failed (" .. tostring(err) .. ")") ; D.ok = false end
+    if not ok then log("[hush] debug file: write failed (" .. tostring(err) .. ")") ; D.ok = false end
 end
 -- what the ROUND meets between `from` and `to` (same call as Visual.reach, but with the details)
 Visual.reachInfo = function(from, to, model, pen)
@@ -2461,7 +2478,7 @@ Visual.crouchInstall = function(client)
     bind(S.remote.OnClientEvent:Connect(function(on, seq)
         if on == false and S.on and seq == S.seq then
             S.on, S.blocked = false, true
-            warn("[hush] CrouchSpoof: stance rejected; paused until toggle-off or respawn")
+            log("[hush] CrouchSpoof: stance rejected; paused until toggle-off or respawn")
         end
     end))
     return true
@@ -2479,7 +2496,7 @@ Visual.crouchSend = function(on)
         end
         if not (sameCtl and sameRemotes and count == 1) then
             S.blocked = true
-            warn("[hush] CrouchSpoof: HushCrouch layout changed; no stance sent")
+            log("[hush] CrouchSpoof: HushCrouch layout changed; no stance sent")
             return false
         end
         S.fn, S.slot = fn, slot
@@ -2594,7 +2611,7 @@ Visual.everywhereInstall = function(ctl)
     local ev = Visual.everywhere
     local target, why = Visual.heldFn("onFire", nil, "canFire") -- held by onFire; searching canFire itself finds our own stale clones
     if not target then
-        warn("[hush] ShootEverywhere off: " .. tostring(why))
+        log("[hush] ShootEverywhere off: " .. tostring(why))
         return
     end
     ev.target = target
@@ -2607,7 +2624,7 @@ Visual.everywhereInstall = function(ctl)
         if not ok then error(res, 0) end
         return res
     end)
-    warn("[hush] ShootEverywhere: canFire hooked")
+    log("[hush] ShootEverywhere: canFire hooked")
 end
 local function install(shoot)
     local b = Visual.fire
@@ -2637,7 +2654,7 @@ local function install(shoot)
     end)
     Life.shootTarget = shoot
     hooked = true
-    warn("[hush] silent: direct shoot adapter, scalar spread + Rounds; no metahook")
+    log("[hush] silent: direct shoot adapter, scalar spread + Rounds; no metahook")
     return true
 end
 
@@ -2706,7 +2723,7 @@ local function install_aim(bindTable)
             sent.fired, sent.at = true, os.clock()
             -- release has ALREADY executed FireServer before invoking this callback.
             Visual.kaRecovery = (heavy and (0.16 + 0.75) or (0.2 + 0.45)) + 0.09
-            if CFG.ShotLog then warn(string.format("[hush] KA Fire branch: %s | power %.2f | next %.2fs",
+            if CFG.ShotLog then log(string.format("[hush] KA Fire branch: %s | power %.2f | next %.2fs",
                 heavy and "heavy" or "quick", power, Visual.kaRecovery)) end
         end
         return Visual.sledgeOriginalSwing(heavy, power)
@@ -2735,7 +2752,7 @@ local function install_aim(bindTable)
         Visual.kaAimResult = true
         if CFG.ShotLog then
             local root = LP.Character:FindFirstChild("HumanoidRootPart")
-            warn(string.format("[hush] KA aim -> Fire: target %s | dist %.2f | lead %.2f | dir %.2f %.2f %.2f | rootDot %.2f | mother %s",
+            log(string.format("[hush] KA aim -> Fire: target %s | dist %.2f | lead %.2f | dir %.2f %.2f %.2f | rootDot %.2f | mother %s",
                 force.model.Name, dist, lead, dir.X, dir.Y, dir.Z, root and root.CFrame.LookVector:Dot(dir) or -1, tostring(bossDistance)))
         end
         return head.Position, dir, bossDistance, pos
@@ -2753,7 +2770,7 @@ local function hook_sledge()
     if not ok or type(mod) ~= "table" or type(mod.release) ~= "function" then return end
     sledgeMod, sledgeRelease = mod, mod.release
     aimWrapped = install_aim(find_bind(sledgeRelease))
-    warn("[hush] sledge aim bound: " .. tostring(aimWrapped))
+    log("[hush] sledge aim bound: " .. tostring(aimWrapped))
 end
 
 -- Sledge.bind runs when Guns loads. Until then u3 is nil and the aim table is not visible.
@@ -2763,7 +2780,7 @@ local function retry_aim_wrap()
     end
     aimWrapped = install_aim(find_bind(sledgeRelease))
     if aimWrapped then
-        warn("[hush] sledge aim wrapped")
+        log("[hush] sledge aim wrapped")
     end
 end
 
@@ -2771,9 +2788,15 @@ end
 -- crosses the executor bridge. All holders below receive the proxy, not the raw object.
 local drawMeta = {}
 drawMeta.stats = { created = 0, removed = 0, live = 0, peak = 0 }
+-- Every Drawing ever made, proxy -> the frame section that was running when it was created. It lives in getgenv so a re-executed copy can
+-- clear what a failed unload left on screen, and a failing section can hide everything it owns.
+local drawSet = getgenv().HushDrawings
+if type(drawSet) ~= "table" then drawSet = {}; getgenv().HushDrawings = drawSet end
+drawMeta.owner = "init"
 drawMeta.remove = function(self)
     if self._dead then return end
-    self._raw:Remove()
+    drawSet[self] = nil
+    pcall(self._raw.Remove, self._raw)
     rawset(self, "_dead", true)
     table.clear(self._cache)
     local stats = drawMeta.stats
@@ -2801,7 +2824,21 @@ local function new_draw(kind)
     stats.created += 1
     stats.live += 1
     stats.peak = math.max(stats.peak, stats.live)
-    return setmetatable({ _raw = raw, _cache = {}, _dead = false }, drawMeta)
+    local proxy = setmetatable({ _raw = raw, _cache = {}, _dead = false }, drawMeta)
+    drawSet[proxy] = drawMeta.owner
+    return proxy
+end
+-- hide (through the proxy, so its write cache stays true) everything a section created
+drawMeta.hideOwned = function(owner)
+    for proxy, o in drawSet do
+        if o == owner and not proxy._dead then proxy.Visible = false end
+    end
+end
+-- last step of unload: nothing may stay on screen whatever an earlier step did
+drawMeta.sweep = function()
+    for proxy in drawSet do pcall(function() proxy:Remove() end) end
+    table.clear(drawSet)
+    drawMeta.stats.live = 0
 end
 
 local function new_line(z, thick)
@@ -3943,7 +3980,7 @@ local function step_killaura(now)
         end
         ka.untilAt = now + (Visual.kaRecovery or QUICK_GAP)
         if not Visual.kaRecovery and CFG.ShotLog then
-            warn("[hush] KA no Fire branch: press was not armed, or release cancelled by aim/range")
+            log("[hush] KA no Fire branch: press was not armed, or release cancelled by aim/range")
         end
     elseif ka.phase == "wind" then
         ka.tick = 1 - math.max(ka.untilAt - now, 0) / QUICK_HOLD
@@ -4162,16 +4199,16 @@ Visual.report = function()
             row.kb / math.max(row.calls, 1))
     end
     table.sort(parts)
-    warn("[hush] perf avg/max per call: " .. table.concat(parts, " | "))
+    log("[hush] perf avg/max per call: " .. table.concat(parts, " | "))
     local st = Loot.stats
     if st then
-        warn(string.format("[hush] loot search since report: queries %d | local rows %d/max %d | rebuilds %d cells %d | CPU %.2f/max %.2fms | position samples %d",
+        log(string.format("[hush] loot search since report: queries %d | local rows %d/max %d | rebuilds %d cells %d | CPU %.2f/max %.2fms | position samples %d",
             st.queries, st.rows, st.maxRows, st.rebuilds, st.cells, st.totalMs, st.maxMs, st.moves))
         for key in st do st[key] = 0 end
     end
     table.clear(Loot.perf)
     local ds = drawMeta.stats
-    warn(string.format("[hush] resources: Drawing live %d peak %d created %d removed %d | ECP active %d free %d | connections %d/%d/%d | particle slots %d",
+    log(string.format("[hush] resources: Drawing live %d peak %d created %d removed %d | ECP active %d free %d | connections %d/%d/%d | particle slots %d",
         ds.live, ds.peak, ds.created, ds.removed, espPool.inUse, #espPool.free,
         #connections, #Life.char, #Life.monsters, #Visual.pfx.lines))
 end
@@ -4324,7 +4361,7 @@ Visual.loadFonts = function()
             if res and res.StatusCode == 200 then
                 writefile(path, res.Body)
             else
-                warn("[hush] font " .. row[1] .. " download failed: " .. tostring(res and res.StatusCode))
+                log("[hush] font " .. row[1] .. " download failed: " .. tostring(res and res.StatusCode))
                 continue
             end
         end
@@ -4603,7 +4640,7 @@ Visual.attachRoundsFx = function(client)
     end
     if bal ~= ballistics or not states then
         f.failed = true
-        warn("[hush] Rounds.fly layout changed; custom shot FX not attached")
+        log("[hush] Rounds.fly layout changed; custom shot FX not attached")
         return
     end
     f.module, f.flyOld, f.landOld = mod, mod.fly, mod.land
@@ -5183,7 +5220,7 @@ Loot.refresh = function(row)
     Loot.nextQuery = 0
 end
 Loot.say = function(...)
-    warn("[hush] auto decrypt:", ...)
+    log("[hush] auto decrypt:", ...)
 end
 local function note_loot(action, part, a, b)
     if not running or typeof(part) ~= "Instance" then return end
@@ -5917,9 +5954,9 @@ Visual.speedStrike = function(now, S)
     if #backs >= 2 then
         CFG.Speed = false
         if Life.uiState then Life.uiState("Speed") end
-        warn("[hush] server put us back twice inside 120 s: Speed switched OFF (3 strikes = kick)")
+        log("[hush] server put us back twice inside 120 s: Speed switched OFF (3 strikes = kick)")
     else
-        warn("[hush] server put us back: Speed paused 6 s")
+        log("[hush] server put us back: Speed paused 6 s")
     end
 end
 Visual.speedSample = function(S, now, pos, hum)
@@ -6017,7 +6054,7 @@ Visual.speedPush = function(now, dt, S, root, char, mdir, hum)
     local push = S.push + bonus
     if hop and CFG.HopLog and push >= 0.3 and now >= (S.logAt or 0) then
         S.logAt = now + 0.5
-        warn(string.format("[hush] hop | fall %.1f -> %.1f (cap %.1f), %.1f st left | state x%.2f (claim %s, uplink estimate %.0f ms) | extra %.1f | fallBurst %s | pushing %.1f st/s",
+        log(string.format("[hush] hop | fall %.1f -> %.1f (cap %.1f), %.1f st left | state x%.2f (claim %s, uplink estimate %.0f ms) | extra %.1f | fallBurst %s | pushing %.1f st/s",
             S.fallIn, S.fallOut, S.fallCap, S.left, S.stateK, S.claimOn and "on" or "off", (Visual.pingHalf() + CFG.HopUplinkMargin) * 1000, fall, S.fallBurst and "on" or "off", push))
     end
     if push < 0.3 then return end
@@ -6121,11 +6158,11 @@ Visual.antiClimbInstall = function(client)
     local beginVault
     for _, fn in debug.getupvalues(vault.try) do
         if type(fn) == "function" and islclosure(fn) and table.find(debug.getconstants(fn), "HushVaultSlow") then
-            if beginVault then C.failed = true; warn("[hush] AntiClimb unavailable: ambiguous vault entry"); return end
+            if beginVault then C.failed = true; log("[hush] AntiClimb unavailable: ambiguous vault entry"); return end
             beginVault = fn
         end
     end
-    if not beginVault then C.failed = true; warn("[hush] AntiClimb unavailable: vault entry not found"); return end
+    if not beginVault then C.failed = true; log("[hush] AntiClimb unavailable: vault entry not found"); return end
     local entries = {
         { vault.try }, { beginVault },
         { climb.try }, { climb.fromHang }, { climb.grabStep }, { climb.grabWall },
@@ -6133,11 +6170,11 @@ Visual.antiClimbInstall = function(client)
         { wall.run }, { wall.up }, { wall.kick },
     }
     for _, row in entries do
-        if type(row[1]) ~= "function" then C.failed = true; warn("[hush] AntiClimb unavailable: movement API changed"); return end
+        if type(row[1]) ~= "function" then C.failed = true; log("[hush] AntiClimb unavailable: movement API changed"); return end
     end
     C.hooks = {}
     for _, row in entries do C.hooks[#C.hooks + 1] = Visual.antiClimbGate(row[1], row[2]) end
-    warn("[hush] AntiClimb ready")
+    log("[hush] AntiClimb ready")
 end
 Visual.antiClimbStop = function()
     local C = Visual.climb
@@ -6293,7 +6330,7 @@ Visual.moveStop = function()
 end
 Visual.toggle = function(flag)
     CFG[flag] = not CFG[flag]
-    warn(string.format("[hush] %s %s", flag, CFG[flag] and "ON" or "OFF"))
+    log(string.format("[hush] %s %s", flag, CFG[flag] and "ON" or "OFF"))
 end
 
 -- WeaponFx / SelfFx groups: fp = workspace.FirstPersonView.FPGun (re-cloned on every item change), tp = Character.HeldGun, me = the character.
@@ -6305,7 +6342,7 @@ end
 Visual.skinMaterial = function(name)
     local ok, m = pcall(function() return Enum.Material[name] end)
     if ok and m then return m end
-    warn("[hush] skin: unknown material '" .. tostring(name) .. "', using Neon")
+    log("[hush] skin: unknown material '" .. tostring(name) .. "', using Neon")
     return Enum.Material.Neon
 end
 Visual.skinPart = function(g, d)
@@ -6395,7 +6432,7 @@ Visual.skinBind = function(g, root)
         g.hl = hl
     end
     g.tries = 0
-    if CFG.ShotLog then warn(string.format("[hush] skin %s: bound %s (%s), %d parts", g.key, root:GetFullName(), root.ClassName, #g.list)) end
+    if CFG.ShotLog then log(string.format("[hush] skin %s: bound %s (%s), %d parts", g.key, root:GetFullName(), root.ClassName, #g.list)) end
 end
 -- 64-step palette of the A->B->A wave, rebuilt only when a colour changes: the per-part cost is one table read and a compare, and a part
 -- whose step did not change since the last tick is not written at all (a Color write crosses the executor bridge).
@@ -6570,7 +6607,7 @@ Visual.swapLoad = function()
             return
         end
         if not obj then
-            warn("[hush] ModelSwap: '" .. tostring(name) .. "' did not load: " .. tostring(preset and res or "unknown preset"))
+            log("[hush] ModelSwap: '" .. tostring(name) .. "' did not load: " .. tostring(preset and res or "unknown preset"))
             S.failed, S.loading = true, false
             return
         end
@@ -6596,7 +6633,7 @@ Visual.swapLoad = function()
         if obj:IsA("BasePart") then obj.CanCollide, obj.CanQuery, obj.CanTouch, obj.Massless = false, false, false, true end
         local root = m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart", true)
         if not root then
-            warn("[hush] ModelSwap: '" .. name .. "' has no part to anchor")
+            log("[hush] ModelSwap: '" .. name .. "' has no part to anchor")
             S.failed, S.loading = true, false
             m:Destroy()
             return
@@ -6622,7 +6659,7 @@ Visual.swapLoad = function()
         S.loading = false
         S.parts = {}
         for _, d in m:GetDescendants() do if d:IsA("BasePart") then S.parts[#S.parts + 1] = d end end
-        warn(string.format("[hush] ModelSwap: loaded %s (%s, %d parts, scaled to %.1f st, feet %.2f below its root)", name, preset.kind, #S.parts, size.Y, S.bottom))
+        log(string.format("[hush] ModelSwap: loaded %s (%s, %d parts, scaled to %.1f st, feet %.2f below its root)", name, preset.kind, #S.parts, size.Y, S.bottom))
     end)
 end
 Visual.swapOff = function()
@@ -6805,7 +6842,7 @@ Visual.healTick = function(now, client)
     if not id then return end
     H.at = now + CFG.AutoHealDelay
     H.remote:FireServer({ action = "Use", id = id })
-    if CFG.ShotLog then warn(string.format("[hush] AutoHeal: used %s at %.0f/%.0f HP", id, hum.Health, hum.MaxHealth)) end
+    if CFG.ShotLog then log(string.format("[hush] AutoHeal: used %s at %.0f/%.0f HP", id, hum.Health, hum.MaxHealth)) end
 end
 
 -- AutoArmor: snap.slots.armor / snap.slots.helmet = worn id, snap.backpack = { id = count }; Wear is the verb the inventory UI sends when a piece is dropped on the ARMOR / HELMET square.
@@ -6895,7 +6932,7 @@ Visual.armorTick = function(now, client)
                     A.tries[best] = { n = (try and try.n or 0) + 1, at = now }
                     A.at = now + 1.5
                     remote:FireServer({ action = "Wear", id = best, from = "backpack" })
-                    if CFG.ShotLog then warn(string.format("[hush] AutoArmor: wear %s (%s, tier %d over %d, condition %d%% over %d%%)", best, row[1], bestTier, wornTier, bestCond, wornCond)) end
+                    if CFG.ShotLog then log(string.format("[hush] AutoArmor: wear %s (%s, tier %d over %d, condition %d%% over %d%%)", best, row[1], bestTier, wornTier, bestCond, wornCond)) end
                     return
                 end
             elseif best == worn then
@@ -6966,7 +7003,7 @@ Visual.waterWalk = function(now)
             hrp.CFrame = hrp.CFrame + Vector3.new(0, depth + CFG.WaterMargin + 0.1, 0)
             local v = hrp.AssemblyLinearVelocity
             hrp.AssemblyLinearVelocity = Vector3.new(v.X, math.max(v.Y, 0), v.Z)
-            if CFG.ShotLog then warn(string.format("[hush] AntiDrown: lifted %.1f st onto the water surface", depth)) end
+            if CFG.ShotLog then log(string.format("[hush] AntiDrown: lifted %.1f st onto the water surface", depth)) end
         end
     end
 end
@@ -7037,14 +7074,14 @@ Visual.baseTick = function(now)
             -- Remotes.Breath:FireServer(bool). The zone is random on the client, the server only sees the bool.
             local mod = require(inst)
             b.breath, b.breathRun, b.breathStop, b.breathToken = mod, mod.run, mod.stop, 0
-            warn("[hush] auto breath hooked (Breath.run)")
+            log("[hush] auto breath hooked (Breath.run)")
             mod.stop = function(...)
                 b.breathToken += 1
                 return b.breathStop(...)
             end
             mod.run = function(checks, onCheck, onDone)
                 if not (running and CFG.AutoBreath) then return b.breathRun(checks, onCheck, onDone) end
-                if CFG.ShotLog then warn("[hush] auto breath: start, " .. tostring(checks) .. " checks") end
+                if CFG.ShotLog then log("[hush] auto breath: start, " .. tostring(checks) .. " checks") end
                 mod.stop()
                 local token = b.breathToken
                 task.spawn(function()
@@ -7059,7 +7096,7 @@ Visual.baseTick = function(now)
                     task.wait(0.9)
                     if b.breathToken ~= token then return end
                     if onDone then onDone(true) end
-                    if CFG.ShotLog then warn("[hush] auto breath: " .. checks .. " checks sent as quiet") end
+                    if CFG.ShotLog then log("[hush] auto breath: " .. checks .. " checks sent as quiet") end
                 end)
             end
         end
@@ -7098,11 +7135,11 @@ Visual.baseTick = function(now)
             b.wireOld = hookfunction(fn, function(st, run, ...)
                 b.wire = st
                 if CFG.ShotLog and type(st) == "table" then
-                    warn("[hush] auto hotwire: " .. tostring(st.kind) .. ", " .. tostring(st.of) .. " checks")
+                    log("[hush] auto hotwire: " .. tostring(st.kind) .. ", " .. tostring(st.of) .. " checks")
                 end
                 return b.wireOld(st, run, ...)
             end)
-            warn("[hush] auto hotwire hooked (Vehicles.runChecks)")
+            log("[hush] auto hotwire hooked (Vehicles.runChecks)")
         end
     end
     if client and not b.fallSlots and CFG.NoFall then
@@ -7126,14 +7163,14 @@ Visual.baseTick = function(now)
             end
         end
         if #b.fallSlots == 0 then
-            warn("[hush] NoFall: Fall.judge not found (filtergc post/landed); fall damage is NOT blocked")
+            log("[hush] NoFall: Fall.judge not found (filtergc post/landed); fall damage is NOT blocked")
         else
             b.fallHook = function(...)
                 if running and CFG.NoFall then return false end
                 return b.fallJudge(...)
             end
             for _, slot in b.fallSlots do debug.setupvalue(slot.fn, slot.idx, b.fallHook) end
-            if CFG.ShotLog then warn(string.format("[hush] NoFall: judge gated in %d closures", #b.fallSlots)) end
+            if CFG.ShotLog then log(string.format("[hush] NoFall: judge gated in %d closures", #b.fallSlots)) end
         end
     end
     if client and not b.hitReact then
@@ -7144,7 +7181,7 @@ Visual.baseTick = function(now)
             b.hitReact, b.hitFall = mod, mod.fall
             mod.fall = function(...)
                 if running and CFG.NoRagdoll then
-                    if CFG.ShotLog then warn("[hush] NoRagdoll: blocked HitReact.fall (limb kicks)") end
+                    if CFG.ShotLog then log("[hush] NoRagdoll: blocked HitReact.fall (limb kicks)") end
                     return
                 end
                 return b.hitFall(...)
@@ -7156,7 +7193,7 @@ Visual.baseTick = function(now)
         b.bounce = b.controls.bounce
         b.controls.bounce = function(v, ...)
             if running and CFG.NoRagdoll then
-                if CFG.ShotLog then warn(string.format("[hush] NoRagdoll: blocked bounce, knock velocity %.0f st/s", typeof(v) == "Vector3" and v.Magnitude or -1)) end
+                if CFG.ShotLog then log(string.format("[hush] NoRagdoll: blocked bounce, knock velocity %.0f st/s", typeof(v) == "Vector3" and v.Magnitude or -1)) end
                 return
             end
             return b.bounce(v, ...)
@@ -7173,7 +7210,7 @@ Visual.baseTick = function(now)
         b.fbBound = true
         b.lighting = cloneref(game:GetService("Lighting"))
         -- WorldFX rewrites Lighting every RenderStepped; write after it, every frame.
-        RunService:BindToRenderStep("HushFullBright", Enum.RenderPriority.Last.Value + 1, Visual.fullBright)
+        RunService:BindToRenderStep("HushFullBright", Enum.RenderPriority.Last.Value + 1, Visual.safe("fullbright", Visual.fullBright))
         b.fbCheckAt = now + 2
     end
     if b.fbBound and not CFG.FullBright then
@@ -7187,7 +7224,7 @@ Visual.baseTick = function(now)
             if L.Ambient ~= Visual.FB_AMBIENT then bad[#bad + 1] = "Ambient" end
             if L.Brightness ~= 2 then bad[#bad + 1] = "Brightness" end
             if L.ClockTime ~= 14 then bad[#bad + 1] = "ClockTime" end
-            if #bad > 0 then warn("[hush] Fullbright: overwritten after our write: " .. table.concat(bad, ", ")) end
+            if #bad > 0 then log("[hush] Fullbright: overwritten after our write: " .. table.concat(bad, ", ")) end
         end
     end
     if b.fullAuto ~= CFG.FullAuto then
@@ -7207,7 +7244,7 @@ Visual.baseTick = function(now)
                 end
             end
             b.fullAuto = CFG.FullAuto
-            if CFG.FullAuto then warn(string.format("[hush] FullAuto: %d weapons switched to auto, %d writes refused", b.autoN or 0, b.autoFail or 0)) end
+            if CFG.FullAuto then log(string.format("[hush] FullAuto: %d weapons switched to auto, %d writes refused", b.autoN or 0, b.autoFail or 0)) end
         end
     end
     if b.recoil ~= CFG.NoRecoil then
@@ -7321,7 +7358,7 @@ Visual.ragReport = function(char, tag)
         local good, v = pcall(isnetworkowner, root)
         own = good and tostring(v) or "err"
     end
-    warn(string.format("[hush] NoRagdoll %s: rig joints ok %d / off %d / destroyed %d of %d | physical joints on %d (we switched off %d) | state %s | PlatformStand %s | rebuilt %d | we own physics %s | root speed %.0f",
+    log(string.format("[hush] NoRagdoll %s: rig joints ok %d / off %d / destroyed %d of %d | physical joints on %d (we switched off %d) | state %s | PlatformStand %s | rebuilt %d | we own physics %s | root speed %.0f",
         tag, ok, off, missing, #R.snap, phys, R.offJoints, hum and hum:GetState().Name or "?", tostring(hum and hum.PlatformStand), R.rebuilt, own,
         root and root.AssemblyLinearVelocity.Magnitude or -1))
 end
@@ -7402,7 +7439,7 @@ Visual.PUSH_CLASSES = { BodyVelocity = true, BodyForce = true, BodyPosition = tr
     AlignPosition = true, AlignOrientation = true, LineForce = true }
 Visual.noPush = function(inst)
     if running and CFG.NoRagdoll and Visual.PUSH_CLASSES[inst.ClassName] then
-        if CFG.ShotLog then warn("[hush] NoRagdoll: removed foreign " .. inst.ClassName .. " from " .. inst.Parent.Name) end
+        if CFG.ShotLog then log("[hush] NoRagdoll: removed foreign " .. inst.ClassName .. " from " .. inst.Parent.Name) end
         inst:Destroy()
     end
 end
@@ -7429,7 +7466,7 @@ Visual.deathCommit = function(pos)
     pos = pos or D.alive
     if not pos then return end
     D.pos, D.at = pos, now
-    if CFG.ShotLog then warn(string.format("[hush] last death marked at %.0f, %.0f, %.0f", pos.X, pos.Y, pos.Z)) end
+    if CFG.ShotLog then log(string.format("[hush] last death marked at %.0f, %.0f, %.0f", pos.X, pos.Y, pos.Z)) end
 end
 Visual.deathHide = function()
     local D = Visual.death
@@ -7670,7 +7707,7 @@ Visual.pvpTick = function(now)
         if why then P.untilAt = now + CFG.PvPHold elseif now < P.untilAt then why = P.why end
     end
     local on = why ~= nil
-    if on ~= P.on then warn("[hush] PvP mode " .. (on and ("ON (" .. why .. ")") or "OFF")) end
+    if on ~= P.on then log("[hush] PvP mode " .. (on and ("ON (" .. why .. ")") or "OFF")) end
     P.on, P.why = on, why or ""
 end
 
@@ -7983,7 +8020,7 @@ Visual.staffTick = function(now)
                     local key = p.UserId .. role .. (row.grants or "")
                     if not S.warned[key] then -- again when the role or the grants change (they are handed out live)
                         S.warned[key] = true
-                        warn(string.format("[hush] STAFF DETECTED: %s (%d) role %s | grants %s | invisible %s invincible %s", p.Name, p.UserId, role, row.grants or "-",
+                        log(string.format("[hush] STAFF DETECTED: %s (%d) role %s | grants %s | invisible %s invincible %s", p.Name, p.UserId, role, row.grants or "-",
                             tostring(p:GetAttribute("AdminInvisible") == true), tostring(p:GetAttribute("AdminInvincible") == true)))
                     end
                 end
@@ -7996,7 +8033,7 @@ Visual.staffTick = function(now)
     end
     if S.kickAt and now >= S.kickAt then
         S.kickAt = nil
-        warn("[hush] staff mode Kick: leaving")
+        log("[hush] staff mode Kick: leaving")
         local ok = pcall(function() LP:Kick(CFG.StaffKickMsg or "staff detected") end)
         if not ok then pcall(function() game:Shutdown() end) end
     end
@@ -8042,22 +8079,49 @@ Visual.staffStop = function()
     table.clear(S.warned)
 end
 
-local function step(dt)
-    if not running then
-        return
+-- Frame sections run isolated: a failing one hides what it owns and is counted in Life.errs (Misc > Debug > Copy Diagnostics); the rest of the frame still runs,
+-- so one bad model or one new game field can no longer freeze every drawing at its last frame.
+Life.errs = {}
+Visual.noteErr = function(name, err)
+    local e = Life.errs[name]
+    if not e then e = { n = 0 }; Life.errs[name] = e end
+    e.n += 1
+    e.msg, e.at = tostring(err), os.clock()
+    if e.n == 1 then log("[hush] section '" .. name .. "' failed: " .. e.msg) end
+end
+Visual.guard = function(name, hide, fn, a, b, c)
+    drawMeta.owner = name
+    local ok, err = pcall(fn, a, b, c)
+    drawMeta.owner = "init"
+    if ok then return true end
+    Visual.noteErr(name, err)
+    drawMeta.hideOwned(name)
+    if hide then pcall(hide) end
+    return false
+end
+Visual.safe = function(name, fn)
+    return function(...)
+        local ok, err = pcall(fn, ...)
+        if not ok then Visual.noteErr(name, err) end
     end
-    dt = math.clamp(type(dt) == "number" and dt or 0.016, 0, 0.05)
-    Visual.dt = dt
-    visPhase += dt * 1.15
-    Cam = Workspace.CurrentCamera
-    if not Cam then
-        return
-    end
+end
+-- one actor that throws (an unexpected rig) is skipped for 5 s; everyone else keeps their box
+local espBad = setmetatable({}, { __mode = "k" })
+local function esp_one(model, plr, origin, color, role)
     local now = os.clock()
-    local origin = Cam.CFrame.Position
-    local measuredAt = os.clock()
-    local stepStart = measuredAt
-    Visual.memStart()
+    if (espBad[model] or 0) > now then return end
+    local ok, err = pcall(update_esp_one, model, plr, origin, color, role)
+    if ok then return end
+    espBad[model] = now + 5
+    local o = espByModel[model]
+    if o then pcall(hide_esp, o) end
+    Visual.noteErr("espActor", tostring(model.Name) .. ": " .. tostring(err))
+end
+local function hide_all_esp()
+    for _, o in espByModel do hide_esp(o) end
+end
+Visual.sec = {}
+Visual.sec.target = function(now, origin)
     if held.firearm then
         draw_fov()
     else
@@ -8073,197 +8137,370 @@ local function step(dt)
     elseif not CFG.Silent or not held.firearm then
         saTgt = nil
     end
+end
+-- a failed target section must not leave a stale target for the shot hook
+local function drop_target()
+    saTgt = nil
+    hide_fov()
+end
+Visual.sec.aimArt = function(now)
     if saTgt and saTgt.pos and held.firearm then
         local pen = Visual.pen(retLines)
         Visual.aim(pen, saTgt, CFG.MuzzleVisual and muzzle_pos() or nil, now, CFG.AimVisuals)
         pen.finish()
         retHidden = false
-
     else
         Visual.lock.model = nil
-
         hide_aim_lines()
     end
-    measuredAt = Visual.measure("aim", measuredAt)
-    draw_killaura()
-    measuredAt = Visual.measure("kaArt", measuredAt)
+end
+Visual.sec.esp = function(now, origin)
     table.clear(seen)
-    if CFG.ESP then
-        for i = 1, #roster do
-            local plr = roster[i]
-            local char = plr.Character
-            if char then
-                seen[char] = true
-                local rel = Rel.of(plr, now)
-                local root = root_of(char)
-                if root and now < (farUntil[char] or 0) then
-                    -- out of range a moment ago: skip all work until the next 0.25 s re-test
-                elseif root and (root.Position - origin).Magnitude > CFG.EspPlayerMaxDist then
-                    farUntil[char] = now + 0.25
-                    local o = espByModel[char]
-                    if o then hide_esp(o) end
-                elseif is_corpse(char) then
-                    update_esp_one(char, plr, origin, COL_CORPSE)
-                elseif rel == "out" then
-                    local o = espByModel[char]
-                    if o then hide_esp(o) end
-                elseif alive_ui(char, now) and (rel == "foe" or CFG.EspAllies) then
-                    update_esp_one(char, plr, origin, nil, rel)
-                else
-                    local o = espByModel[char]
-                    if o then hide_esp(o) end
-                end
+    if not CFG.ESP then
+        hide_all_esp()
+        return
+    end
+    for i = 1, #roster do
+        local plr = roster[i]
+        local char = plr.Character
+        if char then
+            seen[char] = true
+            local rel = Rel.of(plr, now)
+            local root = root_of(char)
+            if root and now < (farUntil[char] or 0) then
+                -- out of range a moment ago: skip all work until the next 0.25 s re-test
+            elseif root and (root.Position - origin).Magnitude > CFG.EspPlayerMaxDist then
+                farUntil[char] = now + 0.25
+                local o = espByModel[char]
+                if o then hide_esp(o) end
+            elseif is_corpse(char) then
+                esp_one(char, plr, origin, COL_CORPSE)
+            elseif rel == "out" then
+                local o = espByModel[char]
+                if o then hide_esp(o) end
+            elseif alive_ui(char, now) and (rel == "foe" or CFG.EspAllies) then
+                esp_one(char, plr, origin, nil, rel)
+            else
+                local o = espByModel[char]
+                if o then hide_esp(o) end
             end
-        end
-        measuredAt = Visual.measure("espPlr", measuredAt)
-        if CFG.Monsters then
-            local list = monsters()
-            for i = 1, #list do
-                local m = list[i]
-                seen[m] = true
-                local root = root_of(m)
-                if root and now < (farUntil[m] or 0) then
-                    -- far: skip until the next re-test
-                elseif root and (root.Position - origin).Magnitude > CFG.EspNpcMaxDist then
-                    farUntil[m] = now + 0.25
-                    local o = espByModel[m]
-                    if o then hide_esp(o) end
-                elseif alive_ui(m, now) then
-                    update_esp_one(m, nil, origin)
-                else
-                    local o = espByModel[m]
-                    if o then hide_esp(o) end
-                end
-            end
-        end
-    else
-        for _, o in espByModel do
-            hide_esp(o)
         end
     end
-    measuredAt = Visual.measure("espNpc", measuredAt)
-    espPool.sweep(seen, now)
-    measuredAt = Visual.measure("sweep", measuredAt)
-    Visual.worldDraw(origin)
-    measuredAt = Visual.measure("world", measuredAt)
-    Visual.pvpTick(now)
-    draw_loot(dt, origin)
-    measuredAt = Visual.measure("loot", measuredAt)
-    draw_mock(dt)
-    measuredAt = Visual.measure("mock", measuredAt)
-    Visual.stepLiveFx(now)
-    measuredAt = Visual.measure("liveFx", measuredAt)
-    Visual.deathStep(now, origin)
-    Visual.exitStep(now, origin)
-    Visual.findStep(now, origin)
-    Visual.bossStep(now, origin)
-    measuredAt = Visual.measure("marks", measuredAt)
-    Visual.aimSpoofTick(now)
-    Visual.pfxStep(Cam, now)
-    measuredAt = Visual.measure("particles", measuredAt)
-    Visual.icon.flush()
-    Visual.measure("iconFlush", measuredAt)
+    Visual.mt = Visual.measure("espPlr", Visual.mt)
+    if CFG.Monsters then
+        local list = monsters()
+        for i = 1, #list do
+            local m = list[i]
+            seen[m] = true
+            local root = root_of(m)
+            if root and now < (farUntil[m] or 0) then
+                -- far: skip until the next re-test
+            elseif root and (root.Position - origin).Magnitude > CFG.EspNpcMaxDist then
+                farUntil[m] = now + 0.25
+                local o = espByModel[m]
+                if o then hide_esp(o) end
+            elseif alive_ui(m, now) then
+                esp_one(m, nil, origin)
+            else
+                local o = espByModel[m]
+                if o then hide_esp(o) end
+            end
+        end
+    end
+end
+local function clear_particles_soft() Visual.clearParticles(false) end
+
+local function step(dt)
+    if not running then
+        return
+    end
+    dt = math.clamp(type(dt) == "number" and dt or 0.016, 0, 0.05)
+    Visual.dt = dt
+    visPhase += dt * 1.15
+    Cam = Workspace.CurrentCamera
+    if not Cam then
+        return
+    end
+    local now = os.clock()
+    local origin = Cam.CFrame.Position
+    local G, S = Visual.guard, Visual.sec
+    Visual.mt = os.clock()
+    local stepStart = Visual.mt
+    Visual.memStart()
+    G("target", drop_target, S.target, now, origin)
+    G("aimArt", hide_aim_lines, S.aimArt, now)
+    Visual.mt = Visual.measure("aim", Visual.mt)
+    G("killaura", hide_ka, draw_killaura)
+    Visual.mt = Visual.measure("kaArt", Visual.mt)
+    G("esp", hide_all_esp, S.esp, now, origin)
+    Visual.mt = Visual.measure("espNpc", Visual.mt)
+    G("espSweep", nil, espPool.sweep, seen, now)
+    Visual.mt = Visual.measure("sweep", Visual.mt)
+    G("world", nil, Visual.worldDraw, origin)
+    Visual.mt = Visual.measure("world", Visual.mt)
+    G("pvp", nil, Visual.pvpTick, now)
+    G("loot", hide_loot, draw_loot, dt, origin)
+    Visual.mt = Visual.measure("loot", Visual.mt)
+    G("mock", hide_mock, draw_mock, dt)
+    Visual.mt = Visual.measure("mock", Visual.mt)
+    G("liveFx", nil, Visual.stepLiveFx, now)
+    Visual.mt = Visual.measure("liveFx", Visual.mt)
+    G("death", nil, Visual.deathStep, now, origin)
+    G("exit", nil, Visual.exitStep, now, origin)
+    G("find", nil, Visual.findStep, now, origin)
+    G("boss", nil, Visual.bossStep, now, origin)
+    Visual.mt = Visual.measure("marks", Visual.mt)
+    G("aimSpoof", nil, Visual.aimSpoofTick, now)
+    G("particles", clear_particles_soft, Visual.pfxStep, Cam, now)
+    Visual.mt = Visual.measure("particles", Visual.mt)
+    G("icons", nil, Visual.icon.flush)
+    Visual.measure("iconFlush", Visual.mt)
     Visual.measureT("STEP", stepStart)
 end
 
 local function unload()
     if not running then return end
     running = false
+    local function try(step)
+        local ok, err = pcall(step)
+        if not ok then
+            Life.errs.unload = { n = ((Life.errs.unload or {}).n or 0) + 1, msg = tostring(err), at = os.clock() }
+            log("[hush] unload step failed: " .. tostring(err))
+        end
+    end
     Life.uiState = nil
-    Visual.aimSpoofTick(math.huge) -- take a spoofed ADS back
-    Visual.dbgFlush(0, true)
-    Life.clear(connections)
-    Visual.worldStop()
-    Visual.baseStop()
-    Visual.weaponScaleStop()
-    Visual.skinStop()
-    Visual.swapStop()
-    Visual.stopLiveFx()
-    Visual.deathStop()
-    game:GetService("ContextActionService"):UnbindAction("HushMoveKeys")
-    Visual.markersStop()
-    Visual.dnClear()
-    Visual.staffStop()
-    Visual.moveStop()
-    Visual.sitStop()
-    Life.clear(Life.char)
-    Life.clear(Life.monsters)
-    Life.character = nil
-    RunService:UnbindFromRenderStep("HushKA_Facing")
-    RunService:UnbindFromRenderStep("HushSwap")
-    Visual.kaFaceStop()
-    if Visual.hitGroup then Visual.hitGroup:Destroy(); Visual.hitGroup = nil end
-    if Visual.sledgeBind then
-        Visual.sledgeBind.aim = Visual.sledgeOriginalAim
-        Visual.sledgeBind.swing = Visual.sledgeOriginalSwing
-        Visual.sledgeBind.__hushAim = nil
-    end
-    Loot.stopAuto()
-    for prompt in searchPrompts do Loot.remove(prompt) end
-    for _, cache in Loot.scan do table.clear(cache.rows); table.clear(cache.keys) end
-    for part, conn in Loot.waiting do conn:Disconnect(); Loot.waiting[part] = nil end
-    table.clear(lootKnown)
-    table.clear(Loot.moving)
-    table.clear(Loot.byPart)
-    table.clear(Loot.grid)
-    Loot.module, Loot.gui = nil, nil
-    for _, buffer in Loot.bufs do table.clear(buffer.rows); table.clear(buffer.d2); buffer.n = 0 end
-    if restorefunction then
-        if Life.shootTarget then restorefunction(Life.shootTarget); Life.shootTarget = nil end
-        if Visual.everywhere.target then restorefunction(Visual.everywhere.target); Visual.everywhere.target = nil end
-    end
-    hooked = false
-    espPool.destroy()
-    Visual.clearParticles(true)
-    for _, pen in Visual.pens do
-        for _, tri in pen.tris do tri:Remove() end
-        for _, quad in pen.quads do quad:Remove() end
-    end
-    table.clear(Visual.pens)
-    table.clear(visCache)
-    table.clear(shotAt)
-    table.clear(reloadAt)
-    table.clear(aimPartCache)
-    table.clear(humCache)
-    table.clear(humRecheck)
-    table.clear(Resolver.track)
-    table.clear(Visual.mp)
-    table.clear(monsterList)
-    table.clear(roster)
-    saTgt, kaAim, lastAim, ka.tgt = nil, nil, nil, nil
-    Visual.lock.model = nil
-    table.clear(Rel.cache)
-    hide_fov()
-    for i = 1, FOV_N do
-        fovLines[i]:Remove()
-    end
-    hide_aim_lines()
-    for i = 1, RET_N do
-        retLines[i]:Remove()
-    end
-    hide_ka()
-    for i = 1, KA_N do
-        kaLines[i]:Remove()
-    end
-    hide_mock()
-    for i = 1, #mockLines do
-        mockLines[i]:Remove()
-    end
-    for i = 1, #mockText do
-        mockText[i]:Remove()
-    end
-    Visual.fxFree()
-    table.clear(Visual.mockActors)
-    table.clear(stations)
-    hide_loot()
-    for i = 1, #lootLines do
-        lootLines[i]:Remove()
-    end
-    for i = 1, #lootText do
-        lootText[i]:Remove()
-    end
+    try(function()
+        Visual.aimSpoofTick(math.huge) -- take a spoofed ADS back
+    end)
+    try(function()
+        Visual.dbgFlush(0, true)
+    end)
+    try(function()
+        Life.clear(connections)
+    end)
+    try(function()
+        Visual.worldStop()
+    end)
+    try(function()
+        Visual.baseStop()
+    end)
+    try(function()
+        Visual.weaponScaleStop()
+    end)
+    try(function()
+        Visual.skinStop()
+    end)
+    try(function()
+        Visual.swapStop()
+    end)
+    try(function()
+        Visual.stopLiveFx()
+    end)
+    try(function()
+        Visual.deathStop()
+    end)
+    try(function()
+        game:GetService("ContextActionService"):UnbindAction("HushMoveKeys")
+    end)
+    try(function()
+        Visual.markersStop()
+    end)
+    try(function()
+        Visual.dnClear()
+    end)
+    try(function()
+        Visual.staffStop()
+    end)
+    try(function()
+        Visual.moveStop()
+    end)
+    try(function()
+        Visual.sitStop()
+    end)
+    try(function()
+        Life.clear(Life.char)
+    end)
+    try(function()
+        Life.clear(Life.monsters)
+    end)
+    try(function()
+        Life.character = nil
+    end)
+    try(function()
+        RunService:UnbindFromRenderStep("HushKA_Facing")
+    end)
+    try(function()
+        RunService:UnbindFromRenderStep("HushSwap")
+    end)
+    try(function()
+        Visual.kaFaceStop()
+    end)
+    try(function()
+        if Visual.hitGroup then Visual.hitGroup:Destroy(); Visual.hitGroup = nil end
+    end)
+    try(function()
+        if Visual.sledgeBind then
+            Visual.sledgeBind.aim = Visual.sledgeOriginalAim
+            Visual.sledgeBind.swing = Visual.sledgeOriginalSwing
+            Visual.sledgeBind.__hushAim = nil
+        end
+    end)
+    try(function()
+        Loot.stopAuto()
+    end)
+    try(function()
+        for prompt in searchPrompts do Loot.remove(prompt) end
+    end)
+    try(function()
+        for _, cache in Loot.scan do table.clear(cache.rows); table.clear(cache.keys) end
+    end)
+    try(function()
+        for part, conn in Loot.waiting do conn:Disconnect(); Loot.waiting[part] = nil end
+    end)
+    try(function()
+        table.clear(lootKnown)
+    end)
+    try(function()
+        table.clear(Loot.moving)
+    end)
+    try(function()
+        table.clear(Loot.byPart)
+    end)
+    try(function()
+        table.clear(Loot.grid)
+    end)
+    try(function()
+        Loot.module, Loot.gui = nil, nil
+    end)
+    try(function()
+        for _, buffer in Loot.bufs do table.clear(buffer.rows); table.clear(buffer.d2); buffer.n = 0 end
+    end)
+    try(function()
+        if restorefunction then
+            if Life.shootTarget then restorefunction(Life.shootTarget); Life.shootTarget = nil end
+            if Visual.everywhere.target then restorefunction(Visual.everywhere.target); Visual.everywhere.target = nil end
+        end
+    end)
+    try(function()
+        hooked = false
+    end)
+    try(function()
+        espPool.destroy()
+    end)
+    try(function()
+        Visual.clearParticles(true)
+    end)
+    try(function()
+        for _, pen in Visual.pens do
+            for _, tri in pen.tris do tri:Remove() end
+            for _, quad in pen.quads do quad:Remove() end
+        end
+    end)
+    try(function()
+        table.clear(Visual.pens)
+    end)
+    try(function()
+        table.clear(visCache)
+    end)
+    try(function()
+        table.clear(shotAt)
+    end)
+    try(function()
+        table.clear(reloadAt)
+    end)
+    try(function()
+        table.clear(aimPartCache)
+    end)
+    try(function()
+        table.clear(humCache)
+    end)
+    try(function()
+        table.clear(humRecheck)
+    end)
+    try(function()
+        table.clear(Resolver.track)
+    end)
+    try(function()
+        table.clear(Visual.mp)
+    end)
+    try(function()
+        table.clear(monsterList)
+    end)
+    try(function()
+        table.clear(roster)
+    end)
+    try(function()
+        saTgt, kaAim, lastAim, ka.tgt = nil, nil, nil, nil
+    end)
+    try(function()
+        Visual.lock.model = nil
+    end)
+    try(function()
+        table.clear(Rel.cache)
+    end)
+    try(function()
+        hide_fov()
+    end)
+    try(function()
+        for i = 1, FOV_N do
+            fovLines[i]:Remove()
+        end
+    end)
+    try(function()
+        hide_aim_lines()
+    end)
+    try(function()
+        for i = 1, RET_N do
+            retLines[i]:Remove()
+        end
+    end)
+    try(function()
+        hide_ka()
+    end)
+    try(function()
+        for i = 1, KA_N do
+            kaLines[i]:Remove()
+        end
+    end)
+    try(function()
+        hide_mock()
+    end)
+    try(function()
+        for i = 1, #mockLines do
+            mockLines[i]:Remove()
+        end
+    end)
+    try(function()
+        for i = 1, #mockText do
+            mockText[i]:Remove()
+        end
+    end)
+    try(function()
+        Visual.fxFree()
+    end)
+    try(function()
+        table.clear(Visual.mockActors)
+    end)
+    try(function()
+        table.clear(stations)
+    end)
+    try(function()
+        hide_loot()
+    end)
+    try(function()
+        for i = 1, #lootLines do
+            lootLines[i]:Remove()
+        end
+    end)
+    try(function()
+        for i = 1, #lootText do
+            lootText[i]:Remove()
+        end
+    end)
+    -- the registry removes whatever the steps above missed or failed to reach
+    try(drawMeta.sweep)
     getgenv().HushSilent = nil
-    warn("[hush] unloaded")
+    log("[hush] unloaded")
 end
 
 bind(UserInputService.InputBegan:Connect(function(input)
@@ -8282,7 +8519,7 @@ bind(UserInputService.InputBegan:Connect(function(input)
         CFG.LootMinRarity = CFG.LootMinRarity == 1 and 3 or 1
         CFG.LootUnknown = CFG.LootMinRarity == 1
         Loot.nextQuery = 0
-        warn("[hush] loot filter: " .. (CFG.LootMinRarity == 3 and "confirmed Rare+ only" or "all + unknown"))
+        log("[hush] loot filter: " .. (CFG.LootMinRarity == 3 and "confirmed Rare+ only" or "all + unknown"))
     elseif key == keys.Perf then
         warn("[hush] sections/resources: " .. game:GetService("HttpService"):JSONEncode({ sections = getgenv().HushSilent.perf(), resources = Life.snapshot() }))
     elseif key == keys.Speed then
@@ -8313,7 +8550,7 @@ bind(UserInputService.InputBegan:Connect(function(input)
         local order, at = Visual.SWAP_ORDER, 1
         for i, n in order do if n == CFG.ModelSwapModel then at = i end end
         CFG.ModelSwapModel = order[at % #order + 1]
-        warn("[hush] ModelSwap model: " .. CFG.ModelSwapModel)
+        log("[hush] ModelSwap model: " .. CFG.ModelSwapModel)
     elseif key == keys.Unload then
         unload()
     end
@@ -8323,17 +8560,17 @@ end))
 game:GetService("ContextActionService"):BindActionAtPriority("HushMoveKeys", function() return Enum.ContextActionResult.Sink end,
     false, 3000, CFG.Keys.Speed, CFG.Keys.HighJump)
 
-bind(RunService.RenderStepped:Connect(step))
-bind(RunService.PreSimulation:Connect(Visual.moveStep))
-bind(RunService.PostSimulation:Connect(Visual.hopHorizontalPost))
+bind(RunService.RenderStepped:Connect(Visual.safe("frame", step)))
+bind(RunService.PreSimulation:Connect(Visual.safe("moveStep", Visual.moveStep)))
+bind(RunService.PostSimulation:Connect(Visual.safe("hopPost", Visual.hopHorizontalPost)))
 Visual.worldStart()
 bind(game:GetService("ProximityPromptService").PromptShown:Connect(Visual.onPromptShown))
 -- Runs after the game's Camera/Character yaw writers; Heartbeat yaw alone is overwritten.
-RunService:BindToRenderStep("HushKA_Facing", Enum.RenderPriority.Character.Value + 1, Visual.kaFaceStep)
+RunService:BindToRenderStep("HushKA_Facing", Enum.RenderPriority.Character.Value + 1, Visual.safe("kaFace", Visual.kaFaceStep))
 -- after the game's cameraStep (Camera+1) rewrote u108: keeps the HUD crosshair and the next shot on the camera centre
-RunService:BindToRenderStep("HushSwap", Enum.RenderPriority.Camera.Value + 3, Visual.swapStep)
+RunService:BindToRenderStep("HushSwap", Enum.RenderPriority.Camera.Value + 3, Visual.safe("swap", Visual.swapStep))
 Visual.perfAt = os.clock() + 15
-bind(RunService.Heartbeat:Connect(function()
+bind(RunService.Heartbeat:Connect(Visual.safe("heartbeat", function()
     if not running then
         return
     end
@@ -8354,7 +8591,7 @@ bind(RunService.Heartbeat:Connect(function()
             Install.why = tostring(err)
         end
         if not hooked and Install.tries == 8 then
-            warn("[hush] silent off: " .. tostring(Install.why) .. ". Unequip and equip a firearm to retry.")
+            log("[hush] silent off: " .. tostring(Install.why) .. ". Unequip and equip a firearm to retry.")
         end
     end
     Visual.ledSweep(now)
@@ -8371,7 +8608,7 @@ bind(RunService.Heartbeat:Connect(function()
         Visual.perfAt = now + 15
         Visual.report()
     end
-end))
+end)))
 
 local function watch_char(char)
     if not running or not char or Life.character == char then return end
@@ -8443,7 +8680,7 @@ Visual.onEffectShot = function(action, payload)
         if rec then
             local shifted = typeof(payload.origin) == "Vector3" and (payload.origin - rec.from).Magnitude > 0.5
             if shifted then
-                warn(string.format("[hush] shot #%d: the SERVER fired from %.2f st away from the origin we claimed (OriginSlack): same direction, the bullet is shifted by that much", payload.seq, (payload.origin - rec.from).Magnitude))
+                log(string.format("[hush] shot #%d: the SERVER fired from %.2f st away from the origin we claimed (OriginSlack): same direction, the bullet is shifted by that much", payload.seq, (payload.origin - rec.from).Magnitude))
             end
             -- the server's own cone radius, from the direction it fired (arcs.v[k] = launch velocity): feeds Visual.coneR (ServerSpread)
             local v = type(payload.arcs) == "table" and type(payload.arcs.v) == "table" and (payload.arcs.v[1] or payload.arcs.v["1"])
@@ -8475,7 +8712,7 @@ Visual.onGunEvent = function(action, kind)
         local left = type(kind) == "table" and kind.reloadLeft
         if CFG.ShotLog and type(left) == "number" and left > 0 and os.clock() - (Visual.reloadLogAt or 0) > 1 then
             Visual.reloadLogAt = os.clock()
-            warn(string.format("[hush] server reload timer %.2fs (client cannot shorten it)", left))
+            log(string.format("[hush] server reload timer %.2fs (client cannot shorten it)", left))
         end
     else
         local note = tostring(action)
@@ -8512,7 +8749,7 @@ task.spawn(function()
                     local hit = type(payload.hit) == "table" and payload.hit or nil
                     local tr = sent.model and sent.model:FindFirstChild("HumanoidRootPart")
                     local hp = hit and typeof(hit.pos) == "Vector3" and hit.pos
-                    warn(string.format("[hush] KA server: landed %s | kind %s | part %s | miss %.2f | lead %.2f | dt %.2f",
+                    log(string.format("[hush] KA server: landed %s | kind %s | part %s | miss %.2f | lead %.2f | dt %.2f",
                         tostring(payload.landed), tostring(hit and hit.kind), tostring(hit and (hit.part or hit.name)),
                         (hp and tr) and (hp - tr.Position).Magnitude or -1, sent.lead, os.clock() - sent.at))
                 end
@@ -8562,7 +8799,7 @@ task.spawn(function()
         task.wait(0.5)
     end
     if running and sledgeMod and not aimWrapped then
-        warn("[hush] sledge aim table never appeared, aura uses look-spoof only (needs silent hook)")
+        log("[hush] sledge aim table never appeared, aura uses look-spoof only (needs silent hook)")
     end
 end)
 
@@ -8571,6 +8808,16 @@ getgenv().HushSilent = {
     unload = unload,
     soundTest = play_hit,
     resources = Life.snapshot,
+    diag = function()
+        local parts = { "HUSH diagnostics", "drawings live " .. drawMeta.stats.live .. " peak " .. drawMeta.stats.peak .. " created " .. drawMeta.stats.created .. " removed " .. drawMeta.stats.removed }
+        local any = false
+        for name, e in Life.errs do
+            any = true
+            parts[#parts + 1] = string.format("%s x%d (%.0f s ago): %s", name, e.n, os.clock() - (e.at or 0), tostring(e.msg))
+        end
+        if not any then parts[#parts + 1] = "no section errors" end
+        return table.concat(parts, "\n")
+    end,
     perf = function()
         local result = {}
         for name, row in Loot.perf do
@@ -8580,7 +8827,7 @@ getgenv().HushSilent = {
     end,
 }
 
-warn("[hush] Standalone keys in CFG.Keys; Syllinse UI uses its own unbound keybinds")
+log("[hush] Standalone keys in CFG.Keys; Syllinse UI uses its own unbound keybinds")
 
 -- The runtime above starts once. The loader only mounts controls and owns teardown.
 return function(_Lib, _Core)
@@ -9232,14 +9479,20 @@ return function(_Lib, _Core)
             bindAction(s, "Gallery key", "Gallery", drop_mock)
         end
         do
-            local s = card("Debug", "Right", "Shot Logs")
-            toggle(s, "Shot Log File", "DebugFile")
-            toggle(s, "Post-Shot Samples", "DebugAfter")
-            toggle(s, "Console Log", "ShotLog")
-            toggle(s, "Hop Log", "HopLog")
-            note(s, "Files: executor workspace / hush / shots_<time>.jsonl. Existing logs are never deleted.")
-            head(s, "Performance")
-            toggle(s, "Perf Log", "PerfLog")
+            local s = card("Debug", "Right", "Diagnostics", "Off by default. Nothing is printed to the console unless Console Output is on. These switches are never saved in a config.")
+            local function volatile(el) el.IgnoreConfig = true; return el end
+            volatile(toggle(s, "Console Output", "Debug", "Every [hush] message: hooks, loot, heal, section errors."))
+            volatile(toggle(s, "Verbose Shot Lines", "ShotLog", "Per-shot and per-event console lines. Needs Console Output."))
+            volatile(toggle(s, "Hop Lines", "HopLog", "One line per 0.5 s while Hop pushes. Needs Console Output."))
+            volatile(toggle(s, "Shot Log File", "DebugFile", "Writes workspace / hush / shots_<time>.jsonl. Existing logs are never deleted."))
+            volatile(toggle(s, "Post-Shot Samples", "DebugAfter"))
+            volatile(toggle(s, "Perf Log", "PerfLog"))
+            s:Button({ Name = "Copy Diagnostics", Callback = function()
+                if not running then return end
+                local text = M.diag()
+                if setclipboard then setclipboard(text); ctx.notify("HUSH", "Diagnostics copied to the clipboard.")
+                else ctx.notify("HUSH", "No clipboard on this executor.") end
+            end })
             local function report()
                 if not running then return end
                 warn("[hush] sections/resources: " .. game:GetService("HttpService"):JSONEncode({
