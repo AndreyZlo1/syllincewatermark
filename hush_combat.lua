@@ -299,7 +299,6 @@ local CFG = {
     AimSpoofHold = true,
     -- Debug file hush/shots_<time>.jsonl in the executor workspace (Potassium: %LOCALAPPDATA%/Potassium/workspace/hush): one line per shot with everything the
     -- solver, the wall trace and the target looked like at the packet, the raw server events, per-shot hit/miss and (DebugAfter) where the target was seen later.
-    Debug = false, -- console output; every message goes through log()
     DebugFile = false,
     DebugAfter = false,
     KaAim = "Head", -- "Head" or "HRP": the part the hammer is aimed at (the other parts are the fallback when it is out of reach)
@@ -341,7 +340,7 @@ local CFG = {
     MPFirst = true, -- covered head: head centre -> MultiPoint -> head edge -> body (false: head edge before MultiPoint)
     LeadCap = 24, -- studs the target may be led at most
     MPRate = 0.15,
-    ShotLog = false, -- verbose per-shot / per-event console lines (needs Debug)
+    ShotLog = false, -- console output: every [hush] message goes through log()
     PerfLog = false, -- one compact console line every 15 s: avg/max ms per section
     -- AutoDecrypt opens through fireproximityprompt (Config.Loot.OpenDistance 10; the server's distance check is unread, the radius is a test).
     AutoDecrypt = false,
@@ -395,9 +394,9 @@ local CFG = {
     },
 }
 
--- Production: nothing reaches the console unless CFG.Debug is on (Misc > Debug). Debug toggles are never saved in a config.
+-- Production: nothing reaches the console unless Debug > Console Log (CFG.ShotLog) is on. The Debug toggles are never saved in a config.
 local function log(...)
-    if CFG.Debug then warn(...) end
+    if CFG.ShotLog then warn(...) end
 end
 
 -- Players: green = clear shot, red = behind cover. NPC: translucent purple. Ally sky blue, protected player gold, corpse bone. States have fixed colours (Drive orange, Aim red, Run light blue).
@@ -3468,7 +3467,10 @@ local function hide_ret()
         retLines[i].Visible = false
     end
     local pen = Visual.pens[retLines]
-    if pen then for _, tri in pen.tris do tri.Visible = false end end
+    if pen then
+        for _, tri in pen.tris do tri.Visible = false end
+        for _, quad in pen.quads do quad.Visible = false end
+    end
 end
 
 local function hide_aim_lines()
@@ -3486,7 +3488,10 @@ local function hide_ka()
     if Visual.kaHidden then return end
     Visual.kaHidden = true
     local pen = Visual.pens and Visual.pens[kaLines]
-    if pen then for _, tri in pen.tris do tri.Visible = false end end
+    if pen then
+        for _, tri in pen.tris do tri.Visible = false end
+        for _, quad in pen.quads do quad.Visible = false end
+    end
     for i = 1, KA_N do
         kaLines[i].Visible = false
     end
@@ -8079,7 +8084,7 @@ Visual.staffStop = function()
     table.clear(S.warned)
 end
 
--- Frame sections run isolated: a failing one hides what it owns and is counted in Life.errs (Misc > Debug > Copy Diagnostics); the rest of the frame still runs,
+-- Frame sections run isolated: a failing one hides what it owns and is counted in Life.errs (HushSilent.diag()); the rest of the frame still runs,
 -- so one bad model or one new game field can no longer freeze every drawing at its last frame.
 Life.errs = {}
 Visual.noteErr = function(name, err)
@@ -8120,6 +8125,12 @@ end
 local function hide_all_esp()
     for _, o in espByModel do hide_esp(o) end
 end
+-- a section that threw may have drawn without reaching its own flag: force "shown", then hide
+local function hide_ret_hard() retHidden = false; hide_ret() end
+local function hide_ka_hard() Visual.kaHidden = false; hide_ka() end
+local function hide_loot_hard() Loot.hidden = false; hide_loot() end
+local function hide_mock_hard() Loot.mockHidden = false; hide_mock() end
+local function hide_fov_hard() fovOn = true; hide_fov() end
 Visual.sec = {}
 Visual.sec.target = function(now, origin)
     if held.firearm then
@@ -8141,14 +8152,14 @@ end
 -- a failed target section must not leave a stale target for the shot hook
 local function drop_target()
     saTgt = nil
-    hide_fov()
+    hide_fov_hard()
 end
 Visual.sec.aimArt = function(now)
     if saTgt and saTgt.pos and held.firearm then
         local pen = Visual.pen(retLines)
+        retHidden = false -- before drawing: a draw that throws midway must still be hideable
         Visual.aim(pen, saTgt, CFG.MuzzleVisual and muzzle_pos() or nil, now, CFG.AimVisuals)
         pen.finish()
-        retHidden = false
     else
         Visual.lock.model = nil
         hide_aim_lines()
@@ -8228,9 +8239,9 @@ local function step(dt)
     local stepStart = Visual.mt
     Visual.memStart()
     G("target", drop_target, S.target, now, origin)
-    G("aimArt", hide_aim_lines, S.aimArt, now)
+    G("aimArt", hide_ret_hard, S.aimArt, now)
     Visual.mt = Visual.measure("aim", Visual.mt)
-    G("killaura", hide_ka, draw_killaura)
+    G("killaura", hide_ka_hard, draw_killaura)
     Visual.mt = Visual.measure("kaArt", Visual.mt)
     G("esp", hide_all_esp, S.esp, now, origin)
     Visual.mt = Visual.measure("espNpc", Visual.mt)
@@ -8239,9 +8250,9 @@ local function step(dt)
     G("world", nil, Visual.worldDraw, origin)
     Visual.mt = Visual.measure("world", Visual.mt)
     G("pvp", nil, Visual.pvpTick, now)
-    G("loot", hide_loot, draw_loot, dt, origin)
+    G("loot", hide_loot_hard, draw_loot, dt, origin)
     Visual.mt = Visual.measure("loot", Visual.mt)
-    G("mock", hide_mock, draw_mock, dt)
+    G("mock", hide_mock_hard, draw_mock, dt)
     Visual.mt = Visual.measure("mock", Visual.mt)
     G("liveFx", nil, Visual.stepLiveFx, now)
     Visual.mt = Visual.measure("liveFx", Visual.mt)
@@ -9479,20 +9490,15 @@ return function(_Lib, _Core)
             bindAction(s, "Gallery key", "Gallery", drop_mock)
         end
         do
-            local s = card("Debug", "Right", "Diagnostics", "Off by default. Nothing is printed to the console unless Console Output is on. These switches are never saved in a config.")
+            local s = card("Debug", "Right", "Shot Logs")
             local function volatile(el) el.IgnoreConfig = true; return el end
-            volatile(toggle(s, "Console Output", "Debug", "Every [hush] message: hooks, loot, heal, section errors."))
-            volatile(toggle(s, "Verbose Shot Lines", "ShotLog", "Per-shot and per-event console lines. Needs Console Output."))
-            volatile(toggle(s, "Hop Lines", "HopLog", "One line per 0.5 s while Hop pushes. Needs Console Output."))
-            volatile(toggle(s, "Shot Log File", "DebugFile", "Writes workspace / hush / shots_<time>.jsonl. Existing logs are never deleted."))
+            volatile(toggle(s, "Shot Log File", "DebugFile"))
             volatile(toggle(s, "Post-Shot Samples", "DebugAfter"))
+            volatile(toggle(s, "Console Log", "ShotLog"))
+            volatile(toggle(s, "Hop Log", "HopLog"))
+            note(s, "Files: executor workspace / hush / shots_<time>.jsonl. Existing logs are never deleted.")
+            head(s, "Performance")
             volatile(toggle(s, "Perf Log", "PerfLog"))
-            s:Button({ Name = "Copy Diagnostics", Callback = function()
-                if not running then return end
-                local text = M.diag()
-                if setclipboard then setclipboard(text); ctx.notify("HUSH", "Diagnostics copied to the clipboard.")
-                else ctx.notify("HUSH", "No clipboard on this executor.") end
-            end })
             local function report()
                 if not running then return end
                 warn("[hush] sections/resources: " .. game:GetService("HttpService"):JSONEncode({
