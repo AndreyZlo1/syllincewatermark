@@ -4344,11 +4344,17 @@ Visual.FONT_FILES = {
     { "Orbitron", "Orbitron.ttf", "orbitron/Orbitron%5Bwght%5D.ttf" },
     { "ShareTechMono", "ShareTechMono-Regular.ttf", "sharetechmono/ShareTechMono-Regular.ttf" },
 }
--- Font.Data takes the TTF BYTES (assigning the Font object to Text.Font turns it into a numeric id). Fonts are downloaded once into
--- workspace hush/fonts, loaded at startup, removed on unload.
+-- Font is an optional Drawing extension; unsupported executors may throw or return a string.
+-- Probe once at startup, before filesystem/HTTP work; fxFont already falls back to built-in 0.
+-- Font.Data takes TTF bytes; assigning the object to Text.Font resolves its numeric id.
 Visual.loadFonts = function()
     local fx = Visual.fx
     if next(fx.fontId) then return end
+    local supported, probeFont = pcall(Drawing.new, "Font")
+    if not supported or (type(probeFont) ~= "table" and type(probeFont) ~= "userdata") then
+        return
+    end
+    probeFont:Remove()
     if not isfolder("hush") then makefolder("hush") end
     if not isfolder("hush/fonts") then makefolder("hush/fonts") end
     for _, row in Visual.FONT_FILES do
